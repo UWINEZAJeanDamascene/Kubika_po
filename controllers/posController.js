@@ -487,7 +487,7 @@ exports.getReceipt = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const invoice = await Invoice.findOne({ _id: req.params.id, company: companyId })
-      .populate('client', 'name contact code')
+      .populate('client', 'name contact code taxId type')
       .populate('createdBy', 'name email')
       .populate('lines.product', 'name sku unit ebm');
 

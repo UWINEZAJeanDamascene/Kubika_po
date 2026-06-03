@@ -70,7 +70,7 @@ const stockMovementSchema = new mongoose.Schema({
   expiryDate: Date,
   referenceType: {
     type: String,
-    enum: ['purchase', 'purchase_order', 'invoice', 'adjustment', 'return', 'credit_note', 'other', 'delivery_note', 'stock_audit']
+    enum: ['purchase', 'purchase_order', 'invoice', 'adjustment', 'return', 'credit_note', 'other', 'delivery_note', 'stock_audit', 'opening_stock']
   },
   referenceNumber: String,
   referenceDocument: {
@@ -109,6 +109,11 @@ stockMovementSchema.index({ company: 1, movementDate: 1 });
 stockMovementSchema.index({ product: 1, type: 1 });
 stockMovementSchema.index({ company_id: 1, type: 1, createdAt: -1 });
 stockMovementSchema.index({ company_id: 1, product_id: 1, createdAt: -1 });
+// Opening stock: enforce one-time entry per product per warehouse
+stockMovementSchema.index(
+  { company: 1, product: 1, warehouse: 1, reason: 1 },
+  { unique: true, partialFilterExpression: { reason: 'initial_stock' } }
+);
 
 // Serialize Decimal128s as strings
 stockMovementSchema.set('toJSON', {

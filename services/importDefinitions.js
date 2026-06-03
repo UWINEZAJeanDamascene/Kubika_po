@@ -116,7 +116,8 @@ const ENTITY_DEFINITIONS = {
       { key: 'productCode', label: 'Product Code', required: true, section: 'Stock', example: 'PRD-001', instructions: 'Must match an existing product SKU.' },
       { key: 'warehouse', label: 'Warehouse', required: true, section: 'Stock', example: 'Main Warehouse', instructions: 'Must match an existing warehouse.' },
       { key: 'quantity', label: 'Quantity', required: true, section: 'Stock', example: '120', instructions: 'Numbers only.' },
-      { key: 'costPerUnit', label: 'Cost Per Unit', required: false, section: 'Stock', example: '950', instructions: 'Numbers only.' }
+      { key: 'costPerUnit', label: 'Cost Per Unit', required: false, section: 'Stock', example: '950', instructions: 'Numbers only.' },
+      { key: 'asOfDate', label: 'As-of Date', required: false, section: 'Stock', example: '31/12/2025', instructions: 'Enter the date your business started or your migration date. Format: DD/MM/YYYY. Leave blank to use today.' }
     ]
   },
   opening_ar_balances: {

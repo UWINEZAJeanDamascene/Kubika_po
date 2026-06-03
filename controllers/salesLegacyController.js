@@ -5,6 +5,7 @@ const StockMovement = require('../models/StockMovement');
 const Warehouse = require('../models/Warehouse');
 const Company = require('../models/Company');
 const { BankAccount } = require('../models/BankAccount');
+const TillSession = require('../models/TillSession');
 const mongoose = require('mongoose');
 const { runInTransaction } = require('../services/transactionService');
 const inventoryService = require('../services/inventoryService');
@@ -57,7 +58,8 @@ exports.createDirectSale = async (req, res, next) => {
       notes,
       dueDate,
       terms,
-      bankAccountId
+      bankAccountId,
+      tillSession
     } = req.body;
 
     // Validation
@@ -65,6 +67,14 @@ exports.createDirectSale = async (req, res, next) => {
       return res.status(400).json({
         success: false,
         message: 'No items provided for sale'
+      });
+    }
+
+    const activeTill = await TillSession.findOne({ company: companyId, openedBy: req.user.id, status: 'open' });
+    if (!activeTill) {
+      return res.status(400).json({
+        success: false,
+        message: 'Till session is required and must be open to record a POS sale'
       });
     }
 
@@ -269,7 +279,10 @@ exports.createDirectSale = async (req, res, next) => {
             cogsAmount = consumeResult.totalCost || (unitCost * quantity);
           } catch (consumeErr) {
             console.error(`[createDirectSale] inventoryService.consume failed:`, consumeErr);
-            // Fallback to average cost
+            if (consumeErr && consumeErr.code === 'INSUFFICIENT_STOCK') {
+              throw consumeErr;
+            }
+            // Fallback to average cost for other errors
             unitCost = product.averageCost || 0;
             cogsAmount = unitCost * quantity;
           }
@@ -536,6 +549,13 @@ exports.createDirectSale = async (req, res, next) => {
     });
 
   } catch (error) {
+    if (error && error.code === 'INSUFFICIENT_STOCK') {
+      return res.status(409).json({
+        success: false,
+        code: 'ERR_INSUFFICIENT_STOCK',
+        message: 'Insufficient stock to complete POS sale'
+      });
+    }
     next(error);
   }
 };

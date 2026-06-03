@@ -197,7 +197,7 @@ exports.createInvoice = async (req, res, next) => {
 
     // Support both lines (Module 6) and items (legacy)
     const invoiceLines = lines || items;
-    const currencyVal = currencyCode || currency || "USD";
+    const currencyVal = "RWF";
 
     // Get client details for TIN and address
     const client = await Client.findOne({ _id: clientId, company: companyId });
@@ -1585,7 +1585,7 @@ exports.recordPayment = async (req, res, next) => {
         paymentMethod: paymentMethod,
         bankAccount: req.body.bankAccountId || null,
         amountReceived: mongoose.Types.Decimal128.fromString(amount.toFixed(2)),
-        currencyCode: invoice.currencyCode || "USD",
+        currencyCode: "RWF",
         exchangeRate: mongoose.Types.Decimal128.fromString("1"),
         reference: reference || `Payment for Invoice ${invoice.invoiceNumber}`,
         status: "posted",
@@ -1922,8 +1922,8 @@ exports.generateInvoicePDF = async (req, res, next) => {
     // Pipe PDF to response
     doc.pipe(res);
 
-    const currency = invoice.currencyCode || invoice.currency || company?.base_currency || "RWF";
-    const currencySymbol =
+    const currency = "RWF";
+    /* Legacy non-RWF currency selector retained only in history; invoice PDFs always print RWF.
       currency === "USD"
         ? "$"
         : currency === "EUR"
@@ -1934,15 +1934,11 @@ exports.generateInvoicePDF = async (req, res, next) => {
               ? "LL"
               : currency === "RWF"
                 ? ""
-                : "$";
+    */
 
     // Helper to format money
     const fmt = (v) => {
-      const amount = Number(v || 0);
-      if (currency === "RWF") return `${amount.toLocaleString("en-US", { maximumFractionDigits: 0 })} RWF`;
-      return currencySymbol
-        ? `${currencySymbol} ${amount.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
-        : amount.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      return formatRwf(v);
     };
     const fmtDate = (value, withTime = false) => {
       if (!value) return "N/A";
@@ -1961,8 +1957,8 @@ exports.generateInvoicePDF = async (req, res, next) => {
       return [address.street, address.city, address.state, address.country, address.postcode].filter(Boolean).join(", ");
     };
     const companyTin = company?.tax_identification_number || company?.registration_number || "";
-    const customerTin = invoice.customerTin || invoice.client?.taxId || "";
-    const hasCustomerTin = Boolean(String(customerTin || "").trim());
+    const customerTin = String(invoice.customerTin || invoice.client?.taxId || "").replace(/\D/g, "").slice(0, 9);
+    const hasCustomerTin = /^\d{9}$/.test(customerTin);
 
     // Page counter
     let pageNumber = 1;
@@ -2079,6 +2075,8 @@ exports.generateInvoicePDF = async (req, res, next) => {
       if (hasCustomerTin) {
         doc.text(`Customer TIN: ${customerTin}`, 310, billY);
         billY += 14;
+        doc.text("Business", 310, billY);
+        billY += 14;
       } else {
         doc.text("Individual", 310, billY);
         billY += 14;
@@ -2149,7 +2147,8 @@ exports.generateInvoicePDF = async (req, res, next) => {
       }
 
       const productName = item.product?.name || item.description || "N/A";
-      const tax = lineTaxDetails(item);
+      const submittedLine = invoice.ebm?.salesPayload?.itemList?.[idx] || {};
+      const tax = lineTaxDetails({ ...(item.toObject ? item.toObject() : item), ...submittedLine, product: item.product });
       doc.fillColor("#111827");
       doc.text(`${idx + 1}`, 56, y);
       doc.text(productName, 80, y, { width: 230 });

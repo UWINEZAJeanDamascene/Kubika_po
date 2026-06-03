@@ -125,6 +125,7 @@ async function initializeServer() {
    require('./models/ARBadDebtWriteoff');
    require('./models/CreditNote');
    require('./models/EmployeeAdvance');
+   require('./models/TillSession');
    require('./src/models/ImportJob');
 
   app = express();
@@ -268,6 +269,7 @@ async function initializeServer() {
   apiRouter.use('/purchases', require('./routes/purchaseRoutes'));
   apiRouter.use('/pos', require('./routes/posRoutes'));
   apiRouter.use('/sales-legacy', require('./routes/salesLegacyRoutes'));
+  apiRouter.use('/tills', require('./routes/tillRoutes'));
   apiRouter.use('/reports/daily', require('./routes/dailyReportsRoutes'));
   apiRouter.use('/reports/weekly', require('./routes/weeklyReportsRoutes'));
   apiRouter.use('/reports/monthly', require('./routes/monthlyReportsRoutes'));

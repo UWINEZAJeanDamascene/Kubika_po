@@ -208,6 +208,7 @@ function cleanMappedRow(entityType, row, mapping) {
 function validateCleanRow(entityType, clean, rowNumber) {
   const definition = getEntityDefinition(entityType);
   const errors = [];
+  const warnings = [];
 
   for (const field of definition.fields) {
     if (field.required && isBlank(clean[field.key])) {
@@ -242,7 +243,11 @@ function validateCleanRow(entityType, clean, rowNumber) {
     errors.push(buildValidationError(rowNumber, 'accountType', `Account type must be Asset, Liability, Equity, Revenue, or Expense - found '${clean.accountType}'.`, clean.accountType));
   }
 
-  return errors;
+  if (entityType === 'products' && !isBlank(clean.openingStockQuantity) && (parseNumber(clean.openingStockQuantity) || 0) > 0) {
+    errors.push(buildValidationError(rowNumber, 'openingStockQuantity', 'Opening stock must be imported via the Opening Stock import, not the product import.', clean.openingStockQuantity));
+  }
+
+  return { errors, warnings };
 }
 
 async function validateImport({ entityType, mapping, rows, file, companyId }) {
@@ -257,14 +262,87 @@ async function validateImport({ entityType, mapping, rows, file, companyId }) {
   const duplicateGroups = {};
   let debitTotal = 0;
   let creditTotal = 0;
+  // Caches for opening stock validation
+  const productCache = new Map(); // sku -> product
+  const warehouseCache = new Map(); // lower(name) -> warehouse
+  const openingKeySeen = new Set(); // productId-warehouseId within file
+  const openingExistingCache = new Map(); // key -> true if opening already exists in DB
 
   for (let index = 0; index < fullRows.length; index++) {
     const rowNumber = index + 2;
     const clean = cleanMappedRow(entityType, fullRows[index], mapping);
-    const errors = validateCleanRow(entityType, clean, rowNumber);
+    const { errors, warnings } = validateCleanRow(entityType, clean, rowNumber);
     if (entityType === 'opening_gl_balances') {
       debitTotal += parseNumber(clean.debitBalance) || 0;
       creditTotal += parseNumber(clean.creditBalance) || 0;
+    }
+    // Opening stock specific validation: existing product + warehouse, positive qty, non-negative cost, uniqueness per product/warehouse
+    if (entityType === 'opening_stock') {
+      const Product = require('../models/Product');
+      const Warehouse = require('../models/Warehouse');
+      const StockMovement = require('../models/StockMovement');
+      const sku = isBlank(clean.productCode) ? null : String(clean.productCode).trim().toUpperCase();
+      const warehouseName = isBlank(clean.warehouse) ? null : String(clean.warehouse).trim();
+      const qty = parseNumber(clean.quantity);
+      const cost = parseNumber(clean.costPerUnit);
+      const asOfDateValue = clean.asOfDate;
+      let movementDate = null;
+
+      if (qty == null || Number.isNaN(qty) || qty <= 0) {
+        errors.push(buildValidationError(rowNumber, 'quantity', 'Quantity must be greater than zero for opening stock.', clean.quantity));
+      }
+      if (cost != null && !Number.isNaN(cost) && cost < 0) {
+        errors.push(buildValidationError(rowNumber, 'costPerUnit', 'Cost per unit cannot be negative.', clean.costPerUnit));
+      }
+
+      if (!isBlank(asOfDateValue)) {
+        movementDate = parseDateValue(asOfDateValue);
+        if (!movementDate) {
+          errors.push(buildValidationError(rowNumber, 'asOfDate', 'As-of Date must be valid (DD/MM/YYYY).', asOfDateValue));
+        }
+      } else {
+        movementDate = new Date();
+        warnings.push({ field: 'asOfDate', message: 'No date provided — opening stock dated today. If migrating historical data please include As-of Date.' });
+      }
+
+      let product = sku ? productCache.get(sku) : null;
+      if (sku && !product) {
+        product = await Product.findOne({ company: companyId, sku }).select('_id name');
+        if (product) productCache.set(sku, product);
+      }
+      if (!product) {
+        errors.push(buildValidationError(rowNumber, 'productCode', 'Product code (SKU) not found. Create products first, then import opening stock.', clean.productCode));
+      }
+
+      const warehouseKey = warehouseName ? warehouseName.toLowerCase() : null;
+      let warehouse = warehouseKey ? warehouseCache.get(warehouseKey) : null;
+      if (warehouseKey && !warehouse) {
+        warehouse = await Warehouse.findOne({ company: companyId, name: new RegExp(`^${warehouseName}$`, 'i') }).select('_id name');
+        if (warehouse) warehouseCache.set(warehouseKey, warehouse);
+      }
+      if (!warehouse) {
+        errors.push(buildValidationError(rowNumber, 'warehouse', 'Warehouse not found. Create the warehouse first.', clean.warehouse));
+      }
+
+      const openingKey = product?._id && warehouse?._id ? `${product._id}-${warehouse._id}` : null;
+      if (openingKey && openingKeySeen.has(openingKey)) {
+        errors.push(buildValidationError(rowNumber, 'duplicate', 'Duplicate opening stock for the same product and warehouse in this file.', `${product._id}-${warehouse._id}`));
+      }
+
+      if (openingKey && !errors.some((err) => err.field === 'productCode' || err.field === 'warehouse')) {
+        if (!openingExistingCache.has(openingKey)) {
+          const existing = await StockMovement.findOne({ company: companyId, product: product._id, warehouse: warehouse._id }).select('_id');
+          openingExistingCache.set(openingKey, !!existing);
+        }
+        if (openingExistingCache.get(openingKey)) {
+          errors.push(buildValidationError(rowNumber, 'existing_stock', 'Stock already exists for this product in this warehouse. If you entered opening stock incorrectly via stock adjustment, you must reverse those entries first through a manual journal entry before importing opening stock here.', openingKey));
+        }
+      }
+
+      if (product) clean.productId = product._id;
+      if (warehouse) clean.warehouseId = warehouse._id;
+      if (movementDate) clean.movementDate = movementDate;
+      if (openingKey) openingKeySeen.add(openingKey);
     }
     const duplicate = errors.length ? { duplicate: false } : await detectDuplicate(entityType, companyId, clean);
     if (duplicate.duplicate) {
@@ -279,6 +357,7 @@ async function validateImport({ entityType, mapping, rows, file, companyId }) {
       data: clean,
       valid: errors.length === 0,
       errors,
+      warnings,
       duplicate
     });
   }
@@ -319,7 +398,7 @@ function productPayload(companyId, userId, data) {
     sku: String(data.sku).toUpperCase(),
     description: data.description,
     unit: data.quantityUnitCode || 'pcs',
-    currentStock: mongoose.Types.Decimal128.fromString(String(parseNumber(data.openingStockQuantity) || 0)),
+    currentStock: mongoose.Types.Decimal128.fromString('0'),
     lowStockThreshold: mongoose.Types.Decimal128.fromString(String(parseNumber(data.reorderLevel) || 0)),
     averageCost: mongoose.Types.Decimal128.fromString(String(parseNumber(data.costPrice) || 0)),
     costPrice: mongoose.Types.Decimal128.fromString(String(parseNumber(data.costPrice) || 0)),
@@ -458,6 +537,26 @@ async function upsertRow(entityType, companyId, userId, data, duplicateAction) {
     return { status: 'success', message: 'Created account.' };
   }
 
+  if (entityType === 'opening_stock') {
+    const OpeningStockService = require('./openingStockService');
+    const quantity = parseNumber(data.quantity) || 0;
+    const unitCost = parseNumber(data.costPerUnit) || 0;
+    if (!data.productId || !data.warehouseId) {
+      throw new Error('Opening stock import missing product or warehouse reference.');
+    }
+    await OpeningStockService.createOpeningStock({
+      companyId,
+      userId,
+      productId: data.productId,
+      warehouseId: data.warehouseId,
+      quantity,
+      unitCost,
+      notes: 'Opening stock import',
+      movementDate: data.movementDate || new Date()
+    });
+    return { status: 'success', message: 'Captured opening stock.' };
+  }
+
   return { status: 'skipped', message: `${entityType} validation is available; database writer is not enabled yet.` };
 }
 
@@ -560,6 +659,13 @@ async function generateTemplate(entityType) {
     ['Step 3', 'Use row 3 instructions to format fields correctly.'],
     ['Limits', 'Maximum 10MB and 10,000 rows per import.']
   ]);
+  if (entityType === 'opening_stock') {
+    instructions.addRows([
+      ['Opening Stock Rules', 'Opening stock can only be imported once per product per warehouse. If you made a mistake — wrong quantity or wrong cost — you cannot re-import. You must ask your accountant to reverse the opening stock journal entry manually through Finance Control → Journal Entries, then import again. Contact your system administrator for assistance.'],
+      ['Existing Stock Guard', 'If stock already exists for a product/warehouse (including adjustments or receipts), the import will be blocked. Reverse the prior entry first, then re-import.'],
+      ['As-of Date', 'Enter the date your business started or migration date in DD/MM/YYYY. Leave blank to use today (not recommended for historical migrations).']
+    ]);
+  }
   instructions.columns = [{ width: 24 }, { width: 90 }];
   return workbook.xlsx.writeBuffer();
 }

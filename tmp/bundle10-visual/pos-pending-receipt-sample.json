@@ -1,16 +1,18 @@
 {
   "success": true,
   "data": {
-    "_id": "6a114915a8630d8e0a89312a",
-    "company": "6a114915a8630d8e0a89305c",
+    "_id": "6a1dc4dfb8b39bf0c403367d",
+    "company": "6a1dc4dfb8b39bf0c403359c",
     "client": {
       "contact": {
         "address": "KN 3 Rd, Kigali"
       },
-      "_id": "6a114915a8630d8e0a893083",
+      "_id": "6a1dc4dfb8b39bf0c40335c4",
       "name": "Rwanda Buyer Ltd",
       "code": "RBL",
-      "id": "6a114915a8630d8e0a893083"
+      "type": "company",
+      "taxId": "100000003",
+      "id": "6a1dc4dfb8b39bf0c40335c4"
     },
     "customerName": "Walk-in Customer",
     "salesOrder": null,
@@ -27,7 +29,7 @@
             "pkgUnitCd": "NT",
             "qtyUnitCd": "U",
             "isRegisteredWithEBM": true,
-            "ebmRegisteredAt": "2026-05-23T06:28:37.248Z",
+            "ebmRegisteredAt": "2026-06-01T17:43:59.131Z",
             "ebmItemCode": "RW1NTXU0000001",
             "ebmLastAttemptAt": null,
             "ebmRegistrationError": null,
@@ -38,7 +40,7 @@
             "packagingUnitCode": null,
             "quantityUnitCode": null
           },
-          "_id": "6a114915a8630d8e0a8930c5",
+          "_id": "6a1dc4dfb8b39bf0c4033605",
           "name": "Supplier laptop computers",
           "sku": "LAP-001",
           "unit": "pcs",
@@ -52,7 +54,7 @@
           "availableStock": 0,
           "cost": 0,
           "avgCost": 0,
-          "id": "6a114915a8630d8e0a8930c5"
+          "id": "6a1dc4dfb8b39bf0c4033605"
         },
         "productName": "Supplier laptop computers",
         "productCode": "LAP-001",
@@ -68,15 +70,15 @@
         "unitCost": 0,
         "cogsAmount": 0,
         "qtyCredited": 0,
-        "_id": "6a114915a8630d8e0a89312b",
-        "lineId": "6a114915a8630d8e0a89312c",
+        "_id": "6a1dc4dfb8b39bf0c403367e",
+        "lineId": "6a1dc4dfb8b39bf0c403367f",
         "quantity": 1,
         "discount": 0,
         "subtotal": 1180000,
         "taxAmount": 212400,
         "totalWithTax": 1392400,
         "itemCode": "LAP-001",
-        "id": "6a114915a8630d8e0a89312b"
+        "id": "6a1dc4dfb8b39bf0c403367e"
       }
     ],
     "taxAmount": 212400,
@@ -97,10 +99,10 @@
         "amount": 1180000,
         "paymentMethod": "cash",
         "reference": "CASH-001",
-        "recordedBy": "6a114915a8630d8e0a893081",
-        "_id": "6a114915a8630d8e0a89312d",
-        "paidDate": "2026-05-23T06:28:37.330Z",
-        "id": "6a114915a8630d8e0a89312d"
+        "recordedBy": "6a1dc4dfb8b39bf0c40335c2",
+        "_id": "6a1dc4dfb8b39bf0c4033680",
+        "paidDate": "2026-06-01T17:43:59.194Z",
+        "id": "6a1dc4dfb8b39bf0c4033680"
       }
     ],
     "invoiceDate": "2026-05-23T10:15:00.000Z",
@@ -158,6 +160,7 @@
         ]
       },
       "ebmPurchaseData": null,
+      "purchaseConfirmationPayload": null,
       "ebmConfirmedAt": null,
       "ebmPurchaseSalesInvcNo": null,
       "ebmPurchaseMatchStatus": "unmatched",
@@ -173,8 +176,8 @@
       "qrPlaceholder": "QR Pending"
     },
     "creditNotes": [],
-    "createdAt": "2026-05-23T06:28:37.331Z",
-    "updatedAt": "2026-05-23T06:28:37.331Z",
+    "createdAt": "2026-06-01T17:43:59.195Z",
+    "updatedAt": "2026-06-01T17:43:59.195Z",
     "referenceNo": "INV-2024-00002",
     "__v": 0,
     "invoiceNumber": "INV-2024-00002",
@@ -188,7 +191,7 @@
             "pkgUnitCd": "NT",
             "qtyUnitCd": "U",
             "isRegisteredWithEBM": true,
-            "ebmRegisteredAt": "2026-05-23T06:28:37.248Z",
+            "ebmRegisteredAt": "2026-06-01T17:43:59.131Z",
             "ebmItemCode": "RW1NTXU0000001",
             "ebmLastAttemptAt": null,
             "ebmRegistrationError": null,
@@ -199,7 +202,7 @@
             "packagingUnitCode": null,
             "quantityUnitCode": null
           },
-          "_id": "6a114915a8630d8e0a8930c5",
+          "_id": "6a1dc4dfb8b39bf0c4033605",
           "name": "Supplier laptop computers",
           "sku": "LAP-001",
           "unit": "pcs",
@@ -213,7 +216,7 @@
           "availableStock": 0,
           "cost": 0,
           "avgCost": 0,
-          "id": "6a114915a8630d8e0a8930c5"
+          "id": "6a1dc4dfb8b39bf0c4033605"
         },
         "productName": "Supplier laptop computers",
         "productCode": "LAP-001",
@@ -229,15 +232,15 @@
         "unitCost": 0,
         "cogsAmount": 0,
         "qtyCredited": 0,
-        "_id": "6a114915a8630d8e0a89312b",
-        "lineId": "6a114915a8630d8e0a89312c",
+        "_id": "6a1dc4dfb8b39bf0c403367e",
+        "lineId": "6a1dc4dfb8b39bf0c403367f",
         "quantity": 1,
         "discount": 0,
         "subtotal": 1180000,
         "taxAmount": 212400,
         "totalWithTax": 1392400,
         "itemCode": "LAP-001",
-        "id": "6a114915a8630d8e0a89312b"
+        "id": "6a1dc4dfb8b39bf0c403367e"
       }
     ],
     "totalTax": {
@@ -246,14 +249,14 @@
     "grandTotal": 1392400,
     "balance": 212400,
     "date": "2026-05-23T10:15:00.000Z",
-    "id": "6a114915a8630d8e0a89312a",
+    "id": "6a1dc4dfb8b39bf0c403367d",
     "companyReceipt": {
       "name": "Mock Kigali Trading Ltd",
       "tin": "999991130",
       "address": "KG 4 Ave, Kigali, Rwanda",
       "phone": "0780000000"
     },
-    "receiptPrintedAt": "2026-05-23T06:28:37.589Z",
+    "receiptPrintedAt": "2026-06-01T17:43:59.363Z",
     "receiptLines": [
       {
         "itemName": "Supplier laptop computers",
@@ -291,6 +294,6 @@
       "amountPaidRwf": "RWF 1,180,000",
       "changeGivenRwf": "RWF 0"
     },
-    "customerTinDisplay": null
+    "customerTinDisplay": "100000003"
   }
 }

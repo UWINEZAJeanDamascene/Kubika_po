@@ -168,11 +168,11 @@ function drawTaxBreakdown(doc, { x, y, width = 250, ebm = {}, fallback = {}, tit
 function lineTaxDetails(line = {}) {
   const product = line.product || {};
   const ebm = product.ebm || {};
-  const taxTyCd = String(ebm.taxTyCd || ebm.taxTypeCode || line.taxTyCd || line.taxCode || (toNumber(line.taxRate) === 18 ? "B" : "A")).toUpperCase();
+  const taxTyCd = String(line.taxTyCd || line.taxCode || ebm.taxTyCd || ebm.taxTypeCode || (toNumber(line.taxRate) === 18 ? "B" : "A")).toUpperCase();
   const lineTotal = toNumber(line.totAmt ?? line.lineTotal ?? line.totalWithTax);
   const vatAmount = toNumber(line.taxAmt ?? line.lineTax ?? line.taxAmount, taxTyCd === "B" ? Math.round(lineTotal - lineTotal / 1.18) : 0);
   return {
-    itemClassCd: ebm.itemClassCd || ebm.itemClassCode || line.itemClsCd || "N/A",
+    itemClassCd: line.itemClsCd || line.itemClassCd || ebm.itemClassCd || ebm.itemClassCode || "N/A",
     taxTyCd,
     taxTypeLabel: taxTypeLabel(taxTyCd),
     taxableAmount: toNumber(line.taxblAmt, Math.max(0, lineTotal - vatAmount)),

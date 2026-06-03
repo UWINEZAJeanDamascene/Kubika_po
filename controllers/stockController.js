@@ -7,6 +7,7 @@ const InventoryBatch = require('../models/InventoryBatch');
 const JournalService = require('../services/journalService');
 const { runInTransaction } = require('../services/transactionService');
 const EBMStockService = require('../services/ebmStockService');
+const OpeningStockService = require('../services/openingStockService');
 
 // @desc    Get all stock movements
 // @route   GET /api/stock/movements
@@ -395,6 +396,46 @@ exports.adjustStock = async (req, res, next) => {
       success: true,
       message: 'Stock adjusted successfully',
       data: result
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Create opening stock entry (one-time per product + warehouse)
+// @route   POST /api/stock/opening
+// @access  Private (admin)
+exports.createOpeningStock = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const userId = req.user.id;
+    const {
+      product: productId,
+      warehouse: warehouseId,
+      quantity,
+      unitCost,
+      movementDate,
+      notes,
+      branchId,
+      bhfId
+    } = req.body;
+
+    const movement = await OpeningStockService.createOpeningStock({
+      companyId,
+      userId,
+      productId,
+      warehouseId,
+      quantity,
+      unitCost,
+      movementDate,
+      notes,
+      branchId: branchId || bhfId || null
+    });
+
+    res.status(201).json({
+      success: true,
+      message: 'Opening stock captured successfully',
+      data: movement
     });
   } catch (error) {
     next(error);

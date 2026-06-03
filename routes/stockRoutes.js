@@ -5,6 +5,7 @@ const {
   getStockMovement,
   receiveStock,
   adjustStock,
+  createOpeningStock,
   getProductStockMovements,
   getStockSummary,
   getStockLevels,
@@ -25,6 +26,7 @@ router.put('/movements/:id', authorize('admin'), logAction('stock'), updateStock
 router.delete('/movements/:id', authorize('admin'), logAction('stock'), deleteStockMovement);
 router.get('/product/:productId/movements', getProductStockMovements);
 router.post('/adjust', authorize('admin'), logAction('stock'), adjustStock);
+router.post('/opening', authorize('admin'), logAction('stock'), createOpeningStock);
 router.get('/summary', getStockSummary);
 
 // Stock Levels endpoint - provides per-warehouse stock information

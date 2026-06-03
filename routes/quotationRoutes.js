@@ -14,10 +14,19 @@ const {
   convertToSalesOrder,
   getClientQuotations,
   getProductQuotations,
-  generateQuotationPDF
+  generateQuotationPDF,
+  publicAcceptQuotation,
+  publicRejectQuotation,
+  publicQuotationPDF,
+  markExpiredQuotations
 } = require('../controllers/quotationController');
 const { protect, authorize } = require('../middleware/auth');
 const logAction = require('../middleware/logAction');
+
+// Public token routes (no protect)
+router.post('/public/:token/accept', publicAcceptQuotation);
+router.post('/public/:token/reject', publicRejectQuotation);
+router.get('/public/:token/pdf', publicQuotationPDF);
 
 router.use(protect);
 
@@ -44,6 +53,9 @@ router.post('/:id/convert', authorize('admin', 'sales'), logAction('quotation'),
 router.post('/:id/convert-to-invoice', authorize('admin', 'sales'), logAction('quotation'), convertToInvoice);
 // NEW WORKFLOW: Convert to Sales Order
 router.post('/:id/convert-to-so', authorize('admin', 'sales'), logAction('quotation'), convertToSalesOrder);
+
+// Expiry enforcement (cron/manual)
+router.post('/expire', authorize('admin'), markExpiredQuotations);
 
 router.get('/client/:clientId', getClientQuotations);
 router.get('/product/:productId', getProductQuotations);

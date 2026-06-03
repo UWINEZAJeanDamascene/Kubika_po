@@ -13,6 +13,10 @@ const quotationLineSchema = new mongoose.Schema({
     ref: 'Product',
     required: [true, 'Product is required for quotation line']
   },
+  // Snapshot fields to prevent drift when products change
+  productName: { type: String, default: null },
+  productSku: { type: String, default: null },
+  productUnit: { type: String, default: null },
   description: {
     type: String,
     default: null
@@ -52,6 +56,17 @@ const quotationLineSchema = new mongoose.Schema({
     min: [0, 'Tax rate cannot be negative'],
     max: [100, 'Tax rate cannot exceed 100']
   },
+  // Derived amounts in quote currency
+  lineSubtotal: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: 0,
+    get: v => (v == null ? 0 : parseFloat(v.toString()))
+  },
+  lineDiscount: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: 0,
+    get: v => (v == null ? 0 : parseFloat(v.toString()))
+  },
   // Line total: qty × unitPrice × (1 − discountPct/100)
   lineTotal: {
     type: mongoose.Schema.Types.Decimal128,
@@ -60,6 +75,27 @@ const quotationLineSchema = new mongoose.Schema({
   },
   // Line tax amount
   lineTax: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: 0,
+    get: v => (v == null ? 0 : parseFloat(v.toString()))
+  },
+  // Base currency equivalents
+  lineSubtotalBase: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: 0,
+    get: v => (v == null ? 0 : parseFloat(v.toString()))
+  },
+  lineDiscountBase: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: 0,
+    get: v => (v == null ? 0 : parseFloat(v.toString()))
+  },
+  lineTotalBase: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: 0,
+    get: v => (v == null ? 0 : parseFloat(v.toString()))
+  },
+  lineTaxBase: {
     type: mongoose.Schema.Types.Decimal128,
     default: 0,
     get: v => (v == null ? 0 : parseFloat(v.toString()))
@@ -99,7 +135,7 @@ const quotationSchema = new mongoose.Schema({
   // Status: draft, sent, accepted, rejected, expired, converted
   status: {
     type: String,
-    enum: ['draft', 'sent', 'accepted', 'rejected', 'expired', 'converted'],
+    enum: ['draft', 'pending_approval', 'sent', 'accepted', 'rejected', 'expired', 'converted'],
     default: 'draft'
   },
   // Currency
@@ -107,6 +143,11 @@ const quotationSchema = new mongoose.Schema({
     type: String,
     required: [true, 'Currency code is required'],
     default: 'USD',
+    uppercase: true,
+    maxlength: 3
+  },
+  baseCurrency: {
+    type: String,
     uppercase: true,
     maxlength: 3
   },
@@ -143,6 +184,41 @@ const quotationSchema = new mongoose.Schema({
     default: 0,
     get: v => (v == null ? 0 : parseFloat(v.toString()))
   },
+  // Base currency totals
+  subtotalBase: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: 0,
+    get: v => (v == null ? 0 : parseFloat(v.toString()))
+  },
+  totalDiscountBase: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: 0,
+    get: v => (v == null ? 0 : parseFloat(v.toString()))
+  },
+  taxAmountBase: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: 0,
+    get: v => (v == null ? 0 : parseFloat(v.toString()))
+  },
+  totalAmountBase: {
+    type: mongoose.Schema.Types.Decimal128,
+    default: 0,
+    get: v => (v == null ? 0 : parseFloat(v.toString()))
+  },
+  // Public action tokens
+  publicAcceptToken: { type: String, default: null },
+  publicRejectToken: { type: String, default: null },
+  publicTokenExpiresAt: { type: Date, default: null },
+  // Capture customer acceptance/rejection metadata
+  customerAction: {
+    action: { type: String, enum: ['accepted', 'rejected', null], default: null },
+    name: { type: String, default: null },
+    email: { type: String, default: null },
+    comment: { type: String, default: null },
+    ip: { type: String, default: null },
+    actedAt: { type: Date, default: null }
+  },
+  lastGeneratedPdfUrl: { type: String, default: null },
   // Terms and conditions
   terms: {
     type: String,

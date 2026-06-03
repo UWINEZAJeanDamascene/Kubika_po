@@ -185,7 +185,7 @@ const invoiceSchema = new mongoose.Schema({
   // Currency and exchange rate - Module 6 fields
   currencyCode: {
     type: String,
-    default: 'USD',
+    default: 'RWF',
     alias: 'currency'
   },
   exchangeRate: {
@@ -601,7 +601,7 @@ invoiceSchema.virtual('balance').get(function() {
   return 0;
 });
 invoiceSchema.virtual('currency').get(function() {
-  return this.currencyCode || 'USD';
+  return this.currencyCode || 'RWF';
 });
 
 // Post-save hook for AR tracking
