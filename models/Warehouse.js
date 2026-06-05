@@ -91,6 +91,12 @@ const warehouseSchema = new mongoose.Schema({
     type: Boolean,
     default: false
   },
+  ebmInsurances: [{
+    isrccCd: { type: String, trim: true },
+    isrccNm: { type: String, trim: true },
+    isrcRt: { type: Number, default: 0 },
+    useYn: { type: String, enum: ['Y', 'N'], default: 'Y' }
+  }],
   ebmInsuranceSubmitted: {
     type: Boolean,
     default: false

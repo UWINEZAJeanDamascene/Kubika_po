@@ -53,14 +53,14 @@ const VSDC_ENDPOINTS = Object.freeze({
   SELECT_IMPORT_ITEMS: '/imports/selectImportItems',
   UPDATE_IMPORT_ITEMS: '/imports/updateImportItems',
 
-  SAVE_SALES: '/trnsSales/saveSales',
+  SAVE_SALES: '/transactions/saveSales',
 
-  SELECT_PURCHASE_SALES: '/trnsPurchase/selectTrnsPurchaseSales',
-  SAVE_PURCHASES: '/trnsPurchase/savePurchases',
+  SELECT_PURCHASE_SALES: '/transactions/selectTrnsPurchaseSummary',
+  SAVE_PURCHASES: '/transactions/savePurchases',
 
   SELECT_STOCK_ITEMS: '/stock/selectStockItems',
   SAVE_STOCK_ITEMS: '/stock/saveStockItems',
-  SAVE_STOCK_MASTER: '/stockMaster/saveStockMaster',
+  SAVE_STOCK_MASTER: '/stock/saveStockMaster',
 });
 
 const BRANCH_REGISTRATION_EXEMPT_ENDPOINTS = new Set([

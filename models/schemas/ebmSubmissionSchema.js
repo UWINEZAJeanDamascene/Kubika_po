@@ -8,6 +8,8 @@ const ebmSubmissionSchema = new mongoose.Schema({
   orgRcptNo: { type: String, default: null, trim: true },
   rfdRsnCd: { type: String, default: null, trim: true },
   prcOrdCd: { type: String, default: null, trim: true },
+  prchrAcptcYn: { type: String, enum: ['Y', 'N', null], default: null, trim: true },
+  rptNo: { type: Number, default: null, min: 1 },
   rcptTyCd: { type: String, default: null, trim: true },
   pmtTyCd: { type: String, default: null, trim: true },
   salesTyCd: { type: String, default: null, trim: true },

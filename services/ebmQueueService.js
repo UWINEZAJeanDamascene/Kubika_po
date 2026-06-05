@@ -124,6 +124,7 @@ async function resetForManualRetry(queueId, companyId) {
 async function resetSourceDocumentStatus(queueItem) {
   const models = mongoose.models;
   const isStockEndpoint = queueItem.endpoint === '/stock/saveStockItems'
+    || queueItem.endpoint === '/stock/saveStockMaster'
     || queueItem.endpoint === '/stockMaster/saveStockMaster';
   let Model = null;
   if (queueItem.documentType === 'invoice' || queueItem.documentType === 'pos') Model = models.Invoice;

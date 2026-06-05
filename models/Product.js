@@ -194,6 +194,17 @@ const productSchema = new mongoose.Schema({
     taxTyCd: { type: String, trim: true, enum: ['A', 'B', 'C', 'D', null], default: null },
     pkgUnitCd: { type: String, trim: true, default: null },
     qtyUnitCd: { type: String, trim: true, default: null },
+    itemTyCd: { type: String, trim: true, default: null },
+    orgnNatCd: { type: String, trim: true, default: null },
+    itemStdNm: { type: String, trim: true, default: null },
+    btchNo: { type: String, trim: true, default: null },
+    addInfo: { type: String, trim: true, default: null },
+    sftyQty: {
+      type: mongoose.Schema.Types.Decimal128,
+      default: null,
+      get: v => (v == null ? null : (typeof v === 'string' ? v : v.toString()))
+    },
+    isrcAplcbYn: { type: String, trim: true, enum: ['Y', 'N', null], default: null },
     isRegisteredWithEBM: { type: Boolean, default: false },
     ebmRegisteredAt: { type: Date, default: null },
     ebmLastAttemptAt: { type: Date, default: null },

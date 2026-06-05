@@ -9,7 +9,7 @@ const Warehouse = require('../models/Warehouse');
 const ebmService = require('./ebmService');
 const { EBM_DEVICE_STATUSES } = require('../models/EBMDevice');
 const EBMQueueService = require('./ebmQueueService');
-const { formatVsdcDateTime, VSDC_ENDPOINTS } = require('./ebmService');
+const { formatVsdcDate, formatVsdcDateTime, VSDC_ENDPOINTS } = require('./ebmService');
 
 const FIRST_SYNC_DT = '20000101000000';
 const SYNC_TYPE = 'purchase_sales';
@@ -42,8 +42,91 @@ function parseVsdcDate(value) {
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 
+function formatPurchaseDate(...values) {
+  for (const value of values) {
+    if (!value) continue;
+    const raw = String(value);
+    if (/^\d{8}$/.test(raw)) return raw;
+    if (/^\d{14}$/.test(raw)) return raw.slice(0, 8);
+    const parsed = parseVsdcDate(value);
+    if (parsed) return formatVsdcDate(parsed);
+  }
+  return formatVsdcDate();
+}
+
 function getTin(company) {
   return company?.tax_identification_number || company?.registration_number || company?.tin;
+}
+
+function roundRwf(value) {
+  return Math.round(toNumber(value));
+}
+
+function firstDefined(...values) {
+  return values.find((value) => value !== undefined && value !== null && value !== '');
+}
+
+function formatOptionalBarcode(value) {
+  return value ? String(value).slice(0, 20) : '';
+}
+
+function formatOptionalExpiry(value) {
+  if (!value) return null;
+  const raw = String(value);
+  if (/^\d{8}$/.test(raw)) return raw;
+  if (/^\d{14}$/.test(raw)) return raw.slice(0, 8);
+  const parsed = parseVsdcDate(value);
+  return parsed ? formatVsdcDate(parsed) : null;
+}
+
+function buildPurchaseItemPayload(item, index) {
+  const qty = toNumber(firstDefined(item.qty, item.quantity), 0);
+  const prc = toNumber(firstDefined(item.prc, item.price, item.unitCost), 0);
+  const dcAmt = roundRwf(firstDefined(item.dcAmt, item.discountAmount, item.discount, 0));
+  const dcRt = toNumber(firstDefined(item.dcRt, item.discountRate, 0), 0);
+  const splyAmt = roundRwf(firstDefined(item.splyAmt, item.supplyAmount, qty * prc));
+  const taxTyCd = firstDefined(item.taxTyCd, item.taxTypeCode, item.taxCode, 'D');
+  const taxblAmt = roundRwf(firstDefined(item.taxblAmt, item.taxableAmount, splyAmt - dcAmt));
+  const taxAmt = roundRwf(firstDefined(item.taxAmt, item.taxAmount, 0));
+  const totAmt = roundRwf(firstDefined(item.totAmt, item.totalAmount, item.totalWithTax, taxblAmt + taxAmt));
+
+  return {
+    itemSeq: toNumber(item.itemSeq, index + 1),
+    itemCd: firstDefined(item.itemCd, item.itemCode, ''),
+    itemClsCd: firstDefined(item.itemClsCd, item.itemClassCode),
+    itemNm: firstDefined(item.itemNm, item.itemName, 'Item'),
+    bcd: formatOptionalBarcode(firstDefined(item.bcd, item.barcode)),
+    pkgUnitCd: firstDefined(item.pkgUnitCd, item.packagingUnitCode),
+    pkg: toNumber(firstDefined(item.pkg, item.package, 1), 1),
+    qtyUnitCd: firstDefined(item.qtyUnitCd, item.quantityUnitCode),
+    qty,
+    prc,
+    splyAmt,
+    dcRt,
+    dcAmt,
+    taxTyCd,
+    taxblAmt,
+    taxAmt,
+    totAmt,
+    itemExprDt: formatOptionalExpiry(firstDefined(item.itemExprDt, item.expiryDate)),
+  };
+}
+
+function buildTaxBuckets(itemList) {
+  const buckets = {
+    A: { taxbl: 0, tax: 0 },
+    B: { taxbl: 0, tax: 0 },
+    C: { taxbl: 0, tax: 0 },
+    D: { taxbl: 0, tax: 0 },
+  };
+
+  itemList.forEach((item) => {
+    const code = buckets[item.taxTyCd] ? item.taxTyCd : 'D';
+    buckets[code].taxbl += toNumber(item.taxblAmt);
+    buckets[code].tax += toNumber(item.taxAmt);
+  });
+
+  return buckets;
 }
 
 async function getInitializedDevice(companyId, branchId) {
@@ -188,6 +271,15 @@ async function markMatched(match, purchaseSale) {
 function buildPurchaseConfirmationPayload(doc, company, branchId) {
   const raw = doc.ebm?.ebmPurchaseData || {};
   const sellerInvoiceNo = doc.ebm?.ebmPurchaseSalesInvcNo || raw.spplrInvcNo || raw.invcNo;
+  const itemList = asArray(raw.itemList || raw.items).map(buildPurchaseItemPayload);
+  const buckets = buildTaxBuckets(itemList);
+  const totTaxblAmt = roundRwf(itemList.reduce((sum, item) => sum + item.taxblAmt, 0));
+  const totTaxAmt = roundRwf(itemList.reduce((sum, item) => sum + item.taxAmt, 0));
+  const totAmt = roundRwf(itemList.reduce((sum, item) => sum + item.totAmt, 0))
+    || roundRwf(raw.totAmt || raw.totalAmount || doc.totalAmount || doc.grandTotal || doc.roundedAmount);
+  const operatorId = String(getTin(company) || 'system').slice(0, 20);
+  const operatorName = String(company?.name || 'System').slice(0, 60);
+
   return {
     companyId: doc.company,
     tin: getTin(company),
@@ -195,32 +287,40 @@ function buildPurchaseConfirmationPayload(doc, company, branchId) {
     spplrTin: raw.spplrTin || raw.supplierTin || raw.splrTin || raw.sellerTin,
     spplrNm: raw.spplrNm || raw.supplierName || raw.splrNm,
     spplrInvcNo: sellerInvoiceNo,
-    prcOrdCd: raw.prcOrdCd || doc.ebm?.prcOrdCd || doc.purchaseOrderCode || doc.purchaseCode || '',
+    prcOrdCd: String(raw.prcOrdCd || doc.ebm?.prcOrdCd || doc.purchaseOrderCode || doc.purchaseCode || '').slice(0, 5),
     invcNo: sellerInvoiceNo,
+    orgInvcNo: raw.orgInvcNo || 0,
+    spplrBhfId: raw.spplrBhfId || raw.supplierBranchId || '',
+    regTyCd: raw.regTyCd || 'M',
     pchsTyCd: raw.pchsTyCd || raw.salesTyCd || 'N',
     rcptTyCd: raw.rcptTyCd || 'P',
+    pmtTyCd: raw.pmtTyCd || '',
     pchsSttsCd: '02',
     cfmDt: formatVsdcDateTime(),
-    pchsDt: raw.pchsDt || raw.salesDt || formatVsdcDateTime().slice(0, 8),
-    totTaxblAmt: toNumber(raw.totTaxblAmt || raw.taxblAmt),
-    totTaxAmt: toNumber(raw.totTaxAmt || raw.taxAmt),
-    totAmt: toNumber(raw.totAmt || raw.totalAmount || doc.totalAmount || doc.grandTotal || doc.roundedAmount),
+    pchsDt: formatPurchaseDate(raw.pchsDt, raw.salesDt, raw.invcDt, raw.rcptDt, doc.purchaseDate, doc.orderDate, doc.createdAt),
+    wrhsDt: formatPurchaseDate(raw.wrhsDt, doc.receivedDate, doc.updatedAt),
+    totItemCnt: itemList.length,
+    taxblAmtA: roundRwf(buckets.A.taxbl),
+    taxblAmtB: roundRwf(buckets.B.taxbl),
+    taxblAmtC: roundRwf(buckets.C.taxbl),
+    taxblAmtD: roundRwf(buckets.D.taxbl),
+    taxRtA: 0,
+    taxRtB: 0,
+    taxRtC: 0,
+    taxRtD: 0,
+    taxAmtA: roundRwf(buckets.A.tax),
+    taxAmtB: roundRwf(buckets.B.tax),
+    taxAmtC: roundRwf(buckets.C.tax),
+    taxAmtD: roundRwf(buckets.D.tax),
+    totTaxblAmt,
+    totTaxAmt,
+    totAmt,
     remark: `Confirmed from ${doc.referenceNo || doc.purchaseNumber || doc._id}`,
-    itemList: asArray(raw.itemList || raw.items).map((item, index) => ({
-      itemSeq: item.itemSeq || index + 1,
-      itemCd: item.itemCd || item.itemCode,
-      itemClsCd: item.itemClsCd || item.itemClassCode,
-      itemNm: item.itemNm || item.itemName,
-      pkgUnitCd: item.pkgUnitCd,
-      qtyUnitCd: item.qtyUnitCd,
-      qty: toNumber(item.qty || item.quantity),
-      prc: toNumber(item.prc || item.price || item.unitCost),
-      splyAmt: toNumber(item.splyAmt || item.supplyAmount),
-      taxTyCd: item.taxTyCd || item.taxTypeCode,
-      taxblAmt: toNumber(item.taxblAmt),
-      taxAmt: toNumber(item.taxAmt),
-      totAmt: toNumber(item.totAmt || item.totalAmount),
-    })),
+    regrId: operatorId,
+    regrNm: operatorName,
+    modrId: operatorId,
+    modrNm: operatorName,
+    itemList,
   };
 }
 
@@ -372,3 +472,7 @@ class EBMPurchaseService {
 }
 
 module.exports = EBMPurchaseService;
+module.exports.__test__ = {
+  buildPurchaseConfirmationPayload,
+  buildPurchaseItemPayload,
+};

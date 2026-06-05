@@ -14,6 +14,34 @@ function getIntervalMs() {
   return Math.max(1, Number(process.env.EBM_RETRY_INTERVAL_MINUTES || 5)) * 60 * 1000;
 }
 
+const LEGACY_ENDPOINT_MAP = Object.freeze({
+  '/trnsSales/saveSales': ebmService.VSDC_ENDPOINTS.SAVE_SALES,
+  '/trnsPurchase/selectTrnsPurchaseSales': ebmService.VSDC_ENDPOINTS.SELECT_PURCHASE_SALES,
+  '/trnsPurchase/savePurchases': ebmService.VSDC_ENDPOINTS.SAVE_PURCHASES,
+  '/stockMaster/saveStockMaster': ebmService.VSDC_ENDPOINTS.SAVE_STOCK_MASTER,
+});
+
+function normalizeQueueEndpoint(endpoint) {
+  return LEGACY_ENDPOINT_MAP[endpoint] || endpoint;
+}
+
+function normalizeQueuePayload(endpoint, payload) {
+  if (endpoint !== ebmService.VSDC_ENDPOINTS.SAVE_SALES || !payload) {
+    return payload;
+  }
+
+  let normalizedPayload = payload;
+  if (!payload.salesSttsCd && payload.invcSttsCd) {
+    normalizedPayload = { ...normalizedPayload, salesSttsCd: payload.invcSttsCd };
+    delete normalizedPayload.invcSttsCd;
+  }
+  if (typeof normalizedPayload.salesDt === 'string' && /^\d{14}$/.test(normalizedPayload.salesDt)) {
+    normalizedPayload = { ...normalizedPayload, salesDt: normalizedPayload.salesDt.slice(0, 8) };
+  }
+
+  return normalizedPayload;
+}
+
 async function updateSourceDocument(queueRecord, response = null, status = 'submitted', error = null) {
   const models = mongoose.models;
   const now = new Date();
@@ -132,7 +160,19 @@ async function createAbandonedNotification(record) {
 
 async function processRecord(record) {
   try {
-    const response = await ebmService.call(record.endpoint, record.payload);
+    const normalizedEndpoint = normalizeQueueEndpoint(record.endpoint);
+    let normalizedRecord = false;
+    if (record.endpoint !== normalizedEndpoint) {
+      record.endpoint = normalizedEndpoint;
+      normalizedRecord = true;
+    }
+    const normalizedPayload = normalizeQueuePayload(normalizedEndpoint, record.payload);
+    if (record.payload !== normalizedPayload) {
+      record.payload = normalizedPayload;
+      normalizedRecord = true;
+    }
+    if (normalizedRecord && typeof record.save === 'function') await record.save();
+    const response = await ebmService.call(normalizedEndpoint, normalizedPayload);
     await updateSourceDocument(record, response, 'submitted');
     await EBMQueueService.markSubmitted(record);
     return { id: record._id, status: 'submitted' };
@@ -201,4 +241,6 @@ module.exports = {
   runOnce,
   startRetryJob,
   processRecord,
+  normalizeQueueEndpoint,
+  normalizeQueuePayload,
 };

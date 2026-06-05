@@ -1,5 +1,6 @@
 const Warehouse = require('../models/Warehouse');
 const User = require('../models/User');
+const Product = require('../models/Product');
 const ebmService = require('./ebmService');
 
 const REGISTERED = 'registered';
@@ -78,12 +79,8 @@ class EBMBranchService {
       branch.ebmRegistrationError = null;
       await branch.save();
 
-      await this.submitBranchUsers(companyId, branch.rraBranchId).catch((err) => {
-        console.error('[EBMBranch] User account submission failed:', err.message);
-      });
-      await this.submitBranchInsurance(companyId, branch.rraBranchId).catch((err) => {
-        console.error('[EBMBranch] Insurance submission failed:', err.message);
-      });
+      await this.submitBranchUsers(companyId, branch.rraBranchId);
+      await this.submitBranchInsurance(companyId, branch.rraBranchId);
 
       return branch;
     } catch (error) {
@@ -124,15 +121,44 @@ class EBMBranchService {
     if (!branch) throw new Error(`Branch ${branchId} not found`);
     const Company = require('../models/Company');
     const company = await Company.findById(companyId).lean();
+    const insuranceList = Array.isArray(branch.ebmInsurances) ? branch.ebmInsurances : [];
+    const activeInsurances = insuranceList
+      .filter((item) => item && item.isrccCd && item.isrccNm && (item.useYn || 'Y') !== 'N')
+      .map((item) => ({
+        isrccCd: String(item.isrccCd).trim(),
+        isrccNm: String(item.isrccNm).trim(),
+        isrcRt: item.isrcRt == null ? 0 : Number(item.isrcRt),
+        useYn: 'Y',
+      }));
+
+    const insuranceApplicableProductExists = await Product.exists({
+      company: companyId,
+      'ebm.isrcAplcbYn': 'Y',
+      isActive: { $ne: false },
+    });
+
+    if (insuranceApplicableProductExists && activeInsurances.length === 0) {
+      const error = new Error('EBM branch insurance list is required for insurance-applicable products');
+      error.code = 'EBM_BRANCH_INSURANCE_REQUIRED';
+      error.statusCode = 400;
+      throw error;
+    }
+
+    if (activeInsurances.length === 0) {
+      branch.ebmInsuranceSubmitted = false;
+      await branch.save();
+      return { submitted: 0 };
+    }
+
     await ebmService.saveBranchInsurances({
       companyId,
       tin: company?.tax_identification_number || company?.registration_number,
       bhfId: branchId,
-      isrccList: [],
+      isrccList: activeInsurances,
     });
     branch.ebmInsuranceSubmitted = true;
     await branch.save();
-    return { submitted: 0 };
+    return { submitted: activeInsurances.length };
   }
 }
 
