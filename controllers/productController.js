@@ -1,3 +1,4 @@
+const mongoose = require('mongoose');
 const Product = require('../models/Product');
 const StockMovement = require('../models/StockMovement');
 const Quotation = require('../models/Quotation');
@@ -5,9 +6,47 @@ const Invoice = require('../models/Invoice');
 const Supplier = require('../models/Supplier');
 const bwipjs = require('bwip-js');
 const QRCode = require('qrcode');
+const ChartOfAccount = require('../models/ChartOfAccount');
 const { notifyLowStock, notifyOutOfStock, notifyStockReceived } = require('../services/notificationHelper');
 const cacheService = require('../services/cacheService');
 const { parsePagination, paginationMeta } = require('../utils/pagination');
+
+async function validateProductAccounts(body, companyId) {
+  const errors = {};
+  const checks = [
+    { key: 'inventoryAccount', types: ['asset'], label: 'inventoryAccount' },
+    { key: 'cogsAccount', types: ['cogs', 'expense'], label: 'cogsAccount' },
+    { key: 'revenueAccount', types: ['revenue'], label: 'revenueAccount' },
+  ];
+
+  for (const { key, types, label } of checks) {
+    const value = body[key];
+    if (!value) continue;
+
+    let account = null;
+    try {
+      if (mongoose.Types.ObjectId.isValid(value)) {
+        account = await ChartOfAccount.findOne({ _id: value, company: companyId, isActive: true });
+      }
+    } catch (err) {
+      // ignore cast errors and fall back to code lookup
+    }
+
+    if (!account) {
+      account = await ChartOfAccount.findOne({ code: value, company: companyId, isActive: true });
+    }
+
+    if (!account) {
+      errors[label] = 'Account not found for this company';
+      continue;
+    }
+    if (!types.includes(account.type)) {
+      errors[label] = `Account must be of type ${types.join('/')}`;
+    }
+  }
+
+  return errors;
+}
 
 // @desc    Get all products
 // @route   GET /api/products
@@ -195,6 +234,11 @@ exports.createProduct = async (req, res, next) => {
     if (req.body.cogs_account_id) req.body.cogsAccount = req.body.cogs_account_id;
     if (req.body.revenue_account_id) req.body.revenueAccount = req.body.revenue_account_id;
 
+    const accountErrors = await validateProductAccounts(req.body, companyId);
+    if (Object.keys(accountErrors).length) {
+      return res.status(422).json({ success: false, errors: accountErrors });
+    }
+
     // If averageCost is not provided or is 0, use costPrice as default
     if ((!req.body.averageCost || Number(req.body.averageCost) === 0) && req.body.costPrice && Number(req.body.costPrice) > 0) {
       req.body.averageCost = req.body.costPrice;
@@ -265,6 +309,16 @@ exports.updateProduct = async (req, res, next) => {
       if (hasMovements) {
         return res.status(409).json({ success: false, code: 'COSTING_METHOD_LOCKED', message: 'Changing costing_method is locked while stock exists' });
       }
+    }
+
+    // Normalize account fields to new schema keys
+    if (req.body.inventory_account_id) req.body.inventoryAccount = req.body.inventory_account_id;
+    if (req.body.cogs_account_id) req.body.cogsAccount = req.body.cogs_account_id;
+    if (req.body.revenue_account_id) req.body.revenueAccount = req.body.revenue_account_id;
+
+    const accountErrors = await validateProductAccounts(req.body, companyId);
+    if (Object.keys(accountErrors).length) {
+      return res.status(422).json({ success: false, errors: accountErrors });
     }
 
     // Update product
