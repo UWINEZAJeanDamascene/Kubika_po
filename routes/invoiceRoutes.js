@@ -11,6 +11,7 @@ const {
   writeOffInvoiceBadDebt,
   cancelInvoice,
   saveReceiptMetadata,
+  verifyInvoiceCustomerTin,
   getClientInvoices,
   getProductInvoices,
   generateInvoicePDF,
@@ -34,6 +35,7 @@ router.route('/:id')
 // Confirm invoice (deducts stock)
 router.put('/:id/confirm', requirePermission('sales_invoices', 'approve'), logAction('invoice'), confirmInvoice);
 
+router.post('/:id/ebm/verify-tin', requirePermission('sales_invoices', 'update'), verifyInvoiceCustomerTin);
 // Record payment
 router.post('/:id/payment', requirePermission('ar_receipts', 'create'), logAction('invoice'), recordPayment);
 

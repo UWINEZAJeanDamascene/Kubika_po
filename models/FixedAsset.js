@@ -674,7 +674,6 @@ const depreciationEntrySchema = new mongoose.Schema({
 // Indexes
 depreciationEntrySchema.index({ company: 1, asset: 1, periodDate: 1 }, { unique: true });
 depreciationEntrySchema.index({ company: 1, periodDate: 1 });
-depreciationEntrySchema.index({ asset: 1, isReversed: 1 });
 
 // Pre-save
 depreciationEntrySchema.pre('save', function(next) {

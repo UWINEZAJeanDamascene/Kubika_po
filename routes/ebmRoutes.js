@@ -15,6 +15,18 @@ router.get('/codes/status', ebmController.getCodeSyncStatus);
 router.get('/codes', ebmController.getCodes);
 router.get('/codes/item-classes', ebmController.getItemClasses);
 router.get('/codes/tins', ebmController.searchTINs);
+router.post(
+  '/customers/verify-tin',
+  authorize('admin', 'stock_manager', 'sales'),
+  body('tin').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 9, max: 9 }),
+  body('custmTin').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 9, max: 9 }),
+  body('custTin').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 9, max: 9 }),
+  body('branchId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
+  body('bhfId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
+  validateRequest,
+  stripUnvalidatedBody,
+  ebmController.verifyCustomerTin,
+);
 router.get('/notices', ebmController.getNotices);
 router.get('/imports', ebmController.listImportedItems);
 router.get('/purchases/unmatched', ebmController.listUnmatchedPurchases);
@@ -110,6 +122,31 @@ router.post(
   stripUnvalidatedBody,
   ebmController.retryImportedItemStock,
 );
+router.post(
+  '/stock/reconcile',
+  authorize('admin', 'stock_manager'),
+  body('branchId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
+  body('bhfId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
+  body('lastReqDt').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 14, max: 14 }),
+  validateRequest,
+  stripUnvalidatedBody,
+  ebmController.reconcileStockMaster,
+);
+
+router.post(
+  '/stock/reconcile/resubmit',
+  authorize('admin', 'stock_manager'),
+  body('branchId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
+  body('bhfId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
+  body('itemCd').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ max: 20 }),
+  body('itemCode').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ max: 20 }),
+  body('productId').optional({ nullable: true, checkFalsy: true }).isMongoId(),
+  body('allDiscrepancies').optional().isBoolean(),
+  body('lastReqDt').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 14, max: 14 }),
+  validateRequest,
+  stripUnvalidatedBody,
+  ebmController.resubmitStockMaster,
+);
 
 router.post(
   '/queue/bulk-retry',
@@ -152,3 +189,4 @@ router.post(
 );
 
 module.exports = router;
+

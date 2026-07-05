@@ -31,6 +31,12 @@ describe('EBM sales payload', () => {
         customerTin: '999991130',
         invoiceDate: new Date('2026-06-04T10:00:00Z'),
         createdAt: new Date('2026-06-04T10:00:00Z'),
+        ebm: {
+          invcNo: 1001,
+          curRcptNo: 2001,
+          totRcptNo: 2001,
+          rptNo: 3001,
+        },
         deliveryNote: { status: 'dispatched' },
         lpoNumber: 'LPO-123456',
         currencyCode: 'USD',
@@ -75,9 +81,10 @@ describe('EBM sales payload', () => {
     expect(payload).not.toHaveProperty('payList');
     expect(payload.salesDt).toMatch(/^\d{8}$/);
     expect(payload.cfmDt).toMatch(/^\d{14}$/);
-    expect(payload.receipt.curRcptNo).toBe(1001);
-    expect(payload.receipt.totRcptNo).toBe(1001);
-    expect(payload.receipt.rptNo).toBe(1001);
+    expect(payload.invcNo).toBe('1001');
+    expect(payload.receipt.curRcptNo).toBe(2001);
+    expect(payload.receipt.totRcptNo).toBe(2001);
+    expect(payload.receipt.rptNo).toBe(3001);
     expect(payload.receipt.rcptPbctDt).toMatch(/^\d{14}$/);
     expect(payload.receipt.totItemCnt).toBe(1);
     expect(payload.prchrAcptcYn).toBe('N');
@@ -102,6 +109,7 @@ describe('EBM sales payload', () => {
           actualDeliveryDate: new Date('2026-06-05T08:30:00Z'),
         },
         ebm: {
+          invcNo: 1002,
           rptNo: 42,
           curRcptNo: 77,
           totRcptNo: 80,

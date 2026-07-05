@@ -1,4 +1,5 @@
 const express = require('express');
+const { body } = require('express-validator');
 const router = express.Router();
 const {
   getClients,
@@ -14,11 +15,15 @@ const {
   getClientInvoices,
   getClientReceipts,
   getClientCreditNotes,
-  getClientStatementPDF
+  getClientStatementPDF,
+  verifyClientTin,
+  saveClientBranchCustomer
 } = require('../controllers/clientController');
 const { protect } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/rbacMiddleware');
 const logAction = require('../middleware/logAction');
+const validateRequest = require('../middleware/validateRequest');
+const stripUnvalidatedBody = require('../middleware/stripUnvalidatedBody');
 
 router.use(protect);
 
@@ -39,6 +44,24 @@ router.route('/:id')
 
 // Toggle status
 router.put('/:id/toggle-status', requirePermission('clients', 'update'), toggleClientStatus);
+router.post(
+  '/:id/ebm/verify-tin',
+  requirePermission('clients', 'update'),
+  body('branchId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
+  body('bhfId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
+  validateRequest,
+  stripUnvalidatedBody,
+  verifyClientTin,
+);
+router.post(
+  '/:id/ebm/branch-customer',
+  requirePermission('clients', 'update'),
+  body('branchId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
+  body('bhfId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
+  validateRequest,
+  stripUnvalidatedBody,
+  saveClientBranchCustomer,
+);
 
 router.get('/:id/purchase-history', requirePermission('clients', 'read'), getClientPurchaseHistory);
 router.get('/:id/outstanding-invoices', requirePermission('clients', 'read'), getClientOutstandingInvoices);
@@ -50,3 +73,4 @@ router.get('/:id/credit-notes', requirePermission('clients', 'read'), getClientC
 router.get('/:id/statement', requirePermission('clients', 'read'), getClientStatementPDF);
 
 module.exports = router;
+

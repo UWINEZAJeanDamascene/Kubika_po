@@ -4,6 +4,8 @@ const EBMItemClass = require("../models/EBMItemClass");
 const EBMCode = require("../models/EBMCode");
 const ebmService = require("./ebmService");
 const EBMBranchService = require("./ebmBranchService");
+const Company = require("../models/Company");
+const { nextGlobalSequence } = require("./sequenceService");
 
 function getEbmValue(product, canonical, legacy) {
   return product.ebm?.[canonical] || product.ebm?.[legacy] || null;
@@ -24,6 +26,45 @@ function toNumber(value, fallback = 0) {
 function optionalText(value, maxLength) {
   const text = String(value || "").trim();
   return text ? text.slice(0, maxLength) : "";
+}
+function normalizeBranchId(value) {
+  return String(value || "00").padStart(2, "0").slice(-2);
+}
+
+function normalizeCompanyTin(value) {
+  return String(value || "").replace(/\D/g, "").slice(0, 9);
+}
+
+function buildTinShort(tin) {
+  const cleaned = String(tin || "").replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+  return (cleaned || "XXXXX").padEnd(5, "X").slice(0, 5);
+}
+
+function isValidRraItemCode(value) {
+  return /^RW[A-Z0-9]{5}[0-9]{2}[0-9]{7}$/.test(String(value || ""));
+}
+
+function buildRraItemCode({ tin, branchId, sequence }) {
+  return `RW${buildTinShort(tin)}${normalizeBranchId(branchId)}${String(sequence).padStart(7, "0").slice(-7)}`;
+}
+
+async function generateRraItemCode(companyId, tin, branchId, productId) {
+  const sequenceName = `ebm_item_${normalizeBranchId(branchId)}`;
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const sequence = await nextGlobalSequence(companyId, sequenceName, 7);
+    const code = buildRraItemCode({ tin, branchId, sequence });
+    const existing = await Product.exists({
+      company: companyId,
+      _id: { $ne: productId },
+      "ebm.ebmItemCode": code,
+    });
+    if (!existing) return code;
+  }
+
+  const error = new Error("Unable to generate a unique RRA item code after 20 attempts");
+  error.code = "EBM_ITEM_CODE_SEQUENCE_EXHAUSTED";
+  error.statusCode = 500;
+  throw error;
 }
 
 function normalizeProductEbm(product) {
@@ -111,7 +152,7 @@ class EBMProductService {
           company: companyId,
           isDefault: true,
         }).lean();
-      const branchId = branch?.rraBranchId || "00";
+      const branchId = normalizeBranchId(branch?.rraBranchId || "00");
       await EBMBranchService.ensureBranchRegistered({
         companyId,
         branchId,
@@ -122,7 +163,18 @@ class EBMProductService {
       const taxTyCd = getEbmValue(product, "taxTyCd", "taxTypeCode");
       const pkgUnitCd = getEbmValue(product, "pkgUnitCd", "packagingUnitCode");
       const qtyUnitCd = getEbmValue(product, "qtyUnitCd", "quantityUnitCode");
-      const itemCode = product.ebm.ebmItemCode || product.sku;
+      const company = await Company.findById(companyId).lean();
+      const tin = normalizeCompanyTin(options.tin || company?.tax_identification_number || company?.registration_number || company?.tin);
+      if (!tin) {
+        const error = new Error("Company TIN must be a 9 digit value before generating an RRA item code");
+        error.code = "EBM_COMPANY_TIN_REQUIRED";
+        error.statusCode = 400;
+        throw error;
+      }
+      const existingItemCode = product.ebm.ebmItemCode;
+      const itemCode = isValidRraItemCode(existingItemCode)
+        ? existingItemCode
+        : await generateRraItemCode(companyId, tin, branchId, product._id);
       const safetyQty = toNumber(
         product.ebm?.sftyQty,
         toNumber(product.lowStockThreshold, 0),
@@ -130,7 +182,7 @@ class EBMProductService {
 
       await ebmService.saveItems({
         companyId,
-        tin: options.tin,
+        tin,
         bhfId: branchId,
         itemCd: itemCode,
         itemClsCd: itemClassCd,
@@ -213,6 +265,11 @@ class EBMProductService {
 EBMProductService.__test__ = {
   normalizeProductEbm,
   optionalText,
+  buildTinShort,
+  buildRraItemCode,
+  isValidRraItemCode,
+  generateRraItemCode,
 };
 
 module.exports = EBMProductService;
+

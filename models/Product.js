@@ -232,6 +232,10 @@ const productSchema = new mongoose.Schema({
 
 // Compound index for company + unique sku
 productSchema.index({ company: 1, sku: 1 }, { unique: true });
+productSchema.index(
+  { company: 1, 'ebm.ebmItemCode': 1 },
+  { unique: true, partialFilterExpression: { 'ebm.ebmItemCode': { $type: 'string' } } }
+);
 // Index for searching
 productSchema.index({ name: 'text', sku: 'text', description: 'text' });
 // Index for company filtering
@@ -384,3 +388,4 @@ const decimalTransform = require('./plugins/decimalTransformPlugin');
 productSchema.plugin(decimalTransform);
 
 module.exports = mongoose.model('Product', productSchema);
+

@@ -7,6 +7,15 @@ describe('EBM VSDC endpoint constants', () => {
     expect(VSDC_ENDPOINTS.SELECT_PURCHASE_SALES).toBe('/transactions/selectTrnsPurchaseSummary');
     expect(VSDC_ENDPOINTS.SAVE_PURCHASES).toBe('/transactions/savePurchases');
     expect(VSDC_ENDPOINTS.SAVE_STOCK_MASTER).toBe('/stock/saveStockMaster');
+    expect(VSDC_ENDPOINTS.SAVE_IMPORT_ITEMS).toBe('/imports/saveImportItems');
+  });
+
+  it('uses RRA VSDC v1.0.5 branch/user/customer/insurance paths', () => {
+    expect(VSDC_ENDPOINTS.SELECT_BRANCHES).toBe('/branches/selectBranches');
+    expect(VSDC_ENDPOINTS.SELECT_CUSTOMER).toBe('/customers/selectCustomer');
+    expect(VSDC_ENDPOINTS.SAVE_BRANCH_USER).toBe('/branches/saveBranchUser');
+    expect(VSDC_ENDPOINTS.SAVE_BRANCH_CUSTOMER).toBe('/branches/saveBranchCustomer');
+    expect(VSDC_ENDPOINTS.SAVE_BRANCH_INSURANCE).toBe('/branches/saveBranchInsurance');
   });
 
   it('normalizes legacy queued VSDC paths before retrying submissions', () => {
@@ -38,3 +47,5 @@ describe('EBM VSDC endpoint constants', () => {
     expect(normalizeQueuePayload(VSDC_ENDPOINTS.SAVE_SALES, payload)).toBe(payload);
   });
 });
+
+

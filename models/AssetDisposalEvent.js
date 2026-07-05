@@ -179,8 +179,6 @@ assetDisposalEventSchema.index({ company: 1, asset: 1 });
 assetDisposalEventSchema.index({ company: 1, disposalDate: -1 });
 assetDisposalEventSchema.index({ company: 1, disposalMethod: 1 });
 assetDisposalEventSchema.index({ company: 1, gainLossType: 1 });
-assetDisposalEventSchema.index({ asset: 1, isReversed: 1 });
-
 // Ensure one non-reversed disposal event per asset
 assetDisposalEventSchema.index(
   { asset: 1, isReversed: 1 },

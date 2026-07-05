@@ -1354,6 +1354,28 @@ exports.confirmInvoice = async (req, res, next) => {
   }
 };
 
+
+// @desc    Verify invoice customer TIN with RRA VSDC
+// @route   POST /api/sales-invoices/:id/ebm/verify-tin
+// @access  Private (admin, stock_manager, sales)
+exports.verifyInvoiceCustomerTin = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const EBMTinService = require('../services/ebmCustomerTinService');
+    const result = await EBMTinService.verifyInvoiceCustomerTin(companyId, req.params.id, {
+      branchId: req.body.branchId || req.body.bhfId || '00',
+    });
+
+    res.json({
+      success: true,
+      data: result.invoice,
+      verification: result.verification,
+      message: 'Invoice customer TIN verified with RRA',
+    });
+  } catch (error) {
+    next(error);
+  }
+};
 // @desc    Record payment for invoice
 // @route   POST /api/invoices/:id/payment
 // @access  Private (admin, stock_manager, sales)
@@ -1545,7 +1567,7 @@ exports.recordPayment = async (req, res, next) => {
           "Error creating bank transaction for invoice payment:",
           bankError,
         );
-        // Non-fatal — journal entry already posted
+        // Non-fatal â€” journal entry already posted
       }
     }
 
@@ -1607,7 +1629,7 @@ exports.recordPayment = async (req, res, next) => {
       await allocation.save();
     } catch (arReceiptError) {
       console.error("Error auto-creating AR receipt for invoice payment:", arReceiptError);
-      // Non-fatal — payment already recorded, journal entries posted
+      // Non-fatal â€” payment already recorded, journal entries posted
     }
 
     res.json({
@@ -1927,9 +1949,9 @@ exports.generateInvoicePDF = async (req, res, next) => {
       currency === "USD"
         ? "$"
         : currency === "EUR"
-          ? "€"
+          ? "â‚¬"
           : currency === "GBP"
-            ? "£"
+            ? "Â£"
         : currency === "LBP"
               ? "LL"
               : currency === "RWF"

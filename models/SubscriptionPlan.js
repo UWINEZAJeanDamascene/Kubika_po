@@ -71,7 +71,6 @@ const subscriptionPlanSchema = new mongoose.Schema({
   timestamps: true
 });
 
-subscriptionPlanSchema.index({ key: 1 });
 subscriptionPlanSchema.index({ is_active: 1 });
 
 module.exports = mongoose.model('SubscriptionPlan', subscriptionPlanSchema);

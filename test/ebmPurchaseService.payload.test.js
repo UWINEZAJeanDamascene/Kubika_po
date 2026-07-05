@@ -78,7 +78,7 @@ describe('EBM purchase confirmation payload', () => {
       taxblAmtC: 0,
       taxblAmtD: 0,
       taxRtA: 0,
-      taxRtB: 0,
+      taxRtB: 18,
       taxRtC: 0,
       taxRtD: 0,
       taxAmtA: 0,
@@ -105,5 +105,99 @@ describe('EBM purchase confirmation payload', () => {
       dcAmt: 0,
       itemExprDt: null,
     });
+  });
+
+  it('falls back to local purchase lines when raw VSDC item lines are missing', () => {
+    const payload = EBMPurchaseService.__test__.buildPurchaseConfirmationPayload(
+      {
+        company: 'company-1',
+        purchaseNumber: 'PUR-1002',
+        supplierTin: '999999999',
+        supplierName: 'Local Supplier',
+        purchaseDate: new Date('2026-06-05T10:00:00Z'),
+        ebm: {
+          ebmPurchaseSalesInvcNo: '88',
+          ebmPurchaseData: {
+            spplrBhfId: '01',
+            pchsDt: '20260605',
+          },
+        },
+        items: [
+          {
+            product: {
+              name: 'Local VAT Item',
+              sku: 'LOCAL-001',
+              barcode: '9876543210123',
+              ebm: {
+                ebmItemCode: 'RW1NTXU0000088',
+                itemClassCd: '5059690800',
+                pkgUnitCd: 'NI',
+                qtyUnitCd: 'U',
+                taxTyCd: 'B',
+              },
+            },
+            quantity: 2,
+            unitCost: 1000,
+            discount: 100,
+            taxCode: 'B',
+            taxRate: 18,
+          },
+        ],
+      },
+      {
+        name: 'Buyer Company',
+        tax_identification_number: '999991130',
+      },
+      '00',
+    );
+
+    expect(payload).toMatchObject({
+      invcNo: '88',
+      spplrTin: '999999999',
+      spplrNm: 'Local Supplier',
+      totItemCnt: 1,
+      taxblAmtB: 1900,
+      taxRtB: 18,
+      taxAmtB: 342,
+      totTaxblAmt: 1900,
+      totTaxAmt: 342,
+      totAmt: 2242,
+    });
+    expect(payload.itemList[0]).toMatchObject({
+      itemCd: 'RW1NTXU0000088',
+      itemClsCd: '5059690800',
+      pkgUnitCd: 'NI',
+      qtyUnitCd: 'U',
+      qty: 2,
+      splyAmt: 2000,
+      dcAmt: 100,
+      taxTyCd: 'B',
+    });
+  });
+
+  it('rejects confirmation when neither raw nor local lines provide required VSDC item fields', () => {
+    expect(() => EBMPurchaseService.__test__.buildPurchaseConfirmationPayload(
+      {
+        company: 'company-1',
+        purchaseNumber: 'PUR-1003',
+        supplier: { taxId: '999999999', name: 'Local Supplier' },
+        ebm: {
+          ebmPurchaseSalesInvcNo: '89',
+          ebmPurchaseData: {},
+        },
+        items: [
+          {
+            product: { name: 'Missing EBM Item', ebm: {} },
+            quantity: 1,
+            unitCost: 1000,
+          },
+        ],
+      },
+      {
+        name: 'Buyer Company',
+        tax_identification_number: '999991130',
+      },
+      '00',
+    )).toThrow(/itemList\[0\]\.itemClsCd/);
   });
 });

@@ -10,8 +10,10 @@ const Purchase = require("../models/Purchase");
 const StockMovement = require("../models/StockMovement");
 const StockTransfer = require("../models/StockTransfer");
 const EBMCode = require("../models/EBMCode");
+const EBMDevice = require("../models/EBMDevice");
 const ebmService = require("./ebmService");
 const EBMQueueService = require("./ebmQueueService");
+const EBMFiscalSequenceService = require("./ebmFiscalSequenceService");
 const { formatVsdcDate, VSDC_ENDPOINTS } = require("./ebmService");
 const {
   EBM_STOCK_TYPE_CODES,
@@ -36,6 +38,16 @@ function roundRwf(value) {
   return Math.round(toNumber(value));
 }
 
+function assertSarNo(value) {
+  const parsed = parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 1) {
+    const error = new Error('Missing EBM stock fiscal sarNo. Allocate branch fiscal stock numbers before building the stock payload.');
+    error.code = 'EBM_STOCK_SAR_NO_MISSING';
+    error.retryable = false;
+    throw error;
+  }
+  return parsed;
+}
 function getTin(company) {
   return (
     company?.tax_identification_number ||
@@ -177,7 +189,7 @@ function buildItemPayload(product, values, itemSeq) {
 function buildMasterPayload(itemData, company, branch) {
   const product = itemData.product;
   const tin = getTin(company);
-  // Spec 3.3.8.3 StockMstSaveReq — only these fields are required
+  // Spec 3.3.8.3 StockMstSaveReq: only these fields are required
   return {
     companyId: company._id || company.id,
     tin,
@@ -201,15 +213,7 @@ async function buildMovementPayload(movementData, company, branch) {
     companyId: company._id || company.id,
     tin: getTin(company),
     bhfId: branch.rraBranchId,
-    sarNo: (() => {
-      // Spec: sarNo is NUMBER type. Extract digits from ref or fall back to timestamp.
-      const raw =
-        movementData.referenceNo || movementData.documentId || Date.now();
-      const digits = String(raw).replace(/\D/g, "");
-      return digits
-        ? parseInt(digits.slice(-15), 10) || Date.now()
-        : Date.now();
-    })(),
+    sarNo: assertSarNo(movementData.sarNo),
     orgSarNo: movementData.orgSarNo || 0,
     regTyCd: await resolveRegistrationTypeCode(company._id || company.id),
     custTin: movementData.custTin || "",
@@ -335,6 +339,177 @@ async function callStockMaster(payload, context) {
   }
 }
 
+
+function normalizeStockBranchId(value) {
+  return String(value || '00').padStart(2, '0').slice(-2);
+}
+
+function extractStockItems(response) {
+  const data = response?.data || response || {};
+  return Array.isArray(data.itemList)
+    ? data.itemList
+    : Array.isArray(data.stockItemList)
+      ? data.stockItemList
+      : Array.isArray(data.items)
+        ? data.items
+        : [];
+}
+
+function buildStockReconciliationRows(localProducts, vsdcItems, branchId) {
+  const byCode = new Map();
+  for (const product of localProducts || []) {
+    const itemCd = getItemCode(product);
+    if (!itemCd) continue;
+    byCode.set(itemCd, {
+      itemCd,
+      productId: product._id || product.id || null,
+      productName: product.name || product.itemNm || '',
+      sku: product.sku || product.code || '',
+      localQty: toNumber(product.currentStock),
+      vsdcQty: null,
+      vsdcItemName: null,
+      branchId,
+      status: 'missing_vsdc',
+      difference: toNumber(product.currentStock),
+    });
+  }
+
+  for (const item of vsdcItems || []) {
+    const itemCd = item.itemCd || item.itemCode;
+    if (!itemCd) continue;
+    const vsdcQty = toNumber(item.rsdQty ?? item.currentQty ?? item.qty);
+    const existing = byCode.get(itemCd);
+    if (existing) {
+      const diff = existing.localQty - vsdcQty;
+      existing.vsdcQty = vsdcQty;
+      existing.vsdcItemName = item.itemNm || item.itemName || null;
+      existing.branchId = item.bhfId || branchId;
+      existing.difference = Number(diff.toFixed(6));
+      existing.status = Math.abs(diff) <= 0.0001 ? 'matched' : 'discrepancy';
+    } else {
+      byCode.set(itemCd, {
+        itemCd,
+        productId: null,
+        productName: null,
+        sku: '',
+        localQty: null,
+        vsdcQty,
+        vsdcItemName: item.itemNm || item.itemName || null,
+        branchId: item.bhfId || branchId,
+        status: 'missing_local',
+        difference: Number((-vsdcQty).toFixed(6)),
+      });
+    }
+  }
+
+  const rows = Array.from(byCode.values()).sort((a, b) => String(a.itemCd).localeCompare(String(b.itemCd)));
+  const summary = rows.reduce((acc, row) => {
+    acc.total += 1;
+    acc[row.status] = (acc[row.status] || 0) + 1;
+    return acc;
+  }, { total: 0, matched: 0, discrepancy: 0, missing_vsdc: 0, missing_local: 0 });
+
+  return { rows, summary };
+}
+
+async function resolveStockTin(companyId, branchId, company) {
+  const device = await EBMDevice.findOne({
+    company: companyId,
+    branchId,
+    initializedMode: ebmService.getConfig().mode,
+    status: 'initialized',
+  }).lean();
+  return device?.tin || getTin(company);
+}
+
+async function reconcileStockMaster(companyId, options = {}) {
+  const requestedBranchId = normalizeStockBranchId(options.branchId || options.bhfId || '00');
+  const branch = await resolveBranchByWarehouse(companyId, null, requestedBranchId);
+  const branchId = branch.rraBranchId || requestedBranchId;
+  const company = await Company.findById(companyId).lean();
+  if (!company) throw new Error('Company not found for EBM stock reconciliation.');
+  const tin = await resolveStockTin(companyId, branchId, company);
+  if (!tin) {
+    const error = new Error('Company TIN is required for EBM stock reconciliation.');
+    error.code = 'EBM_TIN_MISSING';
+    error.retryable = false;
+    throw error;
+  }
+
+  const response = await ebmService.selectStockItems({
+    companyId,
+    tin,
+    bhfId: branchId,
+    lastReqDt: options.lastReqDt || '20000101000000',
+  });
+  const vsdcItems = extractStockItems(response);
+  const products = await Product.find({
+    company: companyId,
+    'ebm.ebmItemCode': { $exists: true, $nin: [null, ''] },
+  }).select('_id name sku code currentStock ebm').lean();
+  const comparison = buildStockReconciliationRows(products, vsdcItems, branchId);
+
+  return {
+    branchId,
+    mode: ebmService.getConfig().mode,
+    resultDt: response.resultDt || null,
+    pulledAt: new Date(),
+    summary: comparison.summary,
+    rows: comparison.rows,
+  };
+}
+
+async function resubmitStockMasterFromReconciliation(companyId, options = {}, user = null) {
+  const reconciliation = await reconcileStockMaster(companyId, options);
+  const branch = await resolveBranchByWarehouse(companyId, null, reconciliation.branchId);
+  const company = await Company.findById(companyId).lean();
+  const wanted = new Set([options.itemCd, options.itemCode].filter(Boolean));
+  const includeAll = options.allDiscrepancies === true || (!wanted.size && !options.productId);
+  const rows = reconciliation.rows.filter((row) => {
+    if (!row.productId) return false;
+    if (options.productId && String(row.productId) !== String(options.productId)) return false;
+    if (wanted.size && !wanted.has(row.itemCd)) return false;
+    return includeAll ? row.status === 'discrepancy' || row.status === 'missing_vsdc' : true;
+  });
+
+  const actorId = String(user?.id || user?._id || getTin(company) || 'system').slice(0, 20);
+  const actorName = String(user?.name || user?.email || company?.name || 'System').slice(0, 60);
+  const results = [];
+
+  for (const row of rows) {
+    const product = await Product.findOne({ _id: row.productId, company: companyId }).lean();
+    if (!product) {
+      results.push({ itemCd: row.itemCd, submitted: false, error: 'Local product not found.' });
+      continue;
+    }
+    const payload = buildMasterPayload({ product, currentQty: product.currentStock }, company, branch);
+    payload.regrId = actorId;
+    payload.regrNm = actorName;
+    payload.modrId = actorId;
+    payload.modrNm = actorName;
+    try {
+      const response = await callStockMaster(payload, {
+        companyId,
+        documentType: 'stockMasterReconciliation',
+        documentId: product._id,
+        operationKey: `${reconciliation.branchId}:${payload.itemCd}`,
+      });
+      results.push({ itemCd: payload.itemCd, productId: product._id, submitted: true, resultCd: response.resultCd, resultMsg: response.resultMsg });
+    } catch (error) {
+      results.push({ itemCd: payload.itemCd, productId: product._id, submitted: false, error: error.message });
+    }
+  }
+
+  return {
+    branchId: reconciliation.branchId,
+    checked: reconciliation.rows.length,
+    selected: rows.length,
+    submitted: results.filter((row) => row.submitted).length,
+    failed: results.filter((row) => !row.submitted).length,
+    results,
+    summary: reconciliation.summary,
+  };
+}
 async function submitStockEvent({
   companyId,
   documentType,
@@ -346,6 +521,20 @@ async function submitStockEvent({
 }) {
   const company = await Company.findById(companyId).lean();
   if (!company) throw new Error("Company not found for EBM stock reporting.");
+  const fiscalSource = await sourceModel.findOne({
+    _id: documentId,
+    $or: [{ company: companyId }, { company_id: companyId }],
+  }).select("ebm").lean();
+  const fiscalDoc = { ebm: fiscalSource?.ebm || movementData.ebm || {} };
+  movementData.sarNo = await EBMFiscalSequenceService.ensureStockSarNumber(
+    fiscalDoc,
+    companyId,
+    branch.rraBranchId,
+    (updates) => sourceModel.updateOne(
+      { _id: documentId, $or: [{ company: companyId }, { company_id: companyId }] },
+      { $set: updates },
+    ),
+  );
   const movementPayload = await buildMovementPayload(
     movementData,
     company,
@@ -664,9 +853,31 @@ async function submitBranchTransfer(transferId, { companyId } = {}) {
     };
   });
 
+  const outSarNo = await EBMFiscalSequenceService.ensureStockSarNumber(
+    transfer,
+    companyId,
+    sourceBranch.rraBranchId,
+    (updates) => StockTransfer.updateOne(
+      { _id: transfer._id, company: companyId },
+      { $set: updates },
+    ),
+    'sarNoOut',
+  );
+  const inSarNo = await EBMFiscalSequenceService.ensureStockSarNumber(
+    transfer,
+    companyId,
+    destBranch.rraBranchId,
+    (updates) => StockTransfer.updateOne(
+      { _id: transfer._id, company: companyId },
+      { $set: updates },
+    ),
+    'sarNoIn',
+  );
+
   const outPayload = await buildMovementPayload(
     {
       documentId: transfer._id,
+      sarNo: outSarNo,
       referenceNo: `${transfer.transferNumber}-OUT`,
       sarTyCd: EBM_STOCK_TYPE_CODES.BRANCH_TRANSFER_OUT,
       occurrenceDate: transfer.confirmedAt || transfer.transferDate,
@@ -682,6 +893,7 @@ async function submitBranchTransfer(transferId, { companyId } = {}) {
   const inPayload = await buildMovementPayload(
     {
       documentId: transfer._id,
+      sarNo: inSarNo,
       referenceNo: `${transfer.transferNumber}-IN`,
       sarTyCd: EBM_STOCK_TYPE_CODES.BRANCH_TRANSFER_IN,
       occurrenceDate:
@@ -764,7 +976,14 @@ module.exports = {
   submitStockForCreditNote,
   submitStockAdjustment,
   submitBranchTransfer,
+  reconcileStockMaster,
+  resubmitStockMasterFromReconciliation,
   __test__: {
     buildItemPayload,
+    buildMovementPayload,
+    buildStockReconciliationRows,
   },
 };
+
+
+

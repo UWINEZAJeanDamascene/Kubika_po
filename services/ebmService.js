@@ -42,16 +42,16 @@ const VSDC_ENDPOINTS = Object.freeze({
   SELECT_BRANCHES: '/branches/selectBranches',
   SELECT_NOTICES: '/notices/selectNotices',
 
-  SAVE_BRANCH_CUSTOMERS: '/branches/saveBrancheCustomers',
-  SAVE_BRANCH_USERS: '/branches/saveBrancheUsers',
-  SAVE_BRANCH_INSURANCES: '/branches/saveBrancheInsurances',
+  SAVE_BRANCH_CUSTOMER: '/branches/saveBranchCustomer',
+  SAVE_BRANCH_USER: '/branches/saveBranchUser',
+  SAVE_BRANCH_INSURANCE: '/branches/saveBranchInsurance',
 
   SELECT_ITEMS: '/items/selectItems',
   SAVE_ITEMS: '/items/saveItems',
   SAVE_ITEM_COMPOSITION: '/items/saveItemComposition',
 
   SELECT_IMPORT_ITEMS: '/imports/selectImportItems',
-  UPDATE_IMPORT_ITEMS: '/imports/updateImportItems',
+  SAVE_IMPORT_ITEMS: '/imports/saveImportItems',
 
   SAVE_SALES: '/transactions/saveSales',
 
@@ -70,15 +70,15 @@ const BRANCH_REGISTRATION_EXEMPT_ENDPOINTS = new Set([
   VSDC_ENDPOINTS.SELECT_CUSTOMER,
   VSDC_ENDPOINTS.SELECT_BRANCHES,
   VSDC_ENDPOINTS.SELECT_NOTICES,
-  VSDC_ENDPOINTS.SAVE_BRANCH_CUSTOMERS,
-  VSDC_ENDPOINTS.SAVE_BRANCH_USERS,
-  VSDC_ENDPOINTS.SAVE_BRANCH_INSURANCES,
+  VSDC_ENDPOINTS.SAVE_BRANCH_CUSTOMER,
+  VSDC_ENDPOINTS.SAVE_BRANCH_USER,
+  VSDC_ENDPOINTS.SAVE_BRANCH_INSURANCE,
 ]);
 
 const BRANCH_REGISTRATION_GUARDED_ENDPOINTS = new Set([
   VSDC_ENDPOINTS.SAVE_ITEMS,
   VSDC_ENDPOINTS.SAVE_ITEM_COMPOSITION,
-  VSDC_ENDPOINTS.UPDATE_IMPORT_ITEMS,
+  VSDC_ENDPOINTS.SAVE_IMPORT_ITEMS,
   VSDC_ENDPOINTS.SAVE_SALES,
   VSDC_ENDPOINTS.SELECT_PURCHASE_SALES,
   VSDC_ENDPOINTS.SAVE_PURCHASES,
@@ -462,7 +462,7 @@ class EBMService {
         return makeSuccessResponse({
           custList: [
             {
-              tin: payload.custTin || payload.tin,
+              tin: payload.custmTin || payload.custTin || payload.tin,
               taxprNm: 'MOCK CUSTOMER',
               taxprSttsCd: 'A',
               prvncNm: 'KIGALI CITY',
@@ -677,12 +677,12 @@ class EBMService {
         }, now);
       }
 
-      case VSDC_ENDPOINTS.SAVE_BRANCH_CUSTOMERS:
-      case VSDC_ENDPOINTS.SAVE_BRANCH_USERS:
-      case VSDC_ENDPOINTS.SAVE_BRANCH_INSURANCES:
+      case VSDC_ENDPOINTS.SAVE_BRANCH_CUSTOMER:
+      case VSDC_ENDPOINTS.SAVE_BRANCH_USER:
+      case VSDC_ENDPOINTS.SAVE_BRANCH_INSURANCE:
       case VSDC_ENDPOINTS.SAVE_ITEMS:
       case VSDC_ENDPOINTS.SAVE_ITEM_COMPOSITION:
-      case VSDC_ENDPOINTS.UPDATE_IMPORT_ITEMS:
+      case VSDC_ENDPOINTS.SAVE_IMPORT_ITEMS:
       case VSDC_ENDPOINTS.SAVE_PURCHASES:
         return makeSuccessResponse({
           confmDt: now,
@@ -727,16 +727,28 @@ class EBMService {
     return this.call(VSDC_ENDPOINTS.SELECT_NOTICES, payload);
   }
 
+  saveBranchCustomer(payload) {
+    return this.call(VSDC_ENDPOINTS.SAVE_BRANCH_CUSTOMER, payload);
+  }
+
+  saveBranchUser(payload) {
+    return this.call(VSDC_ENDPOINTS.SAVE_BRANCH_USER, payload);
+  }
+
+  saveBranchInsurance(payload) {
+    return this.call(VSDC_ENDPOINTS.SAVE_BRANCH_INSURANCE, payload);
+  }
+
   saveBranchCustomers(payload) {
-    return this.call(VSDC_ENDPOINTS.SAVE_BRANCH_CUSTOMERS, payload);
+    return this.saveBranchCustomer(payload);
   }
 
   saveBranchUsers(payload) {
-    return this.call(VSDC_ENDPOINTS.SAVE_BRANCH_USERS, payload);
+    return this.saveBranchUser(payload);
   }
 
   saveBranchInsurances(payload) {
-    return this.call(VSDC_ENDPOINTS.SAVE_BRANCH_INSURANCES, payload);
+    return this.saveBranchInsurance(payload);
   }
 
   selectItems(payload) {
@@ -755,8 +767,12 @@ class EBMService {
     return this.call(VSDC_ENDPOINTS.SELECT_IMPORT_ITEMS, payload);
   }
 
+  saveImportItems(payload) {
+    return this.call(VSDC_ENDPOINTS.SAVE_IMPORT_ITEMS, payload);
+  }
+
   updateImportItems(payload) {
-    return this.call(VSDC_ENDPOINTS.UPDATE_IMPORT_ITEMS, payload);
+    return this.saveImportItems(payload);
   }
 
   saveSales(payload) {
@@ -794,3 +810,7 @@ module.exports.isRetryableResultCode = isRetryableResultCode;
 module.exports.VSDC_ENDPOINTS = VSDC_ENDPOINTS;
 module.exports.formatVsdcDate = formatVsdcDate;
 module.exports.formatVsdcDateTime = formatVsdcDateTime;
+
+
+
+

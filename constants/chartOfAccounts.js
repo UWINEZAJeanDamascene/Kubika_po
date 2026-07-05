@@ -407,6 +407,13 @@ const CHART_OF_ACCOUNTS = {
     normalBalance: "credit",
     allowDirectPosting: true,
   },
+  4260: {
+    name: "Stock Adjustment Gain",
+    type: "revenue",
+    subtype: "non_operating",
+    normalBalance: "credit",
+    allowDirectPosting: true,
+  },
   4300: {
     name: "Interest Income",
     type: "revenue",
@@ -792,6 +799,7 @@ const DEFAULT_ACCOUNTS = {
   serviceRevenue: "4050",
   interestIncome: "4300",
   gainOnDisposal: "4250",
+  stockAdjustmentGain: "4260",
   lossOnDisposal: "6050",
   deferredRevenue: "2850",
 

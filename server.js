@@ -504,7 +504,6 @@ async function initializeServer() {
       const reportScheduler = require('./services/reportSchedulerService');
       if (reportScheduler && typeof reportScheduler.initializeScheduler === 'function') {
         reportScheduler.initializeScheduler(app);
-        console.log('Report scheduler initialized');
       }
     } catch (err) {
       console.warn('Could not initialize report scheduler', err && err.message ? err.message : err);

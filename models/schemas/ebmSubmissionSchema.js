@@ -3,6 +3,12 @@ const mongoose = require('mongoose');
 const ebmSubmissionSchema = new mongoose.Schema({
   rcptSign: { type: String, default: null, trim: true },
   intrlData: { type: String, default: null, trim: true },
+  invcNo: { type: Number, default: null, min: 1 },
+  curRcptNo: { type: Number, default: null, min: 1 },
+  totRcptNo: { type: Number, default: null, min: 1 },
+  sarNo: { type: Number, default: null, min: 1 },
+  sarNoOut: { type: Number, default: null, min: 1 },
+  sarNoIn: { type: Number, default: null, min: 1 },
   rcptNo: { type: String, default: null, trim: true },
   rcptDt: { type: String, default: null, trim: true },
   orgRcptNo: { type: String, default: null, trim: true },
@@ -27,6 +33,7 @@ const ebmSubmissionSchema = new mongoose.Schema({
   salesPayload: { type: mongoose.Schema.Types.Mixed, default: null },
   ebmPurchaseData: { type: mongoose.Schema.Types.Mixed, default: null },
   purchaseConfirmationPayload: { type: mongoose.Schema.Types.Mixed, default: null },
+  customerTinVerification: { type: mongoose.Schema.Types.Mixed, default: null },
   ebmConfirmedAt: { type: Date, default: null },
   ebmPurchaseSalesInvcNo: { type: String, default: null, trim: true },
   ebmPurchaseMatchStatus: {

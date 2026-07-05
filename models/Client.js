@@ -45,6 +45,7 @@ const clientSchema = new mongoose.Schema({
   industry: String,
   registrationDate: Date,
   taxId: String,
+  ebmTinVerification: { type: mongoose.Schema.Types.Mixed, default: null },
   paymentTerms: {
     type: String,
     enum: ['cash', 'credit_7', 'credit_15', 'credit_30', 'credit_45', 'credit_60'],
@@ -75,7 +76,17 @@ const clientSchema = new mongoose.Schema({
   customFields: {
     type: mongoose.Schema.Types.Mixed,
     default: {}
-  }
+  },
+  ebmBranchCustomers: [{
+    branchId: { type: String, trim: true, maxlength: 2 },
+    status: {
+      type: String,
+      enum: ['not_registered', 'registered', 'failed'],
+      default: 'not_registered'
+    },
+    submittedAt: Date,
+    error: String
+  }]
 }, {
   timestamps: true
 });
@@ -107,3 +118,4 @@ clientSchema.pre('save', async function(next) {
 });
 
 module.exports = mongoose.model('Client', clientSchema);
+

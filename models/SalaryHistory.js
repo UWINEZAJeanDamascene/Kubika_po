@@ -60,8 +60,6 @@ const salaryHistorySchema = new mongoose.Schema({
 
 // Indexes for effective salary lookups
 salaryHistorySchema.index({ company: 1, employee: 1, effectiveDate: -1 });
-salaryHistorySchema.index({ company: 1, employee: 1, endDate: 1 });
-
 // Partial index for currently active salaries
 salaryHistorySchema.index(
   { company: 1, employee: 1, endDate: 1 },

@@ -10,11 +10,16 @@
  *   const jwtConfig = config.jwt;
  */
 
-const REQUIRED_ENV_VARS = [
-  'NODE_ENV',
-];
+const REQUIRED_ENV_VARS = [];
 
 const REQUIRED_IN_PRODUCTION = [];
+
+function normalizeNodeEnv() {
+  const raw = String(process.env.NODE_ENV || '').trim();
+  const nodeEnv = raw && raw !== 'undefined' && raw !== 'null' ? raw : 'development';
+  process.env.NODE_ENV = nodeEnv;
+  return nodeEnv;
+}
 
 /**
  * Validate required environment variables
@@ -22,7 +27,7 @@ const REQUIRED_IN_PRODUCTION = [];
  */
 function validateEnv() {
   const missing = [];
-  const nodeEnv = process.env.NODE_ENV || 'development';
+  const nodeEnv = normalizeNodeEnv();
   
   // In test environment, skip strict validation - tests use mongodb-memory-server
   if (nodeEnv === 'test') {
@@ -87,7 +92,7 @@ function array(value, defaultVal = []) {
  * Build the frozen config object
  */
 function buildConfig() {
-  const nodeEnv = process.env.NODE_ENV || 'development';
+  const nodeEnv = normalizeNodeEnv();
   
   const config = {
     // =====================
@@ -105,6 +110,7 @@ function buildConfig() {
     // Server Configuration
     // =====================
     server: {
+      env: nodeEnv,
       port: number(process.env.PORT, 3000),
       frontendUrl: process.env.FRONTEND_URL || 'http://localhost:5173',
       allowedOrigins: array(process.env.ALLOWED_ORIGINS, ['http://localhost:3000', 'http://localhost:5173']),

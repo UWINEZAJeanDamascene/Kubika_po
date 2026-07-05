@@ -10,6 +10,7 @@ const EBMPurchaseService = require('../services/ebmPurchaseService');
 const EBMSubmissionQueue = require('../models/EBMSubmissionQueue');
 const EBMAlert = require('../models/EBMAlert');
 const EBMQueueService = require('../services/ebmQueueService');
+const EBMStockService = require('../services/ebmStockService');
 
 function getCompanyId(req) {
   return req.companyId || req.company?._id || req.user?.company?._id || req.user?.company;
@@ -155,6 +156,19 @@ exports.searchTINs = async (req, res, next) => {
   }
 };
 
+
+exports.verifyCustomerTin = async (req, res, next) => {
+  try {
+    const companyId = getCompanyId(req);
+    const EBMTinService = require('../services/ebmCustomerTinService');
+    const verification = await EBMTinService.verifyTin(companyId, req.body.tin || req.body.custmTin || req.body.custTin, {
+      branchId: req.body.branchId || req.body.bhfId || '00',
+    });
+    res.json({ success: true, data: verification, verification });
+  } catch (error) {
+    next(error);
+  }
+};
 exports.getNotices = async (req, res, next) => {
   try {
     const companyId = getCompanyId(req);
@@ -242,6 +256,39 @@ exports.retryImportedItemStock = async (req, res, next) => {
       req.user,
     );
     res.json({ success: true, data: imported });
+  } catch (error) {
+    next(error);
+  }
+};
+exports.reconcileStockMaster = async (req, res, next) => {
+  try {
+    const companyId = getCompanyId(req);
+    const result = await EBMStockService.reconcileStockMaster(companyId, {
+      branchId: req.body.branchId || req.body.bhfId || '00',
+      lastReqDt: req.body.lastReqDt,
+    });
+    res.json({ success: true, data: result });
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.resubmitStockMaster = async (req, res, next) => {
+  try {
+    const companyId = getCompanyId(req);
+    const result = await EBMStockService.resubmitStockMasterFromReconciliation(
+      companyId,
+      {
+        branchId: req.body.branchId || req.body.bhfId || '00',
+        itemCd: req.body.itemCd,
+        itemCode: req.body.itemCode,
+        productId: req.body.productId,
+        allDiscrepancies: req.body.allDiscrepancies === true,
+        lastReqDt: req.body.lastReqDt,
+      },
+      req.user,
+    );
+    res.json({ success: true, data: result });
   } catch (error) {
     next(error);
   }
@@ -454,3 +501,4 @@ exports.resetAlert = async (req, res, next) => {
     next(error);
   }
 };
+

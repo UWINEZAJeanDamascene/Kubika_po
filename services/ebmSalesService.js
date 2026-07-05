@@ -7,6 +7,8 @@ require("../models/Client");
 require("../models/Product");
 const ebmService = require("./ebmService");
 const EBMQueueService = require("./ebmQueueService");
+const EBMFiscalSequenceService = require("./ebmFiscalSequenceService");
+const EBMTinService = require("./ebmCustomerTinService");
 const { formatVsdcDate, formatVsdcDateTime, VSDC_ENDPOINTS } = require("./ebmService");
 
 const SUCCESS_RESULT = "000";
@@ -48,6 +50,7 @@ function getTin(company) {
 
 function getInvoiceNumber(invoice) {
   return (
+    invoice.ebm?.invcNo ||
     invoice.referenceNo ||
     invoice.invoiceNumber ||
     invoice.creditNoteNumber ||
@@ -111,26 +114,27 @@ function parsePositiveInt(value, fallback = 1) {
 }
 
 function getReceiptNumber(invoice) {
-  return parsePositiveInt(
-    invoice.ebm?.curRcptNo ||
-      invoice.ebm?.rcptNo ||
-      invoice.receiptNumber ||
-      invoice.rcptNo ||
-      getInvoiceNumber(invoice),
-    1,
-  );
+  return parsePositiveInt(invoice.ebm?.curRcptNo, null);
 }
 
 function getReportNumber(invoice, curRcptNo) {
   return parsePositiveInt(
-    invoice.ebm?.rptNo ||
-      invoice.ebm?.reportNo ||
-      invoice.receipt?.rptNo ||
-      invoice.rptNo ||
-      invoice.reportNo ||
-      curRcptNo,
+    invoice.ebm?.rptNo || invoice.ebm?.reportNo || curRcptNo,
     curRcptNo,
   );
+}
+
+function assertFiscalNumber(name, value) {
+  const parsed = parsePositiveInt(value, null);
+  if (!parsed) {
+    const error = new Error(
+      `Missing EBM fiscal ${name}. Allocate branch fiscal numbers before building the sales payload.`,
+    );
+    error.code = "EBM_FISCAL_NUMBER_MISSING";
+    error.retryable = false;
+    throw error;
+  }
+  return parsed;
 }
 
 function normalizeYesNo(value) {
@@ -177,6 +181,12 @@ function getDeliveryDate(invoice) {
   );
 }
 
+function shouldVerifyCustomerTin(invoice) {
+  const tin = String(getCustomerTin(invoice) || '').replace(/\D/g, '').slice(0, 9);
+  if (!/^\d{9}$/.test(tin)) return false;
+  const verification = invoice.ebmCustomerTinVerification || invoice.ebm?.customerTinVerification;
+  return verification?.tin !== tin || verification?.status !== 'valid';
+}
 function resolvePurchaserAcceptance(invoice) {
   const explicit = normalizeYesNo(
     invoice.ebm?.prchrAcptcYn ||
@@ -482,10 +492,11 @@ async function buildSalesTrnPayload(invoice, company, branch) {
   );
   const totTaxAmt = roundRwf(lines.reduce((sum, line) => sum + line.taxAmt, 0));
   const totAmt = roundRwf(lines.reduce((sum, line) => sum + line.totAmt, 0));
-  const curRcptNo = getReceiptNumber(invoice);
-  const totRcptNo = parsePositiveInt(
+  const invcNo = assertFiscalNumber("invcNo", invoice.ebm?.invcNo);
+  const curRcptNo = assertFiscalNumber("curRcptNo", getReceiptNumber(invoice));
+  const totRcptNo = assertFiscalNumber(
+    "totRcptNo",
     invoice.ebm?.totRcptNo || invoice.ebm?.totalRcptNo || curRcptNo,
-    curRcptNo,
   );
   const rcptPbctDt = formatVsdcDateTime(
     invoice.ebm?.rcptPbctDt ||
@@ -504,7 +515,7 @@ async function buildSalesTrnPayload(invoice, company, branch) {
     companyId,
     tin,
     bhfId: branch.rraBranchId,
-    invcNo: String(getInvoiceNumber(invoice)),
+    invcNo: String(invcNo),
     orgInvcNo: invoice.originalInvoiceNo || invoice.orgInvcNo || 0,
     prcOrdCd: getPurchaseOrderCode(invoice),
     custTin: getCustomerTin(invoice),
@@ -512,7 +523,7 @@ async function buildSalesTrnPayload(invoice, company, branch) {
     rcptTyCd: headerCodes.rcptTyCd,
     pmtTyCd: headerCodes.pmtTyCd,
     salesTyCd: headerCodes.salesTyCd,
-    salesSttsCd: "02", // RRA Code 4.11: '02' = Approved — all EBM submissions are confirmed
+    salesSttsCd: "02", // RRA Code 4.11: '02' = Approved â€” all EBM submissions are confirmed
     cfmDt,
     salesDt: formatVsdcDate(
       invoice.invoiceDate || invoice.createdAt || new Date(),
@@ -532,7 +543,7 @@ async function buildSalesTrnPayload(invoice, company, branch) {
     totTaxblAmt,
     totTaxAmt,
     totAmt,
-    // Tax rates per type — B is standard 18% VAT; A/C/D are zero/exempt/non-VAT
+    // Tax rates per type â€” B is standard 18% VAT; A/C/D are zero/exempt/non-VAT
     taxRtA: 0,
     taxRtB: 18,
     taxRtC: 0,
@@ -597,7 +608,7 @@ async function buildRefundPayload(
   payload.rcptTyCd = headerCodes.rcptTyCd;
   payload.pmtTyCd = headerCodes.pmtTyCd;
   payload.salesTyCd = headerCodes.salesTyCd;
-  payload.orgInvcNo = String(getInvoiceNumber(originalInvoice));
+  payload.orgInvcNo = String(originalInvoice.ebm?.invcNo || getInvoiceNumber(originalInvoice));
   payload.orgRcptNo = String(originalInvoice.ebm.rcptNo);
   payload.rfdRsnCd = refundReasonCode;
   payload.remark = note.reason || note.notes || "Refund after sale";
@@ -657,6 +668,9 @@ async function applySuccess(invoiceId, companyId, response, payload) {
         "ebm.cfmDt": payload.cfmDt,
         "ebm.prcOrdCd": payload.prcOrdCd || null,
         "ebm.prchrAcptcYn": payload.prchrAcptcYn,
+        "ebm.invcNo": payload.invcNo,
+        "ebm.curRcptNo": payload.receipt?.curRcptNo || null,
+        "ebm.totRcptNo": payload.receipt?.totRcptNo || null,
         "ebm.rptNo": payload.receipt?.rptNo || null,
         "ebm.salesPayload": payload,
       },
@@ -685,6 +699,9 @@ async function applyFailure(invoiceId, companyId, error, payload = null) {
               "ebm.cfmDt": payload.cfmDt,
               "ebm.prcOrdCd": payload.prcOrdCd || null,
               "ebm.prchrAcptcYn": payload.prchrAcptcYn,
+              "ebm.invcNo": payload.invcNo,
+              "ebm.curRcptNo": payload.receipt?.curRcptNo || null,
+              "ebm.totRcptNo": payload.receipt?.totRcptNo || null,
               "ebm.rptNo": payload.receipt?.rptNo || null,
               "ebm.salesPayload": payload,
             }
@@ -745,6 +762,9 @@ async function applyCreditNoteSuccess(noteId, companyId, response, payload) {
         "ebm.salesTyCd": payload.salesTyCd,
         "ebm.cfmDt": payload.cfmDt,
         "ebm.prchrAcptcYn": payload.prchrAcptcYn,
+        "ebm.invcNo": payload.invcNo,
+        "ebm.curRcptNo": payload.receipt?.curRcptNo || null,
+        "ebm.totRcptNo": payload.receipt?.totRcptNo || null,
         "ebm.rptNo": payload.receipt?.rptNo || null,
         "ebm.orgRcptNo": payload.orgRcptNo,
         "ebm.rfdRsnCd": payload.rfdRsnCd,
@@ -775,6 +795,9 @@ async function applyCreditNoteFailure(
               "ebm.salesTyCd": payload.salesTyCd,
               "ebm.cfmDt": payload.cfmDt,
               "ebm.prchrAcptcYn": payload.prchrAcptcYn,
+              "ebm.invcNo": payload.invcNo,
+              "ebm.curRcptNo": payload.receipt?.curRcptNo || null,
+              "ebm.totRcptNo": payload.receipt?.totRcptNo || null,
               "ebm.rptNo": payload.receipt?.rptNo || null,
               "ebm.orgRcptNo": payload.orgRcptNo,
               "ebm.rfdRsnCd": payload.rfdRsnCd,
@@ -820,6 +843,15 @@ async function submitCreditNote(
 
   const company = await Company.findById(companyId).lean();
   const branch = await resolveBranch(note, companyId, branchId);
+  await EBMFiscalSequenceService.ensureSalesNumbers(
+    note,
+    companyId,
+    branch.rraBranchId,
+    (updates) => CreditNote.updateOne(
+      { _id: note._id, company: companyId, "ebm.ebmStatus": { $ne: "submitted" } },
+      { $set: updates },
+    ),
+  );
   let payload = null;
 
   try {
@@ -892,9 +924,30 @@ async function submitInvoice(invoiceId, { companyId, branchId = null } = {}) {
 
   if (invoice.ebm?.ebmStatus === "submitted") return invoice;
 
-  await markPending(invoice._id, companyId);
   const company = await Company.findById(companyId).lean();
   const branch = await resolveBranch(invoice, companyId, branchId);
+  if (shouldVerifyCustomerTin(invoice)) {
+    await EBMTinService.verifyInvoiceCustomerTin(companyId, invoice._id, { branchId: branch.rraBranchId });
+    const verified = await Invoice.findOne({ _id: invoice._id, company: companyId })
+      .populate("client")
+      .populate("deliveryNote")
+      .populate("lines.product")
+      .populate("createdBy");
+    if (verified) {
+      invoice.ebmCustomerTinVerification = verified.ebmCustomerTinVerification;
+      invoice.ebm = verified.ebm;
+    }
+  }
+  await EBMFiscalSequenceService.ensureSalesNumbers(
+    invoice,
+    companyId,
+    branch.rraBranchId,
+    (updates) => Invoice.updateOne(
+      { _id: invoice._id, company: companyId, "ebm.ebmStatus": { $ne: "submitted" } },
+      { $set: updates },
+    ),
+  );
+  await markPending(invoice._id, companyId);
   let payload = null;
 
   try {

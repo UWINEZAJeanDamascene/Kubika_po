@@ -153,6 +153,7 @@ const invoiceSchema = new mongoose.Schema({
   customerTin: String,
   customerName: String,
   customerAddress: String,
+  ebmCustomerTinVerification: { type: mongoose.Schema.Types.Mixed, default: null },
   
   // Quotation reference - Module 6 naming
   quotation: {
@@ -193,7 +194,7 @@ const invoiceSchema = new mongoose.Schema({
     default: 1
   },
   
-  // Invoice lines - Module 6 naming (items → lines)
+  // Invoice lines - Module 6 naming (items â†’ lines)
   lines: {
     type: [invoiceLineSchema],
     alias: 'items',

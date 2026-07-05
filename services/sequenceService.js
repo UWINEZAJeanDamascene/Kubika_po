@@ -6,11 +6,20 @@ const mongoose = require('mongoose');
 // collection to avoid duplicate key errors when tests or previous runs
 // left documents behind. We special-case 'fixed_asset' below.
 
-// Return zero-padded sequence string of length 5, e.g. 00001
-function padSeq(n) {
-  return String(n).padStart(5, '0');
+function padSeq(n, digits = 5) {
+  return String(n).padStart(digits, '0');
 }
 
+
+async function nextGlobalSequence(companyId, name, digits = 7) {
+  const res = await Sequence.findOneAndUpdate(
+    { company: companyId, name, year: 0 },
+    { $inc: { seq: 1 } },
+    { new: true, upsert: true, setDefaultsOnInsert: true }
+  ).lean();
+
+  return padSeq(res.seq, digits);
+}
 async function nextSequence(companyId, name) {
   const year = new Date().getFullYear();
   // Atomic upsert and increment
@@ -73,4 +82,5 @@ async function nextSequence(companyId, name) {
   return padSeq(res.seq);
 }
 
-module.exports = { nextSequence };
+module.exports = { nextSequence, nextGlobalSequence };
+

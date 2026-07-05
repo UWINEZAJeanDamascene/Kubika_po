@@ -1,34 +1,35 @@
 const EBM_STOCK_TYPE_CODES = Object.freeze({
-  // RRA Stock In/Out Type 01: imported goods confirmed into stock.
+  // RRA v1.0.5 Stock In/Out Type 01: Stock In (Purchase).
+  // Imported goods confirmed into warehouse stock are purchase stock-in.
   IMPORT_CONFIRMED_STOCK_IN: '01',
 
-  // RRA Stock In/Out Type 02: purchase receipt / GRN stock-in.
-  GRN_PURCHASE_RECEIPT: '02',
+  // RRA v1.0.5 Stock In/Out Type 01: Stock In (Purchase).
+  GRN_PURCHASE_RECEIPT: '01',
 
-  // RRA Stock In/Out Type 03: goods returned by customer.
-  CUSTOMER_RETURN_IN: '03',
+  // RRA v1.0.5 Stock In/Out Type 02: Stock In (Return from customer).
+  CUSTOMER_RETURN_IN: '02',
 
-  // RRA Stock In/Out Type 04: branch transfer stock-in at destination.
+  // RRA v1.0.5 has no dedicated branch-transfer-in code; use Stock In (Other).
   BRANCH_TRANSFER_IN: '04',
 
-  // RRA Stock In/Out Type 06: adjustment stock-in.
-  STOCK_ADJUSTMENT_IN: '06',
+  // RRA v1.0.5 has no dedicated adjustment-in code; use Stock In (Other).
+  STOCK_ADJUSTMENT_IN: '04',
 
-  // RRA Stock In/Out Type 11: stock-out due to sale.
+  // RRA v1.0.5 Stock In/Out Type 11: Stock Out (Sale).
   SALE_OUT: '11',
 
-  // RRA Stock In/Out Type 12: stock-out due to supplier return.
+  // RRA v1.0.5 Stock In/Out Type 12: Stock Out (Return to supplier).
   SUPPLIER_RETURN_OUT: '12',
 
-  // RRA Stock In/Out Type 13: branch transfer stock-out from source.
-  BRANCH_TRANSFER_OUT: '13',
+  // RRA v1.0.5 has no dedicated branch-transfer-out code; use Stock Out (Other).
+  BRANCH_TRANSFER_OUT: '14',
 
-  // RRA Stock In/Out Type 16: adjustment stock-out.
-  STOCK_ADJUSTMENT_OUT: '16',
+  // RRA v1.0.5 Stock In/Out Type 13: Stock Out (Adjustment).
+  STOCK_ADJUSTMENT_OUT: '13',
 
   // The VSDC code table has no dedicated opening-stock code in section 4.15.
-  // Opening balances are reported as adjustment stock-in when they are created.
-  OPENING_STOCK: '06',
+  // Opening balances are reported as Stock In (Other).
+  OPENING_STOCK: '04',
 });
 
 function getAdjustmentCode(direction) {

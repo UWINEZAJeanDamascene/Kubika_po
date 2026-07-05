@@ -35,6 +35,109 @@ function normalizeBranchId(value) {
   return String(value || '00').padStart(2, '0').slice(-2);
 }
 
+function firstValue(...values) {
+  return values.find((value) => value !== undefined && value !== null && String(value).trim() !== '');
+}
+
+function cleanString(value, maxLength, fallback = '') {
+  const resolved = firstValue(value, fallback);
+  return String(resolved == null ? '' : resolved).trim().slice(0, maxLength);
+}
+
+function toOptionalNumber(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatVsdcDate(value) {
+  if (!value) return '';
+  const raw = String(value).trim();
+  if (/^\d{8}$/.test(raw)) return raw;
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return '';
+  const year = String(date.getUTCFullYear()).padStart(4, '0');
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(date.getUTCDate()).padStart(2, '0');
+  return `${year}${month}${day}`;
+}
+
+function getActor(user) {
+  const id = cleanString(user?.id || user?._id || user?.email || 'system', 20, 'system');
+  const name = cleanString(user?.name || user?.fullName || user?.email || 'System', 60, 'System');
+  return { id, name };
+}
+
+function omitBlankOptionalFields(payload, requiredFields) {
+  const required = new Set(requiredFields);
+  return Object.fromEntries(Object.entries(payload).filter(([key, value]) => {
+    if (required.has(key)) return true;
+    return value !== null && value !== undefined && value !== '';
+  }));
+}
+
+function buildSaveImportItemPayload(imported, device, branchId, user, statusCode = '2') {
+  const raw = imported.raw || {};
+  const actor = getActor(user);
+  const requiredFields = [
+    'tin',
+    'bhfId',
+    'taskCd',
+    'dclDe',
+    'itemSeq',
+    'dclNo',
+    'hsCd',
+    'imptItemSttsCd',
+    'itemNm',
+    'regrId',
+    'regrNm',
+    'modrId',
+    'modrNm',
+  ];
+
+  const payload = {
+    companyId: imported.company,
+    tin: cleanString(device?.tin, 9),
+    bhfId: normalizeBranchId(branchId),
+    taskCd: cleanString(firstValue(raw.taskCd, imported.importTaskCode), 30),
+    dclDe: formatVsdcDate(firstValue(raw.dclDe, raw.declarationDate, imported.importDate)),
+    itemSeq: toOptionalNumber(firstValue(raw.itemSeq, raw.itemSequence, raw.seq, 1)),
+    dclNo: cleanString(firstValue(raw.dclNo, imported.importDeclarationNo), 20),
+    hsCd: cleanString(firstValue(raw.hsCd, raw.hscd, raw.hsCode), 10),
+    imptItemSttsCd: cleanString(firstValue(statusCode, raw.imptItemSttsCd, '2'), 5),
+    itemNm: cleanString(firstValue(raw.itemNm, imported.itemName), 200),
+    orgnNatCd: cleanString(firstValue(raw.orgnNatCd, imported.originCountryCode), 5),
+    exptNatCd: cleanString(raw.exptNatCd, 5),
+    pkg: toOptionalNumber(raw.pkg),
+    pkgUnitCd: cleanString(raw.pkgUnitCd, 5),
+    qty: toOptionalNumber(firstValue(raw.qty, imported.quantity)),
+    qtyUnitCd: cleanString(firstValue(raw.qtyUnitCd, imported.unitCode), 5),
+    totWt: toOptionalNumber(raw.totWt),
+    netWt: toOptionalNumber(raw.netWt),
+    spplrNm: cleanString(firstValue(raw.spplrNm, raw.splrNm, imported.supplierName), 60),
+    agntNm: cleanString(raw.agntNm, 60),
+    invcFcurAmt: toOptionalNumber(raw.invcFcurAmt),
+    invcFcurCd: cleanString(raw.invcFcurCd, 5),
+    invcFcurExcrt: toOptionalNumber(raw.invcFcurExcrt),
+    dclRefNum: cleanString(raw.dclRefNum, 30),
+    regrId: actor.id,
+    regrNm: actor.name,
+    modrId: actor.id,
+    modrNm: actor.name,
+  };
+
+  const missing = requiredFields.filter((field) => payload[field] === null || payload[field] === undefined || payload[field] === '');
+  if (missing.length) {
+    const error = new Error(`Imported item is missing RRA confirmation fields: ${missing.join(', ')}`);
+    error.code = 'EBM_IMPORT_ITEM_PAYLOAD_INVALID';
+    error.statusCode = 400;
+    error.retryable = false;
+    error.missingFields = missing;
+    throw error;
+  }
+
+  return omitBlankOptionalFields(payload, requiredFields);
+}
 function normalizeImportedItem(raw, companyId, branchId) {
   const importTaskCode = String(raw.taskCd || raw.importTaskCode || raw.taskCode || raw.taskNo || raw.dclNo || '').trim();
   const quantity = Number(raw.qty || raw.quantity || raw.importQty || 0);
@@ -226,16 +329,8 @@ class EBMImportedItemService {
 
     const device = await getInitializedDevice(companyId, branchId);
     try {
-      const response = await ebmService.updateImportItems({
-        companyId,
-        tin: device.tin,
-        bhfId: branchId,
-        taskCd: imported.importTaskCode,
-        itemCd: imported.itemCode,
-        qty: imported.quantity,
-        modrId: user?.id || user?._id || 'system',
-        modrNm: user?.name || user?.email || 'System',
-      });
+      const payload = buildSaveImportItemPayload(imported, device, branchId, user, '2');
+      const response = await ebmService.saveImportItems(payload);
       imported.confirmationStatus = 'confirmed';
       imported.rraConfirmedAt = new Date();
       imported.rraResult = response.raw || response;
@@ -419,4 +514,8 @@ class EBMImportedItemService {
   }
 }
 
+EBMImportedItemService.__test__ = { buildSaveImportItemPayload };
+
 module.exports = EBMImportedItemService;
+
+

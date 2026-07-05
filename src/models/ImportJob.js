@@ -77,7 +77,8 @@ const importJobSchema = new mongoose.Schema({
     required: true
   }
 }, {
-  timestamps: true
+  timestamps: true,
+  suppressReservedKeysWarning: true
 });
 
 // TTL: auto-delete completed/failed jobs after 7 days

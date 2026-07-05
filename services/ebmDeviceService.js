@@ -4,6 +4,7 @@ const Warehouse = require('../models/Warehouse');
 const ebmService = require('./ebmService');
 const { EBM_DEVICE_STATUSES } = require('../models/EBMDevice');
 const { EBM_MODES, EBMServiceError } = require('./ebmService');
+const EBMFiscalSequenceService = require('./ebmFiscalSequenceService');
 
 function normalizeBranchId(value) {
   if (value === undefined || value === null || value === '') return null;
@@ -212,6 +213,11 @@ class EBMDeviceService {
       device.lastErrorMessage = null;
       device.initResult = response.raw;
       await device.save();
+      await EBMFiscalSequenceService.seedFromInitInfo(
+        companyId,
+        branchId,
+        response.data?.info || response.raw?.data?.info || response.raw?.info || {},
+      );
 
       return {
         success: true,

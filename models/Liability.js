@@ -168,7 +168,6 @@ const liabilitySchema = new mongoose.Schema({
 
 // Compound index for company_id + unique reference_no
 liabilitySchema.index({ company_id: 1, reference_no: 1 }, { unique: true });
-liabilitySchema.index({ company_id: 1 });
 liabilitySchema.index({ company_id: 1, status: 1 });
 
 // Pre-save middleware to auto-generate reference number

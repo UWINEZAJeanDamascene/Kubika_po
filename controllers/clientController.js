@@ -2,6 +2,54 @@ const Client = require('../models/Client');
 const Invoice = require('../models/Invoice');
 const CreditNote = require('../models/CreditNote');
 const ARReceipt = require('../models/ARReceipt');
+const EBMBranchService = require('../services/ebmBranchService');
+function sanitizeClientBody(body = {}) {
+  const {
+    registerWithEbmBranch,
+    autoSaveEbmBranchCustomer,
+    ebmBranchId,
+    branchId,
+    bhfId,
+    ...clientData
+  } = body;
+  return clientData;
+}
+
+function shouldRegisterBranchCustomer(body = {}) {
+  return body.registerWithEbmBranch === true
+    || body.registerWithEbmBranch === 'true'
+    || body.autoSaveEbmBranchCustomer === true
+    || body.autoSaveEbmBranchCustomer === 'true'
+    || process.env.EBM_AUTO_SAVE_BRANCH_CUSTOMERS === 'true';
+}
+
+function getRequestedBranchId(body = {}) {
+  return body.ebmBranchId || body.branchId || body.bhfId || '00';
+}
+
+async function trySaveClientBranchCustomer({ companyId, clientId, body, user }) {
+  if (!shouldRegisterBranchCustomer(body)) return null;
+  const branchId = getRequestedBranchId(body);
+  try {
+    const result = await EBMBranchService.saveBranchCustomer(companyId, clientId, branchId, user);
+    return {
+      success: true,
+      branchId,
+      vsdc: {
+        resultCd: result.response?.resultCd,
+        resultMsg: result.response?.resultMsg,
+        resultDt: result.response?.resultDt,
+      },
+    };
+  } catch (error) {
+    return {
+      success: false,
+      branchId,
+      message: error.message || 'Client saved, but RRA EBM branch customer registration failed',
+      code: error.code,
+    };
+  }
+}
 
 // @desc    Get all clients
 // @route   GET /api/clients
@@ -79,14 +127,25 @@ exports.getClient = async (req, res, next) => {
 exports.createClient = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    req.body.createdBy = req.user.id;
-    req.body.company = companyId;
+    const clientData = sanitizeClientBody(req.body);
+    clientData.createdBy = req.user.id;
+    clientData.company = companyId;
 
-    const client = await Client.create(req.body);
+    let client = await Client.create(clientData);
+    const ebmBranchCustomer = await trySaveClientBranchCustomer({
+      companyId,
+      clientId: client._id,
+      body: req.body,
+      user: req.user,
+    });
+    if (ebmBranchCustomer) {
+      client = await Client.findOne({ _id: client._id, company: companyId });
+    }
 
     res.status(201).json({
       success: true,
-      data: client
+      data: client,
+      ...(ebmBranchCustomer ? { ebmBranchCustomer } : {})
     });
   } catch (error) {
     // Handle duplicate key error more gracefully
@@ -116,7 +175,7 @@ exports.updateClient = async (req, res, next) => {
     const companyId = req.user.company._id;
     const client = await Client.findOneAndUpdate(
       { _id: req.params.id, company: companyId },
-      req.body,
+      sanitizeClientBody(req.body),
       {
         new: true,
         runValidators: true
@@ -130,15 +189,77 @@ exports.updateClient = async (req, res, next) => {
       });
     }
 
+    const ebmBranchCustomer = await trySaveClientBranchCustomer({
+      companyId,
+      clientId: client._id,
+      body: req.body,
+      user: req.user,
+    });
+    const responseClient = ebmBranchCustomer
+      ? await Client.findOne({ _id: client._id, company: companyId })
+      : client;
+
     res.json({
       success: true,
-      data: client
+      data: responseClient,
+      ...(ebmBranchCustomer ? { ebmBranchCustomer } : {})
     });
   } catch (error) {
     next(error);
   }
 };
 
+
+// @desc    Save client as an RRA EBM branch customer
+// @route   POST /api/clients/:id/ebm/branch-customer
+// @access  Private (admin, stock_manager, sales)
+exports.saveClientBranchCustomer = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const branchId = req.body.branchId || req.body.bhfId || '00';
+    const result = await EBMBranchService.saveBranchCustomer(
+      companyId,
+      req.params.id,
+      branchId,
+      req.user,
+    );
+
+    res.json({
+      success: true,
+      data: result.client,
+      vsdc: {
+        resultCd: result.response?.resultCd,
+        resultMsg: result.response?.resultMsg,
+        resultDt: result.response?.resultDt,
+      },
+      payload: result.payload,
+      message: 'Client saved as RRA EBM branch customer',
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+// @desc    Verify client TIN with RRA VSDC
+// @route   POST /api/clients/:id/ebm/verify-tin
+// @access  Private (admin, stock_manager, sales)
+exports.verifyClientTin = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const EBMTinService = require('../services/ebmCustomerTinService');
+    const result = await EBMTinService.verifyClientTin(companyId, req.params.id, {
+      branchId: req.body.branchId || req.body.bhfId || '00',
+    });
+
+    res.json({
+      success: true,
+      data: result.client,
+      verification: result.verification,
+      message: 'Client TIN verified with RRA',
+    });
+  } catch (error) {
+    next(error);
+  }
+};
 // @desc    Delete client
 // @route   DELETE /api/clients/:id
 // @access  Private (admin)
@@ -749,3 +870,4 @@ exports.getClientStatementPDF = async (req, res, next) => {
     next(error);
   }
 };
+
