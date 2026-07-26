@@ -105,7 +105,14 @@ const {
 } = require('../controllers/freightBillController');
 
 const { protect, authorize } = require('../middleware/auth');
-const { requirePermission } = require('../middleware/rbacMiddleware');
+const { requirePermission, requireAnyPermission } = require('../middleware/rbacMiddleware');
+
+// GRNs are needed by GRN UI and by purchase-return creation (select confirmed GRN)
+const canReadGrn = requireAnyPermission([
+  { resource: 'grn', action: 'read' },
+  { resource: 'purchase_returns', action: 'read' },
+  { resource: 'purchase_returns', action: 'create' },
+]);
 const logAction = require('../middleware/logAction');
 
 router.use(protect);
@@ -214,9 +221,9 @@ router.post('/purchase-orders/:id/cancel', requirePermission('purchase_orders', 
 router.post('/purchase-orders/:id/payment', requirePermission('ap_payments', 'create'), logAction('stock'), recordPOPayment);
 
 // ========== GRN ROUTES ==========
-router.get('/grn', requirePermission('grn', 'read'), listGRNs);
+router.get('/grn', canReadGrn, listGRNs);
 router.post('/grn', requirePermission('grn', 'create'), logAction('stock'), createGRN);
-router.get('/grn/:id', requirePermission('grn', 'read'), getGRN);
+router.get('/grn/:id', canReadGrn, getGRN);
 router.put('/grn/:id', requirePermission('grn', 'update'), logAction('stock'), updateGRN);
 router.delete('/grn/:id', requirePermission('grn', 'delete'), logAction('stock'), deleteGRN);
 router.post('/grn/:id/confirm', requirePermission('grn', 'confirm'), logAction('stock'), confirmGRN);

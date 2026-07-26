@@ -29,8 +29,13 @@ const connectDB = async () => {
     const dbUri = config.db.uri;
     
     if (!dbUri) {
-      console.error('Error: MONGODB_URI is not defined in environment');
-      process.exit(1);
+      // MongoDB disabled — auth/tenancy runs on PostgreSQL. Domains that are
+      // not yet migrated (inventory, sales, purchases, finance) will have no
+      // data until their migration phases complete or MONGODB_URI is set.
+      console.warn('⚠️  MONGODB_URI not set — MongoDB is DISABLED. Unmigrated domains will be unavailable.');
+      // Fail fast instead of buffering queries for 10s against a dead connection.
+      mongoose.set('bufferCommands', false);
+      return null;
     }
 
     const conn = await mongoose.connect(dbUri, buildMongooseConnectOptions());

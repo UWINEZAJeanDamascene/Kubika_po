@@ -105,26 +105,20 @@ exports.getAuditStats = async (req, res, next) => {
         { $match: { company: companyId, ...dateFilter } },
         { $group: { _id: '$user', count: { $sum: 1 } } },
         { $sort: { count: -1 } },
-        { $limit: 10 },
-        {
-          $lookup: {
-            from: 'users',
-            localField: '_id',
-            foreignField: '_id',
-            as: 'userInfo'
-          }
-        },
-        { $unwind: { path: '$userInfo', preserveNullAndEmptyArrays: true } },
-        {
-          $project: {
-            count: 1,
-            name: '$userInfo.name',
-            email: '$userInfo.email'
-          }
-        }
+        { $limit: 10 }
       ]),
       ActionLog.countDocuments({ company: companyId, ...dateFilter })
     ]);
+
+    // Users live in PostgreSQL now — enrich the aggregation results from there
+    const User = require('../models/User');
+    const topUserIds = byUser.map((u) => (u._id ? String(u._id) : null)).filter(Boolean);
+    const userRows = topUserIds.length ? await User.find({ _id: { $in: topUserIds } }) : [];
+    const usersById = new Map(userRows.map((u) => [String(u._id), u]));
+    const topUsers = byUser.map((u) => {
+      const info = u._id ? usersById.get(String(u._id)) : null;
+      return { _id: u._id, count: u.count, name: info?.name, email: info?.email };
+    });
 
     res.json({
       success: true,
@@ -132,7 +126,7 @@ exports.getAuditStats = async (req, res, next) => {
         total: totalCount,
         byModule,
         byStatus,
-        topUsers: byUser
+        topUsers
       }
     });
   } catch (error) {

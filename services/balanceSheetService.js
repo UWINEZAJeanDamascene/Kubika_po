@@ -2,6 +2,7 @@ const mongoose = require("mongoose");
 const ChartOfAccount = require("../models/ChartOfAccount");
 const JournalEntry = require("../models/JournalEntry");
 const Loan = require("../models/Loan");
+const { isMongoConnected } = require("../utils/mongoConnection");
 const { aggregateWithTimeout } = require("../utils/mongoAggregation");
 const Company = require("../models/Company");
 const PLStatementService = require("./plStatementService");
@@ -474,11 +475,18 @@ class BalanceSheetService {
     twelveMonthsLater.setMonth(twelveMonthsLater.getMonth() + 12);
 
     // Get all active loans for this company
-    const loans = await Loan.find({
-      company: new mongoose.Types.ObjectId(companyId),
-      status: { $in: ['active', 'short-term', 'long-term'] },
-      outstandingBalance: { $gt: 0 }
-    }).lean();
+    let loans = [];
+    if (isMongoConnected()) {
+      try {
+        loans = await Loan.find({
+          company: new mongoose.Types.ObjectId(companyId),
+          status: { $in: ['active', 'short-term', 'long-term'] },
+          outstandingBalance: { $gt: 0 }
+        }).lean();
+      } catch (_err) {
+        loans = [];
+      }
+    }
 
     const maturityMap = new Map();
 

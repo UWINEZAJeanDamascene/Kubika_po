@@ -1413,6 +1413,8 @@ const generateAllReports = async (companyId, periodType, year, periodNumber, use
   const snapshots = [];
 
   for (const { type, generator } of reportTypes) {
+    // Declared outside the try so the catch can mark the snapshot as failed.
+    let snapshot = null;
     try {
       // Check if snapshot already exists (completed). Use atomic upsert to avoid
       // duplicate key errors when multiple schedulers attempt to create the
@@ -1426,7 +1428,7 @@ const generateAllReports = async (companyId, periodType, year, periodNumber, use
       };
 
       // Try to find a completed snapshot first
-      let snapshot = await ReportSnapshot.findOne({ ...snapshotFilter, status: 'completed' });
+      snapshot = await ReportSnapshot.findOne({ ...snapshotFilter, status: 'completed' });
 
       if (!snapshot) {
         // Create or mark in-progress atomically
@@ -2723,19 +2725,8 @@ const generateEmployeeExpenseReport = async (companyId, startDate, endDate) => {
   const expensesByEmployee = await aggregateWithTimeout(Expense, [
     { $match: matchStage },
     {
-      $lookup: {
-        from: 'users',
-        localField: 'createdBy',
-        foreignField: '_id',
-        as: 'creator'
-      }
-    },
-    { $unwind: { path: '$creator', preserveNullAndEmptyArrays: true } },
-    {
       $group: {
         _id: '$createdBy',
-        employeeName: { $first: '$creator.name' },
-        employeeEmail: { $first: '$creator.email' },
         totalAmount: { $sum: '$amount' },
         expenseCount: { $sum: 1 },
         approvedCount: {
@@ -2750,8 +2741,6 @@ const generateEmployeeExpenseReport = async (companyId, startDate, endDate) => {
     {
       $project: {
         _id: 1,
-        employeeName: { $ifNull: ['$employeeName', 'Unknown'] },
-        employeeEmail: { $ifNull: ['$employeeEmail', ''] },
         totalAmount: 1,
         expenseCount: 1,
         approvedCount: 1,
@@ -2762,6 +2751,19 @@ const generateEmployeeExpenseReport = async (companyId, startDate, endDate) => {
     },
     { $sort: { totalAmount: -1 } }
   ]);
+
+  // Users live in PostgreSQL now — enrich employee names/emails from there
+  {
+    const User = require('../models/User');
+    const employeeIds = expensesByEmployee.map((e) => (e._id ? String(e._id) : null)).filter(Boolean);
+    const userRows = employeeIds.length ? await User.find({ _id: { $in: employeeIds } }) : [];
+    const usersById = new Map(userRows.map((u) => [String(u._id), u]));
+    for (const entry of expensesByEmployee) {
+      const info = entry._id ? usersById.get(String(entry._id)) : null;
+      entry.employeeName = info?.name || 'Unknown';
+      entry.employeeEmail = info?.email || '';
+    }
+  }
 
   const summary = {
     totalEmployees: expensesByEmployee.length,

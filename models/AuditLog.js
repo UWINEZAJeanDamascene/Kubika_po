@@ -1,73 +1,49 @@
-const mongoose = require('mongoose');
-const { Schema } = mongoose;
+/**
+ * AuditLog model — PostgreSQL (Prisma) backed.
+ *
+ * Built as a global model: tenant queries pass `company_id` explicitly and the
+ * platform-wide queries deliberately span every tenant.
+ */
 
-const auditLogSchema = new mongoose.Schema({
-  company_id: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Company',
-    // null for system-level actions (login, company creation)
-  },
-  user_id: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
-  },
-  action: {
-    type: String,
-    required: true,
-    // Format: 'resource.verb' e.g. 'invoice.confirm', 'period.close'
-  },
-  entity_type: {
-    type: String,
-    required: true
-    // e.g. 'sales_invoice', 'journal_entry', 'user'
-  },
-  entity_id: {
-    type: Schema.Types.Mixed,  // Can be ObjectId or string for flexible entity tracking
-    default: null,
-  },
-  changes: {
-    type: mongoose.Schema.Types.Mixed,
-    default: null
-    // JSON diff of what changed — before/after for updates
-  },
-  ip_address: {
-    type: String,
-    default: null
-  },
-  user_agent: {
-    type: String,
-    default: null
-  },
-  status: {
-    type: String,
-    enum: ['success', 'failure'],
-    default: 'success'
-  },
-  error_message: {
-    type: String,
-    default: null
-    // Set when status = failure
-  },
-  duration_ms: {
-    type: Number,
-    default: null
-    // How long the operation took
-  }
-}, {
-  timestamps: true
-  // createdAt = when the action happened
+const { buildGlobalModel } = require('../utils/masterDataCommon');
+const {
+  auditLogToApi,
+  auditLogTranslateCreate,
+  auditLogTranslateUpdate,
+  auditLogInclude,
+} = require('../utils/auditMappers');
+
+const FIELD_MAP = {
+  company: { target: 'companyId', isId: true },
+  companyId: { target: 'companyId', isId: true },
+  company_id: { target: 'companyId', isId: true },
+  user: { target: 'userId', isId: true },
+  userId: { target: 'userId', isId: true },
+  user_id: { target: 'userId', isId: true },
+  action: { target: 'action' },
+  entity_type: { target: 'entityType' },
+  entityType: { target: 'entityType' },
+  entity_id: { target: 'entityId' },
+  entityId: { target: 'entityId' },
+  changes: { target: 'changes' },
+  ip_address: { target: 'ipAddress' },
+  ipAddress: { target: 'ipAddress' },
+  user_agent: { target: 'userAgent' },
+  userAgent: { target: 'userAgent' },
+  status: { target: 'status' },
+  error_message: { target: 'errorMessage' },
+  errorMessage: { target: 'errorMessage' },
+  duration_ms: { target: 'durationMs' },
+  durationMs: { target: 'durationMs' },
+};
+
+module.exports = buildGlobalModel({
+  name: 'AuditLog',
+  collection: 'auditlogs',
+  delegateName: 'auditLog',
+  fieldMap: FIELD_MAP,
+  toApi: auditLogToApi,
+  translateCreate: auditLogTranslateCreate,
+  translateUpdate: auditLogTranslateUpdate,
+  include: auditLogInclude,
 });
-
-// Indexes for common audit queries
-auditLogSchema.index({ company_id: 1, createdAt: -1 });
-auditLogSchema.index({ company_id: 1, user_id: 1, createdAt: -1 });
-auditLogSchema.index({ company_id: 1, entity_type: 1, entity_id: 1 });
-auditLogSchema.index({ company_id: 1, action: 1 });
-
-// TTL index — auto-delete audit logs older than 7 years (regulatory requirement)
-auditLogSchema.index(
-  { createdAt: 1 },
-  { expireAfterSeconds: 60 * 60 * 24 * 365 * 7 }
-);
-
-module.exports = mongoose.model('AuditLog', auditLogSchema);

@@ -8,6 +8,7 @@ describe('EBM VSDC endpoint constants', () => {
     expect(VSDC_ENDPOINTS.SAVE_PURCHASES).toBe('/transactions/savePurchases');
     expect(VSDC_ENDPOINTS.SAVE_STOCK_MASTER).toBe('/stock/saveStockMaster');
     expect(VSDC_ENDPOINTS.SAVE_IMPORT_ITEMS).toBe('/imports/saveImportItems');
+    expect(VSDC_ENDPOINTS.SELECT_SALES).toBe('/transactions/selectTrnsSalesSummary');
   });
 
   it('uses RRA VSDC v1.0.5 branch/user/customer/insurance paths', () => {

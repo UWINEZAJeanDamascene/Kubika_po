@@ -1,108 +1,41 @@
-const mongoose = require('mongoose');
+/**
+ * DeferredRevenue model — PostgreSQL (Prisma) backed.
+ *
+ * Mutable so deferredRevenueService can keep using `item.save()` while it walks
+ * the recognition schedule.
+ */
 
-const recognitionSchema = new mongoose.Schema({
-  amount: { type: Number, required: true, min: 0.01 },
-  date: { type: Date, required: true },
-  description: { type: String, trim: true, default: '' },
-  journalEntryId: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'JournalEntry',
-    default: null
-  },
-  status: {
-    type: String,
-    enum: ['pending', 'posted', 'reversed'],
-    default: 'pending'
-  },
-  createdAt: { type: Date, default: Date.now }
-}, { _id: true });
+const { buildTenantModel } = require('../utils/masterDataCommon');
+const {
+  deferredRevenueToApi,
+  deferredRevenueTranslateCreate,
+  deferredRevenueTranslateUpdate,
+} = require('../utils/deferralMappers');
 
-const deferredRevenueSchema = new mongoose.Schema({
-  company: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Company',
-    required: true,
-    index: true
-  },
-  referenceNo: {
-    type: String,
-    required: true,
-    trim: true
-  },
-  customer: {
-    type: String,
-    trim: true,
-    default: ''
-  },
-  description: {
-    type: String,
-    required: true,
-    trim: true
-  },
-  totalAmount: {
-    type: Number,
-    required: true,
-    min: 0.01
-  },
-  revenueAccountCode: {
-    type: String,
-    required: true,
-    trim: true
-  },
-  paymentMethod: {
-    type: String,
-    enum: ['cash', 'bank_transfer', 'mobile_money', 'cheque', 'petty_cash'],
-    required: true,
-    default: 'cash'
-  },
-  bankAccountId: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'BankAccount',
-    default: null
-  },
-  startDate: {
-    type: Date,
-    required: true
-  },
-  endDate: {
-    type: Date,
-    required: true
-  },
-  frequency: {
-    type: String,
-    enum: ['monthly', 'quarterly', 'annually'],
-    required: true,
-    default: 'monthly'
-  },
-  status: {
-    type: String,
-    enum: ['active', 'fully_recognized', 'cancelled'],
-    default: 'active'
-  },
-  remainingBalance: {
-    type: Number,
-    default: 0
-  },
-  totalRecognized: {
-    type: Number,
-    default: 0
-  },
-  recognitions: [recognitionSchema],
-  journalEntryId: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'JournalEntry',
-    default: null
-  },
-  createdBy: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
-    required: true
-  }
-}, {
-  timestamps: true
+const FIELD_MAP = {
+  referenceNo: { target: 'referenceNo' },
+  customer: { target: 'customer' },
+  description: { target: 'description' },
+  status: { target: 'status' },
+  frequency: { target: 'frequency' },
+  paymentMethod: { target: 'paymentMethod' },
+  revenueAccountCode: { target: 'revenueAccountCode' },
+  bankAccountId: { target: 'bankAccountId', isId: true },
+  journalEntryId: { target: 'journalEntryId', isId: true },
+  startDate: { target: 'startDate' },
+  endDate: { target: 'endDate' },
+  totalAmount: { target: 'totalAmount' },
+  remainingBalance: { target: 'remainingBalance' },
+  totalRecognized: { target: 'totalRecognized' },
+};
+
+module.exports = buildTenantModel({
+  name: 'DeferredRevenue',
+  collection: 'deferredrevenues',
+  delegateName: 'deferredRevenue',
+  fieldMap: FIELD_MAP,
+  toApi: deferredRevenueToApi,
+  translateCreate: deferredRevenueTranslateCreate,
+  translateUpdate: deferredRevenueTranslateUpdate,
+  mutable: true,
 });
-
-deferredRevenueSchema.index({ company: 1, status: 1 });
-deferredRevenueSchema.index({ company: 1, referenceNo: 1 });
-
-module.exports = mongoose.model('DeferredRevenue', deferredRevenueSchema);

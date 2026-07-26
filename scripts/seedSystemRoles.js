@@ -1,13 +1,12 @@
 /**
- * Seeds system roles into the database.
+ * Seeds system roles into PostgreSQL.
  * Run this before creating platform admin or any users.
  *   node scripts/seedSystemRoles.js
  */
 require('dotenv').config();
 
-const mongoose = require('mongoose');
-const connectDB = require('../config/database');
-const Role = require('../models/Role');
+const { prisma, connectPrisma, disconnectPrisma } = require('../lib/prisma');
+const { generateObjectId } = require('../utils/objectId');
 
 const systemRoles = [
   {
@@ -129,27 +128,41 @@ const systemRoles = [
 ];
 
 async function run() {
-  await connectDB();
+  await connectPrisma();
 
   console.log('Seeding system roles...\n');
 
   for (const roleData of systemRoles) {
-    const existing = await Role.findOne({ name: roleData.name, is_system_role: true });
+    const existing = await prisma.role.findFirst({
+      where: { name: roleData.name, isSystemRole: true },
+    });
     if (existing) {
       // Update existing role with new permissions
-      existing.description = roleData.description;
-      existing.permissions = roleData.permissions;
-      await existing.save();
+      await prisma.role.update({
+        where: { id: existing.id },
+        data: {
+          description: roleData.description,
+          permissions: roleData.permissions,
+        },
+      });
       console.log(`Updated role: ${roleData.name}`);
       continue;
     }
 
-    await Role.create(roleData);
+    await prisma.role.create({
+      data: {
+        id: generateObjectId(),
+        name: roleData.name,
+        description: roleData.description,
+        isSystemRole: true,
+        permissions: roleData.permissions,
+      },
+    });
     console.log(`Created role: ${roleData.name}`);
   }
 
   console.log('\nSystem roles seeded successfully!');
-  await mongoose.connection.close();
+  await disconnectPrisma();
   process.exit(0);
 }
 

@@ -17,6 +17,10 @@ services:
       - "3000:3000"
     environment:
       - NODE_ENV=development
+      # Inside compose the Postgres host is the service name, not localhost.
+      # Override the .env value here so the API can reach the container.
+      - DATABASE_URL=postgresql://stock:stock@postgres:5432/stock_management?schema=public
+      - DIRECT_URL=postgresql://stock:stock@postgres:5432/stock_management?schema=public
     env_file:
       - .env.development
     volumes:
@@ -24,6 +28,7 @@ services:
     depends_on:
       - mongodb
       - redis
+      - postgres
     networks:
       - stock-network
     healthcheck:
@@ -72,6 +77,28 @@ services:
       retries: 5
       start_period: 10s
 
+  # PostgreSQL (Phase 1 Prisma migration — runs alongside MongoDB)
+  postgres:
+    image: postgres:16-alpine
+    container_name: stock-postgres
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: stock
+      POSTGRES_PASSWORD: stock
+      POSTGRES_DB: stock_management
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - stock-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stock -d stock_management"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
   # MongoDB Express (optional - for debugging)
   mongo-express:
     image: mongo-express:latest
@@ -94,3 +121,4 @@ networks:
 volumes:
   mongodb-data:
   redis-data:
+  postgres-data:

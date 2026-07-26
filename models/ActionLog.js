@@ -1,54 +1,42 @@
-const mongoose = require('mongoose');
+/**
+ * ActionLog model — PostgreSQL (Prisma) backed.
+ *
+ * Built as a global model: audit queries pass `company` explicitly, and the
+ * platform admin screens intentionally read across every tenant.
+ */
 
-const actionLogSchema = new mongoose.Schema({
-  // Multi-tenancy: company reference
-  company: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Company',
-    required: [true, 'Action log must belong to a company']
-  },
-  user: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
-    required: true
-  },
-  action: {
-    type: String,
-    required: true
-  },
-  module: {
-    type: String,
-    enum: [
-      'product', 'stock', 'supplier', 'client', 
-      'quotation', 'invoice', 'user', 'category', 'report', 'purchase', 'company', 'department', 'receivable',
-      'delivery_note', 'warehouse', 'ar_receipt', 'ar_bad_debt', 'ar_reconciliation', 'pos_sale', 'pos_payment', 
-      'drawer_open', 'drawer_close', 'bulk_import', 'payable', 'sales_legacy_direct_sale', 'grn', 'purchase_order', 'purchase_return',
-      'pick_pack', 'sales_order', 'ap_reconciliation', 'ap_payment',
-      // Additional modules observed in audit logs
-      'periods', 'settings'
-    ],
-    required: true
-  },
-  targetId: {
-    type: mongoose.Schema.Types.ObjectId
-  },
-  targetModel: String,
-  details: mongoose.Schema.Types.Mixed,
-  ipAddress: String,
-  userAgent: String,
-  status: {
-    type: String,
-    enum: ['success', 'failed'],
-    default: 'success'
-  }
-}, {
-  timestamps: true
+const { buildGlobalModel } = require('../utils/masterDataCommon');
+const {
+  actionLogToApi,
+  actionLogTranslateCreate,
+  actionLogTranslateUpdate,
+  actionLogInclude,
+} = require('../utils/auditMappers');
+
+const FIELD_MAP = {
+  company: { target: 'companyId', isId: true },
+  companyId: { target: 'companyId', isId: true },
+  company_id: { target: 'companyId', isId: true },
+  user: { target: 'userId', isId: true },
+  userId: { target: 'userId', isId: true },
+  user_id: { target: 'userId', isId: true },
+  action: { target: 'action' },
+  module: { target: 'module' },
+  targetId: { target: 'targetId' },
+  targetModel: { target: 'targetModel' },
+  details: { target: 'details' },
+  ipAddress: { target: 'ipAddress' },
+  userAgent: { target: 'userAgent' },
+  status: { target: 'status' },
+};
+
+module.exports = buildGlobalModel({
+  name: 'ActionLog',
+  collection: 'actionlogs',
+  delegateName: 'actionLog',
+  fieldMap: FIELD_MAP,
+  toApi: actionLogToApi,
+  translateCreate: actionLogTranslateCreate,
+  translateUpdate: actionLogTranslateUpdate,
+  include: actionLogInclude,
 });
-
-// Index for efficient querying
-actionLogSchema.index({ company: 1 });
-actionLogSchema.index({ user: 1, createdAt: -1 });
-actionLogSchema.index({ module: 1, createdAt: -1 });
-actionLogSchema.index({ createdAt: -1 });
-
-module.exports = mongoose.model('ActionLog', actionLogSchema);

@@ -1,5 +1,10 @@
 const crypto = require('crypto');
 const axios = require('axios');
+const {
+  sanitizeForEndpoint,
+  extractInitInfo,
+  mapVsdcErrorCode,
+} = require('../utils/vsdcPayloadSanitizer');
 
 const EBM_MODES = Object.freeze({
   MOCK: 'mock',
@@ -12,10 +17,24 @@ const RESULT_CODES = Object.freeze({
 });
 
 const NON_RETRYABLE_RESULT_CODES = new Set([
+  '001',
+  '002',
+  '003',
+  '004',
+  '007',
+  '800',
+  '801',
   '881',
   '882',
   '883',
   '884',
+]);
+
+const RETRYABLE_RESULT_CODES = new Set([
+  '005',
+  '006',
+  '811',
+  '999',
 ]);
 
 const RESULT_CODE_DETAILS = Object.freeze({
@@ -54,6 +73,7 @@ const VSDC_ENDPOINTS = Object.freeze({
   SAVE_IMPORT_ITEMS: '/imports/saveImportItems',
 
   SAVE_SALES: '/transactions/saveSales',
+  SELECT_SALES: '/transactions/selectTrnsSalesSummary',
 
   SELECT_PURCHASE_SALES: '/transactions/selectTrnsPurchaseSummary',
   SAVE_PURCHASES: '/transactions/savePurchases',
@@ -70,6 +90,8 @@ const BRANCH_REGISTRATION_EXEMPT_ENDPOINTS = new Set([
   VSDC_ENDPOINTS.SELECT_CUSTOMER,
   VSDC_ENDPOINTS.SELECT_BRANCHES,
   VSDC_ENDPOINTS.SELECT_NOTICES,
+  VSDC_ENDPOINTS.SELECT_ITEMS,
+  VSDC_ENDPOINTS.SELECT_SALES,
   VSDC_ENDPOINTS.SAVE_BRANCH_CUSTOMER,
   VSDC_ENDPOINTS.SAVE_BRANCH_USER,
   VSDC_ENDPOINTS.SAVE_BRANCH_INSURANCE,
@@ -153,7 +175,9 @@ function makeSuccessResponse(data = null, resultDt = formatVsdcDateTime()) {
 }
 
 function isRetryableResultCode(resultCd) {
-  if (NON_RETRYABLE_RESULT_CODES.has(String(resultCd))) return false;
+  const code = String(resultCd || '');
+  if (NON_RETRYABLE_RESULT_CODES.has(code)) return false;
+  if (RETRYABLE_RESULT_CODES.has(code)) return true;
   return false;
 }
 
@@ -181,16 +205,17 @@ function normalizeVsdcResponse(raw, mode, endpoint, payload) {
   const resultCd = response.resultCd;
 
   if (resultCd !== RESULT_CODES.SUCCESS) {
-    const codeDescription = RESULT_CODE_DETAILS[resultCd];
+    const codeDescription = RESULT_CODE_DETAILS[resultCd] || mapVsdcErrorCode(resultCd);
     throw new EBMServiceError(
       `VSDC returned ${resultCd || 'an unknown result code'} for ${endpoint}: ${response.resultMsg || codeDescription || 'No message'}`,
       {
-        code: 'EBM_VSDC_REJECTED',
+        code: resultCd && RESULT_CODE_DETAILS[resultCd] ? `EBM_VSDC_${resultCd}` : 'EBM_VSDC_REJECTED',
         mode,
         endpoint,
         response,
         payload,
         retryable: isRetryableResultCode(resultCd),
+        resultCd,
       },
     );
   }
@@ -280,12 +305,14 @@ class EBMService {
     }
 
     if (this.isMockMode()) {
-      const mockResponse = this.buildMockResponse(endpoint, payload);
+      const wirePayload = sanitizeForEndpoint(endpoint, payload);
+      const mockResponse = this.buildMockResponse(endpoint, wirePayload);
       return normalizeVsdcResponse(mockResponse, this.mode, endpoint, payload);
     }
 
+    const wirePayload = sanitizeForEndpoint(endpoint, payload);
     try {
-      const { data } = await this.http.post(endpoint, payload);
+      const { data } = await this.http.post(endpoint, wirePayload);
       return normalizeVsdcResponse(data, this.mode, endpoint, payload);
     } catch (error) {
       if (error instanceof EBMServiceError) throw error;
@@ -310,38 +337,39 @@ class EBMService {
     }
 
     switch (endpoint) {
-      case VSDC_ENDPOINTS.INITIALIZE_DEVICE:
-        return makeSuccessResponse({
-          info: {
-            tin,
-            taxprNm: 'MOCK VSDC TAXPAYER',
-            bsnsActv: 'STOCK MANAGEMENT AND ACCOUNTING',
-            bhfId,
-            bhfNm: bhfId === '00' ? 'Headquarter' : `Branch ${bhfId}`,
-            bhfOpenDt: formatVsdcDate(),
-            prvncNm: 'KIGALI CITY',
-            dstrtNm: 'GASABO',
-            sctrNm: 'REMERA',
-            locDesc: 'Mock VSDC location',
-            hqYn: bhfId === '00' ? 'Y' : 'N',
-            mgrNm: 'Admin',
-            mgrTelNo: '0780000000',
-            mgrEmail: 'admin@example.com',
-            sdcId: `SDC${stableHash({ tin, bhfId }, 9)}`,
-            mrcNo: `MRC${stableHash({ tin, bhfId, type: 'mrc' }, 8)}`,
-            dvcId: `${tin}${stableHash(payload.dvcSrlNo || tin, 7)}`,
-            intrlKey: `MOCK-INTRL-${stableHash(payload, 24)}`,
-            signKey: `MOCK-SIGN-${stableHash({ payload, key: 'sign' }, 24)}`,
-            cmcKey: `MOCK-CMC-${stableHash({ payload, key: 'cmc' }, 24)}`,
-            lastPchsInvcNo: 0,
-            lastSaleRcptNo: 0,
-            lastInvcNo: 0,
-            lastSaleInvcNo: 0,
-            lastTrainInvcNo: 0,
-            lastProfrmInvcNo: 0,
-            lastCopyInvcNo: 0,
-          },
-        }, now);
+      case VSDC_ENDPOINTS.INITIALIZE_DEVICE: {
+        const initInfo = {
+          tin,
+          taxprNm: 'MOCK VSDC TAXPAYER',
+          bsnsActv: 'STOCK MANAGEMENT AND ACCOUNTING',
+          bhfId,
+          bhfNm: bhfId === '00' ? 'Headquarter' : `Branch ${bhfId}`,
+          bhfOpenDt: formatVsdcDate(),
+          prvncNm: 'KIGALI CITY',
+          dstrtNm: 'GASABO',
+          sctrNm: 'REMERA',
+          locDesc: 'Mock VSDC location',
+          hqYn: bhfId === '00' ? 'Y' : 'N',
+          mgrNm: 'Admin',
+          mgrTelNo: '0780000000',
+          mgrEmail: 'admin@example.com',
+          taxprSttsCd: 'A',
+          adrs: 'KG 4 Ave 8',
+          dvcSrlNo: payload.dvcSrlNo || `dvc${tin}${bhfId}`,
+          sdcId: `SDC${stableHash({ tin, bhfId }, 9)}`,
+          mrcNo: `MRC${stableHash({ tin, bhfId, type: 'mrc' }, 8)}`,
+          activateDt: formatVsdcDate(),
+          lastSalesDt: formatVsdcDate(),
+          lastPchsInvcNo: 0,
+          lastSaleRcptNo: 0,
+          lastInvcNo: 0,
+          lastSaleInvcNo: 0,
+          lastTrainInvcNo: 0,
+          lastProfrmInvcNo: 0,
+          lastCopyInvcNo: 0,
+        };
+        return makeSuccessResponse(initInfo, now);
+      }
 
       case VSDC_ENDPOINTS.SELECT_CODES:
         return makeSuccessResponse({
@@ -382,10 +410,13 @@ class EBMService {
             { cdCls: '05', cdClsNm: 'Transaction Type', dtlList: [
               { cd: 'N', cdNm: 'Normal', cdDesc: 'Normal sale', useYn: 'Y' },
               { cd: 'C', cdNm: 'Copy', cdDesc: 'Copy invoice', useYn: 'Y' },
+              { cd: 'D', cdNm: 'Debit Note', cdDesc: 'Debit note', useYn: 'Y' },
             ] },
             { cdCls: '06', cdClsNm: 'Receipt Type', dtlList: [
               { cd: 'S', cdNm: 'Sale', cdDesc: 'Sale receipt', useYn: 'Y' },
               { cd: 'R', cdNm: 'Refund', cdDesc: 'Refund receipt', useYn: 'Y' },
+              { cd: 'P', cdNm: 'Proforma', cdDesc: 'Proforma invoice', useYn: 'Y' },
+              { cd: 'C', cdNm: 'Copy', cdDesc: 'Copy invoice', useYn: 'Y' },
             ] },
             { cdCls: '07', cdClsNm: 'Payment Method', dtlList: [
               { cd: '01', cdNm: 'Cash', cdDesc: 'Cash', useYn: 'Y' },
@@ -458,16 +489,19 @@ class EBMService {
           ],
         }, now);
 
-      case VSDC_ENDPOINTS.SELECT_CUSTOMER:
-        return makeSuccessResponse({
-          custList: [
-            {
-              tin: payload.custmTin || payload.custTin || payload.tin,
-              taxprNm: 'MOCK CUSTOMER',
-              taxprSttsCd: 'A',
-              prvncNm: 'KIGALI CITY',
-              dstrtNm: 'GASABO',
-            },
+      case VSDC_ENDPOINTS.SELECT_CUSTOMER: {
+        const requestedTin = payload.custmTin || payload.custTin;
+        const customers = [
+          {
+            tin: requestedTin || '100600570',
+            taxprNm: 'MOCK CUSTOMER',
+            taxprSttsCd: 'A',
+            prvncNm: 'KIGALI CITY',
+            dstrtNm: 'GASABO',
+          },
+        ];
+        if (!requestedTin) {
+          customers.push(
             {
               tin: '100000003',
               taxprNm: 'KIGALI WHOLESALE LTD',
@@ -482,8 +516,10 @@ class EBMService {
               prvncNm: 'KIGALI CITY',
               dstrtNm: 'GASABO',
             },
-          ],
-        }, now);
+          );
+        }
+        return makeSuccessResponse({ custList: customers }, now);
+      }
 
       case VSDC_ENDPOINTS.SELECT_BRANCHES:
         return makeSuccessResponse({
@@ -507,40 +543,77 @@ class EBMService {
         }, now);
 
       case VSDC_ENDPOINTS.SELECT_ITEMS:
-        return makeSuccessResponse({ itemList: [] }, now);
+        return makeSuccessResponse({
+          itemList: [
+            {
+              itemCd: 'RW1MOCK000000001',
+              itemNm: 'Mock registered item A',
+              itemClsCd: '5059690800',
+              taxTyCd: 'B',
+              pkgUnitCd: 'NT',
+              qtyUnitCd: 'U',
+              useYn: 'Y',
+            },
+            {
+              itemCd: 'RW1MOCK000000002',
+              itemNm: 'Mock registered item B',
+              itemClsCd: '5059690800',
+              taxTyCd: 'A',
+              pkgUnitCd: 'NT',
+              qtyUnitCd: 'U',
+              useYn: 'Y',
+            },
+          ],
+        }, now);
 
       case VSDC_ENDPOINTS.SELECT_IMPORT_ITEMS:
         return makeSuccessResponse({
           itemList: [
             {
               taskCd: `IMP-${formatVsdcDate()}-001`,
-              dclNo: `RWA/IMP/${formatVsdcDate()}/001`,
               dclDe: formatVsdcDate(),
-              itemCd: 'IMP-LAP-001',
+              itemSeq: 1,
+              dclNo: `RWA/IMP/${formatVsdcDate()}/001`,
+              hsCd: '8471300000',
+              imptItemSttsCd: '1',
               itemNm: 'Imported laptop computers',
-              itemClsCd: '43211500',
+              orgnNatCd: 'KE',
+              exptNatCd: 'RW',
+              pkg: 12,
+              pkgUnitCd: 'CT',
               qty: 12,
               qtyUnitCd: 'U',
-              orgnNatCd: 'KE',
-              splrTin: '100000003',
-              splrNm: 'KIGALI WHOLESALE LTD',
-              prc: 450000,
-              taxTyCd: 'B',
+              totWt: 24,
+              netWt: 22,
+              spplrNm: 'KIGALI WHOLESALE LTD',
+              agntNm: 'Mock Customs Agent',
+              invcFcurAmt: 12000,
+              invcFcurCd: 'USD',
+              invcFcurExcrt: 1300,
+              dclRefNum: `REF-${formatVsdcDate()}-001`,
             },
             {
               taskCd: `IMP-${formatVsdcDate()}-002`,
-              dclNo: `RWA/IMP/${formatVsdcDate()}/002`,
               dclDe: formatVsdcDate(),
-              itemCd: 'IMP-CBL-002',
+              itemSeq: 1,
+              dclNo: `RWA/IMP/${formatVsdcDate()}/002`,
+              hsCd: '8544420000',
+              imptItemSttsCd: '1',
               itemNm: 'Network cables',
-              itemClsCd: '5059690800',
+              orgnNatCd: 'RW',
+              exptNatCd: 'RW',
+              pkg: 200,
+              pkgUnitCd: 'CT',
               qty: 200,
               qtyUnitCd: 'U',
-              orgnNatCd: 'RW',
-              splrTin: '100000004',
-              splrNm: 'RWANDA RETAIL GROUP',
-              prc: 1500,
-              taxTyCd: 'A',
+              totWt: 50,
+              netWt: 48,
+              spplrNm: 'RWANDA RETAIL GROUP',
+              agntNm: 'Mock Customs Agent',
+              invcFcurAmt: 3000,
+              invcFcurCd: 'USD',
+              invcFcurExcrt: 1300,
+              dclRefNum: `REF-${formatVsdcDate()}-002`,
             },
           ],
         }, now);
@@ -650,8 +723,33 @@ class EBMService {
           ],
         }, now);
 
+      case VSDC_ENDPOINTS.SELECT_SALES:
+        return makeSuccessResponse({
+          saleList: [
+            {
+              invcNo: 1001,
+              rcptTyCd: 'S',
+              salesTyCd: 'N',
+              salesDt: formatVsdcDate(),
+              totTaxblAmt: 100000,
+              totTaxAmt: 18000,
+              totAmt: 118000,
+              prcOrdCd: payload.prcOrdCd || null,
+            },
+          ],
+        }, now);
+
       case VSDC_ENDPOINTS.SELECT_STOCK_ITEMS:
-        return makeSuccessResponse({ stockList: [] }, now);
+        return makeSuccessResponse({
+          itemList: [
+            {
+              itemCd: 'RW1MOCK000000001',
+              itemNm: 'Mock reconciled item',
+              rsdQty: 10,
+              bhfId,
+            },
+          ],
+        }, now);
 
       case VSDC_ENDPOINTS.SAVE_SALES: {
         const receiptNo = Number.isFinite(Number(payload.invcNo))
@@ -779,6 +877,10 @@ class EBMService {
     return this.call(VSDC_ENDPOINTS.SAVE_SALES, payload);
   }
 
+  selectSales(payload) {
+    return this.call(VSDC_ENDPOINTS.SELECT_SALES, payload);
+  }
+
   selectPurchaseSales(payload) {
     return this.call(VSDC_ENDPOINTS.SELECT_PURCHASE_SALES, payload);
   }
@@ -808,6 +910,7 @@ module.exports.RESULT_CODES = RESULT_CODES;
 module.exports.NON_RETRYABLE_RESULT_CODES = NON_RETRYABLE_RESULT_CODES;
 module.exports.isRetryableResultCode = isRetryableResultCode;
 module.exports.VSDC_ENDPOINTS = VSDC_ENDPOINTS;
+module.exports.extractInitInfo = extractInitInfo;
 module.exports.formatVsdcDate = formatVsdcDate;
 module.exports.formatVsdcDateTime = formatVsdcDateTime;
 

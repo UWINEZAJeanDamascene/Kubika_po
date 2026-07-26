@@ -1,39 +1,30 @@
-const mongoose = require('mongoose');
+/**
+ * PurchaseReturn — PostgreSQL (Prisma) backed.
+ */
 
-const prLineSchema = new mongoose.Schema({
-  grnLine: { type: mongoose.Schema.Types.ObjectId, ref: 'GoodsReceivedNote.lines', required: true },
-  product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
-  qtyReturned: { type: Number, required: true, min: 0.0001 },
-  unitCost: { type: Number, required: true, min: 0 }
-}, { _id: true });
+const { buildDocumentModel, buildLineInclude } = require('../utils/salesApCommon');
+const {
+  purchaseReturnToApi,
+  purchaseReturnTranslateCreate,
+  purchaseReturnTranslateUpdate,
+} = require('../utils/salesApMappers');
 
-const purchaseReturnSchema = new mongoose.Schema({
-  company: { type: mongoose.Schema.Types.ObjectId, ref: 'Company', required: true },
-  referenceNo: { type: String, required: true, uppercase: true },
-  grn: { type: mongoose.Schema.Types.ObjectId, ref: 'GoodsReceivedNote', required: true },
-  supplier: { type: mongoose.Schema.Types.ObjectId, ref: 'Supplier', required: true },
-  warehouse: { type: mongoose.Schema.Types.ObjectId, ref: 'Warehouse', required: true },
-  returnDate: { type: Date, default: Date.now },
-  reason: { type: String, required: true },
-  supplierCreditNoteNo: { type: String },
-  status: { type: String, enum: ['draft', 'confirmed', 'cancelled'], default: 'draft' },
-  subtotal: { type: Number, default: 0 },
-  taxAmount: { type: Number, default: 0 },
-  totalAmount: { type: Number, default: 0 },
-  journalEntry: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', default: null },
-  confirmedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-  confirmedAt: Date,
-  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-  lines: [prLineSchema],
-  // Refund fields
-  refundMethod: { type: String, enum: ['none', 'credit', 'bank_transfer', 'cash'], default: 'none' },
-  bankAccountId: { type: mongoose.Schema.Types.ObjectId, ref: 'BankAccount', default: null },
-  bankRefundReference: { type: String, default: null },
-  refundedAt: { type: Date, default: null },
-  refundJournalEntry: { type: mongoose.Schema.Types.ObjectId, ref: 'JournalEntry', default: null },
-  refundBankTransaction: { type: mongoose.Schema.Types.ObjectId, ref: 'BankTransaction', default: null }
-}, { timestamps: true });
+const FIELD_MAP = {
+  referenceNo: { target: 'referenceNo' },
+  grn: { target: 'grnId', isId: true },
+  supplier: { target: 'supplierId', isId: true },
+  warehouse: { target: 'warehouseId', isId: true },
+  status: { target: 'status' },
+  returnDate: { target: 'returnDate' },
+};
 
-purchaseReturnSchema.index({ company: 1, referenceNo: 1 }, { unique: true });
-
-module.exports = mongoose.model('PurchaseReturn', purchaseReturnSchema);
+module.exports = buildDocumentModel({
+  name: 'PurchaseReturn',
+  collection: 'purchasereturns',
+  delegateName: 'purchaseReturn',
+  fieldMap: FIELD_MAP,
+  toApi: purchaseReturnToApi,
+  translateCreate: purchaseReturnTranslateCreate,
+  translateUpdate: purchaseReturnTranslateUpdate,
+  include: buildLineInclude(),
+});

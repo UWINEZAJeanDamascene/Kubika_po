@@ -1,56 +1,36 @@
-const mongoose = require('mongoose');
+/**
+ * InvoiceReceiptMetadata model — PostgreSQL (Prisma) backed.
+ *
+ * Holds the fiscal receipt details (SDC id, receipt number, signature) that the
+ * EBM device returns for a confirmed invoice.
+ */
 
-const invoiceReceiptMetadataSchema = new mongoose.Schema({
-  // Multi-tenancy: company reference
-  company: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Company',
-    required: true,
-    index: true
-  },
-  invoice: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Invoice',
-    required: true
-  },
-  sdcId: {
-    type: String,
-    // SDC (Sales Data Controller) ID for tax compliance
-  },
-  receiptNumber: {
-    type: String,
-    // Fiscal receipt number
-  },
-  receiptSignature: {
-    type: String,
-    // Digital signature from fiscal device
-  },
-  internalData: {
-    type: String,
-    // Internal reference data
-  },
-  mrcCode: {
-    type: String,
-    // MRC (Machine Readable Code) for tax compliance
-  },
-  deviceId: {
-    type: String,
-    // ID of the fiscal device
-  },
-  fiscalDate: {
-    type: Date,
-    // Date recorded by fiscal device
-  },
-  createdAt: {
-    type: Date,
-    default: Date.now
-  }
-}, {
-  timestamps: true
+const { buildTenantModel } = require('../utils/masterDataCommon');
+const {
+  invoiceReceiptMetadataToApi,
+  invoiceReceiptMetadataTranslateCreate,
+  invoiceReceiptMetadataTranslateUpdate,
+} = require('../utils/invoiceReceiptMappers');
+
+const FIELD_MAP = {
+  invoice: { target: 'invoiceId', isId: true },
+  invoiceId: { target: 'invoiceId', isId: true },
+  sdcId: { target: 'sdcId' },
+  receiptNumber: { target: 'receiptNumber' },
+  receiptSignature: { target: 'receiptSignature' },
+  internalData: { target: 'internalData' },
+  mrcCode: { target: 'mrcCode' },
+  deviceId: { target: 'deviceId' },
+  fiscalDate: { target: 'fiscalDate' },
+};
+
+module.exports = buildTenantModel({
+  name: 'InvoiceReceiptMetadata',
+  collection: 'invoicereceiptmetadatas',
+  delegateName: 'invoiceReceiptMetadata',
+  fieldMap: FIELD_MAP,
+  toApi: invoiceReceiptMetadataToApi,
+  translateCreate: invoiceReceiptMetadataTranslateCreate,
+  translateUpdate: invoiceReceiptMetadataTranslateUpdate,
+  mutable: true,
 });
-
-// Index for efficient queries
-invoiceReceiptMetadataSchema.index({ invoice: 1 });
-invoiceReceiptMetadataSchema.index({ receiptNumber: 1 });
-
-module.exports = mongoose.model('InvoiceReceiptMetadata', invoiceReceiptMetadataSchema);

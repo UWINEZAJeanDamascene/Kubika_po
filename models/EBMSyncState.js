@@ -1,57 +1,30 @@
-const mongoose = require('mongoose');
+/**
+ * EBMSyncState — PostgreSQL (Prisma) backed.
+ */
 
-const ebmSyncStateSchema = new mongoose.Schema({
-  company: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Company',
-    required: true,
-    index: true,
-  },
-  branchId: {
-    type: String,
-    required: true,
-    trim: true,
-    minlength: 2,
-    maxlength: 2,
-  },
-  syncType: {
-    type: String,
-    required: true,
-    enum: ['standard_codes', 'item_classes', 'tins', 'branches', 'notices', 'imported_items', 'purchase_sales'],
-    index: true,
-  },
-  lastReqDt: {
-    type: String,
-    trim: true,
-    default: '20000101000000',
-  },
-  lastSuccessfulSyncAt: {
-    type: Date,
-    default: null,
-    index: true,
-  },
-  lastAttemptAt: {
-    type: Date,
-    default: null,
-  },
-  lastErrorMessage: {
-    type: String,
-    trim: true,
-    default: null,
-  },
-  mode: {
-    type: String,
-    enum: ['mock', 'sandbox', 'production'],
-    required: true,
-    default: 'mock',
-  },
-  summary: {
-    type: mongoose.Schema.Types.Mixed,
-    default: {},
-  },
-}, { timestamps: true });
+const { buildTenantModel } = require('../utils/masterDataCommon');
+const {
+  ebmSyncStateToApi,
+  ebmSyncStateTranslateCreate,
+  ebmSyncStateTranslateUpdate,
+} = require('../utils/phase10Mappers');
 
-ebmSyncStateSchema.index({ company: 1, branchId: 1, syncType: 1, mode: 1 }, { unique: true });
-ebmSyncStateSchema.index({ company: 1, syncType: 1 });
+const FIELD_MAP = {
+  branchId: { target: 'branchId' },
+  syncType: { target: 'syncType' },
+  mode: { target: 'mode' },
+  lastReqDt: { target: 'lastReqDt' },
+  lastSuccessfulSyncAt: { target: 'lastSuccessfulSyncAt' },
+  lastAttemptAt: { target: 'lastAttemptAt' },
+};
 
-module.exports = mongoose.model('EBMSyncState', ebmSyncStateSchema);
+module.exports = buildTenantModel({
+  name: 'EBMSyncState',
+  collection: 'ebmsyncstates',
+  delegateName: 'ebmSyncState',
+  fieldMap: FIELD_MAP,
+  toApi: ebmSyncStateToApi,
+  translateCreate: ebmSyncStateTranslateCreate,
+  translateUpdate: ebmSyncStateTranslateUpdate,
+  mutable: true,
+});

@@ -4,6 +4,7 @@ const smsService = require('../services/smsService');
 const emailService = require('../services/emailService');
 const Invoice = require('../models/Invoice');
 const Company = require('../models/Company');
+const { isMongoConnected } = require('../utils/mongoConnection');
 
 function getRequestUserId(req) {
   return req.user?._id || req.user?.id;
@@ -17,6 +18,20 @@ function sendMissingContext(res) {
   return res.status(401).json({
     success: false,
     message: 'Authenticated user or company context is missing'
+  });
+}
+
+function mongoUnavailableResponse(res, page = 1, limit = 20) {
+  return res.json({
+    success: true,
+    data: [],
+    pagination: {
+      page: parseInt(page, 10),
+      limit: parseInt(limit, 10),
+      total: 0,
+      pages: 0,
+    },
+    unreadCount: 0,
   });
 }
 
@@ -45,6 +60,10 @@ exports.getNotifications = async (req, res, next) => {
         },
         unreadCount: 0
       });
+    }
+
+    if (!isMongoConnected()) {
+      return mongoUnavailableResponse(res, page, limit);
     }
     
     const query = {
@@ -102,6 +121,10 @@ exports.getUnreadCount = async (req, res, next) => {
         count: 0
       });
     }
+
+    if (!isMongoConnected()) {
+      return res.json({ success: true, count: 0 });
+    }
     
     const count = await Notification.countDocuments({
       company: companyId,
@@ -126,6 +149,13 @@ exports.markAsRead = async (req, res, next) => {
     const userId = getRequestUserId(req);
     if (!userId) {
       return sendMissingContext(res);
+    }
+
+    if (!isMongoConnected()) {
+      return res.status(503).json({
+        success: false,
+        message: 'Notifications are temporarily unavailable',
+      });
     }
 
     const notification = await Notification.findById(req.params.id);
@@ -169,6 +199,10 @@ exports.markAllAsRead = async (req, res, next) => {
     if (!companyId || !userId) {
       return sendMissingContext(res);
     }
+
+    if (!isMongoConnected()) {
+      return res.json({ success: true, message: 'All notifications marked as read' });
+    }
     
     await Notification.updateMany(
       { company: companyId, user: userId, isRead: false },
@@ -192,6 +226,13 @@ exports.deleteNotification = async (req, res, next) => {
     const userId = getRequestUserId(req);
     if (!userId) {
       return sendMissingContext(res);
+    }
+
+    if (!isMongoConnected()) {
+      return res.status(503).json({
+        success: false,
+        message: 'Notifications are temporarily unavailable',
+      });
     }
 
     const notification = await Notification.findById(req.params.id);
@@ -232,6 +273,27 @@ exports.getSettings = async (req, res, next) => {
 
     if (!companyId) {
       return sendMissingContext(res);
+    }
+
+    if (!isMongoConnected()) {
+      return res.json({
+        success: true,
+        data: {
+          emailNotifications: {
+            enabled: true,
+            invoiceDelivery: false,
+            paymentReminders: true,
+            lowStockAlerts: true,
+            dailySummary: false,
+            weeklySummary: true,
+          },
+          smsNotifications: {
+            enabled: false,
+            criticalOnly: true,
+            adminPhones: [],
+          },
+        },
+      });
     }
     
     let settings = await NotificationSettings.findOne({ company: companyId });
@@ -275,6 +337,14 @@ exports.updateSettings = async (req, res, next) => {
     if (!companyId) {
       return sendMissingContext(res);
     }
+
+    if (!isMongoConnected()) {
+      return res.status(503).json({
+        success: false,
+        message: 'Notification settings are temporarily unavailable',
+      });
+    }
+
     const {
       emailNotifications,
       smsNotifications,

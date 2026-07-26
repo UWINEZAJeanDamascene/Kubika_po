@@ -1,0 +1,435 @@
+// Phase 2 — Master data enums
+enum ClientType {
+  individual
+  company
+}
+
+enum PaymentTerms {
+  cash
+  credit_7
+  credit_15
+  credit_30
+  credit_45
+  credit_60
+}
+
+enum AccountType {
+  asset
+  liability
+  equity
+  revenue
+  expense
+  cogs
+}
+
+enum NormalBalance {
+  debit
+  credit
+}
+
+enum TaxRateType {
+  vat
+  sales_tax
+  withholding
+  exempt
+  zero_rated
+}
+
+enum TaxRecordType {
+  vat
+  corporate_income
+  paye
+  withholding
+  trading_license
+}
+
+enum TaxRecordStatus {
+  active
+  inactive
+  pending
+}
+
+enum TradingLicenseStatus {
+  active
+  expired
+  pending
+  not_applicable
+}
+
+enum BarcodeType {
+  CODE128
+  EAN13
+  EAN8
+  UPC
+  CODE39
+  ITF14
+  QR
+  NONE
+}
+
+enum CostingMethod {
+  fifo
+  weighted
+  wac
+  avg
+}
+
+enum TrackingType {
+  none
+  batch
+  serial
+}
+
+enum EbmRegistrationStatus {
+  not_registered
+  registered
+  failed
+}
+
+enum ExchangeRateSource {
+  manual
+  api
+  import
+}
+
+// --- Phase 2 models ---
+
+model Category {
+  id                      String   @id @db.Char(24)
+  companyId               String   @map("company_id") @db.Char(24)
+  name                    String
+  description             String?
+  parentId                String?  @map("parent_id") @db.Char(24)
+  defaultInventoryAccount String?  @map("default_inventory_account")
+  defaultCogsAccount      String?  @map("default_cogs_account")
+  defaultRevenueAccount   String?  @map("default_revenue_account")
+  isActive                Boolean  @default(true) @map("is_active")
+  createdById             String?  @map("created_by") @db.Char(24)
+  customFields            Json     @default("{}") @map("custom_fields")
+  createdAt               DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt               DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company  Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  parent   Category?  @relation("CategoryTree", fields: [parentId], references: [id])
+  children Category[] @relation("CategoryTree")
+  products Product[]
+
+  @@index([companyId])
+  @@index([companyId, name])
+  @@index([companyId, parentId])
+  @@map("categories")
+}
+
+model Warehouse {
+  id                     String                @id @db.Char(24)
+  companyId              String                @map("company_id") @db.Char(24)
+  name                   String
+  code                   String
+  description            String?
+  location               Json                  @default("{}")
+  inventoryAccount       String?               @map("inventory_account")
+  isActive               Boolean               @default(true) @map("is_active")
+  isDefault              Boolean               @default(false) @map("is_default")
+  totalProducts          Int                   @default(0) @map("total_products")
+  totalValue             Decimal               @default(0) @map("total_value") @db.Decimal(19, 4)
+  createdById            String?               @map("created_by") @db.Char(24)
+  customFields           Json                  @default("{}") @map("custom_fields")
+  rraBranchId            String?               @map("rra_branch_id") @db.VarChar(2)
+  ebmRegistrationStatus  EbmRegistrationStatus @default(not_registered) @map("ebm_registration_status")
+  ebmRegisteredAt        DateTime?             @map("ebm_registered_at") @db.Timestamptz(3)
+  ebmLastAttemptAt       DateTime?             @map("ebm_last_attempt_at") @db.Timestamptz(3)
+  ebmRegistrationError   String?               @map("ebm_registration_error")
+  ebmUsersSubmitted      Boolean               @default(false) @map("ebm_users_submitted")
+  ebmInsurances          Json                  @default("[]") @map("ebm_insurances")
+  ebmInsuranceSubmitted  Boolean               @default(false) @map("ebm_insurance_submitted")
+  createdAt              DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt              DateTime              @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company          Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  defaultProducts  Product[] @relation("ProductDefaultWarehouse")
+
+  @@unique([companyId, code])
+  @@index([companyId])
+  @@index([companyId, isActive])
+  @@index([companyId, rraBranchId])
+  @@map("warehouses")
+}
+
+model Client {
+  id                  String       @id @db.Char(24)
+  companyId           String       @map("company_id") @db.Char(24)
+  name                String
+  code                String
+  type                ClientType   @default(individual)
+  contact             Json         @default("{}")
+  salesArea           String?      @map("sales_area")
+  salesRepId          String?      @map("sales_rep_id")
+  region              String?
+  industry            String?
+  registrationDate    DateTime?    @map("registration_date") @db.Timestamptz(3)
+  taxId               String?      @map("tax_id")
+  ebmTinVerification  Json?        @map("ebm_tin_verification")
+  paymentTerms        PaymentTerms @default(cash) @map("payment_terms")
+  creditLimit         Decimal      @default(0) @map("credit_limit") @db.Decimal(19, 4)
+  outstandingBalance  Decimal      @default(0) @map("outstanding_balance") @db.Decimal(19, 4)
+  totalPurchases      Decimal      @default(0) @map("total_purchases") @db.Decimal(19, 4)
+  lastPurchaseDate    DateTime?    @map("last_purchase_date") @db.Timestamptz(3)
+  notes               String?
+  isActive            Boolean      @default(true) @map("is_active")
+  createdById         String?      @map("created_by") @db.Char(24)
+  customFields        Json         @default("{}") @map("custom_fields")
+  ebmBranchCustomers  Json         @default("[]") @map("ebm_branch_customers")
+  createdAt           DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, code])
+  @@index([companyId])
+  @@index([companyId, isActive])
+  @@index([companyId, name])
+  @@map("clients")
+}
+
+model Supplier {
+  id               String       @id @db.Char(24)
+  companyId        String       @map("company_id") @db.Char(24)
+  name             String
+  code             String
+  contact          Json         @default("{}")
+  region           String?
+  currency         String?
+  leadTime         Int?         @map("lead_time")
+  minimumOrder     Decimal?     @map("minimum_order") @db.Decimal(19, 4)
+  bankName         String?      @map("bank_name")
+  bankAccount      String?      @map("bank_account")
+  productsSupplied String[]     @default([]) @map("products_supplied") @db.Char(24)
+  paymentTerms     PaymentTerms @default(cash) @map("payment_terms")
+  taxId            String?      @map("tax_id")
+  notes            String?
+  isActive         Boolean      @default(true) @map("is_active")
+  totalPurchases   Decimal      @default(0) @map("total_purchases") @db.Decimal(19, 4)
+  lastPurchaseDate DateTime?    @map("last_purchase_date") @db.Timestamptz(3)
+  createdById      String?      @map("created_by") @db.Char(24)
+  customFields     Json         @default("{}") @map("custom_fields")
+  createdAt        DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company          Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  products         Product[] @relation("ProductSupplier")
+  preferredProducts Product[] @relation("ProductPreferredSupplier")
+
+  @@unique([companyId, code])
+  @@index([companyId])
+  @@index([companyId, isActive])
+  @@index([companyId, name])
+  @@map("suppliers")
+}
+
+model Product {
+  id                String        @id @db.Char(24)
+  companyId         String        @map("company_id") @db.Char(24)
+  name              String
+  sku               String
+  barcode           String?
+  barcodeType       BarcodeType   @default(CODE128) @map("barcode_type")
+  description       String?
+  categoryId        String        @map("category_id") @db.Char(24)
+  unit              String        @default("pcs")
+  supplierId        String?       @map("supplier_id") @db.Char(24)
+  currentStock      Decimal       @default(0) @map("current_stock") @db.Decimal(19, 4)
+  reservedQuantity  Decimal       @default(0) @map("reserved_quantity") @db.Decimal(19, 4)
+  isActive          Boolean       @default(true) @map("is_active")
+  isStockable       Boolean       @default(true) @map("is_stockable")
+  lowStockThreshold Decimal       @default(10) @map("low_stock_threshold") @db.Decimal(19, 4)
+  averageCost       Decimal       @default(0) @map("average_cost") @db.Decimal(19, 4)
+  sellingPrice      Decimal       @default(0) @map("selling_price") @db.Decimal(19, 4)
+  costPrice         Decimal       @default(0) @map("cost_price") @db.Decimal(19, 4)
+  lastSupplyDate    DateTime?     @map("last_supply_date") @db.Timestamptz(3)
+  lastSaleDate      DateTime?     @map("last_sale_date") @db.Timestamptz(3)
+  costingMethod     CostingMethod @default(fifo) @map("costing_method")
+  inventoryAccount  String?       @map("inventory_account")
+  cogsAccount       String?       @map("cogs_account")
+  revenueAccount    String?       @map("revenue_account")
+  isArchived        Boolean       @default(false) @map("is_archived")
+  weight            Float         @default(0)
+  brand             String?
+  location          String?
+  trackingType      TrackingType  @default(none) @map("tracking_type")
+  trackBatch        Boolean       @default(false) @map("track_batch")
+  trackSerialNumbers Boolean      @default(false) @map("track_serial_numbers")
+  reorderPoint      Decimal       @default(0) @map("reorder_point") @db.Decimal(19, 4)
+  reorderQuantity   Decimal       @default(0) @map("reorder_quantity") @db.Decimal(19, 4)
+  defaultWarehouseId String?      @map("default_warehouse_id") @db.Char(24)
+  preferredSupplierId String?     @map("preferred_supplier_id") @db.Char(24)
+  taxCode           String        @default("A") @map("tax_code")
+  taxRate           Decimal       @default(0) @map("tax_rate") @db.Decimal(19, 6)
+  ebm               Json          @default("{}")
+  history           Json          @default("[]")
+  createdById       String?       @map("created_by") @db.Char(24)
+  customFields      Json          @default("{}") @map("custom_fields")
+  createdAt         DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company           Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  category          Category  @relation(fields: [categoryId], references: [id])
+  supplier          Supplier? @relation("ProductSupplier", fields: [supplierId], references: [id])
+  preferredSupplier Supplier? @relation("ProductPreferredSupplier", fields: [preferredSupplierId], references: [id])
+  defaultWarehouse  Warehouse? @relation("ProductDefaultWarehouse", fields: [defaultWarehouseId], references: [id])
+
+  @@unique([companyId, sku])
+  @@index([companyId])
+  @@index([companyId, categoryId])
+  @@index([companyId, isArchived])
+  @@index([companyId, isActive])
+  @@index([companyId, name])
+  @@index([companyId, currentStock])
+  @@index([supplierId])
+  @@map("products")
+}
+
+model ChartOfAccount {
+  id                 String        @id @db.Char(24)
+  companyId          String        @map("company_id") @db.Char(24)
+  code               String
+  name               String
+  type               AccountType   @default(asset)
+  subtype            String?
+  normalBalance      NormalBalance @default(debit) @map("normal_balance")
+  parentId           String?       @map("parent_id") @db.Char(24)
+  allowDirectPosting Boolean       @default(true) @map("allow_direct_posting")
+  isActive           Boolean       @default(true) @map("is_active")
+  createdById        String?       @map("created_by") @db.Char(24)
+  customFields       Json          @default("{}") @map("custom_fields")
+  createdAt          DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company      Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  parent       ChartOfAccount?  @relation("CoaTree", fields: [parentId], references: [id])
+  children     ChartOfAccount[] @relation("CoaTree")
+  taxRatesIn   TaxRate[]        @relation("TaxRateInputAccount")
+  taxRatesOut  TaxRate[]        @relation("TaxRateOutputAccount")
+
+  @@unique([companyId, code])
+  @@index([companyId])
+  @@index([companyId, type])
+  @@index([companyId, parentId])
+  @@index([companyId, isActive])
+  @@map("chart_of_accounts")
+}
+
+model Tax {
+  id                    String               @id @db.Char(24)
+  companyId             String               @map("company_id") @db.Char(24)
+  taxType               TaxRecordType        @map("tax_type")
+  vatRate               Float                @default(18) @map("vat_rate")
+  vatOutput             Decimal              @default(0) @map("vat_output") @db.Decimal(19, 4)
+  vatInput              Decimal              @default(0) @map("vat_input") @db.Decimal(19, 4)
+  vatNet                Decimal              @default(0) @map("vat_net") @db.Decimal(19, 4)
+  vatPeriod             Json?                @map("vat_period")
+  corporateIncomeRate   Float                @default(30) @map("corporate_income_rate")
+  taxableIncome         Decimal              @default(0) @map("taxable_income") @db.Decimal(19, 4)
+  taxOwed               Decimal              @default(0) @map("tax_owed") @db.Decimal(19, 4)
+  payeCollected         Decimal              @default(0) @map("paye_collected") @db.Decimal(19, 4)
+  payePaid              Decimal              @default(0) @map("paye_paid") @db.Decimal(19, 4)
+  payePeriod            Json?                @map("paye_period")
+  withholdingCollected  Decimal              @default(0) @map("withholding_collected") @db.Decimal(19, 4)
+  withholdingPaid       Decimal              @default(0) @map("withholding_paid") @db.Decimal(19, 4)
+  tradingLicenseFee     Decimal              @default(0) @map("trading_license_fee") @db.Decimal(19, 4)
+  tradingLicenseYear    Int?                 @map("trading_license_year")
+  tradingLicenseStatus  TradingLicenseStatus @default(not_applicable) @map("trading_license_status")
+  payments              Json                 @default("[]")
+  filings               Json                 @default("[]")
+  calendar              Json                 @default("[]")
+  status                TaxRecordStatus      @default(active)
+  notes                 String?
+  createdById           String?              @map("created_by") @db.Char(24)
+  createdAt             DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt             DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId])
+  @@index([companyId, taxType])
+  @@map("taxes")
+}
+
+model TaxRate {
+  id                String      @id @db.Char(24)
+  companyId         String      @map("company_id") @db.Char(24)
+  name              String
+  code              String
+  ratePct           Float       @map("rate_pct")
+  type              TaxRateType
+  inputAccountId    String      @map("input_account_id") @db.Char(24)
+  outputAccountId   String      @map("output_account_id") @db.Char(24)
+  inputAccountCode  String      @map("input_account_code")
+  outputAccountCode String      @map("output_account_code")
+  isActive          Boolean     @default(true) @map("is_active")
+  effectiveFrom     DateTime    @map("effective_from") @db.Timestamptz(3)
+  effectiveTo       DateTime?   @map("effective_to") @db.Timestamptz(3)
+  createdAt         DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime    @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company       Company        @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  inputAccount  ChartOfAccount @relation("TaxRateInputAccount", fields: [inputAccountId], references: [id])
+  outputAccount ChartOfAccount @relation("TaxRateOutputAccount", fields: [outputAccountId], references: [id])
+
+  @@unique([companyId, code])
+  @@index([companyId])
+  @@index([companyId, isActive])
+  @@map("tax_rates")
+}
+
+model Currency {
+  id            String   @id @db.Char(24)
+  code          String   @unique @db.VarChar(3)
+  name          String
+  symbol        String?
+  decimalPlaces Int      @default(2) @map("decimal_places")
+  isActive      Boolean  @default(true) @map("is_active")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@index([isActive])
+  @@map("currencies")
+}
+
+model ExchangeRate {
+  id            String             @id @db.Char(24)
+  companyId     String             @map("company_id") @db.Char(24)
+  fromCurrency  String             @map("from_currency") @db.VarChar(3)
+  toCurrency    String             @map("to_currency") @db.VarChar(3)
+  rate          Decimal            @db.Decimal(19, 6)
+  effectiveDate DateTime           @map("effective_date") @db.Timestamptz(3)
+  source        ExchangeRateSource @default(manual)
+  createdById   String?            @map("created_by") @db.Char(24)
+  createdAt     DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime           @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, fromCurrency, effectiveDate(sort: Desc)])
+  @@map("exchange_rates")
+}
+
+model Department {
+  id                  String           @id @db.Char(24)
+  companyId           String           @map("company_id") @db.Char(24)
+  code                String
+  name                String
+  description         String?
+  managerId           String?          @map("manager_id") @db.Char(24)
+  defaultLaborAccount String           @default("5400") @map("default_labor_account") @db.VarChar(4)
+  budgetLimit         Decimal          @default(0) @map("budget_limit") @db.Decimal(19, 4)
+  isActive            Boolean          @default(true) @map("is_active")
+  createdAt           DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, code])
+  @@index([companyId])
+  @@index([companyId, isActive])
+  @@map("departments")
+}

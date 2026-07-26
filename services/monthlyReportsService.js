@@ -23,6 +23,24 @@
  */
 
 const mongoose = require('mongoose');
+const Invoice = require('../models/Invoice');
+const Purchase = require('../models/Purchase');
+const Expense = require('../models/Expense');
+const JournalEntry = require('../models/JournalEntry');
+const ChartOfAccount = require('../models/ChartOfAccount');
+const StockMovement = require('../models/StockMovement');
+const Product = require('../models/Product');
+const AccountBalance = require('../models/AccountBalance');
+const PurchaseOrder = require('../models/PurchaseOrder');
+const Supplier = require('../models/Supplier');
+const Payroll = require('../models/Payroll');
+const PayrollRun = require('../models/PayrollRun');
+const Budget = require('../models/Budget');
+const Client = require('../models/Client');
+const Employee = require('../models/Employee');
+const { BankAccount, BankTransaction, BankStatementLine } = require('../models/BankAccount');
+const { PettyCashFloat } = require('../models/PettyCash');
+const Payslip = Payroll;
 
 const toObjectId = (value) => new mongoose.Types.ObjectId(String(value));
 
@@ -137,15 +155,6 @@ class MonthlyReportsService {
     const prior = getPriorMonth(year, month);
     const priorRange = getMonthRange(prior.year, prior.month);
     const ytdRange = getYearToDateRange(year, month);
-
-    const [Invoice, Purchase, Expense, JournalEntry, ChartOfAccount] = await Promise.all([
-      mongoose.model('Invoice'),
-      mongoose.model('Purchase'),
-      mongoose.model('Expense'),
-      mongoose.model('JournalEntry'),
-      mongoose.model('ChartOfAccount')
-    ]);
-
     // Revenue - current month
     const revenueCurrent = await Invoice.aggregate([
       {
@@ -332,8 +341,7 @@ class MonthlyReportsService {
 
   // Helper: Calculate COGS
   static async _calculateCOGS(companyId, start, end) {
-    const StockMovement = mongoose.model('StockMovement');
-    const Purchase = mongoose.model('Purchase');
+    const Purchase = Purchase;
 
     const stockOut = await StockMovement.aggregate([
       {
@@ -352,8 +360,7 @@ class MonthlyReportsService {
 
   // Helper: Get expenses by category
   static async _getExpensesByCategory(companyId, start, end) {
-    const Expense = mongoose.model('Expense');
-    const JournalEntry = mongoose.model('JournalEntry');
+    const JournalEntry = JournalEntry;
 
     const expenses = await Expense.aggregate([
       {
@@ -380,8 +387,7 @@ class MonthlyReportsService {
 
   // Helper: Get account total by account type/name
   static async _getAccountTotal(companyId, start, end, accountPatterns) {
-    const JournalEntry = mongoose.model('JournalEntry');
-    const ChartOfAccount = mongoose.model('ChartOfAccount');
+    const ChartOfAccount = ChartOfAccount;
 
     const accounts = await ChartOfAccount.find({
       company: companyId,
@@ -429,15 +435,6 @@ class MonthlyReportsService {
     const { start, end } = getMonthRange(year, month);
     const prior = getPriorMonth(year, month);
     const priorEnd = new Date(prior.year, prior.month, 0, 23, 59, 59, 999);
-
-    const [ChartOfAccount, JournalEntry, BankAccount, Product, AccountBalance] = await Promise.all([
-      mongoose.model('ChartOfAccount'),
-      mongoose.model('JournalEntry'),
-      mongoose.model('BankAccount'),
-      mongoose.model('Product'),
-      mongoose.model('AccountBalance')
-    ]);
-
     // Get all accounts with balances at month end
     const accounts = await ChartOfAccount.find({ company: companyId, isActive: true });
 
@@ -667,12 +664,6 @@ class MonthlyReportsService {
    */
   static async getTrialBalance(companyId, year, month) {
     const { end } = getMonthRange(year, month);
-
-    const [ChartOfAccount, JournalEntry] = await Promise.all([
-      mongoose.model('ChartOfAccount'),
-      mongoose.model('JournalEntry')
-    ]);
-
     const accounts = await ChartOfAccount.find({ company: companyId, isActive: true }).sort('code');
 
     // Build account lookup by code (trimmed)
@@ -742,13 +733,6 @@ class MonthlyReportsService {
     const { start, end } = getMonthRange(year, month);
     const priorEnd = new Date(start);
     priorEnd.setMilliseconds(priorEnd.getMilliseconds() - 1);
-
-    const [ChartOfAccount, JournalEntry, BankAccount] = await Promise.all([
-      mongoose.model('ChartOfAccount'),
-      mongoose.model('JournalEntry'),
-      mongoose.model('BankAccount')
-    ]);
-
     // Get all accounts with their types
     const accounts = await ChartOfAccount.find({ company: companyId, isActive: true });
     const accountByCode = new Map();
@@ -876,7 +860,6 @@ class MonthlyReportsService {
 
   // Helper: Get receivables change
   static async _getReceivablesChange(companyId, start, end) {
-    const Invoice = mongoose.model('Invoice');
     const beginning = await Invoice.aggregate([
       { $match: { company: new mongoose.Types.ObjectId(companyId), invoiceDate: { $lt: start }, status: { $in: ['sent', 'partially_paid'] } } },
       { $group: { _id: null, total: { $sum: { $toDouble: '$balanceDue' } } } }
@@ -890,7 +873,6 @@ class MonthlyReportsService {
 
   // Helper: Get payables change
   static async _getPayablesChange(companyId, start, end) {
-    const Purchase = mongoose.model('Purchase');
     const beginning = await Purchase.aggregate([
       { $match: { company: new mongoose.Types.ObjectId(companyId), purchaseDate: { $lt: start }, status: { $in: ['received', 'partial'] } } },
       { $group: { _id: null, total: { $sum: { $toDouble: '$balanceDue' } } } }
@@ -904,7 +886,6 @@ class MonthlyReportsService {
 
   // Helper: Get inventory change
   static async _getInventoryChange(companyId, start, end) {
-    const StockMovement = mongoose.model('StockMovement');
     const movements = await StockMovement.aggregate([
       { $match: { company: new mongoose.Types.ObjectId(companyId), movementDate: { $gte: start, $lte: end } } },
       {
@@ -921,7 +902,6 @@ class MonthlyReportsService {
 
   // Helper: Get investing cash flow
   static async _getInvestingCashFlow(companyId, start, end) {
-    const JournalEntry = mongoose.model('JournalEntry');
     const result = await JournalEntry.aggregate([
       { $match: { company: new mongoose.Types.ObjectId(companyId), date: { $gte: start, $lte: end } } },
       { $unwind: '$lines' },
@@ -933,7 +913,6 @@ class MonthlyReportsService {
 
   // Helper: Get financing cash flow
   static async _getFinancingCashFlow(companyId, start, end) {
-    const JournalEntry = mongoose.model('JournalEntry');
     const result = await JournalEntry.aggregate([
       { $match: { company: new mongoose.Types.ObjectId(companyId), date: { $gte: start, $lte: end } } },
       { $unwind: '$lines' },
@@ -945,7 +924,6 @@ class MonthlyReportsService {
 
   // Helper: Get cash balance at date
   static async _getCashBalance(companyId, asOfDate) {
-    const BankAccount = mongoose.model('BankAccount');
     const accounts = await BankAccount.find({ company: companyId, isActive: true });
     return accounts.reduce((sum, a) => {
       const bal = typeof a.balance === 'object' && a.balance?.$numberDecimal
@@ -961,12 +939,6 @@ class MonthlyReportsService {
    */
   static async getStockValuation(companyId, year, month) {
     const { end } = getMonthRange(year, month);
-
-    const [Product, StockMovement] = await Promise.all([
-      mongoose.model('Product'),
-      mongoose.model('StockMovement')
-    ]);
-
     // Get all products with their current valuation
     // Try multiple field names for quantity (quantityOnHand, stock, quantity)
     const products = await Product.aggregate([
@@ -1059,9 +1031,6 @@ class MonthlyReportsService {
    */
   static async getSalesByCustomer(companyId, year, month) {
     const { start, end } = getMonthRange(year, month);
-
-    const Invoice = mongoose.model('Invoice');
-
     const customerSales = await Invoice.aggregate([
       {
         $match: {
@@ -1122,9 +1091,6 @@ class MonthlyReportsService {
    */
   static async getSalesByCategory(companyId, year, month) {
     const { start, end } = getMonthRange(year, month);
-
-    const Invoice = mongoose.model('Invoice');
-
     const categorySales = await Invoice.aggregate([
       {
         $match: {
@@ -1202,9 +1168,7 @@ class MonthlyReportsService {
    */
   static async getPurchasesBySupplier(companyId, year, month) {
     const { start, end } = getMonthRange(year, month);
-
-    const Purchase = mongoose.model('Purchase');
-    const PurchaseOrder = mongoose.model('PurchaseOrder');
+    const PurchaseOrder = PurchaseOrder;
 
     // Get direct purchases
     const directPurchases = await Purchase.aggregate([
@@ -1266,7 +1230,6 @@ class MonthlyReportsService {
     const supplierIds = [...supplierMap.values()].map(s => s._id).filter(Boolean);
     
     // Get supplier names
-    const Supplier = mongoose.model('Supplier');
     const suppliersData = await Supplier.find({ _id: { $in: supplierIds } }).select('name');
     const supplierNameMap = new Map(suppliersData.map(s => [s._id.toString(), s.name]));
 
@@ -1308,9 +1271,6 @@ class MonthlyReportsService {
    */
   static async getARAging(companyId, year, month) {
     const { end } = getMonthRange(year, month);
-
-    const Invoice = mongoose.model('Invoice');
-
     const invoices = await Invoice.find({
       company: toObjectId(companyId),
       status: { $in: ['confirmed', 'partially_paid'] },
@@ -1394,9 +1354,6 @@ class MonthlyReportsService {
    */
   static async getAPAging(companyId, year, month) {
     const { end } = getMonthRange(year, month);
-
-    const Purchase = mongoose.model('Purchase');
-
     const purchases = await Purchase.find({
       company: toObjectId(companyId),
       status: { $in: ['received', 'partial'] },
@@ -1476,8 +1433,6 @@ class MonthlyReportsService {
    * Employee-level detail: gross pay, PAYE, RSSB, deductions, net pay, employer costs
    */
   static async getPayrollSummary(companyId, year, month) {
-    const Payroll = mongoose.model('Payroll');
-
     const payrollRecords = await Payroll.find({
       company: toObjectId(companyId),
       'period.year': year,
@@ -1527,13 +1482,6 @@ class MonthlyReportsService {
    */
   static async getVATReturn(companyId, year, month) {
     const { start, end } = getMonthRange(year, month);
-
-    const [Invoice, Purchase, JournalEntry] = await Promise.all([
-      mongoose.model('Invoice'),
-      mongoose.model('Purchase'),
-      mongoose.model('JournalEntry')
-    ]);
-
     // Output VAT from sales
     const outputVAT = await Invoice.aggregate([
       {
@@ -1574,7 +1522,6 @@ class MonthlyReportsService {
     ]);
 
     // Input VAT from purchase orders
-    const PurchaseOrder = mongoose.model('PurchaseOrder');
     const poInputVAT = await PurchaseOrder.aggregate([
       {
         $match: {
@@ -1644,12 +1591,6 @@ class MonthlyReportsService {
    */
   static async getBankReconciliation(companyId, year, month) {
     const { start, end } = getMonthRange(year, month);
-
-    const [BankAccount, BankTransaction] = await Promise.all([
-      mongoose.model('BankAccount'),
-      mongoose.model('BankTransaction')
-    ]);
-
     const accounts = await BankAccount.find({ company: companyId, isActive: true });
 
     const reconciliations = await Promise.all(
@@ -1699,8 +1640,6 @@ class MonthlyReportsService {
         }).sort({ date: -1 });
 
         // Get latest bank statement balance
-        const BankStatementLine = mongoose.model('BankStatementLine');
-
         // Check for statement lines in the period first, then fall back to any prior statement
         let latestStatementLine = await BankStatementLine.findOne({
           bankAccount: account._id,
@@ -1780,15 +1719,6 @@ class MonthlyReportsService {
    */
   static async getBudgetVsActual(companyId, year, month) {
     const { start, end } = getMonthRange(year, month);
-
-    const [Budget, Invoice, Expense, Purchase, Payroll] = await Promise.all([
-      mongoose.model('Budget'),
-      mongoose.model('Invoice'),
-      mongoose.model('Expense'),
-      mongoose.model('Purchase'),
-      mongoose.model('Payroll')
-    ]);
-
     // Get budget for the month - query by fiscal_year and period date range
     const budgets = await Budget.find({
       company_id: new mongoose.Types.ObjectId(companyId),
@@ -1968,12 +1898,6 @@ class MonthlyReportsService {
    */
   static async getGeneralLedger(companyId, year, month) {
     const { start, end } = getMonthRange(year, month);
-
-    const [ChartOfAccount, JournalEntry] = await Promise.all([
-      mongoose.model('ChartOfAccount'),
-      mongoose.model('JournalEntry')
-    ]);
-
     const accounts = await ChartOfAccount.find({ company: companyId, isActive: true }).sort('code');
 
     const accountActivity = await Promise.all(
@@ -2043,14 +1967,6 @@ class MonthlyReportsService {
    */
   static async getSemiAnnualProfitAndLoss(companyId, startYear, startMonth, endYear, endMonth) {
     const months = getMonthsInRange(startYear, startMonth, endYear, endMonth);
-    const [Invoice, Purchase, Expense, JournalEntry, ChartOfAccount] = await Promise.all([
-      mongoose.model('Invoice'),
-      mongoose.model('Purchase'),
-      mongoose.model('Expense'),
-      mongoose.model('JournalEntry'),
-      mongoose.model('ChartOfAccount')
-    ]);
-
     // Calculate data for each month
     const monthlyData = await Promise.all(
       months.map(async ({ year, month }) => {
@@ -2156,12 +2072,6 @@ class MonthlyReportsService {
    */
   static async getSemiAnnualBalanceSheetTrend(companyId, startYear, startMonth, endYear, endMonth) {
     const months = getMonthsInRange(startYear, startMonth, endYear, endMonth);
-    const [ChartOfAccount, JournalEntry, BankAccount] = await Promise.all([
-      mongoose.model('ChartOfAccount'),
-      mongoose.model('JournalEntry'),
-      mongoose.model('BankAccount')
-    ]);
-
     // Get all accounts
     const accounts = await ChartOfAccount.find({ company: companyId, isActive: true });
 
@@ -2279,13 +2189,10 @@ class MonthlyReportsService {
   static async getSemiAnnualCashFlowSummary(companyId, startYear, startMonth, endYear, endMonth) {
     const { start, end } = getSemiAnnualRange(startYear, startMonth, endYear, endMonth);
     const { CASH_FLOW_CLASSIFICATION } = require('../config/cashFlowConfig');
-    const JournalEntry = mongoose.model('JournalEntry');
-
     // Get cash account codes from BankAccount and PettyCash (same as CashFlowService)
     let cashAccountCodes = [];
     try {
-      const BankAccount = mongoose.model('BankAccount');
-      const PettyCashFloat = mongoose.model('PettyCashFloat');
+      const PettyCashFloat = PettyCashFloat;
       const [bankAccts, pettyCash] = await Promise.all([
         BankAccount.find({ company: new mongoose.Types.ObjectId(companyId), isActive: true }).lean(),
         PettyCashFloat.find({ company: new mongoose.Types.ObjectId(companyId), isActive: true }).lean()
@@ -2448,13 +2355,6 @@ class MonthlyReportsService {
    */
   static async getSemiAnnualStockTurnover(companyId, startYear, startMonth, endYear, endMonth) {
     const { start, end } = getSemiAnnualRange(startYear, startMonth, endYear, endMonth);
-    const [Product, StockMovement, Invoice, Purchase] = await Promise.all([
-      mongoose.model('Product'),
-      mongoose.model('StockMovement'),
-      mongoose.model('Invoice'),
-      mongoose.model('Purchase')
-    ]);
-
     // Get all products with current stock
     const products = await Product.find({ company: companyId, isActive: true });
 
@@ -2574,12 +2474,6 @@ class MonthlyReportsService {
    */
   static async getSemiAnnualReceivablesCollection(companyId, startYear, startMonth, endYear, endMonth) {
     const { start, end } = getSemiAnnualRange(startYear, startMonth, endYear, endMonth);
-    const [Invoice, Client, JournalEntry] = await Promise.all([
-      mongoose.model('Invoice'),
-      mongoose.model('Client'),
-      mongoose.model('JournalEntry')
-    ]);
-
     // Get all invoices in period with payment info
     const invoices = await Invoice.find({
       company: companyId,
@@ -2741,13 +2635,6 @@ class MonthlyReportsService {
    */
   static async getSemiAnnualPayrollHRCost(companyId, startYear, startMonth, endYear, endMonth) {
     const months = getMonthsInRange(startYear, startMonth, endYear, endMonth);
-    const [PayrollRun, Payslip, Employee, Expense] = await Promise.all([
-      mongoose.model('PayrollRun'),
-      mongoose.model('Payslip'),
-      mongoose.model('Employee'),
-      mongoose.model('Expense')
-    ]);
-
     // Monthly payroll data
     const monthlyData = await Promise.all(
       months.map(async ({ year, month }) => {
@@ -2890,13 +2777,6 @@ class MonthlyReportsService {
    */
   static async getSemiAnnualTaxObligations(companyId, startYear, startMonth, endYear, endMonth) {
     const { start, end } = getSemiAnnualRange(startYear, startMonth, endYear, endMonth);
-    const [Invoice, Purchase, Payslip, JournalEntry] = await Promise.all([
-      mongoose.model('Invoice'),
-      mongoose.model('Purchase'),
-      mongoose.model('Payslip'),
-      mongoose.model('JournalEntry')
-    ]);
-
     // VAT Analysis
     const vatOutput = await Invoice.aggregate([
       {

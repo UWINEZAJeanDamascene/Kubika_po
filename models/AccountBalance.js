@@ -1,35 +1,76 @@
+/**
+ * AccountBalance — PostgreSQL (Prisma) backed.
+ * Atomic adjust() via upsert + increment for fast trial balance reads.
+ */
+
 const mongoose = require('mongoose');
-const { Schema } = mongoose;
+const { prisma } = require('../lib/prisma');
+const { makeCompatModel, translateFilter, IMPOSSIBLE, toId } = require('../utils/prismaCompat');
+const { generateObjectId } = require('../utils/objectId');
+const { accountBalanceToApi } = require('../utils/inventoryJournalMappers');
 
-const AccountBalanceSchema = new Schema({
-  company: { type: Schema.Types.ObjectId, ref: 'Company', required: true },
-  accountCode: { type: String, required: true },
-  debit: { type: Number, default: 0, min: 0 },
-  credit: { type: Number, default: 0, min: 0 },
-  updatedAt: { type: Date, default: Date.now }
-}, { timestamps: false });
-
-// Virtual net balance (debit - credit)
-AccountBalanceSchema.virtual('net').get(function() {
-  return (this.debit || 0) - (this.credit || 0);
-});
-
-// Static helper to adjust balances atomically (upsert)
-AccountBalanceSchema.statics.adjust = async function(companyId, accountCode, deltaDebit = 0, deltaCredit = 0, options = {}) {
-  const session = options.session;
-  const query = { company: companyId, accountCode };
-  // Ensure we never decrement below zero in the schema; caller should ensure data validity.
-  const update = {
-    $inc: { debit: deltaDebit, credit: deltaCredit },
-    $set: { updatedAt: new Date() }
-  };
-  const opts = { upsert: true, new: true, setDefaultsOnInsert: true };
-  if (session) opts.session = session;
-
-  return this.findOneAndUpdate(query, update, opts).lean();
+const FIELD_MAP = {
+  _id: { target: 'id', isId: true },
+  id: { target: 'id', isId: true },
+  company: { target: 'companyId', isId: true },
+  companyId: { target: 'companyId', isId: true },
+  accountCode: { target: 'accountCode' },
 };
 
-// Create a compound index to keep lookups fast
-AccountBalanceSchema.index({ company: 1, accountCode: 1 }, { unique: true });
+if (!mongoose.models.AccountBalance) {
+  mongoose.model('AccountBalance', new mongoose.Schema({}, { strict: false, collection: 'accountbalances' }));
+}
 
-module.exports = mongoose.model('AccountBalance', AccountBalanceSchema);
+const base = makeCompatModel({
+  delegate: () => prisma.accountBalance,
+  fieldMap: FIELD_MAP,
+  toApi: accountBalanceToApi,
+  translateCreate: async (data) => ({
+    id: toId(data._id) || generateObjectId(),
+    companyId: toId(data.company || data.companyId),
+    accountCode: data.accountCode,
+    debit: data.debit ?? 0,
+    credit: data.credit ?? 0,
+  }),
+  translateUpdate: (update) => {
+    const data = update.$set ? { ...update, ...update.$set } : { ...update };
+    const out = {};
+    if (data.debit !== undefined) out.debit = data.debit;
+    if (data.credit !== undefined) out.credit = data.credit;
+    if (data.updatedAt !== undefined) out.updatedAt = data.updatedAt;
+    return out;
+  },
+  tenantField: 'companyId',
+});
+
+base.adjust = async function adjust(companyId, accountCode, deltaDebit = 0, deltaCredit = 0) {
+  const cid = toId(companyId);
+  const code = String(accountCode);
+  const existing = await prisma.accountBalance.findUnique({
+    where: { companyId_accountCode: { companyId: cid, accountCode: code } },
+  });
+  if (existing) {
+    const row = await prisma.accountBalance.update({
+      where: { id: existing.id },
+      data: {
+        debit: { increment: deltaDebit },
+        credit: { increment: deltaCredit },
+        updatedAt: new Date(),
+      },
+    });
+    return accountBalanceToApi(row);
+  }
+  const row = await prisma.accountBalance.create({
+    data: {
+      id: generateObjectId(),
+      companyId: cid,
+      accountCode: code,
+      debit: deltaDebit,
+      credit: deltaCredit,
+      updatedAt: new Date(),
+    },
+  });
+  return accountBalanceToApi(row);
+};
+
+module.exports = base;

@@ -1,30 +1,37 @@
-const mongoose = require('mongoose');
+/**
+ * EBMAlert — PostgreSQL (Prisma) backed.
+ */
+
+const { buildTenantModel } = require('../utils/masterDataCommon');
+const {
+  ebmAlertToApi,
+  ebmAlertTranslateCreate,
+  ebmAlertTranslateUpdate,
+} = require('../utils/phase10Mappers');
 
 const ALERT_STATUSES = Object.freeze(['open', 'acknowledged', 'reset']);
 
-const ebmAlertSchema = new mongoose.Schema({
-  companyId: { type: mongoose.Schema.Types.ObjectId, ref: 'Company', required: true, index: true },
-  queueId: { type: mongoose.Schema.Types.ObjectId, ref: 'EBMSubmissionQueue', required: true, index: true },
-  documentType: { type: String, required: true, index: true },
-  documentId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true },
-  endpoint: { type: String, required: true },
-  operationKey: { type: String, default: 'default' },
-  attemptsMade: { type: Number, required: true, min: 0 },
-  lastErrorMessage: { type: String, default: null },
-  lastErrorCode: { type: String, default: null },
-  lastHttpStatus: { type: Number, default: null },
-  payload: { type: mongoose.Schema.Types.Mixed, default: null },
-  abandonedAt: { type: Date, default: Date.now, index: true },
-  acknowledged: { type: Boolean, default: false, index: true },
-  acknowledgedAt: { type: Date, default: null },
-  acknowledgedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
-  resetAt: { type: Date, default: null },
-  resetBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
-  status: { type: String, enum: ALERT_STATUSES, default: 'open', index: true },
-}, { timestamps: true });
+const FIELD_MAP = {
+  companyId: { target: 'companyId', isId: true },
+  company: { target: 'companyId', isId: true },
+  queueId: { target: 'queueId', isId: true },
+  documentType: { target: 'documentType' },
+  documentId: { target: 'documentId', isId: true },
+  status: { target: 'status' },
+  acknowledged: { target: 'acknowledged' },
+};
 
-ebmAlertSchema.index({ companyId: 1, acknowledged: 1, abandonedAt: -1 });
-ebmAlertSchema.index({ queueId: 1, status: 1 });
+const EBMAlert = buildTenantModel({
+  name: 'EBMAlert',
+  collection: 'ebmalerts',
+  delegateName: 'ebmAlert',
+  fieldMap: FIELD_MAP,
+  toApi: ebmAlertToApi,
+  translateCreate: ebmAlertTranslateCreate,
+  translateUpdate: ebmAlertTranslateUpdate,
+  tenantField: 'companyId',
+  mutable: true,
+});
 
-module.exports = mongoose.model('EBMAlert', ebmAlertSchema);
+module.exports = EBMAlert;
 module.exports.ALERT_STATUSES = ALERT_STATUSES;

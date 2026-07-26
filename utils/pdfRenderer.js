@@ -290,6 +290,30 @@ function renderSummaryRow(doc, label, value, options = {}) {
   doc.moveDown(0.3);
 }
 
+function formatCurrencyValue(value) {
+  if (value === null || value === undefined || value === '') return '-';
+  if (typeof value === 'string' && value.includes('%')) return value;
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return String(value);
+  const sign = numeric < 0 ? '-' : '';
+  return `${sign}RWF ${Math.abs(numeric).toLocaleString('en-RW', {
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 0,
+  })}`;
+}
+
+/**
+ * Render a section heading within the report body.
+ */
+function renderSectionTitle(doc, title, options = {}) {
+  const { leftMargin = 30, fontSize = 12, spacing = 0.6 } = options;
+  doc.moveDown(spacing);
+  doc.fontSize(fontSize).font('Helvetica-Bold').fillColor('#111827').text(title, leftMargin, doc.y);
+  doc.moveDown(0.4);
+  renderDivider(doc, { leftMargin, color: '#D1D5DB' });
+  doc.fillColor('#000000');
+}
+
 /**
  * Render multiple summary rows (for totals section)
  * @param {Object} doc - PDFKit document instance
@@ -300,7 +324,8 @@ function renderSummarySection(doc, rows, options = {}) {
   const {
     leftMargin = 30,
     indent = 0,
-    fontSize = 10
+    fontSize = 10,
+    currency = false,
   } = options;
   
   doc.moveDown(0.5);
@@ -316,15 +341,18 @@ function renderSummarySection(doc, rows, options = {}) {
     }
     
     if (row.value !== undefined) {
-      const valueX = doc.page.width - 150;
+      const valueX = doc.page.width - 170;
       const labelWidth = valueX - x - 10;
+      const displayValue = currency && typeof row.value === 'number'
+        ? formatCurrencyValue(row.value)
+        : (typeof row.value === 'number' ? row.value.toFixed(2) : String(row.value));
       doc.text(row.label, x, doc.y, { width: labelWidth });
-      doc.text(typeof row.value === 'number' ? row.value.toFixed(2) : String(row.value), valueX, doc.y, { width: 120, align: 'right' });
+      doc.text(displayValue, valueX, doc.y, { width: 140, align: 'right' });
     } else {
       doc.text(row.label, x, doc.y);
     }
     
-    doc.moveDown(0.3);
+    doc.moveDown(0.35);
   });
 }
 
@@ -478,8 +506,10 @@ module.exports = {
   renderSimpleTable,
   renderSummaryRow,
   renderSummarySection,
+  renderSectionTitle,
   renderDivider,
   renderFooter,
+  formatCurrencyValue,
   COLUMN_TEMPLATES,
   calculateColumnWidths,
   FORMATTERS,

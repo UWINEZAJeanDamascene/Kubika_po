@@ -1,101 +1,40 @@
-const mongoose = require('mongoose');
-const { generateUniqueCode, generateShortSequentialCode } = require('./utils/autoIncrement');
+/**
+ * Supplier model — PostgreSQL (Prisma) backed.
+ */
 
-const supplierSchema = new mongoose.Schema({
-  // Multi-tenancy: company reference
-  company: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Company',
-    required: [true, 'Supplier must belong to a company']
-  },
-  name: {
-    type: String,
-    required: [true, 'Please provide a supplier name'],
-    trim: true
-  },
-  code: {
-    type: String,
-    uppercase: true,
-    trim: true
-  },
-  contact: {
-    phone: String,
-    email: {
-      type: String,
-      lowercase: true,
-      trim: true
-    },
-    fax: String,
-    website: String,
-    address: String,
-    city: String,
-    state: String,
-    zipCode: String,
-    country: String,
-    contactPerson: String
-  },
-  region: String,
-  currency: String,
-  leadTime: Number,
-  minimumOrder: Number,
-  bankName: String,
-  bankAccount: String,
-  productsSupplied: [{
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Product'
-  }],
-  paymentTerms: {
-    type: String,
-    enum: ['cash', 'credit_7', 'credit_15', 'credit_30', 'credit_45', 'credit_60'],
-    default: 'cash'
-  },
-  taxId: String,
-  notes: String,
-  isActive: {
-    type: Boolean,
-    default: true
-  },
-  totalPurchases: {
-    type: Number,
-    default: 0
-  },
-  lastPurchaseDate: Date,
-  createdBy: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User'
-  },
-  customFields: {
-    type: mongoose.Schema.Types.Mixed,
-    default: {}
-  }
-}, {
-  timestamps: true
+const { buildTenantModel } = require('../utils/masterDataCommon');
+const {
+  supplierToApi,
+  supplierTranslateCreate,
+  supplierTranslateUpdate,
+} = require('../utils/masterDataMappers');
+
+const FIELD_MAP = {
+  name: { target: 'name' },
+  code: { target: 'code', transform: (v) => ({ code: typeof v === 'string' ? v.toUpperCase() : v }) },
+  contact: { target: 'contact' },
+  region: { target: 'region' },
+  currency: { target: 'currency' },
+  leadTime: { target: 'leadTime' },
+  minimumOrder: { target: 'minimumOrder' },
+  bankName: { target: 'bankName' },
+  bankAccount: { target: 'bankAccount' },
+  productsSupplied: { target: 'productsSupplied' },
+  paymentTerms: { target: 'paymentTerms' },
+  taxId: { target: 'taxId' },
+  notes: { target: 'notes' },
+  totalPurchases: { target: 'totalPurchases' },
+  lastPurchaseDate: { target: 'lastPurchaseDate' },
+  customFields: { target: 'customFields' },
+};
+
+module.exports = buildTenantModel({
+  name: 'Supplier',
+  collection: 'suppliers',
+  delegateName: 'supplier',
+  fieldMap: FIELD_MAP,
+  toApi: supplierToApi,
+  translateCreate: supplierTranslateCreate,
+  translateUpdate: supplierTranslateUpdate,
+  mutable: true,
 });
-
-// Compound index for company + unique code
-supplierSchema.index({ company: 1, code: 1 }, { unique: true });
-supplierSchema.index({ company: 1 });
-
-// Auto-generate supplier code
-supplierSchema.pre('save', async function(next) {
-  if (this.isNew) {
-    if (!this.code) {
-      // Auto-generate short sequential supplier code if not provided (e.g., SUP001)
-      this.code = await generateShortSequentialCode('SUP', mongoose.model('Supplier'), this.company, 'code', 3);
-    } else {
-      // Check if provided code already exists for this company
-      const existingSupplier = await mongoose.model('Supplier').findOne({
-        company: this.company,
-        code: this.code.toUpperCase()
-      });
-      
-      if (existingSupplier) {
-        // Auto-generate a new short sequential supplier code instead of throwing error
-        this.code = await generateShortSequentialCode('SUP', mongoose.model('Supplier'), this.company, 'code', 3);
-      }
-    }
-  }
-  next();
-});
-
-module.exports = mongoose.model('Supplier', supplierSchema);

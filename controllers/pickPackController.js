@@ -172,10 +172,11 @@ exports.createPickPack = async (req, res, next) => {
     }
     
     // Create PickPack
+    const clientId = salesOrder.client?._id || salesOrder.client?.id || salesOrder.client;
     const pickPack = await PickPack.create({
       company: companyId,
       salesOrder: salesOrderId,
-      client: salesOrder.client._id,
+      client: clientId,
       warehouse: warehouseId,
       lines: lines,
       priority: priority,
@@ -183,11 +184,12 @@ exports.createPickPack = async (req, res, next) => {
       shippingMethod: salesOrder.shippingMethod,
       createdBy: req.user.id
     });
-    
-    // Update Sales Order status to picking
+
+    // Link pick pack and move SO into picking
     salesOrder.status = 'picking';
+    salesOrder.pickPackId = pickPack._id;
     await salesOrder.save();
-    
+
     await pickPack.populate('salesOrder client warehouse lines.product');
     
     res.status(201).json({
@@ -379,7 +381,11 @@ exports.completePicking = async (req, res, next) => {
     }
     
     // Check if all lines are picked
-    const notFullyPicked = pickPack.lines.filter(line => line.qtyPicked < line.qtyToPick);
+    const notFullyPicked = pickPack.lines.filter((line) => {
+      const picked = Number(line.qtyPicked) || 0;
+      const toPick = Number(line.qtyToPick) || 0;
+      return picked < toPick;
+    });
     if (notFullyPicked.length > 0) {
       return res.status(400).json({
         success: false,
@@ -512,7 +518,8 @@ exports.completePacking = async (req, res, next) => {
     const pickPack = await PickPack.findOne({ _id: req.params.id, company: companyId })
       .populate('salesOrder')
       .populate('client')
-      .populate('warehouse');
+      .populate('warehouse')
+      .populate('lines.product');
     
     if (!pickPack) {
       return res.status(404).json({
@@ -546,49 +553,81 @@ exports.completePacking = async (req, res, next) => {
     try {
       const DeliveryNote = require('../models/DeliveryNote');
       const SalesOrder = require('../models/SalesOrder');
+      const Product = require('../models/Product');
 
       // Fetch sales order with lines to get correct unit prices
-      const salesOrder = await SalesOrder.findById(pickPack.salesOrder._id);
+      const salesOrderId = pickPack.salesOrder?._id || pickPack.salesOrder?.id || pickPack.salesOrder;
+      const clientId = pickPack.client?._id || pickPack.client?.id || pickPack.client;
+      const warehouseId = pickPack.warehouse?._id || pickPack.warehouse?.id || pickPack.warehouse;
+      const salesOrder = await SalesOrder.findById(salesOrderId);
 
-      const deliveryLines = pickPack.lines.map((line) => {
-        // Find matching sales order line by lineId
-        const soLine = salesOrder?.lines?.find(l => l.lineId === line.salesOrderLineId);
-        // Use sales order line unitPrice, fallback to product lookup if needed
-        const unitPrice = soLine?.unitPrice || 0;
-        const qtyToDeliver = line.qtyPacked;
-        return {
-          product: line.product,
-          productName: line.description,
-          qtyToDeliver: qtyToDeliver,
+      const sourceLines = (pickPack.lines || []).filter((line) => (Number(line.qtyPacked) || 0) > 0);
+      if (sourceLines.length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: ERR_INVALID_STATUS,
+          message: 'No packed quantities to put on a delivery note',
+        });
+      }
+
+      const deliveryLines = [];
+      for (const line of sourceLines) {
+        const productId = line.product?._id || line.product?.id || line.product;
+        const soLine = salesOrder?.lines?.find((l) =>
+          String(l.lineId) === String(line.salesOrderLineId)
+          || String(l._id) === String(line.salesOrderLineId)
+        ) || salesOrder?.lines?.find((l) =>
+          String(l.product?._id || l.product?.id || l.product) === String(productId)
+        );
+
+        let productName = soLine?.description || line.product?.name || null;
+        let productCode = line.product?.sku || null;
+        let unit = line.unit || soLine?.unit || line.product?.unit || null;
+        if ((!productName || !unit) && productId) {
+          const product = await Product.findById(productId);
+          productName = productName || product?.name || null;
+          productCode = productCode || product?.sku || null;
+          unit = unit || product?.unit || 'pcs';
+        }
+
+        const qtyToDeliver = Number(line.qtyPacked) || 0;
+        const unitPrice = Number(soLine?.unitPrice) || Number(line.product?.sellingPrice) || 0;
+        deliveryLines.push({
+          product: productId,
+          productName,
+          productCode,
+          unit,
+          qtyToDeliver,
           deliveredQty: 0,
-          pendingQty: qtyToDeliver,
-          unitPrice: unitPrice,
+          unitPrice,
+          unitCost: 0,
           lineTotal: qtyToDeliver * unitPrice,
-          batchId: line.batchId,
-          serialNumbers: line.serialNumbers || []
-        };
-      });
+          batchId: line.batchId || null,
+          serialNumbers: line.serialNumbers || [],
+        });
+      }
       
       deliveryNote = await DeliveryNote.create({
         company: companyId,
-        salesOrder: pickPack.salesOrder._id,
+        salesOrder: salesOrderId,
         pickPack: pickPack._id,
-        client: pickPack.client._id,
-        warehouse: pickPack.warehouse._id,
+        client: clientId,
+        warehouse: warehouseId,
         sourceType: 'pick_pack',
         lines: deliveryLines,
         status: 'draft',
-        carrier: pickPack.shippingMethod,
-        trackingNo: trackingNumber,
-        packageCount: packageCount || 1,
-        totalWeight: totalWeight || 0,
-        deliveryAddress: pickPack.salesOrder.deliveryAddress,
+        notes: pickPack.notes || null,
         createdBy: req.user.id
       });
       
-      console.log('Delivery Note created:', deliveryNote._id);
+      console.log('Delivery Note created:', deliveryNote._id, 'lines:', deliveryLines.length);
     } catch (dnError) {
       console.error('Failed to create Delivery Note:', dnError);
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to create delivery note from packed items',
+        error: dnError.message,
+      });
     }
     
     // Update PickPack
@@ -598,16 +637,29 @@ exports.completePacking = async (req, res, next) => {
     pickPack.packageType = packageType || 'box';
     pickPack.totalWeight = totalWeight || 0;
     pickPack.trackingNumber = trackingNumber;
-    pickPack.deliveryNote = deliveryNote._id;
+    if (deliveryNote) {
+      pickPack.deliveryNote = deliveryNote._id;
+    }
     
     await pickPack.save();
     
     // Update Sales Order with delivery note reference
     const SalesOrder = require('../models/SalesOrder');
-    await SalesOrder.findByIdAndUpdate(pickPack.salesOrder._id, {
-      $addToSet: { deliveryNotes: deliveryNote._id },
-      status: 'packed'
-    });
+    const soId = pickPack.salesOrder?._id || pickPack.salesOrder?.id || pickPack.salesOrder;
+    const so = await SalesOrder.findById(soId);
+    if (so) {
+      const existing = Array.isArray(so.deliveryNotes) ? so.deliveryNotes : [];
+      const dnId = String(deliveryNote._id);
+      if (!existing.map(String).includes(dnId)) {
+        so.deliveryNotes = [...existing, dnId];
+      }
+      if (so.canTransitionTo && so.canTransitionTo('packed')) {
+        so.status = 'packed';
+      } else if (so.status === 'picking' || so.status === 'picked') {
+        so.status = 'packed';
+      }
+      await so.save();
+    }
     
     res.status(200).json({
       success: true,

@@ -24,7 +24,7 @@ exports.getRecurringInvoices = async (req, res, next) => {
     const { page, limit, skip } = parsePagination(req.query);
     const total = await RecurringInvoice.countDocuments(query);
     const recs = await RecurringInvoice.find(query)
-      .populate('client createdBy')
+      .populate('client lines.product createdBy')
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(limit);
@@ -44,7 +44,8 @@ exports.getRecurringInvoices = async (req, res, next) => {
 exports.getRecurringInvoice = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const rec = await RecurringInvoice.findOne({ _id: req.params.id, company: companyId }).populate('client createdBy');
+    const rec = await RecurringInvoice.findOne({ _id: req.params.id, company: companyId })
+      .populate('client lines.product createdBy');
     if (!rec) return res.status(404).json({ success: false, message: 'Not found' });
     res.json({ success: true, data: rec });
   } catch (err) {
@@ -204,7 +205,7 @@ exports.getRecurringInvoiceRuns = async (req, res, next) => {
     }
     
     const runQuery = {
-      template: templateId,
+      recurringInvoice: templateId,
       company: companyId,
     };
     const { page, limit, skip } = parsePagination(req.query, { defaultLimit: 20 });

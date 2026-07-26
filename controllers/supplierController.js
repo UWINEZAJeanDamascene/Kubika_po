@@ -57,7 +57,6 @@ exports.getSupplier = async (req, res, next) => {
     const companyId = req.user.company._id;
     
     const supplier = await Supplier.findOne({ _id: req.params.id, company: companyId })
-      .populate('productsSupplied', 'name sku unit')
       .populate('createdBy', 'name email');
 
     if (!supplier) {
@@ -74,9 +73,34 @@ exports.getSupplier = async (req, res, next) => {
       .select('purchaseDate')
       .limit(1);
 
-    const supplierData = supplier.toObject();
+    const supplierData = supplier.toObject ? supplier.toObject() : { ...supplier };
     if (!supplierData.lastPurchaseDate && lastPurchase) {
       supplierData.lastPurchaseDate = lastPurchase.purchaseDate;
+    }
+
+    // Resolve productsSupplied Json id list into product cards for the UI
+    const productIds = (supplierData.productsSupplied || [])
+      .map((item) => (item && typeof item === 'object' ? item._id || item.id : item))
+      .filter(Boolean)
+      .map(String);
+    if (productIds.length) {
+      const Product = require('../models/Product');
+      const products = await Product.find({
+        _id: { $in: productIds },
+        company: companyId,
+      }).select('name sku unit');
+      const byId = new Map((products || []).map((p) => [String(p._id), p]));
+      supplierData.productsSupplied = productIds
+        .map((id) => byId.get(id))
+        .filter(Boolean)
+        .map((p) => ({
+          _id: p._id,
+          name: p.name,
+          sku: p.sku,
+          unit: p.unit,
+        }));
+    } else {
+      supplierData.productsSupplied = [];
     }
 
     res.json({

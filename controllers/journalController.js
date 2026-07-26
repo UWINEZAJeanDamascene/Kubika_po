@@ -233,12 +233,6 @@ exports.postJournalEntry = async (req, res, next) => {
       entry.postedBy = userId;
       const postedEntry = await entry.save(opts);
 
-      for (const line of entry.lines) {
-        const deltaDebit = line.debit || 0;
-        const deltaCredit = line.credit || 0;
-        await AccountBalance.adjust(companyId, line.accountCode, deltaDebit, deltaCredit, opts);
-      }
-
       try {
         await cacheService.bumpCompanyFinancialCaches(companyId);
       } catch (cacheErr) {
@@ -483,88 +477,52 @@ exports.getTrialBalance = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const { startDate, endDate } = req.query;
-    
-    // Default to all dates (no filter) if not provided
-    let query = { company: companyId, status: 'posted' };
-    
+
+    const matchStage = {
+      company: new (require('mongoose').Types.ObjectId)(companyId),
+      status: 'posted',
+      reversed: { $ne: true },
+    };
+
     if (startDate || endDate) {
-      query.date = {};
-      if (startDate) query.date.$gte = new Date(startDate);
-      if (endDate) query.date.$lte = new Date(endDate);
+      matchStage.date = {};
+      if (startDate) matchStage.date.$gte = new Date(startDate);
+      if (endDate) matchStage.date.$lte = new Date(endDate);
     }
-    
-    // If no date range is provided, prefer precomputed AccountBalance collection (fast)
-    let accountBalances = {};
-    if (!startDate && !endDate) {
-      const AccountBalance = require('../models/AccountBalance');
-      const balances = await AccountBalance.find({ company: companyId }).lean();
-      balances.forEach(b => {
-        const account = getAccount(b.accountCode) || {};
-        accountBalances[b.accountCode] = {
-          accountCode: b.accountCode,
-          accountName: account.name || b.accountCode,
-          accountType: account.type || 'unknown',
-          normalBalance: account.normalBalance || 'debit',
-          debit: b.debit || 0,
-          credit: b.credit || 0,
-          balance: 0
-        };
-      });
-    } else {
-      const entries = await JournalEntry.find(query);
 
-      // Initialize account balances
-      accountBalances = {};
+    const pipeline = [
+      { $match: matchStage },
+      { $unwind: '$lines' },
+      {
+        $group: {
+          _id: '$lines.accountCode',
+          accountName: { $first: '$lines.accountName' },
+          debit: { $sum: '$lines.debit' },
+          credit: { $sum: '$lines.credit' },
+        },
+      },
+      { $sort: { _id: 1 } },
+    ];
 
-      // Process each entry
-      entries.forEach(entry => {
-        entry.lines.forEach(line => {
-          const code = line.accountCode;
+    const results = await JournalEntry.aggregate(pipeline).exec();
 
-          if (!accountBalances[code]) {
-            const account = getAccount(code);
-            accountBalances[code] = {
-              accountCode: code,
-              accountName: line.accountName,
-              accountType: account?.type || 'unknown',
-              normalBalance: account?.normalBalance || 'debit',
-              debit: 0,
-              credit: 0,
-              balance: 0
-            };
-          }
+    const report = results.map((group) => {
+      const code = group._id;
+      const account = getAccount(code);
+      const normalBalance = account?.normalBalance || 'debit';
+      const debit = parseFloat(group.debit?.toString() || '0');
+      const credit = parseFloat(group.credit?.toString() || '0');
+      const balance = normalBalance === 'debit' ? debit - credit : credit - debit;
 
-          accountBalances[code].debit += line.debit || 0;
-          accountBalances[code].credit += line.credit || 0;
-        });
-      });
-    }
-    
-    // Calculate balances based on normal balance
-    const report = Object.values(accountBalances).map(account => {
-      // For assets and expenses (debit normal): balance = debit - credit
-      // For liabilities, equity, and revenue (credit normal): balance = credit - debit
-      if (account.normalBalance === 'debit') {
-        account.balance = account.debit - account.credit;
-      } else {
-        account.balance = account.credit - account.debit;
-      }
-
-      // Map fields to frontend expected names and format numbers
-      const mapped = {
-        accountCode: account.accountCode,
-        accountName: account.accountName,
-        accountType: account.accountType,
-        debit: parseFloat(account.debit.toFixed(2)),
-        credit: parseFloat(account.credit.toFixed(2)),
-        balance: parseFloat(account.balance.toFixed(2))
+      return {
+        accountCode: code,
+        accountName: group.accountName || account?.name || code,
+        accountType: account?.type || 'unknown',
+        debit: parseFloat(debit.toFixed(2)),
+        credit: parseFloat(credit.toFixed(2)),
+        balance: parseFloat(balance.toFixed(2)),
       };
-
-      return mapped;
     });
-    
-    // Sort by account code
-    report.sort((a, b) => (a.accountCode || '').localeCompare(b.accountCode || ''));
     
     // Calculate totals
     const totals = {

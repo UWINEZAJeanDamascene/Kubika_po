@@ -1,36 +1,30 @@
-const mongoose = require('mongoose');
+/**
+ * Currency model — PostgreSQL (Prisma) backed (global, no tenant).
+ */
 
-const currencySchema = new mongoose.Schema({
-  code: {
-    type: String,
-    required: true,
-    uppercase: true,
-    trim: true,
-    unique: true
-    // ISO 4217: USD, EUR, GBP, KES, UGX, TZS, RWF
-  },
-  name: {
-    type: String,
-    required: true,
-    trim: true
-  },
-  symbol: {
-    type: String,
-    trim: true,
-    default: null
-    // e.g. $, €, £, Ksh
-  },
-  decimal_places: {
-    type: Number,
-    default: 2
-    // Some currencies have 0 decimal places (e.g. JPY)
-  },
-  is_active: {
-    type: Boolean,
-    default: true
-  }
-}, {
-  timestamps: true
+const { buildGlobalModel } = require('../utils/masterDataCommon');
+const {
+  currencyToApi,
+  currencyTranslateCreate,
+  currencyTranslateUpdate,
+} = require('../utils/masterDataMappers');
+
+const FIELD_MAP = {
+  code: { target: 'code', transform: (v) => ({ code: typeof v === 'string' ? v.toUpperCase() : v }) },
+  name: { target: 'name' },
+  symbol: { target: 'symbol' },
+  decimal_places: { target: 'decimalPlaces' },
+  decimalPlaces: { target: 'decimalPlaces' },
+  is_active: { target: 'isActive' },
+  isActive: { target: 'isActive' },
+};
+
+module.exports = buildGlobalModel({
+  name: 'Currency',
+  collection: 'currencies',
+  delegateName: 'currency',
+  fieldMap: FIELD_MAP,
+  toApi: currencyToApi,
+  translateCreate: currencyTranslateCreate,
+  translateUpdate: currencyTranslateUpdate,
 });
-
-module.exports = mongoose.model('Currency', currencySchema);

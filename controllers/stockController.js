@@ -8,6 +8,7 @@ const JournalService = require('../services/journalService');
 const { runInTransaction } = require('../services/transactionService');
 const EBMStockService = require('../services/ebmStockService');
 const OpeningStockService = require('../services/openingStockService');
+const inventoryService = require('../services/inventoryService');
 
 // @desc    Get all stock movements
 // @route   GET /api/stock/movements
@@ -328,6 +329,21 @@ exports.adjustStock = async (req, res, next) => {
       // Update product stock
       product.currentStock = newStock;
       await product.save(opts);
+
+      // Keep FIFO cost layers aligned with the new stock level, otherwise a sale
+      // of this quantity later fails costing with "insufficient stock".
+      if (type === 'in') {
+        await inventoryService.createLayer(
+          companyId,
+          productId,
+          Number(quantity),
+          unitCost,
+          { sourceType: 'adjustment', sourceId: movement._id },
+          { session: trx || null, userId: req.user.id, warehouse: req.body.warehouse || null },
+        );
+      } else {
+        await inventoryService.reduceLayers(companyId, productId, Number(quantity), { session: trx || null });
+      }
 
       await JournalService.createStockAdjustmentEntry(companyId, req.user.id, {
         _id: movement._id,

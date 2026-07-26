@@ -9,6 +9,7 @@ const ebmService = require("./ebmService");
 const EBMQueueService = require("./ebmQueueService");
 const EBMFiscalSequenceService = require("./ebmFiscalSequenceService");
 const EBMTinService = require("./ebmCustomerTinService");
+const { extractSaveSalesFiscalData, mapVsdcErrorCode } = require("../utils/vsdcPayloadSanitizer");
 const { formatVsdcDate, formatVsdcDateTime, VSDC_ENDPOINTS } = require("./ebmService");
 
 const SUCCESS_RESULT = "000";
@@ -267,18 +268,42 @@ async function resolveHeaderCodes(invoice, companyId) {
   const paymentCode = await resolvePaymentCode(invoice, companyId);
   const receiptCode =
     invoice.ebm?.rcptTyCd ||
-    (await findCode(companyId, {
-      className: "receipt",
-      namePatterns: ["sale", "normal sale"],
-      requiredFor: "receipt type",
-    }));
+    (invoice.isProforma
+      ? await findCode(companyId, {
+          className: "receipt",
+          namePatterns: ["proforma"],
+          requiredFor: "proforma receipt type",
+        })
+      : invoice.isCopy
+        ? await findCode(companyId, {
+            className: "receipt",
+            namePatterns: ["copy"],
+            requiredFor: "copy receipt type",
+          })
+        : await findCode(companyId, {
+            className: "receipt",
+            namePatterns: ["sale", "normal sale"],
+            requiredFor: "receipt type",
+          }));
   const salesCode =
     invoice.ebm?.salesTyCd ||
-    (await findCode(companyId, {
-      className: "transaction",
-      namePatterns: ["normal", "sale"],
-      requiredFor: "sales transaction type",
-    }));
+    (invoice.isCopy
+      ? await findCode(companyId, {
+          className: "transaction",
+          namePatterns: ["copy"],
+          requiredFor: "copy transaction type",
+        })
+      : invoice.isDebitNote
+        ? await findCode(companyId, {
+            className: "transaction",
+            namePatterns: ["debit"],
+            requiredFor: "debit note transaction type",
+          })
+        : await findCode(companyId, {
+            className: "transaction",
+            namePatterns: ["normal", "sale"],
+            requiredFor: "sales transaction type",
+          }));
   return {
     pmtTyCd: paymentCode,
     rcptTyCd: receiptCode,
@@ -515,8 +540,8 @@ async function buildSalesTrnPayload(invoice, company, branch) {
     companyId,
     tin,
     bhfId: branch.rraBranchId,
-    invcNo: String(invcNo),
-    orgInvcNo: invoice.originalInvoiceNo || invoice.orgInvcNo || 0,
+    invcNo,
+    orgInvcNo: toNumber(invoice.originalInvoiceNo || invoice.orgInvcNo, 0),
     prcOrdCd: getPurchaseOrderCode(invoice),
     custTin: getCustomerTin(invoice),
     custNm: getCustomerName(invoice),
@@ -608,37 +633,37 @@ async function buildRefundPayload(
   payload.rcptTyCd = headerCodes.rcptTyCd;
   payload.pmtTyCd = headerCodes.pmtTyCd;
   payload.salesTyCd = headerCodes.salesTyCd;
-  payload.orgInvcNo = String(originalInvoice.ebm?.invcNo || getInvoiceNumber(originalInvoice));
+  payload.orgInvcNo = toNumber(originalInvoice.ebm?.invcNo || getInvoiceNumber(originalInvoice), 0);
   payload.orgRcptNo = String(originalInvoice.ebm.rcptNo);
   payload.rfdRsnCd = refundReasonCode;
   payload.remark = note.reason || note.notes || "Refund after sale";
   return payload;
 }
 
-async function markPending(invoiceId, companyId) {
+async function mergeInvoiceEbm(invoiceId, companyId, ebmPatch) {
+  const current = await Invoice.findOne({ _id: invoiceId, company: companyId });
+  if (!current) return null;
+  const ebm = {
+    ...(current.ebm && typeof current.ebm === 'object' ? current.ebm : {}),
+    ...ebmPatch,
+  };
   return Invoice.findOneAndUpdate(
-    {
-      _id: invoiceId,
-      company: companyId,
-      "ebm.ebmStatus": { $ne: "submitted" },
-    },
-    {
-      $set: {
-        "ebm.ebmStatus": "pending",
-        "ebm.lastError": null,
-      },
-    },
+    { _id: invoiceId, company: companyId },
+    { $set: { ebm } },
     { new: true },
   ).populate("client lines.product createdBy");
 }
 
+async function markPending(invoiceId, companyId) {
+  return mergeInvoiceEbm(invoiceId, companyId, {
+    ebmStatus: "pending",
+    lastError: null,
+  });
+}
+
 async function applySuccess(invoiceId, companyId, response, payload) {
-  const data = response?.data || {};
-  const rcptDt =
-    data.rcptDt ||
-    data.vsdcRcptPbctDate ||
-    response?.resultDt ||
-    formatVsdcDateTime();
+  const data = extractSaveSalesFiscalData(response);
+  const rcptDt = data.rcptDt || formatVsdcDateTime();
   const qrCode = buildQrString({
     rcptSign: data.rcptSign,
     intrlData: data.intrlData,
@@ -646,69 +671,66 @@ async function applySuccess(invoiceId, companyId, response, payload) {
     rcptDt,
   });
 
-  return Invoice.findOneAndUpdate(
-    {
-      _id: invoiceId,
-      company: companyId,
-      "ebm.ebmStatus": { $ne: "submitted" },
-    },
-    {
-      $set: {
-        "ebm.rcptSign": data.rcptSign || null,
-        "ebm.intrlData": data.intrlData || null,
-        "ebm.rcptNo": data.rcptNo != null ? String(data.rcptNo) : null,
-        "ebm.rcptDt": rcptDt,
-        "ebm.qrCode": qrCode,
-        "ebm.submittedAt": new Date(),
-        "ebm.ebmStatus": "submitted",
-        "ebm.lastError": null,
-        "ebm.rcptTyCd": payload.rcptTyCd,
-        "ebm.pmtTyCd": payload.pmtTyCd,
-        "ebm.salesTyCd": payload.salesTyCd,
-        "ebm.cfmDt": payload.cfmDt,
-        "ebm.prcOrdCd": payload.prcOrdCd || null,
-        "ebm.prchrAcptcYn": payload.prchrAcptcYn,
-        "ebm.invcNo": payload.invcNo,
-        "ebm.curRcptNo": payload.receipt?.curRcptNo || null,
-        "ebm.totRcptNo": payload.receipt?.totRcptNo || null,
-        "ebm.rptNo": payload.receipt?.rptNo || null,
-        "ebm.salesPayload": payload,
-      },
-    },
-    { new: true },
-  ).populate("client lines.product createdBy");
+  return mergeInvoiceEbm(invoiceId, companyId, {
+    rcptSign: data.rcptSign || null,
+    intrlData: data.intrlData || null,
+    rcptNo: data.rcptNo != null ? String(data.rcptNo) : null,
+    rcptDt,
+    qrCode,
+    submittedAt: new Date(),
+    ebmStatus: "submitted",
+    lastError: null,
+    rcptTyCd: payload.rcptTyCd,
+    pmtTyCd: payload.pmtTyCd,
+    salesTyCd: payload.salesTyCd,
+    cfmDt: payload.cfmDt,
+    prcOrdCd: payload.prcOrdCd || null,
+    prchrAcptcYn: payload.prchrAcptcYn,
+    invcNo: payload.invcNo,
+    curRcptNo: payload.receipt?.curRcptNo || null,
+    totRcptNo: payload.receipt?.totRcptNo || null,
+    rptNo: payload.receipt?.rptNo || null,
+    salesPayload: payload,
+  });
+}
+
+function formatEbmErrorMessage(error) {
+  const resultCd = error?.resultCd || error?.response?.resultCd;
+  const mapped = mapVsdcErrorCode(resultCd);
+  if (mapped) return mapped;
+  return error?.message || "EBM sales submission failed";
 }
 
 async function applyFailure(invoiceId, companyId, error, payload = null) {
   const status = error?.retryable === false ? "failed" : "pending";
+  const current = await Invoice.findOne({ _id: invoiceId, company: companyId });
+  if (!current) return null;
+  const prev = current.ebm && typeof current.ebm === 'object' ? current.ebm : {};
+  const ebm = {
+    ...prev,
+    ebmStatus: status,
+    lastError: formatEbmErrorMessage(error),
+    lastErrorCode: error?.resultCd || error?.code || null,
+    retryCount: (Number(prev.retryCount) || 0) + 1,
+    ...(payload
+      ? {
+          rcptTyCd: payload.rcptTyCd,
+          pmtTyCd: payload.pmtTyCd,
+          salesTyCd: payload.salesTyCd,
+          cfmDt: payload.cfmDt,
+          prcOrdCd: payload.prcOrdCd || null,
+          prchrAcptcYn: payload.prchrAcptcYn,
+          invcNo: payload.invcNo,
+          curRcptNo: payload.receipt?.curRcptNo || null,
+          totRcptNo: payload.receipt?.totRcptNo || null,
+          rptNo: payload.receipt?.rptNo || null,
+          salesPayload: payload,
+        }
+      : {}),
+  };
   return Invoice.findOneAndUpdate(
-    {
-      _id: invoiceId,
-      company: companyId,
-      "ebm.ebmStatus": { $ne: "submitted" },
-    },
-    {
-      $set: {
-        "ebm.ebmStatus": status,
-        "ebm.lastError": error?.message || "EBM sales submission failed",
-        ...(payload
-          ? {
-              "ebm.rcptTyCd": payload.rcptTyCd,
-              "ebm.pmtTyCd": payload.pmtTyCd,
-              "ebm.salesTyCd": payload.salesTyCd,
-              "ebm.cfmDt": payload.cfmDt,
-              "ebm.prcOrdCd": payload.prcOrdCd || null,
-              "ebm.prchrAcptcYn": payload.prchrAcptcYn,
-              "ebm.invcNo": payload.invcNo,
-              "ebm.curRcptNo": payload.receipt?.curRcptNo || null,
-              "ebm.totRcptNo": payload.receipt?.totRcptNo || null,
-              "ebm.rptNo": payload.receipt?.rptNo || null,
-              "ebm.salesPayload": payload,
-            }
-          : {}),
-      },
-      $inc: { "ebm.retryCount": 1 },
-    },
+    { _id: invoiceId, company: companyId },
+    { $set: { ebm } },
     { new: true },
   ).populate("client lines.product createdBy");
 }
@@ -732,12 +754,8 @@ async function markCreditNotePending(noteId, companyId, extra = {}) {
 }
 
 async function applyCreditNoteSuccess(noteId, companyId, response, payload) {
-  const data = response?.data || {};
-  const rcptDt =
-    data.rcptDt ||
-    data.vsdcRcptPbctDate ||
-    response?.resultDt ||
-    formatVsdcDateTime();
+  const data = extractSaveSalesFiscalData(response);
+  const rcptDt = data.rcptDt || formatVsdcDateTime();
   const qrCode = buildQrString({
     rcptSign: data.rcptSign,
     intrlData: data.intrlData,
@@ -787,7 +805,8 @@ async function applyCreditNoteFailure(
     {
       $set: {
         "ebm.ebmStatus": status,
-        "ebm.lastError": error?.message || "EBM refund submission failed",
+        "ebm.lastError": formatEbmErrorMessage(error),
+        "ebm.lastErrorCode": error?.resultCd || error?.code || null,
         ...(payload
           ? {
               "ebm.rcptTyCd": payload.rcptTyCd,
@@ -809,6 +828,28 @@ async function applyCreditNoteFailure(
     },
     { new: true },
   ).populate("invoice client lines.product items.product createdBy");
+}
+
+async function submitInvoiceVariant(invoiceId, companyId, variant = {}) {
+  const invoice = await Invoice.findOne({ _id: invoiceId, company: companyId });
+  if (!invoice) {
+    const error = new Error("Invoice not found for EBM submission.");
+    error.code = "EBM_INVOICE_NOT_FOUND";
+    error.retryable = false;
+    throw error;
+  }
+  if (variant.isProforma) {
+    invoice.isProforma = true;
+    invoice.isCopy = false;
+  } else if (variant.isCopy) {
+    invoice.isCopy = true;
+    invoice.isProforma = false;
+  } else {
+    invoice.isProforma = false;
+    invoice.isCopy = false;
+  }
+  await invoice.save();
+  return submitInvoice(invoiceId, { companyId, branchId: variant.branchId || null });
 }
 
 async function submitCreditNote(
@@ -942,10 +983,13 @@ async function submitInvoice(invoiceId, { companyId, branchId = null } = {}) {
     invoice,
     companyId,
     branch.rraBranchId,
-    (updates) => Invoice.updateOne(
-      { _id: invoice._id, company: companyId, "ebm.ebmStatus": { $ne: "submitted" } },
-      { $set: updates },
-    ),
+    async (updates) => {
+      const patch = {};
+      for (const [key, value] of Object.entries(updates || {})) {
+        patch[key.startsWith('ebm.') ? key.slice(4) : key] = value;
+      }
+      return mergeInvoiceEbm(invoice._id, companyId, patch);
+    },
   );
   await markPending(invoice._id, companyId);
   let payload = null;
@@ -1017,7 +1061,9 @@ module.exports = {
   markPending,
   markCreditNotePending,
   submitInvoice,
+  submitInvoiceVariant,
   submitInvoiceAsync,
   submitCreditNote,
   resolveBranch,
+  formatEbmErrorMessage,
 };

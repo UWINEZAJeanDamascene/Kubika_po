@@ -1763,4 +1763,44 @@ router.get('/semi-annual/tax-obligations', authorize('reports', 'read'), validat
   }
 });
 
+// Semi-annual export helper
+const semiAnnualExports = require('../utils/semiAnnualReportExports');
+
+const SEMI_ANNUAL_REPORTS = [
+  { path: 'profit-loss', fetch: (cid, sy, sm, ey, em) => MonthlyReportsService.getSemiAnnualProfitAndLoss(cid, sy, sm, ey, em) },
+  { path: 'balance-sheet-trend', fetch: (cid, sy, sm, ey, em) => MonthlyReportsService.getSemiAnnualBalanceSheetTrend(cid, sy, sm, ey, em) },
+  { path: 'cash-flow', fetch: (cid, sy, sm, ey, em) => MonthlyReportsService.getSemiAnnualCashFlowSummary(cid, sy, sm, ey, em) },
+  { path: 'stock-turnover', fetch: (cid, sy, sm, ey, em) => MonthlyReportsService.getSemiAnnualStockTurnover(cid, sy, sm, ey, em) },
+  { path: 'receivables-collection', fetch: (cid, sy, sm, ey, em) => MonthlyReportsService.getSemiAnnualReceivablesCollection(cid, sy, sm, ey, em) },
+  { path: 'payroll-hr', fetch: (cid, sy, sm, ey, em) => MonthlyReportsService.getSemiAnnualPayrollHRCost(cid, sy, sm, ey, em) },
+  { path: 'tax-obligations', fetch: (cid, sy, sm, ey, em) => MonthlyReportsService.getSemiAnnualTaxObligations(cid, sy, sm, ey, em) },
+];
+
+for (const report of SEMI_ANNUAL_REPORTS) {
+  router.get(`/semi-annual/${report.path}/pdf`, authorize('reports', 'read'), validateSemiAnnualParams, async (req, res) => {
+    try {
+      const Company = require('../models/Company');
+      const data = await report.fetch(req.companyId, req.startYear, req.startMonth, req.endYear, req.endMonth);
+      const company = await Company.findById(req.companyId);
+      await semiAnnualExports.streamSemiAnnualPdf(res, report.path, data, company);
+    } catch (error) {
+      console.error(`Semi-Annual ${report.path} PDF error:`, error);
+      if (!res.headersSent) res.status(500).json({ success: false, error: error.message });
+    }
+  });
+
+  router.get(`/semi-annual/${report.path}/excel`, authorize('reports', 'read'), validateSemiAnnualParams, async (req, res) => {
+    try {
+      const data = await report.fetch(req.companyId, req.startYear, req.startMonth, req.endYear, req.endMonth);
+      const buffer = await semiAnnualExports.buildSemiAnnualExcel(report.path, data);
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="semi-annual-${report.path}-${req.startYear}.xlsx"`);
+      res.send(buffer);
+    } catch (error) {
+      console.error(`Semi-Annual ${report.path} Excel error:`, error);
+      res.status(500).json({ success: false, error: error.message });
+    }
+  });
+}
+
 module.exports = router;

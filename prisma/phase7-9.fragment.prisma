@@ -1,0 +1,470 @@
+// Phase 7 — Banking & Petty Cash + Phase 9 — ReportSnapshot
+//
+// ── Merge into Company model ─────────────────────────────────────────────
+// bankAccounts               BankAccount[]
+// bankTransactions           BankTransaction[]
+// bankStatementLines         BankStatementLine[]
+// bankReconciliations        BankReconciliation[]
+// bankReconciliationSessions BankReconciliationSession[]
+// bankStatementTransactions  BankStatementTransaction[]
+// bankReconciliationMatches  BankReconciliationMatch[]
+// pettyCashFloats            PettyCashFloat[]
+// pettyCashExpenses          PettyCashExpense[]
+// pettyCashReplenishments    PettyCashReplenishment[]
+// pettyCashTransactions      PettyCashTransaction[]
+// pettyCashReconciliations   PettyCashReconciliation[]
+// reportSnapshots            ReportSnapshot[]
+
+// ── Phase 7 — Banking ──────────────────────────────────────────────────────
+
+model BankAccount {
+  id                      String    @id @db.Char(24)
+  companyId               String    @map("company_id") @db.Char(24)
+  name                    String
+  accountNumber           String?   @map("account_number")
+  bankName                String?   @map("bank_name")
+  currencyCode            String    @default("USD") @map("currency_code")
+  ledgerAccountId         String    @default("1100") @map("ledger_account_id")
+  openingBalance          Decimal   @default(0) @map("opening_balance") @db.Decimal(19, 2)
+  openingBalanceDate      DateTime  @default(now()) @map("opening_balance_date") @db.Timestamptz(3)
+  isActive                Boolean   @default(true) @map("is_active")
+  isDefault               Boolean   @default(false) @map("is_default")
+  accountType             String    @default("bk_bank") @map("account_type")
+  branch                  String?
+  swiftCode               String?   @map("swift_code")
+  cachedBalance           Decimal   @default(0) @map("cached_balance") @db.Decimal(19, 2)
+  cacheValid              Boolean   @default(false) @map("cache_valid")
+  cacheLastComputed       DateTime? @map("cache_last_computed") @db.Timestamptz(3)
+  targetBalance           Decimal   @default(0) @map("target_balance") @db.Decimal(19, 2)
+  holderName              String?   @map("holder_name")
+  lastReconciledAt        DateTime? @map("last_reconciled_at") @db.Timestamptz(3)
+  lastReconciledBalance   Decimal   @default(0) @map("last_reconciled_balance") @db.Decimal(19, 2)
+  notes                   String?
+  color                   String    @default("#3B82F6")
+  icon                    String    @default("bank")
+  interestAccountType     String    @default("current") @map("interest_account_type")
+  interestRate            Decimal   @default(0) @map("interest_rate") @db.Decimal(19, 4)
+  interestCalculationMethod String  @default("simple") @map("interest_calculation_method")
+  interestCreditFrequency String    @default("monthly") @map("interest_credit_frequency")
+  interestIncomeAccount   String    @default("4300") @map("interest_income_account")
+  interestAccrualAccount  String    @default("1350") @map("interest_accrual_account")
+  bankStatementReference  Boolean   @default(false) @map("bank_statement_reference")
+  interestStartDate       DateTime? @map("interest_start_date") @db.Timestamptz(3)
+  lastInterestPostedDate  DateTime? @map("last_interest_posted_date") @db.Timestamptz(3)
+  customFields            Json      @default("{}") @map("custom_fields")
+  createdById             String?   @map("created_by") @db.Char(24)
+  createdAt               DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt               DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company                  Company                     @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  transactions             BankTransaction[]
+  statementLines           BankStatementLine[]
+  reconciliations          BankReconciliation[]
+  reconciliationSessions   BankReconciliationSession[]
+  statementTransactions    BankStatementTransaction[]
+  reconciliationMatches    BankReconciliationMatch[]
+  pettyCashReplenishments  PettyCashReplenishment[]
+
+  @@index([companyId, isActive])
+  @@index([companyId, accountType])
+  @@index([companyId, isDefault])
+  @@map("bank_accounts")
+}
+
+model BankTransaction {
+  id                   String    @id @db.Char(24)
+  companyId            String    @map("company_id") @db.Char(24)
+  bankAccountId        String    @map("bank_account_id") @db.Char(24)
+  type                 String
+  amount               Decimal   @db.Decimal(19, 2)
+  balanceAfter         Decimal   @map("balance_after") @db.Decimal(19, 2)
+  balance              Decimal   @default(0) @db.Decimal(19, 2)
+  reference            Json?
+  referenceType        String?   @map("reference_type")
+  description          String?
+  date                 DateTime  @default(now()) @db.Timestamptz(3)
+  paymentMethod        String    @default("bank_transfer") @map("payment_method")
+  referenceNumber      String?   @map("reference_number")
+  status               String    @default("completed")
+  notes                String?
+  attachments          Json      @default("[]")
+  journalEntryId       String?   @map("journal_entry_id") @db.Char(24)
+  journalEntryLineId   String?   @map("journal_entry_line_id") @db.Char(24)
+  transactionType      String    @default("other") @map("transaction_type")
+  sourceDocumentType   String    @default("journal_entry") @map("source_document_type")
+  sourceDocumentId     String?   @map("source_document_id") @db.Char(24)
+  sourceReference      String?   @map("source_reference")
+  reconciliationStatus String    @default("unreconciled") @map("reconciliation_status")
+  reconciledSessionId  String?   @map("reconciled_session_id") @db.Char(24)
+  isReversed           Boolean   @default(false) @map("is_reversed")
+  reversalTransactionId String?  @map("reversal_transaction_id") @db.Char(24)
+  createdById          String    @map("created_by") @db.Char(24)
+  createdAt            DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt            DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company           Company                    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  bankAccount       BankAccount                @relation(fields: [bankAccountId], references: [id], onDelete: Cascade)
+  reconciledSession BankReconciliationSession? @relation(fields: [reconciledSessionId], references: [id])
+  reversalTransaction BankTransaction?         @relation("BankTxReversal", fields: [reversalTransactionId], references: [id])
+  reversedBy        BankTransaction[]          @relation("BankTxReversal")
+  bookMatches       BankReconciliationMatch[]
+  matchedStatementTransactions BankStatementTransaction[]
+
+  @@index([companyId, bankAccountId, date(sort: Desc)])
+  @@index([companyId, bankAccountId, reconciliationStatus])
+  @@index([companyId, journalEntryId, journalEntryLineId])
+  @@index([bankAccountId, date(sort: Desc)])
+  @@map("bank_transactions")
+}
+
+model BankStatementLine {
+  id                String    @id @db.Char(24)
+  companyId         String    @map("company_id") @db.Char(24)
+  bankAccountId     String    @map("bank_account_id") @db.Char(24)
+  reconciliationId  String?   @map("reconciliation_id") @db.Char(24)
+  transactionDate   DateTime  @map("transaction_date") @db.Timestamptz(3)
+  description       String
+  debitAmount       Decimal   @default(0) @map("debit_amount") @db.Decimal(19, 2)
+  creditAmount      Decimal   @default(0) @map("credit_amount") @db.Decimal(19, 2)
+  balance           Decimal?  @db.Decimal(19, 2)
+  reference         String?
+  status            String    @default("unmatched")
+  isReconciled      Boolean   @default(false) @map("is_reconciled")
+  matchedAmount     Decimal?  @map("matched_amount") @db.Decimal(19, 2)
+  importedAt        DateTime  @default(now()) @map("imported_at") @db.Timestamptz(3)
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company        Company                   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  bankAccount    BankAccount               @relation(fields: [bankAccountId], references: [id], onDelete: Cascade)
+  reconciliation BankReconciliation?       @relation(fields: [reconciliationId], references: [id])
+  matches        BankReconciliationMatch[]
+
+  @@index([bankAccountId, transactionDate])
+  @@index([bankAccountId, isReconciled])
+  @@index([bankAccountId, status])
+  @@index([reconciliationId, status])
+  @@index([companyId, bankAccountId])
+  @@map("bank_statement_lines")
+}
+
+model BankReconciliation {
+  id                      String    @id @db.Char(24)
+  companyId               String    @map("company_id") @db.Char(24)
+  bankAccountId           String    @map("bank_account_id") @db.Char(24)
+  statementDateStart      DateTime  @map("statement_date_start") @db.Timestamptz(3)
+  statementDateEnd        DateTime  @map("statement_date_end") @db.Timestamptz(3)
+  statementClosingBalance Decimal   @map("statement_closing_balance") @db.Decimal(19, 2)
+  bookClosingBalance      Decimal?  @map("book_closing_balance") @db.Decimal(19, 2)
+  difference              Decimal   @default(0) @db.Decimal(19, 2)
+  status                  String    @default("draft")
+  startedById             String    @map("started_by") @db.Char(24)
+  completedById           String?   @map("completed_by") @db.Char(24)
+  startedAt               DateTime  @default(now()) @map("started_at") @db.Timestamptz(3)
+  completedAt             DateTime? @map("completed_at") @db.Timestamptz(3)
+  reportSnapshot          Json      @default("{}") @map("report_snapshot")
+  notes                   String?
+  createdAt               DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt               DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company       Company             @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  bankAccount   BankAccount         @relation(fields: [bankAccountId], references: [id], onDelete: Cascade)
+  statementLines BankStatementLine[]
+
+  @@index([bankAccountId, status])
+  @@index([bankAccountId, statementDateEnd(sort: Desc)])
+  @@index([companyId, status])
+  @@map("bank_reconciliations")
+}
+
+model BankReconciliationSession {
+  id                      String    @id @db.Char(24)
+  companyId               String    @map("company_id") @db.Char(24)
+  bankAccountId           String    @map("bank_account_id") @db.Char(24)
+  periodStart             DateTime  @map("period_start") @db.Timestamptz(3)
+  periodEnd               DateTime  @map("period_end") @db.Timestamptz(3)
+  openingBookBalance      Decimal   @default(0) @map("opening_book_balance") @db.Decimal(19, 2)
+  closingBookBalance      Decimal   @default(0) @map("closing_book_balance") @db.Decimal(19, 2)
+  openingStatementBalance Decimal   @default(0) @map("opening_statement_balance") @db.Decimal(19, 2)
+  closingStatementBalance Decimal   @default(0) @map("closing_statement_balance") @db.Decimal(19, 2)
+  status                  String    @default("in_progress")
+  completedAt             DateTime? @map("completed_at") @db.Timestamptz(3)
+  completedById           String?   @map("completed_by") @db.Char(24)
+  lockedAt                DateTime? @map("locked_at") @db.Timestamptz(3)
+  adjustedBookBalance     Decimal   @default(0) @map("adjusted_book_balance") @db.Decimal(19, 2)
+  adjustedBankBalance     Decimal   @default(0) @map("adjusted_bank_balance") @db.Decimal(19, 2)
+  isBalanced              Boolean   @default(false) @map("is_balanced")
+  outstandingDeposits     Decimal   @default(0) @map("outstanding_deposits") @db.Decimal(19, 2)
+  outstandingChecks       Decimal   @default(0) @map("outstanding_checks") @db.Decimal(19, 2)
+  unrecordedBankItems     Decimal   @default(0) @map("unrecorded_bank_items") @db.Decimal(19, 2)
+  notes                   String?
+  createdAt               DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt               DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company               Company                    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  bankAccount           BankAccount                @relation(fields: [bankAccountId], references: [id], onDelete: Cascade)
+  transactions          BankTransaction[]
+  statementTransactions BankStatementTransaction[]
+  matches               BankReconciliationMatch[]
+
+  @@index([companyId, bankAccountId, periodEnd(sort: Desc)])
+  @@index([companyId, status])
+  @@map("bank_reconciliation_sessions")
+}
+
+model BankStatementTransaction {
+  id                       String   @id @db.Char(24)
+  companyId                String   @map("company_id") @db.Char(24)
+  bankAccountId            String   @map("bank_account_id") @db.Char(24)
+  reconciliationSessionId  String   @map("reconciliation_session_id") @db.Char(24)
+  date                     DateTime @db.Timestamptz(3)
+  description              String
+  reference                String?
+  debit                    Decimal  @default(0) @db.Decimal(19, 2)
+  credit                   Decimal  @default(0) @db.Decimal(19, 2)
+  balance                  Decimal  @default(0) @db.Decimal(19, 2)
+  matchStatus              String   @default("unmatched") @map("match_status")
+  matchedBookTransactionId String?  @map("matched_book_transaction_id") @db.Char(24)
+  importedAt               DateTime @default(now()) @map("imported_at") @db.Timestamptz(3)
+  importSource             String   @default("manual") @map("import_source")
+  isAdjustment             Boolean  @default(false) @map("is_adjustment")
+  createdAt                DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company              Company                   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  bankAccount          BankAccount               @relation(fields: [bankAccountId], references: [id], onDelete: Cascade)
+  reconciliationSession BankReconciliationSession @relation(fields: [reconciliationSessionId], references: [id], onDelete: Cascade)
+  matchedBookTransaction BankTransaction?        @relation(fields: [matchedBookTransactionId], references: [id])
+  matches              BankReconciliationMatch[]
+
+  @@index([companyId, reconciliationSessionId, matchStatus])
+  @@index([companyId, bankAccountId, date])
+  @@map("bank_statement_transactions")
+}
+
+model BankReconciliationMatch {
+  id                      String   @id @db.Char(24)
+  companyId               String   @map("company_id") @db.Char(24)
+  sessionId               String?  @map("session_id") @db.Char(24)
+  bookTransactionId       String?  @map("book_transaction_id") @db.Char(24)
+  statementTransactionId  String?  @map("statement_transaction_id") @db.Char(24)
+  bankStatementLineId     String?  @map("bank_statement_line_id") @db.Char(24)
+  journalEntryLineId      String?  @map("journal_entry_line_id") @db.Char(24)
+  journalEntryId          String?  @map("journal_entry_id") @db.Char(24)
+  bankAccountId           String?  @map("bank_account_id") @db.Char(24)
+  matchType               String   @default("manual") @map("match_type")
+  amount                  Decimal? @db.Decimal(19, 2)
+  matchedAmount           Decimal? @map("matched_amount") @db.Decimal(19, 2)
+  matchedById             String?  @map("matched_by") @db.Char(24)
+  matchedAt               DateTime @default(now()) @map("matched_at") @db.Timestamptz(3)
+  notes                   String?
+  createdAt               DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt               DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company              Company                    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  session              BankReconciliationSession? @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  bookTransaction      BankTransaction?           @relation(fields: [bookTransactionId], references: [id])
+  statementTransaction BankStatementTransaction?  @relation(fields: [statementTransactionId], references: [id])
+  bankStatementLine    BankStatementLine?         @relation(fields: [bankStatementLineId], references: [id])
+  bankAccount          BankAccount?               @relation(fields: [bankAccountId], references: [id])
+
+  @@unique([sessionId, bookTransactionId, statementTransactionId])
+  @@unique([bankStatementLineId, journalEntryLineId])
+  @@index([companyId, sessionId])
+  @@index([companyId, bankAccountId])
+  @@map("bank_reconciliation_matches")
+}
+
+// ── Phase 7 — Petty Cash ───────────────────────────────────────────────────
+
+model PettyCashFloat {
+  id                String    @id @db.Char(24)
+  companyId         String    @map("company_id") @db.Char(24)
+  name              String
+  ledgerAccountId   String    @default("1050") @map("ledger_account_id")
+  openingBalance    Decimal   @default(0) @map("opening_balance") @db.Decimal(19, 2)
+  currentBalance    Decimal   @default(0) @map("current_balance") @db.Decimal(19, 2)
+  floatAmount       Decimal   @default(0) @map("float_amount") @db.Decimal(19, 2)
+  imprestMode       Boolean   @default(true) @map("imprest_mode")
+  minimumBalance    Decimal   @default(10000) @map("minimum_balance") @db.Decimal(19, 2)
+  custodianId       String    @map("custodian_id") @db.Char(24)
+  location          String?
+  isActive          Boolean   @default(true) @map("is_active")
+  cachedBalance     Decimal   @default(0) @map("cached_balance") @db.Decimal(19, 2)
+  cacheValid        Boolean   @default(false) @map("cache_valid")
+  cacheLastComputed DateTime? @map("cache_last_computed") @db.Timestamptz(3)
+  notes             String?
+  createdAt         DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company         Company                  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  expenses        PettyCashExpense[]
+  replenishments  PettyCashReplenishment[]
+  transactions    PettyCashTransaction[]
+  reconciliations PettyCashReconciliation[]
+
+  @@index([companyId, isActive])
+  @@map("petty_cash_floats")
+}
+
+model PettyCashExpense {
+  id                 String    @id @db.Char(24)
+  companyId          String    @map("company_id") @db.Char(24)
+  floatId            String    @map("float_id") @db.Char(24)
+  description        String
+  amount             Decimal   @db.Decimal(19, 2)
+  expenseAccountId   String    @default("5100") @map("expense_account_id")
+  category           String    @default("office_stationery")
+  subcategory        String?
+  recipientType      String?   @map("recipient_type")
+  isTaxable          Boolean   @default(false) @map("is_taxable")
+  isStaffAdvance     Boolean   @default(false) @map("is_staff_advance")
+  staffAdvanceStatus String?   @map("staff_advance_status")
+  purpose            String?
+  date               DateTime  @default(now()) @db.Timestamptz(3)
+  receiptNumber      String?   @map("receipt_number")
+  receiptImage       Json?     @map("receipt_image")
+  receiptUploadUrl   String?   @map("receipt_upload_url")
+  receiptUploadName  String?   @map("receipt_upload_name")
+  notes              String?
+  voucherNumber      String?   @unique @map("voucher_number")
+  status             String    @default("pending")
+  approvedById       String?   @map("approved_by") @db.Char(24)
+  approvedAt         DateTime? @map("approved_at") @db.Timestamptz(3)
+  createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  float   PettyCashFloat @relation(fields: [floatId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, floatId, date(sort: Desc)])
+  @@index([companyId, status])
+  @@map("petty_cash_expenses")
+}
+
+model PettyCashReplenishment {
+  id                  String    @id @db.Char(24)
+  companyId           String    @map("company_id") @db.Char(24)
+  floatId             String    @map("float_id") @db.Char(24)
+  amount              Decimal   @db.Decimal(19, 2)
+  actualAmount        Decimal?  @map("actual_amount") @db.Decimal(19, 2)
+  reason              String?
+  receipts            Json      @default("[]")
+  status              String    @default("pending")
+  requestedById       String    @map("requested_by") @db.Char(24)
+  approvedById        String?   @map("approved_by") @db.Char(24)
+  approvedAt          DateTime? @map("approved_at") @db.Timestamptz(3)
+  completedById       String?   @map("completed_by") @db.Char(24)
+  completedAt         DateTime? @map("completed_at") @db.Timestamptz(3)
+  notes               String?
+  replenishmentNumber String?   @map("replenishment_number")
+  bankAccountId       String?   @map("bank_account_id") @db.Char(24)
+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company     Company        @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  float       PettyCashFloat @relation(fields: [floatId], references: [id], onDelete: Cascade)
+  bankAccount BankAccount?   @relation(fields: [bankAccountId], references: [id])
+
+  @@index([companyId, floatId, status])
+  @@index([companyId, status])
+  @@index([companyId, createdAt(sort: Desc)])
+  @@map("petty_cash_replenishments")
+}
+
+model PettyCashTransaction {
+  id               String    @id @db.Char(24)
+  companyId        String    @map("company_id") @db.Char(24)
+  floatId          String    @map("float_id") @db.Char(24)
+  referenceNo      String?   @unique @map("reference_no")
+  voucherNumber    String?   @unique @map("voucher_number")
+  type             String
+  transactionDate  DateTime  @default(now()) @map("transaction_date") @db.Timestamptz(3)
+  status           String    @default("posted")
+  approvedById     String?   @map("approved_by") @db.Char(24)
+  approvedAt       DateTime? @map("approved_at") @db.Timestamptz(3)
+  referenceId      String?   @map("reference_id") @db.Char(24)
+  referenceType    String?   @map("reference_type")
+  amount           Decimal   @db.Decimal(19, 2)
+  receiptRef       String?   @map("receipt_ref")
+  expenseAccountId String?   @map("expense_account_id")
+  balanceAfter     Decimal   @map("balance_after") @db.Decimal(19, 2)
+  description      String
+  journalEntryId   String?   @map("journal_entry_id") @db.Char(24)
+  createdById      String    @map("created_by") @db.Char(24)
+  notes            String?
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company        @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  float   PettyCashFloat @relation(fields: [floatId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, floatId, transactionDate(sort: Desc)])
+  @@index([companyId, referenceNo])
+  @@map("petty_cash_transactions")
+}
+
+model PettyCashReconciliation {
+  id                       String    @id @db.Char(24)
+  companyId                String    @map("company_id") @db.Char(24)
+  floatId                  String    @map("float_id") @db.Char(24)
+  reconciliationNumber     String    @unique @map("reconciliation_number")
+  countDate                DateTime  @default(now()) @map("count_date") @db.Timestamptz(3)
+  systemBalance            Decimal   @map("system_balance") @db.Decimal(19, 2)
+  cashDenominations        Json      @default("[]") @map("cash_denominations")
+  physicalCashTotal        Decimal   @map("physical_cash_total") @db.Decimal(19, 2)
+  difference               Decimal   @db.Decimal(19, 2)
+  differenceType           String    @map("difference_type")
+  status                   String    @default("pending")
+  countedById              String    @map("counted_by") @db.Char(24)
+  approvedById             String?   @map("approved_by") @db.Char(24)
+  approvedAt               DateTime? @map("approved_at") @db.Timestamptz(3)
+  notes                    String?
+  discrepancyExplanation   String?   @map("discrepancy_explanation")
+  shortageOverageAccountId String    @default("5900") @map("shortage_overage_account_id")
+  journalEntryId           String?   @map("journal_entry_id") @db.Char(24)
+  createdAt                DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company        @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  float   PettyCashFloat @relation(fields: [floatId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, floatId, countDate(sort: Desc)])
+  @@index([companyId, status])
+  @@map("petty_cash_reconciliations")
+}
+
+// ── Phase 9 — Report snapshots ─────────────────────────────────────────────
+
+model ReportSnapshot {
+  id                String   @id @db.Char(24)
+  companyId         String   @map("company_id") @db.Char(24)
+  reportType        String   @map("report_type")
+  periodType        String   @map("period_type")
+  periodStart       DateTime @map("period_start") @db.Timestamptz(3)
+  periodEnd         DateTime @map("period_end") @db.Timestamptz(3)
+  periodLabel       String   @map("period_label")
+  year              Int
+  periodNumber      Int      @map("period_number")
+  data              Json?
+  summary           Json     @default("{}")
+  topProducts       Json     @default("[]") @map("top_products")
+  topCustomers      Json     @default("[]") @map("top_customers")
+  comparison        Json     @default("{}")
+  generatedAt       DateTime @default(now()) @map("generated_at") @db.Timestamptz(3)
+  generatedById     String?  @map("generated_by") @db.Char(24)
+  calculationSource String   @default("snapshot") @map("calculation_source")
+  status            String   @default("completed")
+  errorMessage      String?  @map("error_message")
+  version           Int      @default(1)
+  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, reportType, periodType, year, periodNumber])
+  @@index([companyId, periodType, periodStart(sort: Desc)])
+  @@index([companyId, reportType, year, periodNumber])
+  @@index([generatedAt])
+  @@map("report_snapshots")
+}

@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const Product = require('../models/Product');
+const User = require('../models/User');
 const StockMovement = require('../models/StockMovement');
 const Quotation = require('../models/Quotation');
 const Invoice = require('../models/Invoice');
@@ -10,6 +11,11 @@ const ChartOfAccount = require('../models/ChartOfAccount');
 const { notifyLowStock, notifyOutOfStock, notifyStockReceived } = require('../services/notificationHelper');
 const cacheService = require('../services/cacheService');
 const { parsePagination, paginationMeta } = require('../utils/pagination');
+const {
+  slimProductForHistory,
+  buildProductHistoryChanges,
+  enrichProductHistory,
+} = require('../utils/productHistoryHelpers');
 
 async function validateProductAccounts(body, companyId) {
   const errors = {};
@@ -48,20 +54,34 @@ async function validateProductAccounts(body, companyId) {
   return errors;
 }
 
+const ALLOWED_PRODUCT_SORT_FIELDS = new Set([
+  'createdAt', 'updatedAt', 'name', 'sku', 'currentStock', 'sellingPrice', 'costPrice',
+]);
+
+function serializeProductDoc(product) {
+  if (!product) return product;
+  if (typeof product.toJSON === 'function') return product.toJSON();
+  if (typeof product.toObject === 'function') return product.toObject();
+  return product;
+}
+
 // @desc    Get all products
 // @route   GET /api/products
 // @access  Private
 exports.getProducts = async (req, res, next) => {
   try {
-    const { 
-      search, 
-      category, 
+    const {
+      search,
+      category,
       supplier,
       status,
-      isArchived = false,
       sortBy = 'createdAt',
       order = 'desc'
     } = req.query;
+    const isArchived =
+      req.query.isArchived === undefined
+        ? false
+        : req.query.isArchived === true || req.query.isArchived === 'true';
 
     const { page, limit, skip } = parsePagination(req.query, { defaultLimit: 20 });
 
@@ -108,19 +128,21 @@ exports.getProducts = async (req, res, next) => {
       }
     }
 
+    const sortField = ALLOWED_PRODUCT_SORT_FIELDS.has(String(sortBy)) ? sortBy : 'createdAt';
+
     const total = await Product.countDocuments(query);
     const products = await Product.find(query)
       .populate('category', 'name')
       .populate('supplier', 'name code')
       .populate('createdBy', 'name email')
-      .sort({ [sortBy]: order === 'desc' ? -1 : 1 })
+      .sort({ [sortField]: order === 'desc' ? -1 : 1 })
       .skip(skip)
       .limit(limit);
 
     // Backfill: if averageCost is 0 but costPrice is set, use costPrice and persist
     const backfillOps = [];
-    const data = products.map(p => {
-      const obj = p.toJSON();
+    const data = products.map((p) => {
+      const obj = serializeProductDoc(p);
       if ((!p.averageCost || Number(p.averageCost) === 0) && p.costPrice && Number(p.costPrice) > 0) {
         obj.averageCost = p.costPrice;
         backfillOps.push({ updateOne: { filter: { _id: p._id }, update: { $set: { averageCost: p.costPrice } } } });
@@ -297,8 +319,8 @@ exports.updateProduct = async (req, res, next) => {
       });
     }
 
-    // Store old values for history
-    const oldValues = product.toObject();
+    // Store old values for history (slim snapshot — never embed nested history)
+    const oldValues = slimProductForHistory(product);
     const oldSupplierId = product.supplier?.toString();
     const newSupplierId = req.body.supplier;
 
@@ -321,6 +343,13 @@ exports.updateProduct = async (req, res, next) => {
       return res.status(422).json({ success: false, errors: accountErrors });
     }
 
+    // Merge the ebm payload so an edit never drops RRA registration state
+    // (ebmItemCode, isRegisteredWithEBM, registration timestamps) that the form does not submit.
+    if (req.body.ebm && typeof req.body.ebm === 'object' && !Array.isArray(req.body.ebm)) {
+      const existingEbm = (product.ebm && typeof product.ebm === 'object') ? product.ebm : {};
+      req.body.ebm = { ...existingEbm, ...req.body.ebm };
+    }
+
     // Update product
     Object.assign(product, req.body);
 
@@ -333,10 +362,8 @@ exports.updateProduct = async (req, res, next) => {
     product.history.push({
       action: 'updated',
       changedBy: req.user.id,
-      changes: {
-        old: oldValues,
-        new: req.body
-      }
+      timestamp: new Date(),
+      changes: buildProductHistoryChanges(oldValues, req.body),
     });
 
     await product.save();
@@ -435,7 +462,12 @@ exports.deleteProduct = async (req, res, next) => {
       await Product.findByIdAndDelete(req.params.id);
     } else {
       product.isActive = false;
-      product.history.push({ action: 'archived', changedBy: req.user.id, notes: 'soft-deleted' });
+      product.history.push({
+        action: 'archived',
+        changedBy: req.user.id,
+        timestamp: new Date(),
+        notes: 'soft-deleted',
+      });
       await product.save();
     }
 
@@ -474,7 +506,8 @@ exports.archiveProduct = async (req, res, next) => {
     product.history.push({
       action: 'archived',
       changedBy: req.user.id,
-      notes: req.body.notes
+      timestamp: new Date(),
+      notes: req.body.notes,
     });
 
     await product.save();
@@ -518,7 +551,8 @@ exports.restoreProduct = async (req, res, next) => {
     product.history.push({
       action: 'restored',
       changedBy: req.user.id,
-      notes: req.body.notes
+      timestamp: new Date(),
+      notes: req.body.notes,
     });
 
     await product.save();
@@ -548,20 +582,21 @@ exports.getProductHistory = async (req, res, next) => {
   try {
     const company = req.user && req.user.company;
     const companyId = (company && company._id) ? company._id : company;
-    
-    const product = await Product.findOne({ _id: req.params.id, company: companyId })
-      .populate('history.changedBy', 'name email');
+
+    const product = await Product.findOne({ _id: req.params.id, company: companyId });
 
     if (!product) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Product not found' 
+      return res.status(404).json({
+        success: false,
+        message: 'Product not found',
       });
     }
 
+    const history = await enrichProductHistory(product.history || [], User);
+
     res.json({
       success: true,
-      data: product.history
+      data: history,
     });
   } catch (error) {
     next(error);

@@ -1,9 +1,8 @@
 const jwt = require('jsonwebtoken');
-const User = require('../models/User');
-const Role = require('../models/Role');
-const Company = require('../models/Company');
 const { notifyPasswordChanged, notifyFailedLogin } = require('../services/notificationHelper');
 const sessionService = require('../services/sessionService');
+const authData = require('../services/authDataService');
+const passwordUtils = require('../utils/passwordUtils');
 // Centralized config
 const env = require('../src/config/environment');
 const config = env.getConfig();
@@ -16,6 +15,14 @@ const generateToken = (id, companyId, role) => {
     { expiresIn: process.env.JWT_EXPIRE }
   );
 };
+
+function entityId(value) {
+  if (value == null) return null;
+  if (typeof value === 'string') return value;
+  if (value._id) return String(value._id);
+  if (value.id) return String(value.id);
+  return String(value);
+}
 
 // @desc    Login user
 // @route   POST /api/auth/login
@@ -32,8 +39,8 @@ exports.login = async (req, res, next) => {
       });
     }
 
-     // Check for user
-     const user = await User.findOne({ email: email.toLowerCase() }).select('+password').populate('company', 'name email isActive approvalStatus').populate('roles');
+     // Check for user (PostgreSQL via authDataService)
+     const user = await authData.findUserByEmailForLogin(email);
 
     if (!user) {
       return res.status(401).json({ 
@@ -53,7 +60,7 @@ exports.login = async (req, res, next) => {
     // Check if user is platform admin - they don't have a company
     if (user.role === 'platform_admin') {
       // Check if password matches for platform admin
-      const isMatch = await user.comparePassword(password);
+      const isMatch = await authData.compareUserPassword(user, password);
       if (!isMatch) {
         return res.status(401).json({
           success: false,
@@ -62,13 +69,13 @@ exports.login = async (req, res, next) => {
       }
 
       // Generate token without companyId for platform admin
-      const token = generateToken(user._id, null, user.role);
+      const token = generateToken(entityId(user), null, user.role);
       
-      const userWithoutPassword = user.toJSON();
+      const userWithoutPassword = authData.toPublicUser(user);
 
       // Create Redis session
       await sessionService.createSession(
-        user._id.toString(),
+        entityId(user),
         null,
         user.role,
         token,
@@ -108,14 +115,14 @@ exports.login = async (req, res, next) => {
     }
 
     // Check if password matches
-    const isMatch = await user.comparePassword(password);
+    const isMatch = await authData.compareUserPassword(user, password);
 
     if (!isMatch) {
       // Notify about failed login attempt
       try {
         await notifyFailedLogin(
-          user.company?._id || user.company,
-          user._id,
+          entityId(user.company) || user.company,
+          entityId(user),
           email,
           req.ip || req.connection?.remoteAddress
         );
@@ -133,14 +140,14 @@ exports.login = async (req, res, next) => {
     const requirePasswordChange = user.mustChangePassword;
 
      // Update last login
-     user.lastLogin = new Date();
-     await user.save();
+     await authData.markUserLoggedIn(user);
 
      // Generate token with companyId
-     const token = generateToken(user._id, user.company._id, user.role);
+     const companyId = entityId(user.company);
+     const token = generateToken(entityId(user), companyId, user.role);
 
      // Remove password from user object
-     const userWithoutPassword = user.toJSON();
+     const userWithoutPassword = authData.toPublicUser(user);
 
      // Compute flat permissions array from populated roles
      // Format: ["products:read", "products:create", "stock:read", ...]
@@ -183,7 +190,7 @@ exports.login = async (req, res, next) => {
        }
      } else if (user.role && user.role !== 'admin' && user.role !== 'platform_admin') {
        // Fallback: look up the Role document by the legacy role string name
-       const legacyRole = await Role.findOne({ name: user.role, is_system_role: true });
+       const legacyRole = await authData.findSystemRoleByName(user.role);
        if (legacyRole && legacyRole.permissions && legacyRole.permissions.length > 0) {
          for (const perm of legacyRole.permissions) {
            if (perm.resource === '*') {
@@ -215,8 +222,8 @@ exports.login = async (req, res, next) => {
 
      // Create Redis session
      await sessionService.createSession(
-       user._id.toString(),
-       user.company._id.toString(),
+       entityId(user),
+       companyId,
        user.role,
        token,
        { email: user.email, name: user.name, companyName: user.company.name }
@@ -246,11 +253,17 @@ exports.login = async (req, res, next) => {
 // @access  Private
 exports.getMe = async (req, res, next) => {
   try {
-    const user = await User.findById(req.user.id)
-      .populate('company', 'name email')
-      .populate('roles');
+    const user = await authData.findUserById(req.user.id || req.user._id, {
+      populateCompany: true,
+      populateRoles: true,
+      companyFields: 'name email',
+    });
 
-    const userObj = user.toJSON();
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+
+    const userObj = authData.toPublicUser(user);
 
     // Compute flat permissions array from populated roles
     // Format: ["products:read", "products:create", "stock:read", ...]
@@ -293,7 +306,7 @@ exports.getMe = async (req, res, next) => {
       }
     } else if (user.role && user.role !== 'admin' && user.role !== 'platform_admin') {
       // Fallback: look up the Role document by the legacy role string name
-      const legacyRole = await Role.findOne({ name: user.role, is_system_role: true });
+      const legacyRole = await authData.findSystemRoleByName(user.role);
       if (legacyRole && legacyRole.permissions && legacyRole.permissions.length > 0) {
         for (const perm of legacyRole.permissions) {
           if (perm.resource === '*') {
@@ -346,10 +359,16 @@ exports.updatePassword = async (req, res, next) => {
       });
     }
 
-    const user = await User.findById(req.user.id).select('+password');
+    const user = await authData.findUserById(req.user.id || req.user._id, {
+      includePassword: true,
+    });
+
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
 
     // Check current password
-    const isMatch = await user.comparePassword(currentPassword);
+    const isMatch = await authData.compareUserPassword(user, currentPassword);
 
     if (!isMatch) {
       return res.status(401).json({ 
@@ -358,20 +377,17 @@ exports.updatePassword = async (req, res, next) => {
       });
     }
 
-    user.password = newPassword;
-    user.passwordChangedAt = new Date();
-    user.mustChangePassword = false;
-    user.tempPassword = false;
-    await user.save();
+    const hashed = await passwordUtils.hash(newPassword);
+    await authData.updateUserPassword(entityId(user), hashed);
 
     // Notify about password change
     try {
-      await notifyPasswordChanged(req.user.company._id, user._id);
+      await notifyPasswordChanged(entityId(req.user.company), entityId(user));
     } catch (notifyErr) {
       console.error('Failed to send password change notification:', notifyErr);
     }
 
-    const token = generateToken(user._id, req.user.company._id, user.role);
+    const token = generateToken(entityId(user), entityId(req.user.company), user.role);
 
     res.json({
       success: true,
@@ -393,7 +409,7 @@ exports.logout = async (req, res, next) => {
 
     // Delete session from Redis
     if (req.user) {
-      await sessionService.deleteSession(req.user._id.toString(), token);
+      await sessionService.deleteSession(String(req.user._id || req.user.id), token);
     }
 
     // Blacklist the token

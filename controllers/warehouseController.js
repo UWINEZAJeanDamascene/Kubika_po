@@ -126,9 +126,11 @@ exports.createWarehouse = async (req, res, next) => {
       createdBy: req.user.id
     });
 
-    EBMBranchService.registerBranch(companyId, warehouse, req.user.id).catch((err) => {
-      console.error('[Warehouse] EBM branch registration failed:', err.message);
-    });
+    if (warehouse.rraBranchId) {
+      EBMBranchService.registerBranch(companyId, warehouse, req.user.id).catch((err) => {
+        console.error('[Warehouse] EBM branch registration failed:', err.message);
+      });
+    }
 
     res.status(201).json({
       success: true,
@@ -181,9 +183,11 @@ exports.updateWarehouse = async (req, res, next) => {
       { new: true, runValidators: true }
     );
 
-    EBMBranchService.registerBranch(companyId, warehouse, req.user.id).catch((err) => {
-      console.error('[Warehouse] EBM branch update registration failed:', err.message);
-    });
+    if (warehouse.rraBranchId) {
+      EBMBranchService.registerBranch(companyId, warehouse, req.user.id).catch((err) => {
+        console.error('[Warehouse] EBM branch update registration failed:', err.message);
+      });
+    }
 
     res.json({
       success: true,

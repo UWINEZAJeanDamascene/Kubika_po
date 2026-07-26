@@ -3,6 +3,7 @@ const GoodsReceivedNote = require('../models/GoodsReceivedNote');
 const JournalService = require('../services/journalService');
 const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
 const transactionService = require('../services/transactionService');
+const { decimalToNumber } = require('../utils/decimalHelpers');
 
 // Helper: resolve credit account for payment method
 function resolveCreditAccount(paymentMethod) {
@@ -10,6 +11,23 @@ function resolveCreditAccount(paymentMethod) {
   if (paymentMethod === 'bank_transfer') return DEFAULT_ACCOUNTS.cashAtBank || '1100';
   if (paymentMethod === 'mobile_money') return DEFAULT_ACCOUNTS.mtnMoMo || '1200';
   return DEFAULT_ACCOUNTS.accountsPayable || '2000';
+}
+
+function resolveCompanyId(req) {
+  return req.user?.company?._id || req.user?.company || req.user?.companyId || null;
+}
+
+/** Goods value from GRN lines, with totalAmount fallback when lines are missing/zero. */
+function computeGrnGoodsValue(grn) {
+  const lines = Array.isArray(grn?.lines) ? grn.lines : [];
+  const fromLines = lines.reduce((sum, line) => {
+    const qty = decimalToNumber(line.qtyReceived ?? line.qty, 0);
+    const unitCost = decimalToNumber(line.unitCost, 0);
+    const lineTotal = decimalToNumber(line.lineTotal ?? line.totalWithTax, 0);
+    return sum + (qty * unitCost || lineTotal);
+  }, 0);
+  if (fromLines > 0) return fromLines;
+  return decimalToNumber(grn?.totalAmount ?? grn?.subtotal, 0);
 }
 
 // Create freight bill
@@ -149,7 +167,10 @@ exports.getFreightBill = async (req, res, next) => {
 // Freight Cost Analysis
 exports.getFreightAnalysis = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
+    const companyId = resolveCompanyId(req);
+    if (!companyId) {
+      return res.status(400).json({ success: false, message: 'Company context required' });
+    }
     const { date_from, date_to, supplier_id } = req.query;
 
     const match = { company: companyId, status: 'confirmed' };
@@ -169,7 +190,7 @@ exports.getFreightAnalysis = async (req, res, next) => {
       { $project: { supplierName: { $ifNull: ['$supplierDoc.name', 'Unknown'] }, totalFreight: 1, billCount: 1 } },
     ]);
 
-    // GRN-level analysis
+    // GRN-level analysis — always include lines (needed for goods value)
     const grnQuery = { company: companyId, status: 'confirmed' };
     if (date_from || date_to) {
       grnQuery.confirmedAt = {};
@@ -180,11 +201,12 @@ exports.getFreightAnalysis = async (req, res, next) => {
     const grns = await GoodsReceivedNote.find(grnQuery)
       .populate('supplier', 'name')
       .populate('purchaseOrder', 'referenceNo')
+      .populate('lines')
       .lean();
 
     const grnAnalysis = grns.map((grn) => {
-      const goodsValue = grn.lines.reduce((s, l) => s + (Number(l.qtyReceived) * Number(l.unitCost || 0)), 0);
-      const freightAmt = Number(grn.freight?.actualAmount) || 0;
+      const goodsValue = computeGrnGoodsValue(grn);
+      const freightAmt = decimalToNumber(grn.freight?.actualAmount, 0);
       return {
         grnId: grn._id,
         referenceNo: grn.referenceNo,
@@ -198,7 +220,7 @@ exports.getFreightAnalysis = async (req, res, next) => {
       };
     });
 
-    const totalFreight = perSupplier.reduce((s, r) => s + r.totalFreight, 0);
+    const totalFreight = perSupplier.reduce((s, r) => s + decimalToNumber(r.totalFreight, 0), 0);
     const totalGoodsValue = grnAnalysis.reduce((s, r) => s + r.goodsValue, 0);
     const flaggedGRNs = grnAnalysis.filter((g) => !g.hasFreight);
 

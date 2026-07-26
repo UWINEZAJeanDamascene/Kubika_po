@@ -2,6 +2,7 @@
 const Notification = require('../models/Notification');
 const User = require('../models/User');
 const socketService = require('./socketService');
+const { isMongoConnected } = require('../utils/mongoConnection');
 
 // Notification types based on user requirements
 const NOTIFICATION_TYPES = {
@@ -54,6 +55,11 @@ const SEVERITY = {
  */
 const createNotification = async ({ companyId, userId, type, title, message, severity = SEVERITY.INFO, link = null, metadata = {} }) => {
   try {
+    if (!isMongoConnected()) {
+      console.warn(`[notification] Mongo unavailable — skipped: ${type} - ${title}`);
+      return null;
+    }
+
     // If no specific user provided, notify all admins
     let usersToNotify = [];
     

@@ -1,17 +1,33 @@
-const mongoose = require('mongoose');
+/**
+ * TillSession model — PostgreSQL (Prisma) backed.
+ *
+ * Mutable so the close-till flow can keep using `till.save()`.
+ */
 
-const tillSessionSchema = new mongoose.Schema({
-  company: { type: mongoose.Schema.Types.ObjectId, ref: 'Company', required: true, index: true },
-  openedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
-  status: { type: String, enum: ['open', 'closed'], default: 'open', index: true },
-  openingFloat: { type: Number, default: 0, min: 0 },
-  closingCount: { type: Number, min: 0 },
-  openedAt: { type: Date, default: Date.now },
-  closedAt: { type: Date },
+const { buildTenantModel } = require('../utils/masterDataCommon');
+const {
+  tillSessionToApi,
+  tillSessionTranslateCreate,
+  tillSessionTranslateUpdate,
+} = require('../utils/tillMappers');
+
+const FIELD_MAP = {
+  openedBy: { target: 'openedById', isId: true },
+  openedById: { target: 'openedById', isId: true },
+  status: { target: 'status' },
+  openingFloat: { target: 'openingFloat' },
+  closingCount: { target: 'closingCount' },
+  openedAt: { target: 'openedAt' },
+  closedAt: { target: 'closedAt' },
+};
+
+module.exports = buildTenantModel({
+  name: 'TillSession',
+  collection: 'tillsessions',
+  delegateName: 'tillSession',
+  fieldMap: FIELD_MAP,
+  toApi: tillSessionToApi,
+  translateCreate: tillSessionTranslateCreate,
+  translateUpdate: tillSessionTranslateUpdate,
+  mutable: true,
 });
-
-// Ensure only one open session per user/company
-tillSessionSchema.index({ company: 1, openedBy: 1, status: 1 });
-
-const TillSession = mongoose.model('TillSession', tillSessionSchema);
-module.exports = TillSession;

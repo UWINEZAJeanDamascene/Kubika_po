@@ -12,6 +12,7 @@ const {
   cancelInvoice,
   saveReceiptMetadata,
   verifyInvoiceCustomerTin,
+  submitInvoiceEbm,
   getClientInvoices,
   getProductInvoices,
   generateInvoicePDF,
@@ -36,6 +37,7 @@ router.route('/:id')
 router.put('/:id/confirm', requirePermission('sales_invoices', 'approve'), logAction('invoice'), confirmInvoice);
 
 router.post('/:id/ebm/verify-tin', requirePermission('sales_invoices', 'update'), verifyInvoiceCustomerTin);
+router.post('/:id/ebm/submit', requirePermission('sales_invoices', 'update'), logAction('invoice'), submitInvoiceEbm);
 // Record payment
 router.post('/:id/payment', requirePermission('ar_receipts', 'create'), logAction('invoice'), recordPayment);
 

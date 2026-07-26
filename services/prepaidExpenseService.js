@@ -99,14 +99,16 @@ class PrepaidExpenseService {
     const prepaid = await PrepaidExpense.findOne({ _id: prepaidId, company: companyId });
     if (!prepaid) throw new Error('NOT_FOUND');
 
-    const amortization = prepaid.amortizations.id(amortizationId);
+    const amortization = (prepaid.amortizations || []).find((a) => String(a._id) === String(amortizationId));
     if (!amortization) throw new Error('AMORTIZATION_NOT_FOUND');
     if (amortization.status === 'posted') throw new Error('ALREADY_POSTED');
 
     // Post journal entry: Dr Expense / Cr Prepaid Expenses
     const journalEntry = await this._postAmortizationJournal(companyId, userId, prepaid, amortization);
-    amortization.journalEntryId = journalEntry._id;
+    amortization.journalEntryId = String(journalEntry._id);
     amortization.status = 'posted';
+    // The schedule is a JSON column, so reassign it for the change to persist.
+    prepaid.amortizations = [...prepaid.amortizations];
 
     prepaid.totalAmortized += amortization.amount;
     prepaid.remainingBalance = Math.max(0, prepaid.totalAmount - prepaid.totalAmortized);

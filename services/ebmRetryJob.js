@@ -1,5 +1,6 @@
 const mongoose = require('mongoose');
 const EBMSubmissionQueue = require('../models/EBMSubmissionQueue');
+const { extractSaveSalesFiscalData } = require('../utils/vsdcPayloadSanitizer');
 const ebmService = require('./ebmService');
 const EBMQueueService = require('./ebmQueueService');
 
@@ -46,7 +47,7 @@ async function updateSourceDocument(queueRecord, response = null, status = 'subm
   const models = mongoose.models;
   const now = new Date();
   const isSales = queueRecord.endpoint === ebmService.VSDC_ENDPOINTS.SAVE_SALES;
-  const data = response?.data || {};
+  const data = isSales ? extractSaveSalesFiscalData(response) : (response?.data || {});
   const update = {};
   let incrementField = 'ebm.retryCount';
 

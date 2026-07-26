@@ -165,14 +165,18 @@ exports.createPurchase = async (req, res, next) => {
 
     // Process items with tax codes - prefer product defaults when present
     const processedItems = [];
+    let headerSubtotal = 0;
+    let headerTax = 0;
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
       const product = await Product.findOne({
         _id: item.product,
         company: companyId,
       });
-      const subtotal = item.quantity * item.unitCost;
-      const discount = item.discount || 0;
+      const qty = Number(item.quantity ?? item.qty ?? 0) || 0;
+      const unitCost = Number(item.unitCost ?? 0) || 0;
+      const subtotal = qty * unitCost;
+      const discount = Number(item.discount || 0) || 0;
       const netAmount = subtotal - discount;
       const taxRate =
         item.taxRate != null
@@ -183,15 +187,21 @@ exports.createPurchase = async (req, res, next) => {
       const taxCode = item.taxCode || product?.taxCode || "A";
       const taxAmount = netAmount * (taxRate / 100);
       const totalWithTax = netAmount + taxAmount;
+      headerSubtotal += netAmount;
+      headerTax += taxAmount;
 
       processedItems.push({
         ...item,
+        quantity: qty,
+        qty,
+        unitCost,
         itemCode: item.itemCode || `ITEM-${i + 1}`,
         taxCode,
         taxRate,
         subtotal,
         taxAmount,
         totalWithTax,
+        lineTotal: totalWithTax,
         budgetId: item.budgetId || budgetId,
         budget_line_id: item.budget_line_id || budget_line_id,
       });
@@ -201,6 +211,12 @@ exports.createPurchase = async (req, res, next) => {
       ...req.body,
       company: companyId,
       items: processedItems,
+      subtotal: headerSubtotal,
+      taxAmount: headerTax,
+      totalAmount: headerSubtotal + headerTax,
+      roundedAmount: headerSubtotal + headerTax,
+      grandTotal: headerSubtotal + headerTax,
+      totalTax: headerTax,
       supplierTin: supplierTin || supplier.taxId,
       supplierName: supplierName || supplier.name,
       supplierAddress: supplierAddress || supplier.contact?.address,
@@ -275,14 +291,14 @@ exports.createPurchase = async (req, res, next) => {
         _id: purchase._id,
         purchaseNumber: purchase.purchaseNumber,
         date: purchase.purchaseDate,
-        total: purchase.roundedAmount,
-        vatAmount: purchase.totalTax,
+        total: Number(purchase.roundedAmount ?? purchase.totalAmount ?? purchase.grandTotal ?? 0) || 0,
+        vatAmount: Number(purchase.totalTax ?? purchase.taxAmount ?? 0) || 0,
       });
       // Record AP ledger entry for the purchase so AP ledger and reconciliation include direct purchases
       try {
         const APTransactionLedger = require('../models/APTransactionLedger');
         const APTrackingService = require('../services/apTrackingService');
-        const amount = parseFloat(purchase.roundedAmount || purchase.grandTotal || 0) || 0;
+        const amount = parseFloat(purchase.roundedAmount ?? purchase.totalAmount ?? purchase.grandTotal ?? 0) || 0;
         const currentBalance = await APTrackingService.getSupplierBalance(companyId, purchase.supplier);
         const newBalance = currentBalance + amount;
 
@@ -473,8 +489,13 @@ exports.receivePurchase = async (req, res, next) => {
       const opts = useSession ? { session: trx } : {};
 
       for (const item of purchase.items) {
+        const productId = item.product?._id || item.product;
+        const qty = Number(item.quantity ?? item.qty ?? 0) || 0;
+        const unitCost = Number(item.unitCost ?? 0) || 0;
+        if (!productId || qty <= 0) continue;
+
         const productQuery = Product.findOne({
-          _id: item.product._id,
+          _id: productId,
           company: companyId,
         });
         const product = useSession
@@ -483,14 +504,14 @@ exports.receivePurchase = async (req, res, next) => {
         if (!product) continue;
 
         const previousStock = Number(product.currentStock || 0);
-        const newStock = previousStock + Number(item.quantity);
+        const newStock = previousStock + qty;
 
         // Create inventory layer for received goods
         await inventoryService.createLayer(
           companyId,
           product._id,
-          item.quantity,
-          item.unitCost,
+          qty,
+          unitCost,
           { sourceType: "purchase", sourceId: purchase._id },
           useSession
             ? { session: trx, userId: req.user.id }
@@ -503,11 +524,11 @@ exports.receivePurchase = async (req, res, next) => {
           product: product._id,
           type: "in",
           reason: "purchase",
-          quantity: item.quantity,
+          quantity: qty,
           previousStock,
           newStock,
-          unitCost: item.unitCost,
-          totalCost: item.totalWithTax,
+          unitCost,
+          totalCost: Number(item.totalWithTax ?? item.lineTotal ?? qty * unitCost) || 0,
           supplier: purchase.supplier,
           referenceType: "purchase",
           referenceNumber: purchase.purchaseNumber,
@@ -521,11 +542,11 @@ exports.receivePurchase = async (req, res, next) => {
         // Update product stock and average cost (ensure numeric coercion)
         product.currentStock = newStock;
         if (!product.averageCost) {
-          product.averageCost = item.unitCost;
+          product.averageCost = unitCost;
         } else {
           const totalValue =
             Number(product.averageCost || 0) * previousStock +
-            Number(item.unitCost) * Number(item.quantity);
+            unitCost * qty;
           product.averageCost = totalValue / newStock;
         }
         await product.save(opts);
@@ -535,7 +556,7 @@ exports.receivePurchase = async (req, res, next) => {
           await notifyStockReceived(
             companyId,
             product,
-            item.quantity,
+            qty,
             supplier,
           );
           if (product.reorderPoint && newStock <= product.reorderPoint) {
@@ -597,8 +618,8 @@ exports.receivePurchase = async (req, res, next) => {
             _id: purchase._id,
             purchaseNumber: purchase.purchaseNumber,
             date: purchase.purchaseDate,
-            total: purchase.roundedAmount,
-            vatAmount: purchase.totalTax,
+            total: Number(purchase.roundedAmount ?? purchase.totalAmount ?? purchase.grandTotal ?? 0) || 0,
+            vatAmount: Number(purchase.totalTax ?? purchase.taxAmount ?? 0) || 0,
           },
           useSession ? { session: trx } : undefined,
         );
@@ -615,7 +636,7 @@ exports.receivePurchase = async (req, res, next) => {
 
     // Update supplier stats (supplier was fetched above)
     if (supplier) {
-      const roundedAmount = parseFloat(purchase.roundedAmount) || 0;
+      const roundedAmount = parseFloat(purchase.roundedAmount ?? purchase.totalAmount ?? purchase.grandTotal ?? 0) || 0;
       supplier.totalPurchases += roundedAmount;
       supplier.outstandingBalance += roundedAmount;
       supplier.lastPurchaseDate = new Date();
@@ -766,25 +787,29 @@ exports.recordPayment = async (req, res, next) => {
     ) {
       // Add stock
       for (const item of purchase.items) {
+        const productId = item.product?._id || item.product;
+        const qty = Number(item.quantity ?? item.qty ?? 0) || 0;
+        if (!productId || qty <= 0) continue;
+
         const product = await Product.findOne({
-          _id: item.product._id,
+          _id: productId,
           company: companyId,
         });
 
         if (product) {
           const previousStock = Number(product.currentStock || 0);
-          const newStock = previousStock + Number(item.quantity);
+          const newStock = previousStock + qty;
 
           await StockMovement.create({
             company: companyId,
             product: product._id,
             type: "in",
             reason: "purchase",
-            quantity: item.quantity,
+            quantity: qty,
             previousStock,
             newStock,
             unitCost: item.unitCost,
-            totalCost: item.totalWithTax,
+            totalCost: item.totalWithTax ?? item.lineTotal,
             supplier: purchase.supplier,
             referenceType: "purchase",
             referenceNumber: purchase.purchaseNumber,
@@ -805,7 +830,7 @@ exports.recordPayment = async (req, res, next) => {
             await notifyStockReceived(
               companyId,
               product,
-              item.quantity,
+              qty,
               supplier,
             );
 
@@ -1046,14 +1071,18 @@ exports.cancelPurchase = async (req, res, next) => {
     // Reverse stock if it was added
     if (purchase.stockAdded) {
       for (const item of purchase.items) {
+        const productId = item.product?._id || item.product;
+        const qty = Number(item.quantity ?? item.qty ?? 0) || 0;
+        if (!productId || qty <= 0) continue;
+
         const product = await Product.findOne({
-          _id: item.product._id,
+          _id: productId,
           company: companyId,
         });
 
         if (product) {
           const previousStock = product.currentStock;
-          const newStock = Math.max(0, previousStock - item.quantity);
+          const newStock = Math.max(0, previousStock - qty);
 
           // Create reversal stock movement
           await StockMovement.create({
@@ -1061,11 +1090,11 @@ exports.cancelPurchase = async (req, res, next) => {
             product: product._id,
             type: "out",
             reason: "return",
-            quantity: item.quantity,
+            quantity: qty,
             previousStock,
             newStock,
             unitCost: item.unitCost,
-            totalCost: item.totalWithTax,
+            totalCost: item.totalWithTax ?? item.lineTotal,
             referenceType: "purchase",
             referenceNumber: purchase.purchaseNumber,
             referenceDocument: purchase._id,

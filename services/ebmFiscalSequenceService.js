@@ -1,7 +1,15 @@
-const EBMSequence = require('../models/EBMSequence');
-const { EBM_SEQUENCE_TYPES } = require('../models/EBMSequence');
+const {
+  MAX_VSDC_NUMBER,
+  allocateEbmSequence,
+  seedEbmSequence,
+} = require('./postgresSequenceStore');
 
-const MAX_VSDC_NUMBER = 9999999999;
+const EBM_SEQUENCE_TYPES = Object.freeze({
+  SALES_INVOICE: 'sales_invoice',
+  RECEIPT: 'receipt',
+  REPORT: 'report',
+  STOCK_SAR: 'stock_sar',
+});
 
 function normalizeBranchId(value) {
   if (value === undefined || value === null || value === '') return '00';
@@ -15,47 +23,12 @@ function toPositiveInteger(value, fallback = null) {
 }
 
 async function allocate(companyId, branchId, sequenceType, options = {}) {
-  const normalizedBranchId = normalizeBranchId(branchId);
   const seed = toPositiveInteger(options.seed, 0) || 0;
-  const filter = {
-    company: companyId,
-    branchId: normalizedBranchId,
-    sequenceType,
-  };
-
-  try {
-    await EBMSequence.findOneAndUpdate(
-      filter,
-      {
-        $setOnInsert: {
-          ...filter,
-          lastNumber: seed,
-          seededFrom: options.seededFrom || null,
-          seededAt: seed ? new Date() : null,
-        },
-      },
-      { upsert: true, new: true, setDefaultsOnInsert: true },
-    );
-  } catch (error) {
-    if (error?.code !== 11000) throw error;
-  }
-
-  const sequence = await EBMSequence.findOneAndUpdate(
-    filter,
-    { $inc: { lastNumber: 1 } },
-    { new: true },
-  ).lean();
-
-  if (!sequence || sequence.lastNumber > MAX_VSDC_NUMBER) {
-    const error = new Error(
-      `EBM ${sequenceType} fiscal sequence exceeded VSDC NUMBER(10) capacity for branch ${normalizedBranchId}.`,
-    );
-    error.code = 'EBM_FISCAL_SEQUENCE_EXHAUSTED';
-    error.retryable = false;
-    throw error;
-  }
-
-  return sequence.lastNumber;
+  return allocateEbmSequence(companyId, normalizeBranchId(branchId), sequenceType, {
+    seed,
+    seededFrom: options.seededFrom || null,
+    tx: options.tx || null,
+  });
 }
 
 async function seedFromInitInfo(companyId, branchId, initInfo = {}) {
@@ -72,24 +45,11 @@ async function seedFromInitInfo(companyId, branchId, initInfo = {}) {
     [EBM_SEQUENCE_TYPES.REPORT, receiptSeed],
   ].filter(([, seed]) => seed > 0);
 
-  await Promise.all(seeds.map(([sequenceType, seed]) =>
-    EBMSequence.findOneAndUpdate(
-      { company: companyId, branchId: normalizedBranchId, sequenceType },
-      {
-        $max: { lastNumber: seed },
-        $set: {
-          seededFrom: 'vsdc_init',
-          seededAt: new Date(),
-        },
-        $setOnInsert: {
-          company: companyId,
-          branchId: normalizedBranchId,
-          sequenceType,
-        },
-      },
-      { upsert: true, new: true, setDefaultsOnInsert: true },
+  await Promise.all(
+    seeds.map(([sequenceType, seed]) =>
+      seedEbmSequence(companyId, normalizedBranchId, sequenceType, seed, 'vsdc_init'),
     ),
-  ));
+  );
 }
 
 function getFiscalField(doc, field) {
@@ -98,13 +58,16 @@ function getFiscalField(doc, field) {
 
 async function ensureSalesNumbers(doc, companyId, branchId, persist) {
   const updates = {};
-  const invcNo = getFiscalField(doc, 'invcNo') ||
-    await allocate(companyId, branchId, EBM_SEQUENCE_TYPES.SALES_INVOICE);
-  const curRcptNo = getFiscalField(doc, 'curRcptNo') ||
-    await allocate(companyId, branchId, EBM_SEQUENCE_TYPES.RECEIPT);
+  const invcNo =
+    getFiscalField(doc, 'invcNo') ||
+    (await allocate(companyId, branchId, EBM_SEQUENCE_TYPES.SALES_INVOICE));
+  const curRcptNo =
+    getFiscalField(doc, 'curRcptNo') ||
+    (await allocate(companyId, branchId, EBM_SEQUENCE_TYPES.RECEIPT));
   const totRcptNo = getFiscalField(doc, 'totRcptNo') || curRcptNo;
-  const rptNo = getFiscalField(doc, 'rptNo') ||
-    await allocate(companyId, branchId, EBM_SEQUENCE_TYPES.REPORT);
+  const rptNo =
+    getFiscalField(doc, 'rptNo') ||
+    (await allocate(companyId, branchId, EBM_SEQUENCE_TYPES.REPORT));
 
   if (getFiscalField(doc, 'invcNo') !== invcNo) updates['ebm.invcNo'] = invcNo;
   if (getFiscalField(doc, 'curRcptNo') !== curRcptNo) updates['ebm.curRcptNo'] = curRcptNo;

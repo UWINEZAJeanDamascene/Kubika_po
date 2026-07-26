@@ -577,6 +577,8 @@ exports.approveExpense = async (req, res, next) => {
       amount: -expense.amount,
       balanceAfter,
       description: `Expense: ${expense.description}`,
+      expenseAccountId: expense.expenseAccountId || null,
+      receiptRef: expense.receiptNumber || null,
       createdBy: req.user._id,
       notes: `Status: ${status}`,
     });
@@ -2013,9 +2015,15 @@ exports.getFundTransactions = async (req, res, next) => {
       balanceMap.set(tx._id.toString(), cumulativeBalance);
     }
 
-    // Get expense account details for populated expenseAccountIds
+    // Resolve account names for expense accounts + float ledger account (top-up / replenishment)
+    const floatLedgerId = float.ledgerAccountId || DEFAULT_ACCOUNTS.pettyCash;
     const expenseAccountIds = [
-      ...new Set(transactions.map((tx) => tx.expenseAccountId).filter(Boolean)),
+      ...new Set(
+        [
+          ...transactions.map((tx) => tx.expenseAccountId).filter(Boolean),
+          floatLedgerId,
+        ],
+      ),
     ];
     const expenseAccounts = {};
     if (expenseAccountIds.length > 0) {
@@ -2035,9 +2043,14 @@ exports.getFundTransactions = async (req, res, next) => {
     }
 
     const transactionsWithRunningBalance = transactions.map((tx) => {
+      const isExpenseLike = tx.type === "expense";
+      const ledgerAccountId = isExpenseLike
+        ? tx.expenseAccountId
+        : floatLedgerId;
       return {
         _id: tx._id,
         referenceNo: tx.referenceNo,
+        voucherNumber: tx.voucherNumber || null,
         type: tx.type,
         typeLabel:
           tx.type === "top_up"
@@ -2054,11 +2067,12 @@ exports.getFundTransactions = async (req, res, next) => {
         amount: Math.abs(tx.amount),
         runningBalance: balanceMap.get(tx._id.toString()),
         description: tx.description,
-        expenseAccountId: tx.expenseAccountId,
-        expenseAccountName: tx.expenseAccountId
-          ? expenseAccounts[tx.expenseAccountId] || null
+        expenseAccountId: ledgerAccountId || null,
+        expenseAccountName: ledgerAccountId
+          ? expenseAccounts[ledgerAccountId] || null
           : null,
-        receiptRef: tx.receiptRef,
+        receiptRef: tx.receiptRef || null,
+        journalEntryId: tx.journalEntryId || null,
         transactionDate: tx.transactionDate,
         createdAt: tx.createdAt,
         createdBy: tx.createdBy,

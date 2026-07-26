@@ -8,17 +8,53 @@ const InventoryBatch = require('../models/InventoryBatch');
  */
 async function createLayer(companyId, productId, qty, unitCost, sourceRef = {}, options = {}) {
   const session = options.session || null;
+  const qtyReceived = Number(qty);
+  if (!Number.isFinite(qtyReceived) || qtyReceived <= 0) {
+    throw new Error('Inventory layer requires a positive qtyReceived');
+  }
   const layer = new InventoryLayer({
     company: companyId,
     product: productId,
-    qtyReceived: qty,
-    qtyRemaining: qty,
-    unitCost,
-    receiptDate: new Date(),
+    qtyReceived,
+    qtyRemaining: qtyReceived,
+    unitCost: Number(unitCost) || 0,
+    receiptDate: options.receiptDate || new Date(),
     sourceRef,
+    ...(options.warehouse ? { warehouse: options.warehouse } : {}),
     createdBy: options.userId
   });
   return layer.save({ session });
+}
+
+/**
+ * Draw down FIFO layers by up to `qty` without failing when they hold less.
+ * Used for stock reductions that are not sales (adjustments, write-offs), where
+ * Product.currentStock is authoritative and the layers only carry cost.
+ *
+ * @returns {Promise<{ consumed: number, shortfall: number }>}
+ */
+async function reduceLayers(companyId, productId, qty, options = {}) {
+  if (qty <= 0) return { consumed: 0, shortfall: 0 };
+  const session = options.session || null;
+
+  const layers = await InventoryLayer.find({
+    company: companyId,
+    product: productId,
+    qtyRemaining: { $gt: 0 }
+  })
+    .sort({ receiptDate: 1 })
+    .session(session);
+
+  let remaining = qty;
+  for (const layer of layers) {
+    if (remaining <= 0) break;
+    const take = Math.min(Number(layer.qtyRemaining) || 0, remaining);
+    layer.qtyRemaining = Math.max(0, Number(layer.qtyRemaining) - take);
+    await layer.save({ session });
+    remaining -= take;
+  }
+
+  return { consumed: qty - remaining, shortfall: remaining };
 }
 
 /**
@@ -64,9 +100,10 @@ async function consume(companyId, productId, qty, opts = {}) {
     }
 
     if (remaining > 0) {
-      // insufficient stock
       const err = new Error('Insufficient stock to consume');
       err.code = 'INSUFFICIENT_STOCK';
+      err.requested = qty;
+      err.costedQty = qty - remaining;
       throw err;
     }
 
@@ -190,7 +227,15 @@ async function consumeReservedBatches(companyId, productId, qty, options = {}) {
   return { allocations, total: qty };
 }
 
-module.exports = { createLayer, consume, reserveBatches, releaseReservedBatches, consumeReservedBatches, reverseConsume };
+module.exports = {
+  createLayer,
+  reduceLayers,
+  consume,
+  reserveBatches,
+  releaseReservedBatches,
+  consumeReservedBatches,
+  reverseConsume,
+};
 
 /**
  * Reverse a consumption by adding back to inventory layers.

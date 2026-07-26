@@ -1,5 +1,6 @@
 const ARTransactionLedger = require('../models/ARTransactionLedger');
 const ARTrackingService = require('../services/arTrackingService');
+const { getARTransactions } = require('../services/ledgerReadService');
 
 /**
  * AR Reconciliation Controller
@@ -30,36 +31,26 @@ exports.getTransactions = async (req, res, next) => {
       reconciliationStatus
     } = req.query;
 
-    const query = { company: companyId };
-
-    if (clientId) query.client = clientId;
-    if (invoiceId) query.invoice = invoiceId;
-    if (transactionType) query.transactionType = transactionType;
-    if (reconciliationStatus) query.reconciliationStatus = reconciliationStatus;
-    
-    if (startDate || endDate) {
-      query.transactionDate = {};
-      if (startDate) query.transactionDate.$gte = new Date(startDate);
-      if (endDate) query.transactionDate.$lte = new Date(endDate);
-    }
-
-    const total = await ARTransactionLedger.countDocuments(query);
-    
-    const transactions = await ARTransactionLedger.find(query)
-      .populate('client', 'name code')
-      .populate('invoice', 'referenceNo invoiceNumber')
-      .populate('createdBy', 'name email')
-      .sort({ transactionDate: -1, createdAt: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit);
+    const { items, total, pages, currentPage } = await getARTransactions(
+      companyId,
+      {
+        clientId,
+        invoiceId,
+        transactionType,
+        startDate,
+        endDate,
+        reconciliationStatus,
+      },
+      { page, limit },
+    );
 
     res.json({
       success: true,
-      count: transactions.length,
+      count: items.length,
       total,
-      pages: Math.ceil(total / limit),
-      currentPage: page,
-      data: transactions
+      pages,
+      currentPage,
+      data: items,
     });
   } catch (error) {
     next(error);

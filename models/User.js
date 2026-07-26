@@ -1,8 +1,23 @@
+/**
+ * User model — PostgreSQL (Prisma) backed.
+ *
+ * Exposes a Mongoose-compatible query facade so not-yet-migrated domains can
+ * keep calling `User.find(...)`, `User.findById(...)`, etc. while all user
+ * data lives in PostgreSQL.
+ *
+ * A minimal Mongoose schema is still registered under the name 'User' so
+ * legacy `ref: 'User'` populate() calls in unmigrated Mongo models do not
+ * crash (they resolve against the historical Mongo collection).
+ */
+
 const mongoose = require('mongoose');
-const bcrypt = require('bcryptjs');
+const { prisma } = require('../lib/prisma');
+const { makeCompatModel } = require('../utils/prismaCompat');
+const { generateObjectId, toIdString } = require('../utils/objectId');
+const { userToApi, userInputToPrisma } = require('../utils/authMappers');
 const passwordUtils = require('../utils/passwordUtils');
 
-// Error codes for user operations
+// Error codes for user operations (kept for backward compatibility)
 const USER_ERRORS = {
   EMAIL_ALREADY_REGISTERED: 'EMAIL_ALREADY_REGISTERED',
   INVALID_CREDENTIALS: 'INVALID_CREDENTIALS',
@@ -14,203 +29,107 @@ const USER_ERRORS = {
   USER_ALREADY_MEMBER: 'USER_ALREADY_MEMBER'
 };
 
-const userSchema = new mongoose.Schema({
-  name: {
-    type: String,
-    required: [true, 'Please provide a name'],
-    trim: true
-  },
-  email: {
-    type: String,
-    required: [true, 'Please provide an email'],
-    lowercase: true,
-    trim: true,
-    match: [/^\w+([\.-]?\w+)*@\w+([\.-]?\w+)*(\.\w{2,3})+$/, 'Please provide a valid email']
-  },
-  password: {
-    type: String,
-    required: [true, 'Please provide a password'],
-    minlength: 6,
-    select: false
-  },
-  // Legacy plain refresh (migrated to refresh_token_hash only)
-  refresh_token: {
-    type: String,
-    select: false,
-    default: null
-  },
-  refresh_token_hash: {
-    type: String,
-    select: false,
-    default: null
-  },
-  // Multi-tenancy: company reference
-  company: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Company',
-    required: function() {
-      // Company is required unless user is a platform admin
-      return this.role !== 'platform_admin';
+// Register a bare schema for legacy populate() compatibility only.
+if (!mongoose.models.User) {
+  mongoose.model('User', new mongoose.Schema({
+    password: { type: String, select: false },
+    refresh_token: { type: String, select: false },
+    refresh_token_hash: { type: String, select: false },
+    twoFASecret: { type: String, select: false },
+    passwordResetToken: { type: String, select: false },
+  }, { strict: false, collection: 'users' }));
+}
+
+const FIELD_MAP = {
+  _id: { target: 'id', isId: true },
+  id: { target: 'id', isId: true },
+  email: { target: 'email', transform: (v) => ({ email: typeof v === 'string' ? v.toLowerCase() : v }) },
+  name: { target: 'name' },
+  phone: { target: 'phone' },
+  role: { target: 'role' },
+  company: { target: 'companyId', isId: true },
+  companyId: { target: 'companyId', isId: true },
+  department: { target: 'departmentId', isId: true },
+  branch: { target: 'branchId', isId: true },
+  createdBy: { target: 'createdById', isId: true },
+  isActive: { target: 'isActive' },
+  mustChangePassword: { target: 'mustChangePassword' },
+  tempPassword: { target: 'tempPassword' },
+  twoFAEnabled: { target: 'twoFAEnabled' },
+  lastLogin: { target: 'lastLogin' },
+  locked_until: { target: 'lockedUntil' },
+  failed_login_attempts: { target: 'failedLoginAttempts' },
+  passwordResetToken: { target: 'passwordResetToken' },
+  passwordResetExpires: { target: 'passwordResetExpires' },
+  createdAt: { target: 'createdAt' },
+  updatedAt: { target: 'updatedAt' },
+};
+
+async function translateCreate(data) {
+  const roleIds = (data.roles || []).map((r) => toIdString(r)).filter(Boolean);
+  return {
+    id: toIdString(data._id || data.id) || generateObjectId(),
+    name: data.name,
+    email: String(data.email).toLowerCase(),
+    password: await passwordUtils.hash(String(data.password)),
+    companyId: data.company ? toIdString(data.company) : (data.companyId ? toIdString(data.companyId) : null),
+    role: data.role || 'viewer',
+    departmentId: data.department ? toIdString(data.department) : null,
+    branchId: data.branch ? toIdString(data.branch) : null,
+    createdById: data.createdBy ? toIdString(data.createdBy) : null,
+    isActive: data.isActive !== false,
+    mustChangePassword: Boolean(data.mustChangePassword),
+    tempPassword: Boolean(data.tempPassword),
+    avatar: data.avatar || null,
+    phone: data.phone || null,
+    jobTitle: data.jobTitle || null,
+    failedLoginAttempts: data.failed_login_attempts || 0,
+    lockedUntil: data.locked_until || null,
+    roles: roleIds.length ? { create: roleIds.map((roleId) => ({ roleId })) } : undefined,
+  };
+}
+
+function translateUpdate(update = {}) {
+  const data = {};
+  const direct = { ...update };
+  if (direct.$set) {
+    Object.assign(direct, direct.$set);
+    delete direct.$set;
+  }
+  if (direct.$unset) {
+    for (const key of Object.keys(direct.$unset)) {
+      if (key === 'department') data.departmentId = null;
+      else if (key === 'branch') data.branchId = null;
+      else if (key === 'company') data.companyId = null;
+      else if (FIELD_MAP[key]) data[FIELD_MAP[key].target] = null;
     }
-  },
-  role: {
-    // Legacy single-role kept for backward compatibility. Prefer `roles` array of Role refs.
-    // Note: enum removed to allow custom company-specific roles
-    type: String,
-    default: 'viewer'
-  },
-  roles: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Role' }],
-  // Department-based access
-  department: { type: mongoose.Schema.Types.ObjectId, ref: 'Department' },
-  branch: { type: mongoose.Schema.Types.ObjectId, ref: 'Warehouse', default: null },
-  isActive: {
-    type: Boolean,
-    default: true
-  },
-  lastLogin: {
-    type: Date
-  },
-  createdBy: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User'
-  },
-  // Password management fields
-  mustChangePassword: {
-    type: Boolean,
-    default: false
-  },
-  passwordChangedAt: {
-    type: Date,
-    default: null
-  },
-  tempPassword: {
-    type: Boolean,
-    default: false
-  },
-  // Profile avatar/image
-  avatar: {
-    type: String,
-    default: null
-  },
-  // User profile information
-  phone: {
-    type: String,
-    default: null
-  },
-  jobTitle: {
-    type: String,
-    default: null
-  },
-  bio: {
-    type: String,
-    default: null,
-    maxlength: 500
-  },
-  // Two-factor authentication (TOTP)
-  twoFAEnabled: { type: Boolean, default: false },
-  twoFASecret: { type: String, select: false, default: null },
-  twoFAConfirmed: { type: Boolean, default: false },
-  // Optional per-user IP whitelist (array of IP strings)
-  ipWhitelist: [{ type: String }],
-  // Login security fields
-  failed_login_attempts: {
-    type: Number,
-    default: 0
-  },
-  locked_until: {
-    type: Date,
-    default: null
-  },
-  // Password reset token
-  passwordResetToken: {
-    type: String,
-    select: false,
-    default: null
-  },
-  passwordResetExpires: {
-    type: Date,
-    default: null
+    delete direct.$unset;
   }
-}, {
-  timestamps: true
+  Object.assign(data, userInputToPrisma(direct));
+  // Fields userInputToPrisma does not cover
+  if (direct.lastLogin !== undefined) data.lastLogin = direct.lastLogin;
+  if (direct.failed_login_attempts !== undefined) data.failedLoginAttempts = direct.failed_login_attempts;
+  if (direct.locked_until !== undefined) data.lockedUntil = direct.locked_until;
+  return data;
+}
+
+const User = makeCompatModel({
+  delegate: () => prisma.user,
+  fieldMap: FIELD_MAP,
+  toApi: userToApi,
+  translateCreate,
+  translateUpdate,
+  // Legacy Mongoose User schema had a `company` path, so tenantPlugin
+  // auto-scoped every query. Mirror that behavior against Postgres.
+  tenantField: 'companyId',
+  include: (populate) => {
+    if (populate && populate.some((p) => p.path === 'roles')) {
+      return { roles: { include: { role: true } } };
+    }
+    return undefined;
+  },
 });
 
-// Compound index for company + email uniqueness
-userSchema.index({ company: 1, email: 1 }, { unique: true });
+User.ERRORS = USER_ERRORS;
 
-// Index for password reset token
-userSchema.index({ passwordResetToken: 1 });
-
-// Hash password before saving
-userSchema.pre('save', async function(next) {
-  if (!this.isModified('password')) {
-    return next();
-  }
-  try {
-    this.password = await passwordUtils.hash(this.password);
-    return next();
-  } catch (err) {
-    return next(err);
-  }
-});
-
-// Compare password
-userSchema.methods.comparePassword = async function(enteredPassword) {
-  return await bcrypt.compare(enteredPassword, this.password);
-};
-
-// Check if account is locked
-userSchema.methods.isLocked = function() {
-  if (!this.locked_until) return false;
-  return new Date() < this.locked_until;
-};
-
-// Increment failed login attempts and optionally lock
-userSchema.methods.incrementFailedLoginAttempts = async function(maxAttempts = 5, lockDurationMinutes = 30) {
-  // Check if lock has expired - reset counter if so
-  if (this.locked_until && new Date() >= this.locked_until) {
-    this.failed_login_attempts = 0;
-    this.locked_until = null;
-  }
-  
-  this.failed_login_attempts += 1;
-  
-  if (this.failed_login_attempts >= maxAttempts) {
-    // Lock the account
-    this.locked_until = new Date(Date.now() + lockDurationMinutes * 60 * 1000);
-  }
-  
-  return this.save();
-};
-
-// Reset failed login attempts on successful login
-userSchema.methods.resetFailedLoginAttempts = function() {
-  this.failed_login_attempts = 0;
-  this.locked_until = null;
-};
-
-// Remove password from JSON output
-userSchema.methods.toJSON = function() {
-  const obj = this.toObject();
-  delete obj.password;
-  delete obj.refresh_token;
-  delete obj.refresh_token_hash;
-  delete obj.passwordResetToken;
-  delete obj.passwordResetExpires;
-  delete obj.twoFASecret;
-  return obj;
-};
-
-// Static method to find by email (case-insensitive)
-userSchema.statics.findByEmail = function(email, companyId = null) {
-  const query = { email: email.toLowerCase() };
-  if (companyId) {
-    query.company = companyId;
-  }
-  return this.findOne(query);
-};
-
-// Export error codes
-userSchema.statics.ERRORS = USER_ERRORS;
-
-module.exports = mongoose.model('User', userSchema);
+module.exports = User;

@@ -11,6 +11,7 @@ router.use(protect);
 router.use(attachCompanyId);
 
 router.get('/devices', ebmController.getDeviceStatus);
+router.get('/readiness', ebmController.getReadiness);
 router.get('/codes/status', ebmController.getCodeSyncStatus);
 router.get('/codes', ebmController.getCodes);
 router.get('/codes/item-classes', ebmController.getItemClasses);
@@ -87,6 +88,29 @@ router.post(
   validateRequest,
   stripUnvalidatedBody,
   ebmController.syncPurchases,
+);
+
+router.post(
+  '/sales/sync',
+  authorize('admin', 'stock_manager'),
+  body('branchId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
+  body('bhfId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
+  body('full').optional().isBoolean(),
+  body('prcOrdCd').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ max: 5 }),
+  validateRequest,
+  stripUnvalidatedBody,
+  ebmController.syncSalesSummaries,
+);
+
+router.post(
+  '/items/sync',
+  authorize('admin', 'stock_manager'),
+  body('branchId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
+  body('bhfId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
+  body('full').optional().isBoolean(),
+  validateRequest,
+  stripUnvalidatedBody,
+  ebmController.syncRegisteredItems,
 );
 
 router.post(

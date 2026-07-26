@@ -52,7 +52,7 @@ exports.importStatement = async (req, res, next) => {
     if (isOfx) {
       // Parse OFX
       const ofxData = await OfxParser.parseString(file.buffer.toString());
-      transactions = OfxParser.standardizeTransactions(ofData.transactions);
+      transactions = OfxParser.standardizeTransactions(ofxData.transactions);
     } else {
       // Parse CSV
       const parsed = CsvParser.parse(file.buffer);

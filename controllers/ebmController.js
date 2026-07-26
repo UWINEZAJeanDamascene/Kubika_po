@@ -11,6 +11,9 @@ const EBMSubmissionQueue = require('../models/EBMSubmissionQueue');
 const EBMAlert = require('../models/EBMAlert');
 const EBMQueueService = require('../services/ebmQueueService');
 const EBMStockService = require('../services/ebmStockService');
+const EBMReadinessService = require('../services/ebmReadinessService');
+const EBMSalesSyncService = require('../services/ebmSalesSyncService');
+const EBMItemSyncService = require('../services/ebmItemSyncService');
 
 function getCompanyId(req) {
   return req.companyId || req.company?._id || req.user?.company?._id || req.user?.company;
@@ -497,6 +500,44 @@ exports.resetAlert = async (req, res, next) => {
     alert.resetBy = req.user?._id || req.user?.id || null;
     await alert.save();
     res.json({ success: true, data: { alert, queue: item } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.getReadiness = async (req, res, next) => {
+  try {
+    const companyId = getCompanyId(req);
+    const branchId = String(req.query.branchId || req.query.bhfId || '00').padStart(2, '0').slice(-2);
+    const data = await EBMReadinessService.getReadiness(companyId, branchId);
+    res.json({ success: true, data });
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.syncSalesSummaries = async (req, res, next) => {
+  try {
+    const companyId = getCompanyId(req);
+    const result = await EBMSalesSyncService.syncSalesSummaries(companyId, {
+      branchId: req.body.branchId || req.body.bhfId || '00',
+      full: req.body.full === true,
+      prcOrdCd: req.body.prcOrdCd,
+    });
+    res.json({ success: true, data: result });
+  } catch (error) {
+    next(error);
+  }
+};
+
+exports.syncRegisteredItems = async (req, res, next) => {
+  try {
+    const companyId = getCompanyId(req);
+    const result = await EBMItemSyncService.syncRegisteredItems(companyId, {
+      branchId: req.body.branchId || req.body.bhfId || '00',
+      full: req.body.full === true,
+    });
+    res.json({ success: true, data: result });
   } catch (error) {
     next(error);
   }

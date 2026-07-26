@@ -220,33 +220,16 @@ class InventoryDashboardService {
     const ninetyDaysAgo = dateHelpers.lastNDays(DEAD_STOCK_LOOKBACK_DAYS).start;
     const coid = new mongoose.Types.ObjectId(companyId);
 
-    const matchForActive = {
-      $and: [
-        {
-          $or: [
-            { company: coid },
-            { company_id: coid },
-            { company: companyId },
-            { company_id: companyId },
-          ],
-        },
-        {
-          $or: [
-            { reason: { $in: ["dispatch", "transfer_out"] } },
-            { type: { $in: ["dispatch", "transfer_out", "out"] } },
-          ],
-        },
-        {
-          $or: [
-            { movementDate: { $gte: ninetyDaysAgo } },
-            { created_at: { $gte: ninetyDaysAgo } },
-          ],
-        },
-      ],
-    };
-
-    const moves = await StockMovement.find(matchForActive).lean();
-    const rawIds = (moves || [])
+    const moves = await StockMovement.find({
+      company: companyId,
+      movementDate: { $gte: ninetyDaysAgo },
+    }).lean();
+    const activeMoves = (moves || []).filter((m) => {
+      const reason = m.reason || m.movement_type;
+      const type = m.type || m.movement_type;
+      return ['dispatch', 'transfer_out'].includes(reason) || type === 'out';
+    });
+    const rawIds = activeMoves
       .map((m) => m.product || m.product_id)
       .filter(Boolean);
     const activeProductIds = Array.from(

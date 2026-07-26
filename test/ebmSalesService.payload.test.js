@@ -81,7 +81,7 @@ describe('EBM sales payload', () => {
     expect(payload).not.toHaveProperty('payList');
     expect(payload.salesDt).toMatch(/^\d{8}$/);
     expect(payload.cfmDt).toMatch(/^\d{14}$/);
-    expect(payload.invcNo).toBe('1001');
+    expect(payload.invcNo).toBe(1001);
     expect(payload.receipt.curRcptNo).toBe(2001);
     expect(payload.receipt.totRcptNo).toBe(2001);
     expect(payload.receipt.rptNo).toBe(3001);

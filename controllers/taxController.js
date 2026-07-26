@@ -9,6 +9,7 @@ const JournalService = require("../services/journalService");
 const TaxService = require("../services/taxService");
 const TaxAutomationService = require("../services/taxAutomationService");
 const { parsePagination, paginationMeta } = require("../utils/pagination");
+const { safeAggregate } = require("../utils/mongoAggregation");
 
 // =====================================================
 // TAX RATE CONFIGURATION (Module 9: Taxes)
@@ -861,7 +862,7 @@ exports.getTaxDashboard = async (req, res) => {
       expenseVatMatch.date = dateFilter;
     }
 
-    const vatInput = await Expense.aggregate([
+    const vatInput = await safeAggregate(Expense, [
       { $match: expenseVatMatch },
       {
         $group: {
@@ -882,7 +883,7 @@ exports.getTaxDashboard = async (req, res) => {
       payrollMatch.pay_period_start = dateFilter;
     }
 
-    const payeData = await Payroll.aggregate([
+    const payeData = await safeAggregate(Payroll, [
       { $match: payrollMatch },
       {
         $group: {

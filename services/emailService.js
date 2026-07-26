@@ -31,6 +31,12 @@ const esc = (str) => {
     .replace(/"/g, '&quot;');
 };
 
+/** Coerce Decimal/string/number amounts for email templates */
+const moneyFmt = (value, digits = 2) => {
+  const n = typeof value === 'number' ? value : Number(value);
+  return (Number.isFinite(n) ? n : 0).toFixed(digits);
+};
+
 /** Sleep helper for retry backoff */
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -489,7 +495,7 @@ const sendPurchaseOrderEmail = async (po, company, supplier, action) => {
           <tbody>${itemsHtml}</tbody>
         </table>
         <div style="text-align:right; margin:20px 0;">
-          <p style="margin:5px 0; font-size:18px; font-weight:bold; color:#7c3aed;">Total: ${currency} ${totalAmount.toFixed(2)}</p>
+          <p style="margin:5px 0; font-size:18px; font-weight:bold; color:#7c3aed;">Total: ${currency} ${moneyFmt(totalAmount)}</p>
         </div>
         ${po.notes ? `<div style="background:white; padding:15px; border-radius:8px; margin:20px 0;"><strong>Notes:</strong><br/>${esc(po.notes)}</div>` : ''}
         <div style="text-align:center; margin-top:30px;">
@@ -546,7 +552,7 @@ const sendGRNReceivedEmail = async (grn, po, company, supplier) => {
           <tbody>${itemsHtml}</tbody>
         </table>
         <div style="text-align:right; margin:20px 0;">
-          <p style="margin:5px 0; font-size:18px; font-weight:bold; color:#10b981;">Total Value: ${po?.currencyCode || 'RF'} ${totalAmount.toFixed(2)}</p>
+          <p style="margin:5px 0; font-size:18px; font-weight:bold; color:#10b981;">Total Value: ${po?.currencyCode || 'RF'} ${moneyFmt(totalAmount)}</p>
         </div>
         <div style="text-align:center; margin-top:30px;">
           <a href="${FRONTEND_URL}/goods-received-notes/${grn._id}" style="background:#10b981; color:white; padding:12px 30px; text-decoration:none; border-radius:8px; display:inline-block;">View GRN Details</a>
@@ -630,7 +636,7 @@ const sendSalesOrderEmail = async (so, company, client, action) => {
         <div style="text-align:right; margin:20px 0;">
           <p style="margin:5px 0;">Subtotal: ${currency} ${subtotal.toFixed(2)}</p>
           <p style="margin:5px 0;">Tax: ${currency} ${taxAmount.toFixed(2)}</p>
-          <p style="margin:5px 0; font-size:18px; font-weight:bold; color:#7c3aed;">Total: ${currency} ${totalAmount.toFixed(2)}</p>
+          <p style="margin:5px 0; font-size:18px; font-weight:bold; color:#7c3aed;">Total: ${currency} ${moneyFmt(totalAmount)}</p>
         </div>
         ${so.notes ? `<div style="background:white; padding:15px; border-radius:8px; margin:20px 0;"><strong>Notes:</strong><br/>${esc(so.notes)}</div>` : ''}
         <div style="text-align:center; margin-top:30px;">
@@ -669,14 +675,14 @@ const sendPurchaseEmail = async (purchase, company, supplier, action) => {
     itemsHtml = purchase.items.map(item => `
       <tr>
         <td style="padding:10px; border-bottom:1px solid #ddd;">${esc(item.product?.name || item.itemCode || 'Item')}</td>
-        <td style="padding:10px; border-bottom:1px solid #ddd; text-align:center;">${item.quantity || 0}</td>
-        <td style="padding:10px; border-bottom:1px solid #ddd; text-align:right;">${purchase.currency || 'USD'} ${(item.unitCost || 0).toFixed(2)}</td>
-        <td style="padding:10px; border-bottom:1px solid #ddd; text-align:right;">${purchase.currency || 'USD'} ${(item.totalWithTax || 0).toFixed(2)}</td>
+        <td style="padding:10px; border-bottom:1px solid #ddd; text-align:center;">${item.quantity ?? item.qty ?? 0}</td>
+        <td style="padding:10px; border-bottom:1px solid #ddd; text-align:right;">${purchase.currency || 'USD'} ${moneyFmt(item.unitCost)}</td>
+        <td style="padding:10px; border-bottom:1px solid #ddd; text-align:right;">${purchase.currency || 'USD'} ${moneyFmt(item.totalWithTax ?? item.lineTotal)}</td>
       </tr>
     `).join('');
   }
 
-  const totalAmount = purchase.roundedAmount || purchase.totalAmount || 0;
+  const totalAmount = purchase.roundedAmount || purchase.totalAmount || purchase.grandTotal || 0;
   const currency = purchase.currency || 'USD';
 
   const statusColor = {
@@ -710,9 +716,9 @@ const sendPurchaseEmail = async (purchase, company, supplier, action) => {
           <tbody>${itemsHtml}</tbody>
         </table>
         <div style="text-align:right; margin:20px 0;">
-          <p style="margin:5px 0; font-size:18px; font-weight:bold; color:#7c3aed;">Total: ${currency} ${totalAmount.toFixed(2)}</p>
-          ${purchase.amountPaid ? `<p style="margin:5px 0; color:#10b981;">Paid: ${currency} ${purchase.amountPaid.toFixed(2)}</p>` : ''}
-          ${purchase.balance ? `<p style="margin:5px 0; color:#ef4444;">Balance: ${currency} ${purchase.balance.toFixed(2)}</p>` : ''}
+          <p style="margin:5px 0; font-size:18px; font-weight:bold; color:#7c3aed;">Total: ${currency} ${moneyFmt(totalAmount)}</p>
+          ${purchase.amountPaid ? `<p style="margin:5px 0; color:#10b981;">Paid: ${currency} ${moneyFmt(purchase.amountPaid)}</p>` : ''}
+          ${purchase.balance ? `<p style="margin:5px 0; color:#ef4444;">Balance: ${currency} ${moneyFmt(purchase.balance)}</p>` : ''}
         </div>
         ${purchase.notes ? `<div style="background:white; padding:15px; border-radius:8px; margin:20px 0;"><strong>Notes:</strong><br/>${esc(purchase.notes)}</div>` : ''}
         <div style="text-align:center; margin-top:30px;">
@@ -870,6 +876,107 @@ const sendUserInvitationEmail = async ({ to, name, companyName, inviterName, rol
 };
 
 // ============================================
+// QUOTATION NOTIFICATIONS
+// ============================================
+
+const sendQuotationEmail = async (quotation, company, client, action = 'sent', recipientEmail) => {
+  const config = env.getConfig();
+  if (!config.features?.emailNotifications) {
+    console.warn('[Quotation] Email notifications disabled (ENABLE_EMAIL_NOTIFICATIONS=false)');
+    return false;
+  }
+
+  const { valid } = require('../config/email').validateConfig();
+  if (!valid) {
+    console.warn('[Quotation] Email provider is not configured — skipping quotation email');
+    return false;
+  }
+
+  const clientEmail = recipientEmail || client?.contact?.email || client?.email;
+  if (!clientEmail) {
+    console.warn('[Quotation] No client email found for quotation:', quotation?.referenceNo || quotation?._id);
+    return false;
+  }
+
+  const actionText = { sent: 'Sent', accepted: 'Accepted', rejected: 'Rejected', expired: 'Expired' }[action] || 'Updated';
+  const refNo = quotation.referenceNo || quotation.quotationNumber || quotation._id;
+  const subject = `Quotation ${refNo} - ${actionText}`;
+  const currency = quotation.currencyCode || quotation.currency || 'RWF';
+  const lines = quotation.lines || [];
+  const statusColor = action === 'accepted' ? '#10b981' : action === 'rejected' ? '#ef4444' : action === 'expired' ? '#f59e0b' : '#7c3aed';
+
+  const itemsHtml = lines.length
+    ? lines.map((line) => {
+      const productName = line.product?.name || line.productName || line.description || 'Item';
+      const qty = line.qty ?? line.quantity ?? 0;
+      const unitPrice = Number(line.unitPrice || 0);
+      const lineTotal = Number(line.lineTotal || 0);
+      return `
+        <tr>
+          <td style="padding:10px; border-bottom:1px solid #ddd;">${esc(productName)}</td>
+          <td style="padding:10px; border-bottom:1px solid #ddd; text-align:center;">${qty}</td>
+          <td style="padding:10px; border-bottom:1px solid #ddd; text-align:right;">${currency} ${unitPrice.toFixed(2)}</td>
+          <td style="padding:10px; border-bottom:1px solid #ddd; text-align:right;">${currency} ${lineTotal.toFixed(2)}</td>
+        </tr>`;
+    }).join('')
+    : '';
+
+  const acceptToken = quotation.publicAcceptToken || quotation.customerAction?.publicAcceptToken;
+  const rejectToken = quotation.publicRejectToken || quotation.customerAction?.publicRejectToken;
+  const acceptUrl = acceptToken
+    ? `${FRONTEND_URL}/quotations/public/${acceptToken}/accept`
+    : `${FRONTEND_URL}/quotations/${quotation._id}`;
+  const rejectUrl = rejectToken
+    ? `${FRONTEND_URL}/quotations/public/${rejectToken}/reject`
+    : `${FRONTEND_URL}/quotations/${quotation._id}`;
+
+  const totalAmount = Number(quotation.totalAmount ?? quotation.grandTotal ?? 0);
+  const expiryDate = quotation.expiryDate || quotation.validUntil;
+
+  const html = `
+    <div style="font-family:Arial,sans-serif; max-width:600px; margin:0 auto;">
+      <div style="background:${statusColor}; padding:30px; border-radius:10px 10px 0 0;">
+        <h1 style="color:white; margin:0; text-align:center;">📄 Quotation ${esc(actionText)}</h1>
+      </div>
+      <div style="background:#f9f9f9; padding:30px; border:1px solid #ddd; border-top:none; border-radius:0 0 10px 10px;">
+        <h2 style="color:${statusColor}; margin:0 0 5px;">${esc(refNo)}</h2>
+        <p style="color:#666; margin:5px 0;">From: ${esc(company?.name || 'KUBIKA')}</p>
+        <p style="color:#666; margin:5px 0;">Date: ${new Date(quotation.quotationDate || quotation.createdAt).toLocaleDateString()}</p>
+        <p style="color:#666; margin:5px 0;">Status: <strong>${esc(actionText)}</strong></p>
+        <div style="background:white; padding:15px; border-radius:8px; margin:20px 0;">
+          <strong>Customer:</strong><br/>${esc(client?.name || 'Customer')}
+        </div>
+        <table style="width:100%; border-collapse:collapse; margin:20px 0;">
+          <thead>
+            <tr style="background:${statusColor}; color:white;">
+              <th style="padding:12px; text-align:left;">Product</th>
+              <th style="padding:12px; text-align:center;">Qty</th>
+              <th style="padding:12px; text-align:right;">Unit Price</th>
+              <th style="padding:12px; text-align:right;">Total</th>
+            </tr>
+          </thead>
+          <tbody>${itemsHtml}</tbody>
+        </table>
+        <div style="text-align:right; margin:20px 0;">
+          <p style="margin:5px 0; font-size:18px; font-weight:bold; color:${statusColor};">Total: ${currency} ${moneyFmt(totalAmount)}</p>
+        </div>
+        ${expiryDate ? `<p style="color:#666;">Valid until: ${new Date(expiryDate).toLocaleDateString()}</p>` : ''}
+        ${quotation.notes ? `<div style="background:white; padding:15px; border-radius:8px; margin:20px 0;"><strong>Notes:</strong><br/>${esc(quotation.notes)}</div>` : ''}
+        ${action === 'sent' ? `
+        <div style="text-align:center; margin-top:30px; display:flex; gap:12px; justify-content:center; flex-wrap:wrap;">
+          <a href="${acceptUrl}" style="background:#10b981; color:white; padding:12px 18px; text-decoration:none; border-radius:8px; display:inline-block;">Accept</a>
+          <a href="${rejectUrl}" style="background:#ef4444; color:white; padding:12px 18px; text-decoration:none; border-radius:8px; display:inline-block;">Reject</a>
+          <a href="${FRONTEND_URL}/quotations/${quotation._id}" style="background:${statusColor}; color:white; padding:12px 18px; text-decoration:none; border-radius:8px; display:inline-block;">View</a>
+        </div>` : ''}
+        <hr style="border:none; border-top:1px solid #ddd; margin:30px 0;"/>
+        <p style="font-size:12px; color:#888; text-align:center;">KUBIKA system — Manage Your Stock From Supply to Final Sale</p>
+      </div>
+    </div>`;
+
+  return sendEmail(clientEmail, subject, html);
+};
+
+// ============================================
 // EXPORTS
 // ============================================
 
@@ -895,6 +1002,7 @@ module.exports = {
   sendRejectionEmail,
   // Purchase Order notifications
   sendPurchaseOrderEmail,
+  sendQuotationEmail,
   sendGRNReceivedEmail,
   // Sales Order notifications
   sendSalesOrderEmail,

@@ -131,6 +131,63 @@ exports.getCurrentRate = async (req, res, next) => {
   }
 };
 
+// @desc    Latest known rate per active currency (vs base) with staleness flags
+// @route   GET /api/exchange-rates/latest
+// @access  Private
+exports.getLatestRates = async (req, res, next) => {
+  try {
+    if (req.isPlatformAdmin) {
+      return res.status(400).json({
+        success: false,
+        message: 'Platform admin should use a company context for exchange rates'
+      });
+    }
+    const companyId = (req.user.company._id || req.user.company).toString();
+    const skipCache = req.query.fresh === 'true';
+    const rates = await CurrencyService.getLatestRates(companyId, { skipCache });
+
+    res.json({
+      success: true,
+      data: {
+        base_currency: rates.length ? rates[0].base_currency : undefined,
+        rates,
+        as_of: new Date()
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// @desc    Manual "Refresh Now" — pull today's market rates from the external API
+// @route   POST /api/exchange-rates/sync
+// @access  Private/Admin
+exports.syncNow = async (req, res, next) => {
+  try {
+    if (req.isPlatformAdmin) {
+      return res.status(400).json({
+        success: false,
+        message: 'Platform admin should use a company context for exchange rates'
+      });
+    }
+    const companyId = (req.user.company._id || req.user.company).toString();
+    const userId = req.user._id;
+
+    const result = await CurrencyService.syncRates(companyId, userId);
+
+    res.json({ success: true, data: result });
+  } catch (error) {
+    const msg = error.message || '';
+    if (msg.startsWith('RATE_SYNC_ERROR') || error.code === 'ECONNABORTED' || error.isAxiosError) {
+      return res.status(502).json({
+        success: false,
+        message: 'Exchange rate provider is unreachable. Last known rates are retained (they may be flagged as stale).'
+      });
+    }
+    next(error);
+  }
+};
+
 // @desc    Convert amount (legacy / internal use)
 // @route   POST /api/exchange-rates/convert
 // @access  Private

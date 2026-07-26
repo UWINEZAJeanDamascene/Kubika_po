@@ -16,8 +16,35 @@
  */
 
 const mongoose = require('mongoose');
-
+const Invoice = require('../models/Invoice');
+const Purchase = require('../models/Purchase');
+const GoodsReceivedNote = require('../models/GoodsReceivedNote');
+const Supplier = require('../models/Supplier');
+const { BankAccount, BankTransaction } = require('../models/BankAccount');
+const JournalEntry = require('../models/JournalEntry');
+const StockMovement = require('../models/StockMovement');
+const ARReceipt = require('../models/ARReceipt');
+const CreditNote = require('../models/CreditNote');
+const APPayment = require('../models/APPayment');
+const PurchaseReturn = require('../models/PurchaseReturn');
+const Expense = require('../models/Expense');
 const toObjectId = (value) => new mongoose.Types.ObjectId(String(value));
+
+function aggregateExpenseWithholdingTax(companyId, start, end) {
+  return Expense.aggregate([
+    {
+      $match: {
+        company: toObjectId(companyId),
+        $or: [
+          { expense_date: { $gte: new Date(start), $lte: new Date(end) } },
+          { date: { $gte: new Date(start), $lte: new Date(end) } }
+        ],
+        withholdingTax: { $exists: true, $gt: 0 }
+      }
+    },
+    { $group: { _id: null, total: { $sum: { $toDouble: '$withholdingTax' } }, count: { $sum: 1 } } }
+  ]);
+}
 
 const toNumber = (value) => {
   if (value === null || value === undefined || value === '') return 0;
@@ -58,8 +85,6 @@ class DailyReportsService {
    */
   static async getDailySalesSummary(companyId, dateStr) {
     const { start, end } = getDateRange(dateStr);
-    
-    const Invoice = mongoose.model('Invoice');
     
     // Aggregate sales data
     const salesData = await Invoice.aggregate([
@@ -167,10 +192,6 @@ class DailyReportsService {
    */
   static async getDailyPurchasesSummary(companyId, dateStr) {
     const { start, end } = getDateRange(dateStr);
-    
-    const Purchase = mongoose.model('Purchase');
-    const GoodsReceivedNote = mongoose.model('GoodsReceivedNote');
-    const Supplier = mongoose.model('Supplier');
     
     // Get both direct purchases (by receivedDate) and GRN-based purchases
     const [purchaseData, grnData] = await Promise.all([
@@ -360,10 +381,6 @@ class DailyReportsService {
   static async getDailyCashPosition(companyId, dateStr) {
     const { start, end } = getDateRange(dateStr);
     
-    const BankAccount = mongoose.model('BankAccount');
-    const BankTransaction = mongoose.model('BankTransaction');
-    const JournalEntry = mongoose.model('JournalEntry');
-    
     // Get all bank accounts for the company
     const accounts = await BankAccount.find({ company: companyId, isActive: true });
     
@@ -477,8 +494,6 @@ class DailyReportsService {
   static async getDailyStockMovement(companyId, dateStr) {
     const { start, end } = getDateRange(dateStr);
     
-    const StockMovement = mongoose.model('StockMovement');
-    
     // Get all movements for the day
     const movements = await StockMovement.find({
       company: toObjectId(companyId),
@@ -561,10 +576,6 @@ class DailyReportsService {
    */
   static async getDailyARActivity(companyId, dateStr) {
     const { start, end } = getDateRange(dateStr);
-    
-    const Invoice = mongoose.model('Invoice');
-    const ARReceipt = mongoose.model('ARReceipt');
-    const CreditNote = mongoose.model('CreditNote');
     
     // Fetch all data in parallel with optimized projections and lean()
     const [newInvoices, paymentsReceived, creditNotes, invoiceTotals] = await Promise.all([
@@ -678,10 +689,6 @@ class DailyReportsService {
   static async getDailyAPActivity(companyId, dateStr) {
     const { start, end } = getDateRange(dateStr);
     
-    const Purchase = mongoose.model('Purchase');
-    const APPayment = mongoose.model('APPayment');
-    const PurchaseReturn = mongoose.model('PurchaseReturn');
-    
     // Fetch all data in parallel with optimized projections and lean()
     const [newBills, paymentsMade, purchaseReturns, purchaseTotals] = await Promise.all([
       // New bills (purchases) - only fetch needed fields
@@ -794,8 +801,6 @@ class DailyReportsService {
   static async getDailyJournalEntries(companyId, dateStr) {
     const { start, end } = getDateRange(dateStr);
     
-    const JournalEntry = mongoose.model('JournalEntry');
-    
     const entries = await JournalEntry.find({
       company: toObjectId(companyId),
       date: { $gte: new Date(start), $lte: new Date(end) },
@@ -844,11 +849,6 @@ class DailyReportsService {
    */
   static async getDailyTaxCollected(companyId, dateStr) {
     const { start, end } = getDateRange(dateStr);
-    
-    const Invoice = mongoose.model('Invoice');
-    const CreditNote = mongoose.model('CreditNote');
-    const Purchase = mongoose.model('Purchase');
-    const Expense = mongoose.model('Expense');
     
     // Get tax data from invoices - use taxAmount (actual field), not taxTotal (alias)
     const [invoiceTax, creditNoteTax, invoiceWHT, purchaseWHT, expenseWHT] = await Promise.all([
@@ -910,19 +910,7 @@ class DailyReportsService {
         },
         { $group: { _id: null, total: { $sum: { $toDouble: '$withholdingTax' } }, count: { $sum: 1 } } }
       ]),
-      Expense.aggregate([
-        {
-          $match: {
-            company: toObjectId(companyId),
-            $or: [
-              { expense_date: { $gte: new Date(start), $lte: new Date(end) } },
-              { date: { $gte: new Date(start), $lte: new Date(end) } }
-            ],
-            withholdingTax: { $exists: true, $gt: 0 }
-          }
-        },
-        { $group: { _id: null, total: { $sum: { $toDouble: '$withholdingTax' } }, count: { $sum: 1 } } }
-      ])
+      aggregateExpenseWithholdingTax(companyId, start, end)
     ]);
     
     // Get tax breakdown by tax code from invoice lines

@@ -12,7 +12,8 @@
 const connectDB = require('../config/database');
 const mongoose = require('mongoose');
 const ChartOfAccount = require('../models/ChartOfAccount');
-const Company = require('../models/Company');
+const Company = require('../models/Company'); // Prisma-backed shim
+const { prisma, connectPrisma, disconnectPrisma } = require('../lib/prisma');
 const { CHART_OF_ACCOUNTS } = require('../constants/chartOfAccounts');
 
 function parseArgs() {
@@ -51,6 +52,7 @@ async function main() {
   const args = parseArgs();
 
   await connectDB();
+  await connectPrisma(); // companies live in PostgreSQL
 
   try {
     const company = await findOrCreateCompany(args);
@@ -89,21 +91,25 @@ async function main() {
 
     console.log('Bulk write result:', JSON.stringify(result.toJSON ? result.toJSON() : result, null, 2));
 
-    // Mark company setup step for chart of accounts
+    // Mark company setup step for chart of accounts (company lives in Postgres)
     try {
-      company.setup_steps_completed = company.setup_steps_completed || {};
-      company.setup_steps_completed.chart_of_accounts = true;
-      await company.save();
+      const steps = { ...(company.setup_steps_completed || {}), chart_of_accounts: true };
+      await prisma.company.update({
+        where: { id: String(company._id) },
+        data: { setupStepsCompleted: steps },
+      });
     } catch (err) {
       console.warn('Could not update company setup steps:', err.message);
     }
 
     console.log('Done.');
     await mongoose.connection.close();
+    await disconnectPrisma();
     process.exit(0);
   } catch (err) {
     console.error('Error during import:', err);
     await mongoose.connection.close();
+    await disconnectPrisma().catch(() => {});
     process.exit(1);
   }
 }

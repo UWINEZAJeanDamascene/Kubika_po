@@ -1,0 +1,582 @@
+// Phase 3 — Inventory + Phase 4 — Journal engine (append to schema.prisma)
+
+enum StockMovementType {
+  in
+  out
+  adjustment
+}
+
+enum StockMovementReason {
+  purchase
+  sale
+  return
+  damage
+  loss
+  theft
+  expired
+  transfer_in
+  transfer_out
+  correction
+  initial_stock
+  audit_surplus
+  audit_shortage
+  dispatch
+  dispatch_reversal
+}
+
+enum InventoryBatchStatus {
+  active
+  partially_used
+  exhausted
+  expired
+  quarantined
+}
+
+enum StockTransferStatus {
+  draft
+  pending
+  in_transit
+  confirmed
+  completed
+  cancelled
+}
+
+enum StockTransferReason {
+  rebalance
+  sale
+  return
+  repair
+  consignment
+  other
+}
+
+enum StockAuditStatus {
+  draft
+  counting
+  posted
+  cancelled
+}
+
+enum StockAuditType {
+  full
+  partial
+  cycle_count
+  spot_check
+}
+
+enum StockSerialStatus {
+  in_stock
+  reserved
+  dispatched
+  returned
+  scrapped
+}
+
+enum JournalEntryStatus {
+  draft
+  posted
+  voided
+  reversed
+}
+
+enum JournalReconciliationStatus {
+  unreconciled
+  reconciled
+  adjusting_entry
+}
+
+enum AccountingPeriodType {
+  month
+  quarter
+  year
+}
+
+enum AccountingPeriodStatus {
+  open
+  closed
+  locked
+}
+
+enum LegacyPeriodStatus {
+  open
+  closed
+}
+
+model StockLevel {
+  id               String    @id @db.Char(24)
+  companyId        String    @map("company_id") @db.Char(24)
+  productId        String    @map("product_id") @db.Char(24)
+  warehouseId      String    @map("warehouse_id") @db.Char(24)
+  qtyOnHand        Decimal   @default(0) @map("qty_on_hand") @db.Decimal(19, 4)
+  qtyReserved      Decimal   @default(0) @map("qty_reserved") @db.Decimal(19, 4)
+  qtyOnOrder       Decimal   @default(0) @map("qty_on_order") @db.Decimal(19, 4)
+  avgCost          Decimal   @default(0) @map("avg_cost") @db.Decimal(19, 6)
+  totalValue       Decimal   @default(0) @map("total_value") @db.Decimal(19, 2)
+  lastCountedAt    DateTime? @map("last_counted_at") @db.Timestamptz(3)
+  lastCountedById  String?   @map("last_counted_by") @db.Char(24)
+  lastMovementAt   DateTime? @map("last_movement_at") @db.Timestamptz(3)
+  lastMovementType String?   @map("last_movement_type")
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company   Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  product   Product   @relation(fields: [productId], references: [id])
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id])
+
+  @@unique([companyId, productId, warehouseId])
+  @@index([companyId, warehouseId])
+  @@index([companyId, qtyOnHand])
+  @@index([companyId, lastMovementAt])
+  @@index([companyId, productId])
+  @@map("stock_levels")
+}
+
+model StockMovement {
+  id                String              @id @db.Char(24)
+  companyId         String              @map("company_id") @db.Char(24)
+  productId         String?             @map("product_id") @db.Char(24)
+  type              StockMovementType
+  reason            StockMovementReason
+  quantity          Decimal             @default(0) @db.Decimal(19, 4)
+  previousStock     Decimal             @default(0) @map("previous_stock") @db.Decimal(19, 4)
+  newStock          Decimal             @default(0) @map("new_stock") @db.Decimal(19, 4)
+  unitCost          Decimal             @default(0) @map("unit_cost") @db.Decimal(19, 6)
+  totalCost         Decimal             @default(0) @map("total_cost") @db.Decimal(19, 2)
+  supplierId        String?             @map("supplier_id") @db.Char(24)
+  warehouseId       String?             @map("warehouse_id") @db.Char(24)
+  batchNumber       String?             @map("batch_number")
+  lotNumber         String?             @map("lot_number")
+  expiryDate        DateTime?           @map("expiry_date") @db.Timestamptz(3)
+  referenceType     String?             @map("reference_type")
+  referenceNumber   String?             @map("reference_number")
+  referenceDocumentId String?           @map("reference_document_id") @db.Char(24)
+  referenceModel    String?             @map("reference_model")
+  notes             String?
+  performedById     String?             @map("performed_by") @db.Char(24)
+  movementDate      DateTime            @default(now()) @map("movement_date") @db.Timestamptz(3)
+  ebm               Json                @default("{}")
+  createdAt         DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company   Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  product   Product?   @relation(fields: [productId], references: [id])
+  supplier  Supplier?  @relation(fields: [supplierId], references: [id])
+  warehouse Warehouse? @relation(fields: [warehouseId], references: [id])
+
+  @@index([companyId, movementDate(sort: Desc)])
+  @@index([companyId, productId, movementDate(sort: Desc)])
+  @@index([companyId, type, reason, movementDate])
+  @@index([companyId, type, createdAt(sort: Desc)])
+  @@map("stock_movements")
+}
+
+model InventoryBatch {
+  id                String               @id @db.Char(24)
+  companyId         String               @map("company_id") @db.Char(24)
+  productId         String               @map("product_id") @db.Char(24)
+  warehouseId       String               @map("warehouse_id") @db.Char(24)
+  batchNumber       String?              @map("batch_number")
+  lotNumber         String?              @map("lot_number")
+  expiryDate        DateTime?            @map("expiry_date") @db.Timestamptz(3)
+  quantity          Decimal              @db.Decimal(19, 4)
+  availableQuantity Decimal              @map("available_quantity") @db.Decimal(19, 4)
+  reservedQuantity  Decimal              @default(0) @map("reserved_quantity") @db.Decimal(19, 4)
+  unitCost          Decimal              @default(0) @map("unit_cost") @db.Decimal(19, 6)
+  totalCost         Decimal              @default(0) @map("total_cost") @db.Decimal(19, 2)
+  supplierId        String?              @map("supplier_id") @db.Char(24)
+  stockMovementId   String?              @map("stock_movement_id") @db.Char(24)
+  manufacturingDate DateTime?            @map("manufacturing_date") @db.Timestamptz(3)
+  notes             String?
+  status            InventoryBatchStatus @default(active)
+  receivedDate      DateTime             @default(now()) @map("received_date") @db.Timestamptz(3)
+  createdById       String?              @map("created_by") @db.Char(24)
+  createdAt         DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company   Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  product   Product   @relation(fields: [productId], references: [id])
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id])
+  supplier  Supplier? @relation(fields: [supplierId], references: [id])
+
+  @@index([companyId, productId])
+  @@index([companyId, warehouseId, productId, status])
+  @@index([companyId, status, expiryDate])
+  @@index([companyId, batchNumber])
+  @@map("inventory_batches")
+}
+
+model InventoryLayer {
+  id                String   @id @db.Char(24)
+  companyId         String   @map("company_id") @db.Char(24)
+  productId         String   @map("product_id") @db.Char(24)
+  warehouseId       String?  @map("warehouse_id") @db.Char(24)
+  qtyReceived       Decimal  @map("qty_received") @db.Decimal(19, 4)
+  qtyRemaining      Decimal  @map("qty_remaining") @db.Decimal(19, 4)
+  unitCost          Decimal  @map("unit_cost") @db.Decimal(19, 6)
+  receiptDate       DateTime @default(now()) @map("receipt_date") @db.Timestamptz(3)
+  sourceType        String?  @map("source_type")
+  sourceId          String?  @map("source_id") @db.Char(24)
+  originTransferId  String?  @map("origin_transfer_id") @db.Char(24)
+  originQty         Decimal? @map("origin_qty") @db.Decimal(19, 4)
+  createdById       String?  @map("created_by") @db.Char(24)
+  createdAt         DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company   Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  product   Product    @relation(fields: [productId], references: [id])
+  warehouse Warehouse? @relation(fields: [warehouseId], references: [id])
+
+  @@index([companyId, productId, warehouseId, receiptDate])
+  @@map("inventory_layers")
+}
+
+model StockTransfer {
+  id              String              @id @db.Char(24)
+  companyId       String              @map("company_id") @db.Char(24)
+  transferNumber  String              @map("transfer_number")
+  fromWarehouseId String              @map("from_warehouse_id") @db.Char(24)
+  toWarehouseId   String              @map("to_warehouse_id") @db.Char(24)
+  status          StockTransferStatus @default(draft)
+  transferDate    DateTime            @default(now()) @map("transfer_date") @db.Timestamptz(3)
+  completedDate   DateTime?           @map("completed_date") @db.Timestamptz(3)
+  reason          StockTransferReason @default(rebalance)
+  notes           String?
+  confirmedById   String?             @map("confirmed_by") @db.Char(24)
+  confirmedAt     DateTime?           @map("confirmed_at") @db.Timestamptz(3)
+  receivedById    String?             @map("received_by") @db.Char(24)
+  receivedDate    DateTime?           @map("received_date") @db.Timestamptz(3)
+  receivedNotes   String?             @map("received_notes")
+  referenceNumber String?             @map("reference_number")
+  signatures      Json                @default("[]")
+  journalEntryId  String?             @map("journal_entry_id") @db.Char(24)
+  ebm             Json                @default("{}")
+  createdById     String?             @map("created_by") @db.Char(24)
+  createdAt       DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company       Company             @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  fromWarehouse Warehouse           @relation("TransferFrom", fields: [fromWarehouseId], references: [id])
+  toWarehouse   Warehouse           @relation("TransferTo", fields: [toWarehouseId], references: [id])
+  journalEntry  JournalEntry?       @relation(fields: [journalEntryId], references: [id])
+  lines         StockTransferLine[]
+
+  @@unique([companyId, transferNumber])
+  @@index([companyId, status, createdAt(sort: Desc)])
+  @@index([fromWarehouseId, status])
+  @@index([toWarehouseId, status])
+  @@map("stock_transfers")
+}
+
+model StockTransferLine {
+  id          String   @id @db.Char(24)
+  companyId   String   @map("company_id") @db.Char(24)
+  transferId  String   @map("transfer_id") @db.Char(24)
+  productId   String   @map("product_id") @db.Char(24)
+  qty         Decimal  @db.Decimal(19, 4)
+  unitCost    Decimal? @map("unit_cost") @db.Decimal(19, 6)
+  notes       String?
+  createdById String?  @map("created_by") @db.Char(24)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company  Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  transfer StockTransfer @relation(fields: [transferId], references: [id], onDelete: Cascade)
+  product  Product       @relation(fields: [productId], references: [id])
+
+  @@index([transferId])
+  @@index([companyId, transferId])
+  @@map("stock_transfer_lines")
+}
+
+model StockAudit {
+  id                  String           @id @db.Char(24)
+  companyId           String           @map("company_id") @db.Char(24)
+  referenceNo         String           @map("reference_no")
+  warehouseId         String           @map("warehouse_id") @db.Char(24)
+  auditDate           DateTime         @default(now()) @map("audit_date") @db.Timestamptz(3)
+  status              StockAuditStatus @default(draft)
+  totalVarianceValue  String           @default("0") @map("total_variance_value")
+  notes               String?
+  postedById          String?          @map("posted_by") @db.Char(24)
+  postedAt            DateTime?        @map("posted_at") @db.Timestamptz(3)
+  createdById         String           @map("created_by") @db.Char(24)
+  type                StockAuditType   @default(cycle_count)
+  categoryId          String?          @map("category_id") @db.Char(24)
+  totalItems          Int              @default(0) @map("total_items")
+  itemsCounted        Int              @default(0) @map("items_counted")
+  itemsWithVariance   Int              @default(0) @map("items_with_variance")
+  journalEntryId      String?          @map("journal_entry_id") @db.Char(24)
+  approvedById        String?          @map("approved_by") @db.Char(24)
+  approvedDate        DateTime?        @map("approved_date") @db.Timestamptz(3)
+  startDate           DateTime         @default(now()) @map("start_date") @db.Timestamptz(3)
+  completedDate       DateTime?        @map("completed_date") @db.Timestamptz(3)
+  dueDate             DateTime?        @map("due_date") @db.Timestamptz(3)
+  createdAt           DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company      Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  warehouse    Warehouse        @relation(fields: [warehouseId], references: [id])
+  category     Category?        @relation(fields: [categoryId], references: [id])
+  journalEntry JournalEntry?    @relation(fields: [journalEntryId], references: [id])
+  lines        StockAuditLine[]
+
+  @@unique([companyId, referenceNo])
+  @@index([companyId, status, auditDate(sort: Desc)])
+  @@index([warehouseId, status])
+  @@map("stock_audits")
+}
+
+model StockAuditLine {
+  id              String   @id @db.Char(24)
+  auditId         String   @map("audit_id") @db.Char(24)
+  productId       String   @map("product_id") @db.Char(24)
+  qtySystem       String   @default("0") @map("qty_system")
+  qtyCounted      String?  @map("qty_counted")
+  qtyVariance     String   @default("0") @map("qty_variance")
+  unitCost        String   @default("0") @map("unit_cost")
+  varianceValue   String   @default("0") @map("variance_value")
+  journalEntryId  String?  @map("journal_entry_id") @db.Char(24)
+  notes           String?
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  audit   StockAudit @relation(fields: [auditId], references: [id], onDelete: Cascade)
+  product Product    @relation(fields: [productId], references: [id])
+
+  @@index([auditId])
+  @@index([productId])
+  @@map("stock_audit_lines")
+}
+
+model ReorderPoint {
+  id                  String    @id @db.Char(24)
+  companyId           String    @map("company_id") @db.Char(24)
+  productId           String    @map("product_id") @db.Char(24)
+  supplierId          String    @map("supplier_id") @db.Char(24)
+  reorderPoint        Decimal   @map("reorder_point") @db.Decimal(19, 4)
+  reorderQuantity     Decimal   @map("reorder_quantity") @db.Decimal(19, 4)
+  safetyStock         Decimal   @default(0) @map("safety_stock") @db.Decimal(19, 4)
+  maxStock            Decimal?  @map("max_stock") @db.Decimal(19, 4)
+  leadTimeDays        Int       @default(7) @map("lead_time_days")
+  estimatedUnitCost   Decimal?  @map("estimated_unit_cost") @db.Decimal(19, 6)
+  autoReorder         Boolean   @default(false) @map("auto_reorder")
+  isActive            Boolean   @default(true) @map("is_active")
+  lastReorderDate     DateTime? @map("last_reorder_date") @db.Timestamptz(3)
+  lastReorderQuantity Decimal?  @map("last_reorder_quantity") @db.Decimal(19, 4)
+  lastReorderPrice    Decimal?  @map("last_reorder_price") @db.Decimal(19, 2)
+  nextReorderDate     DateTime? @map("next_reorder_date") @db.Timestamptz(3)
+  notes               String?
+  createdById         String?   @map("created_by") @db.Char(24)
+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company  Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  product  Product  @relation(fields: [productId], references: [id])
+  supplier Supplier @relation(fields: [supplierId], references: [id])
+
+  @@unique([companyId, productId])
+  @@index([companyId, supplierId])
+  @@index([companyId, isActive])
+  @@map("reorder_points")
+}
+
+model StockBatch {
+  id              String    @id @db.Char(24)
+  companyId       String    @map("company_id") @db.Char(24)
+  batchNo         String    @map("batch_no")
+  productId       String    @map("product_id") @db.Char(24)
+  warehouseId     String    @map("warehouse_id") @db.Char(24)
+  grnId           String?   @map("grn_id") @db.Char(24)
+  qtyReceived     Decimal   @map("qty_received") @db.Decimal(19, 4)
+  qtyOnHand       Decimal   @map("qty_on_hand") @db.Decimal(19, 4)
+  unitCost        Decimal   @map("unit_cost") @db.Decimal(19, 6)
+  manufactureDate DateTime? @map("manufacture_date") @db.Timestamptz(3)
+  expiryDate      DateTime? @map("expiry_date") @db.Timestamptz(3)
+  isQuarantined   Boolean   @default(false) @map("is_quarantined")
+  notes           String?
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company   Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  product   Product   @relation(fields: [productId], references: [id])
+  warehouse Warehouse @relation(fields: [warehouseId], references: [id])
+  serials   StockSerialNumber[]
+
+  @@unique([batchNo, productId, warehouseId])
+  @@index([companyId, productId])
+  @@index([companyId, warehouseId])
+  @@index([companyId, expiryDate])
+  @@map("stock_batches")
+}
+
+model StockSerialNumber {
+  id            String            @id @db.Char(24)
+  companyId     String            @map("company_id") @db.Char(24)
+  serialNo      String            @map("serial_no")
+  productId     String            @map("product_id") @db.Char(24)
+  warehouseId   String            @map("warehouse_id") @db.Char(24)
+  grnId         String?           @map("grn_id") @db.Char(24)
+  batchId       String?           @map("batch_id") @db.Char(24)
+  unitCost      Decimal           @map("unit_cost") @db.Decimal(19, 6)
+  status        StockSerialStatus @default(in_stock)
+  dispatchedVia String?           @map("dispatched_via") @db.Char(24)
+  returnedVia   String?           @map("returned_via") @db.Char(24)
+  notes         String?
+  createdAt     DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime          @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company   Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  product   Product    @relation(fields: [productId], references: [id])
+  warehouse Warehouse  @relation(fields: [warehouseId], references: [id])
+  batch     StockBatch? @relation(fields: [batchId], references: [id])
+
+  @@unique([productId, serialNo])
+  @@index([companyId, productId, status])
+  @@map("stock_serial_numbers")
+}
+
+model JournalEntry {
+  id                             String                      @id @db.Char(24)
+  companyId                      String                      @map("company_id") @db.Char(24)
+  entryNumber                    String                      @map("entry_number")
+  date                           DateTime                    @db.Timestamptz(3)
+  description                    String
+  sourceType                     String?                     @map("source_type")
+  sourceId                       String?                     @map("source_id")
+  sourceReference                String?                     @map("source_reference")
+  reference                      String?
+  status                         JournalEntryStatus          @default(draft)
+  totalDebit                     Decimal                     @default(0) @map("total_debit") @db.Decimal(19, 2)
+  totalCredit                    Decimal                     @default(0) @map("total_credit") @db.Decimal(19, 2)
+  debitTotal                     Decimal                     @default(0) @map("debit_total") @db.Decimal(19, 2)
+  creditTotal                    Decimal                     @default(0) @map("credit_total") @db.Decimal(19, 2)
+  isAutoGenerated                Boolean                     @default(false) @map("is_auto_generated")
+  reversalOfId                   String?                     @map("reversal_of_id") @db.Char(24)
+  createdById                    String                      @map("created_by") @db.Char(24)
+  postedById                     String?                     @map("posted_by") @db.Char(24)
+  notes                          String?
+  reversed                       Boolean                     @default(false)
+  reconciliationStatus           JournalReconciliationStatus @default(unreconciled) @map("reconciliation_status")
+  reconciledAt                   DateTime?                   @map("reconciled_at") @db.Timestamptz(3)
+  reconciledInReconciliationId   String?                     @map("reconciled_in_reconciliation_id") @db.Char(24)
+  reconciledById                 String?                     @map("reconciled_by") @db.Char(24)
+  isReconciliationAdjustingEntry Boolean                     @default(false) @map("is_reconciliation_adjusting_entry")
+  reversedAt                     DateTime?                   @map("reversed_at") @db.Timestamptz(3)
+  reversedById                   String?                     @map("reversed_by") @db.Char(24)
+  reversalEntryId                String?                     @map("reversal_entry_id") @db.Char(24)
+  isLocked                       Boolean                     @default(false) @map("is_locked")
+  lockedAt                       DateTime?                   @map("locked_at") @db.Timestamptz(3)
+  lockedById                     String?                     @map("locked_by") @db.Char(24)
+  lockedReason                   String?                     @map("locked_reason")
+  createdAt                      DateTime                    @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                      DateTime                    @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company      Company            @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  lines        JournalEntryLine[]
+  stockTransfers StockTransfer[]
+  stockAudits  StockAudit[]
+
+  @@unique([companyId, entryNumber])
+  @@index([companyId, date(sort: Desc), entryNumber(sort: Desc)])
+  @@index([companyId, status, date])
+  @@index([companyId, sourceType, date])
+  @@map("journal_entries")
+}
+
+model JournalEntryLine {
+  id                     String   @id @db.Char(24)
+  companyId              String   @map("company_id") @db.Char(24)
+  journalEntryId         String   @map("journal_entry_id") @db.Char(24)
+  lineOrder              Int      @default(0) @map("line_order")
+  accountCode            String   @map("account_code")
+  accountName            String   @map("account_name")
+  description            String?
+  debit                  Decimal  @default(0) @db.Decimal(19, 2)
+  credit                 Decimal  @default(0) @db.Decimal(19, 2)
+  reference              String?
+  reconciled             Boolean  @default(false)
+  matchedStatementLineId String?  @map("matched_statement_line_id") @db.Char(24)
+  accountId              String?  @map("account_id") @db.Char(24)
+  createdAt              DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt              DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company       Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  journalEntry  JournalEntry  @relation(fields: [journalEntryId], references: [id], onDelete: Cascade)
+  account       ChartOfAccount? @relation(fields: [accountId], references: [id])
+
+  @@index([companyId, accountCode])
+  @@index([journalEntryId])
+  @@index([companyId, accountId])
+  @@map("journal_entry_lines")
+}
+
+model AccountBalance {
+  id          String   @id @db.Char(24)
+  companyId   String   @map("company_id") @db.Char(24)
+  accountCode String   @map("account_code")
+  debit       Decimal  @default(0) @db.Decimal(19, 2)
+  credit      Decimal  @default(0) @db.Decimal(19, 2)
+  updatedAt   DateTime @default(now()) @map("updated_at") @db.Timestamptz(3)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, accountCode])
+  @@map("account_balances")
+}
+
+model AccountMapping {
+  id          String   @id @db.Char(24)
+  companyId   String   @map("company_id") @db.Char(24)
+  module      String
+  key         String
+  accountCode Json     @map("account_code")
+  description String?
+  createdById String?  @map("created_by") @db.Char(24)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, module, key])
+  @@map("account_mappings")
+}
+
+model AccountingPeriod {
+  id                   String                 @id @db.Char(24)
+  companyId            String                 @map("company_id") @db.Char(24)
+  name                 String
+  periodType           AccountingPeriodType   @default(month) @map("period_type")
+  startDate            DateTime               @map("start_date") @db.Timestamptz(3)
+  endDate              DateTime               @map("end_date") @db.Timestamptz(3)
+  fiscalYear           Int                    @map("fiscal_year")
+  status               AccountingPeriodStatus @default(open)
+  closedById           String?                @map("closed_by") @db.Char(24)
+  closedAt             DateTime?              @map("closed_at") @db.Timestamptz(3)
+  yearEndCloseEntryId  String?                @map("year_end_close_entry_id") @db.Char(24)
+  isYearEnd            Boolean                @default(false) @map("is_year_end")
+  createdAt            DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt            DateTime               @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, startDate, endDate])
+  @@index([companyId, status])
+  @@index([companyId, fiscalYear])
+  @@map("accounting_periods")
+}
+
+model Period {
+  id        String             @id @db.Char(24)
+  companyId String             @map("company_id") @db.Char(24)
+  name      String?
+  startDate DateTime           @map("start_date") @db.Timestamptz(3)
+  endDate   DateTime           @map("end_date") @db.Timestamptz(3)
+  status    LegacyPeriodStatus @default(open)
+  createdAt DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime           @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, startDate, endDate])
+  @@map("periods")
+}

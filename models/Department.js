@@ -1,51 +1,29 @@
-const mongoose = require('mongoose');
+/**
+ * Department model — PostgreSQL (Prisma) backed.
+ */
 
-const departmentSchema = new mongoose.Schema({
-  company: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Company',
-    required: true,
-    index: true
-  },
-  code: {
-    type: String,
-    required: true,
-    uppercase: true,
-    trim: true
-  },
-  name: {
-    type: String,
-    required: true,
-    trim: true
-  },
-  description: {
-    type: String,
-    trim: true
-  },
-  manager: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
-    default: null
-  },
-  defaultLaborAccount: {
-    type: String,
-    enum: ['5300', '5400'],
-    default: '5400'
-  },
-  budgetLimit: {
-    type: Number,
-    default: 0
-  },
-  isActive: {
-    type: Boolean,
-    default: true
-  }
-}, {
-  timestamps: true
+const { buildTenantModel } = require('../utils/masterDataCommon');
+const {
+  departmentToApi,
+  departmentTranslateCreate,
+  departmentTranslateUpdate,
+} = require('../utils/masterDataMappers');
+
+const FIELD_MAP = {
+  code: { target: 'code', transform: (v) => ({ code: typeof v === 'string' ? v.toUpperCase() : v }) },
+  name: { target: 'name' },
+  description: { target: 'description' },
+  manager: { target: 'managerId', isId: true },
+  defaultLaborAccount: { target: 'defaultLaborAccount' },
+  budgetLimit: { target: 'budgetLimit' },
+};
+
+module.exports = buildTenantModel({
+  name: 'Department',
+  collection: 'departments',
+  delegateName: 'department',
+  fieldMap: FIELD_MAP,
+  toApi: departmentToApi,
+  translateCreate: departmentTranslateCreate,
+  translateUpdate: departmentTranslateUpdate,
 });
-
-// Compound index for unique department code per company
-departmentSchema.index({ company: 1, code: 1 }, { unique: true });
-departmentSchema.index({ company: 1, isActive: 1 });
-
-module.exports = mongoose.model('Department', departmentSchema);

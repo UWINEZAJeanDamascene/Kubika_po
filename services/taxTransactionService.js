@@ -2,6 +2,23 @@ const mongoose = require('mongoose');
 const TaxTransaction = require('../models/TaxTransaction');
 const TaxRate = require('../models/TaxRate');
 const { CHART_OF_ACCOUNTS, DEFAULT_ACCOUNTS, isTaxAccount, getTaxSubtype } = require('../constants/chartOfAccounts');
+const { isMongoEnabled } = require('./transactionService');
+
+let warnedMongoUnavailable = false;
+
+/**
+ * TaxTransaction is still Mongoose-backed. With Mongo disabled every write sits
+ * in the driver buffer until it times out, adding ~10s to each sale, so skip the
+ * work instead of failing slowly.
+ */
+function taxLedgerAvailable() {
+  if (isMongoEnabled()) return true;
+  if (!warnedMongoUnavailable) {
+    warnedMongoUnavailable = true;
+    console.warn('TaxTransactionService: MongoDB is disabled — tax transaction records are not being written.');
+  }
+  return false;
+}
 
 /**
  * TaxTransactionService
@@ -81,6 +98,8 @@ class TaxTransactionService {
     if (!companyId || !journalEntry || !journalEntry.lines) {
       return [];
     }
+
+    if (!taxLedgerAvailable()) return [];
 
     const taxTransactions = [];
     const entryDate = journalEntry.date || new Date();
@@ -240,6 +259,8 @@ class TaxTransactionService {
       metadata = {},
       session = null
     } = data;
+
+    if (!taxLedgerAvailable()) return null;
 
     const period = {
       month: date.getMonth() + 1,

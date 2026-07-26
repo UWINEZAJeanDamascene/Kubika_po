@@ -219,28 +219,35 @@ exports.getPurchaseOrders = async (req, res, next) => {
     const total = await PurchaseOrder.countDocuments(q);
     const list = await PurchaseOrder.find(q)
       .populate('supplier', 'name code contact email')
+      .populate('lines.product', 'name sku unit')
       .sort({ orderDate: -1 })
       .skip(skip)
       .limit(limit);
 
     // Add computed linesCount to each PO and backfill totals if needed
     const data = list.map(po => {
-      const obj = po.toObject();
+      const obj = po.toObject ? po.toObject() : { ...po };
+      const lines = Array.isArray(obj.lines) ? obj.lines : [];
       // Backfill: compute totals on the fly if they're zero but lines exist
-      if (po.lines && po.lines.length > 0 && (!po.totalAmount || po.totalAmount === 0)) {
+      if (lines.length > 0 && (!obj.totalAmount || Number(obj.totalAmount) === 0)) {
         let subtotal = 0;
         let taxAmount = 0;
-        po.lines.forEach(line => {
+        lines.forEach(line => {
           const lineSubtotal = (Number(line.qtyOrdered) || 0) * (Number(line.unitCost) || 0);
-          const lineTax = lineSubtotal * ((Number(line.taxRate) || 0) / 100);
+          const lineTax = Number(line.taxAmount) > 0
+            ? Number(line.taxAmount)
+            : lineSubtotal * ((Number(line.taxRate) || 0) / 100);
           subtotal += lineSubtotal;
           taxAmount += lineTax;
         });
         obj.subtotal = subtotal;
         obj.taxAmount = taxAmount;
         obj.totalAmount = subtotal + taxAmount;
+        if (obj.balance == null || Number(obj.balance) === 0) {
+          obj.balance = Math.max(0, obj.totalAmount - (Number(obj.amountPaid) || 0));
+        }
       }
-      obj.linesCount = po.lines ? po.lines.length : 0;
+      obj.linesCount = obj.linesCount ?? lines.length;
       return obj;
     });
 

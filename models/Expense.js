@@ -1,554 +1,67 @@
-const mongoose = require('mongoose');
+/**
+ * Expense model — PostgreSQL (Prisma) backed.
+ *
+ * Derived fields the legacy Mongoose pre-save hook computed (reference number,
+ * period, withholding tax, RWF conversions) are handled by the mappers in
+ * utils/phase10Mappers.js (expenseTranslateCreate / expenseDocToUpdate).
+ */
 
-const expenseItemSchema = new mongoose.Schema({
-  description: {
-    type: String,
-    trim: true,
-    default: ''
-  },
-  amount: {
-    type: Number,
-    required: true,
-    min: 0
-  },
-  date: {
-    type: Date,
-    default: Date.now
-  },
-  reference: String,
-  notes: String
-});
+const { buildTenantModel } = require('../utils/masterDataCommon');
+const {
+  expenseToApi,
+  expenseTranslateCreate,
+  expenseTranslateUpdate,
+  expenseDocToUpdate,
+} = require('../utils/phase10Mappers');
 
-const expenseSchema = new mongoose.Schema({
-  // Multi-tenancy: company reference (keeping existing pattern)
-  company: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Company',
-    required: [true, 'Expense must belong to a company'],
-    index: true
-  },
-
-  // Reference number - unique per company
-  reference_no: {
-    type: String
-  },
-
-  // Expense date
-  expense_date: {
-    type: Date,
-    required: true
-  },
-
-  // Description
-  description: {
-    type: String,
-    required: true,
-    trim: true
-  },
-
-  // Expense account (ChartOfAccounts reference)
-  expense_account_id: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'ChartOfAccount',
-    required: true
-  },
-
-  // Amount (net of tax)
-  amount: {
-    type: Number,
-    required: true,
-    min: 0.01
-  },
-
-  // Tax amount (VAT input)
-  tax_amount: {
-    type: Number,
-    default: 0
-  },
-
-  // Total amount (including tax)
-  total_amount: {
-    type: Number,
-    required: true
-  },
-
-  // Currency fields - RWF as functional currency (Rwanda context)
-  currencyCode: {
-    type: String,
-    default: 'RWF',  // Rwanda Franc as default functional currency
-    enum: ['RWF', 'USD', 'EUR', 'GBP', 'UGX', 'KES', 'TZS'],  // Common regional currencies
-    required: true
-  },
-  exchangeRate: {
-    type: Number,
-    default: 1,  // 1 for RWF, calculated for foreign currencies
-    min: 0
-  },
-  amountInRWF: {
-    type: Number,
-    min: 0.01
-    // Auto-calculated in pre-save hook based on amount and exchangeRate
-  },
-  taxAmountInRWF: {
-    type: Number,
-    default: 0
-    // Auto-calculated in pre-save hook
-  },
-  totalAmountInRWF: {
-    type: Number
-    // Auto-calculated in pre-save hook
-  },
-
-  // Tax account for input VAT
-  tax_account_id: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'ChartOfAccount',
-    default: null
-  },
-
-  // Payment method: bank, petty_cash, credit_card, payable
-  payment_method: {
-    type: String,
-    enum: ['bank', 'cash', 'bank_transfer', 'cheque', 'mobile_money', 'credit_card', 'petty_cash', 'payable'],
-    required: true
-  },
-
-  // Bank account (required when payment_method = 'bank')
-  bank_account_id: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'BankAccount',
-    default: null
-  },
-
-  // Petty cash fund (required when payment_method = 'petty_cash')
-  petty_cash_fund_id: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'PettyCashFloat',
-    default: null
-  },
-
-  // RRA Tax Categories - Rwanda-specific tax compliance
-  rraTaxCategory: {
-    type: String,
-    enum: [
-      'vat_standard',      // 18% VAT - standard rate
-      'vat_exempt',        // No VAT (education, healthcare, etc.)
-      'vat_zero',          // 0% VAT (exports)
-      'wht_15_services',   // 15% withholding - services
-      'wht_30_dividends',  // 30% withholding - dividends
-      'wht_10_interest',   // 10% withholding - interest
-      'reverse_charge',    // Reverse charge mechanism
-      'not_taxable'        // Outside scope
-    ],
-    default: 'vat_standard'
-  },
-  rraTaxTransactionId: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'TaxTransaction',
-    default: null
-  },
-  isVATRecoverable: {
-    type: Boolean,
-    default: true  // Most business expenses recoverable
-  },
-
-  // Withholding Tax (Rwanda WHT)
-  withholdingTax: {
-    type: Number,
-    default: 0
-  },
-  withholdingTaxRate: {
-    type: Number,
-    default: 0
-  },
-  withholdingTaxInRWF: {
-    type: Number,
-    default: 0
-  },
-
-  // Department / Cost Center allocation
-  department_id: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Department',
-    default: null
-  },
-  departmentAllocations: [{
-    department_id: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'Department',
-      required: true
-    },
-    percentage: {
-      type: Number,
-      min: 0,
-      max: 100,
-      required: true
-    },
-    amount: Number  // Calculated amount for this department
-  }],
-
-  // Budget reference (for budget tracking and encumbrances)
-  budget_id: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Budget',
-    default: null
-  },
-
-  // Budget line reference (specific budget line this expense encumbers)
-  budget_line_id: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'BudgetLine',
-    default: null
-  },
-
-  // Linked encumbrance reference
-  encumbrance_id: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Encumbrance',
-    default: null
-  },
-
-  // Supplier reference
-  supplier_id: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Supplier',
-    default: null
-  },
-
-  // Receipt reference
-  receipt_ref: {
-    type: String,
-    default: null
-  },
-
-  // Status: pending, approved, rejected, posted, reversed, cancelled
-  status: {
-    type: String,
-    enum: ['pending', 'approved', 'rejected', 'posted', 'reversed', 'cancelled'],
-    default: 'pending'
-  },
-
-  // Approval tracking
-  approvedBy: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
-    default: null
-  },
-  approvedAt: {
-    type: Date,
-    default: null
-  },
-  rejectedBy: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
-    default: null
-  },
-  rejectedAt: {
-    type: Date,
-    default: null
-  },
-  rejectionReason: {
-    type: String,
-    default: null
-  },
-
-  // Journal entry for the expense
-  journal_entry_id: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'JournalEntry',
-    default: null
-  },
-
-  // Reversal journal entry
-  reversal_journal_entry_id: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'JournalEntry',
-    default: null
-  },
-
-  // Posted by user
-  posted_by: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
-    required: true
-  },
-
-  // Legacy fields - keeping for backward compatibility
-  // Expense type/category (kept for reporting)
-  type: {
-    type: String,
-    enum: [
-      'salaries_wages',
-      'rent',
-      'utilities',
-      'transport_delivery',
-      'marketing_advertising',
-      'other_expense',
-      'interest_income',
-      'other_income',
-      'other_expense_income'
-    ],
-    default: 'other_expense'
-  },
-
-  // For backward compatibility - category name
-  category: {
-    type: String,
-    default: function() {
-      return this.type;
-    }
-  },
-
-  // Reference number (legacy)
-  expenseNumber: {
-    type: String,
-    uppercase: true
-  },
-
-  // Date (legacy)
-  expenseDate: {
-    type: Date
-  },
-
-  // Period for reporting (monthly)
-  period: {
-    type: String, // Format: YYYY-MM
-    index: true
-  },
-
-  // Payment info (legacy)
-  paymentMethod: {
-    type: String,
-    enum: ['bank', 'cash', 'bank_transfer', 'cheque', 'mobile_money', 'credit_card', 'petty_cash', 'payable'],
-    default: 'bank'
-  },
-  paid: {
-    type: Boolean,
-    default: false
-  },
-  paidDate: Date,
-
-  // Recurring
-  isRecurring: {
-    type: Boolean,
-    default: false
-  },
-  recurringFrequency: {
-    type: String,
-    enum: ['daily', 'weekly', 'monthly', 'quarterly', 'yearly'],
-    default: 'monthly'
-  },
-
-  // User tracking (legacy)
-  createdBy: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User'
-  },
-
-  // Notes
-  notes: String,
-
-  // Attachments/references
-  attachments: [{
-    name: String,
-    url: String
-  }]
-}, {
-  timestamps: true
-});
-
-// Compound indexes for efficient queries
-expenseSchema.index({ company: 1, reference_no: 1 }, { unique: true });
-expenseSchema.index({ company: 1, expense_date: -1 });
-expenseSchema.index({ company: 1, expense_account_id: 1 });
-expenseSchema.index({ company: 1, payment_method: 1 });
-expenseSchema.index({ company: 1, type: 1 });
-expenseSchema.index({ company: 1, status: 1 });
-// Rwanda-specific indexes
-expenseSchema.index({ company: 1, currencyCode: 1 });  // For multi-currency reporting
-expenseSchema.index({ company: 1, department_id: 1 });  // For department reporting
-expenseSchema.index({ company: 1, rraTaxCategory: 1 });  // For tax reporting
-
-// Auto-generate reference number
-expenseSchema.pre('save', async function(next) {
-  // Check immutability for posted expenses
-  if (!this.isNew && this.isModified()) {
-    const original = await this.constructor.findById(this._id).lean();
-    if (original && original.status === 'posted') {
-      // Only allow specific fields to be modified on posted expenses
-      const allowedModifications = ['status', 'reversal_journal_entry_id', 'updatedAt'];
-      const isOnlyAllowedChanges = this.modifiedPaths().every(path =>
-        allowedModifications.includes(path) || path.startsWith('reversal')
-      );
-
-      if (!isOnlyAllowedChanges && this.status !== 'reversed') {
-        const error = new Error('POSTED_EXPENSE_IMMUTABLE: Posted expenses cannot be modified. Use reversal instead.');
-        error.code = 'POSTED_EXPENSE_IMMUTABLE';
-        return next(error);
-      }
-    }
-  }
-
-  if (this.isNew && !this.reference_no) {
-    const count = await mongoose.model('Expense').countDocuments({ company: this.company });
-    this.reference_no = `EXP-${String(count + 1).padStart(5, '0')}`;
-  }
-
-  // Set period from expense_date
-  if (this.expense_date) {
-    const year = this.expense_date.getFullYear();
-    const month = String(this.expense_date.getMonth() + 1).padStart(2, '0');
-    this.period = `${year}-${month}`;
-  }
-
-  // Auto-calculate withholding tax from rraTaxCategory
-  // Looks up TaxRate collection first (configurable), falls back to rate embedded in category name
-  if ((this.isNew || this.isModified('amount') || this.isModified('rraTaxCategory')) && this.rraTaxCategory && this.rraTaxCategory.startsWith('wht_')) {
-    const rateMatch = this.rraTaxCategory.match(/wht_(\d+)/);
-    const impliedRate = rateMatch ? parseFloat(rateMatch[1]) : 0;
-
-    let appliedRate = impliedRate;
-    if (this.company && impliedRate > 0) {
-      try {
-        const TaxRate = mongoose.model('TaxRate');
-        const taxRate = await TaxRate.findOne({
-          company: this.company,
-          type: 'withholding',
-          rate_pct: impliedRate,
-          is_active: true,
-        }).sort({ effective_from: -1 });
-        if (taxRate) {
-          appliedRate = taxRate.rate_pct;
-        }
-      } catch (_) {
-        // TaxRate lookup failed — use implied rate fallback
-      }
-    }
-
-    this.withholdingTaxRate = appliedRate;
-    this.withholdingTax = Math.round(this.amount * (appliedRate / 100) * 100) / 100;
-  } else if (!this.rraTaxCategory || !this.rraTaxCategory.startsWith('wht_')) {
-    this.withholdingTaxRate = 0;
-    this.withholdingTax = 0;
-  }
-
-  // Set total_amount if not set
-  if (this.isNew && !this.total_amount && this.amount !== undefined) {
-    this.total_amount = this.amount + (this.tax_amount || 0);
-  }
-
-  // Calculate RWF amounts for Rwanda functional currency
-  if (this.isNew || this.isModified('amount') || this.isModified('tax_amount') || this.isModified('exchangeRate') || this.isModified('currencyCode') || this.isModified('withholdingTax')) {
-    // Set defaults
-    if (!this.currencyCode) this.currencyCode = 'RWF';
-    if (!this.exchangeRate || this.exchangeRate <= 0) {
-      this.exchangeRate = this.currencyCode === 'RWF' ? 1 : (this.exchangeRate || 1);
-    }
-
-    // Calculate RWF amounts
-    if (this.currencyCode === 'RWF') {
-      this.exchangeRate = 1;
-      this.amountInRWF = this.amount;
-      this.taxAmountInRWF = this.tax_amount || 0;
-      this.withholdingTaxInRWF = this.withholdingTax || 0;
-      this.totalAmountInRWF = this.total_amount || (this.amount + (this.tax_amount || 0));
-    } else {
-      // Foreign currency conversion
-      this.amountInRWF = Math.round(this.amount * this.exchangeRate * 100) / 100;
-      this.taxAmountInRWF = Math.round((this.tax_amount || 0) * this.exchangeRate * 100) / 100;
-      this.withholdingTaxInRWF = Math.round((this.withholdingTax || 0) * this.exchangeRate * 100) / 100;
-      this.totalAmountInRWF = this.amountInRWF + this.taxAmountInRWF;
-    }
-  }
-
-  // Calculate department allocation amounts if percentage provided
-  if (this.departmentAllocations && this.departmentAllocations.length > 0) {
-    this.departmentAllocations.forEach(alloc => {
-      if (alloc.percentage && !alloc.amount) {
-        alloc.amount = Math.round(this.amountInRWF * (alloc.percentage / 100) * 100) / 100;
-      }
-    });
-  }
-
-  // Sync legacy fields
-  if (this.isNew) {
-    if (!this.expenseNumber) this.expenseNumber = this.reference_no;
-    if (!this.expenseDate) this.expenseDate = this.expense_date;
-    if (!this.createdBy) this.createdBy = this.posted_by;
-  }
-
-  next();
-});
-
-// Static method to get expenses by type for a period
-expenseSchema.statics.getByTypeAndPeriod = async function(companyId, type, startDate, endDate) {
-  const match = {
-    company: companyId,
-    type: type,
-    status: { $ne: 'reversed' }
-  };
-  
-  if (startDate || endDate) {
-    match.expense_date = {};
-    if (startDate) match.expense_date.$gte = startDate;
-    if (endDate) match.expense_date.$lte = endDate;
-  }
-  
-  const expenses = await this.find(match);
-  const total = expenses.reduce((sum, exp) => sum + (exp.amount || 0), 0);
-  
-  return { expenses, total };
+const FIELD_MAP = {
+  reference_no: { target: 'referenceNo' },
+  expenseNumber: { target: 'expenseNumber' },
+  expense_date: { target: 'expenseDate' },
+  expenseDate: { target: 'expenseDate' },
+  description: { target: 'description' },
+  expense_account_id: { target: 'expenseAccountId', isId: true },
+  expenseAccountId: { target: 'expenseAccountId', isId: true },
+  amount: { target: 'amount' },
+  tax_amount: { target: 'taxAmount' },
+  total_amount: { target: 'totalAmount' },
+  currencyCode: { target: 'currencyCode' },
+  exchangeRate: { target: 'exchangeRate' },
+  tax_account_id: { target: 'taxAccountId', isId: true },
+  payment_method: { target: 'paymentMethod' },
+  paymentMethod: { target: 'paymentMethod' },
+  bank_account_id: { target: 'bankAccountId', isId: true },
+  bankAccountId: { target: 'bankAccountId', isId: true },
+  petty_cash_fund_id: { target: 'pettyCashFundId', isId: true },
+  rraTaxCategory: { target: 'rraTaxCategory' },
+  department_id: { target: 'departmentId', isId: true },
+  budget_id: { target: 'budgetId', isId: true },
+  budget_line_id: { target: 'budgetLineId', isId: true },
+  encumbrance_id: { target: 'encumbranceId', isId: true },
+  supplier_id: { target: 'supplierId', isId: true },
+  status: { target: 'status' },
+  type: { target: 'type' },
+  category: { target: 'category' },
+  period: { target: 'period' },
+  paid: { target: 'paid' },
+  paidDate: { target: 'paidDate' },
+  withholdingTax: { target: 'withholdingTax' },
+  journal_entry_id: { target: 'journalEntryId', isId: true },
+  reversal_journal_entry_id: { target: 'reversalJournalEntryId', isId: true },
+  posted_by: { target: 'postedById', isId: true },
+  approvedBy: { target: 'approvedById', isId: true },
+  rejectedBy: { target: 'rejectedById', isId: true },
+  isRecurring: { target: 'isRecurring' },
 };
 
-// Static method to get all operating expenses for a period
-expenseSchema.statics.getOperatingExpenses = async function(companyId, startDate, endDate) {
-  const operatingTypes = [
-    'salaries_wages',
-    'rent',
-    'utilities',
-    'transport_delivery',
-    'marketing_advertising',
-    'other_expense'
-  ];
-  
-  const result = {};
-  let totalOperatingExpenses = 0;
-  
-  for (const type of operatingTypes) {
-    const { total } = await this.getByTypeAndPeriod(companyId, type, startDate, endDate);
-    const key = type.replace(/_([a-z])/g, (m, p1) => p1.toUpperCase());
-    result[key] = total;
-    totalOperatingExpenses += total;
-  }
-  
-  return { ...result, total: totalOperatingExpenses };
-};
-
-// Static method to get other income/expenses for a period
-expenseSchema.statics.getOtherIncomeExpenses = async function(companyId, startDate, endDate) {
-  const result = {
-    interestIncome: 0,
-    otherIncome: 0,
-    otherExpense: 0,
-    netOtherIncome: 0
-  };
-  
-  // Interest Income
-  const interestIncomeData = await this.getByTypeAndPeriod(companyId, 'interest_income', startDate, endDate);
-  result.interestIncome = interestIncomeData.total;
-  
-  // Other Income
-  const otherIncomeData = await this.getByTypeAndPeriod(companyId, 'other_income', startDate, endDate);
-  result.otherIncome = otherIncomeData.total;
-  
-  // Other Expense (from income statement perspective)
-  const otherExpenseData = await this.getByTypeAndPeriod(companyId, 'other_expense_income', startDate, endDate);
-  result.otherExpense = otherExpenseData.total;
-  
-  // Net Other Income = Interest Income + Other Income - Other Expense
-  result.netOtherIncome = result.interestIncome + result.otherIncome - result.otherExpense;
-  
-  return result;
-};
-
-module.exports = mongoose.model('Expense', expenseSchema);
+module.exports = buildTenantModel({
+  name: 'Expense',
+  collection: 'expenses',
+  delegateName: 'expense',
+  fieldMap: FIELD_MAP,
+  toApi: expenseToApi,
+  translateCreate: expenseTranslateCreate,
+  translateUpdate: expenseTranslateUpdate,
+  docToUpdate: expenseDocToUpdate,
+  mutable: true,
+});

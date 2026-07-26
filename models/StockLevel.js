@@ -1,331 +1,197 @@
-const mongoose = require('mongoose')
+/**
+ * StockLevel — PostgreSQL (Prisma) backed.
+ * Preserves snake_case API fields and static helpers for GRN/transfers.
+ */
 
-const stockLevelSchema = new mongoose.Schema({
+const mongoose = require('mongoose');
+const { prisma } = require('../lib/prisma');
+const { makeCompatModel, translateFilter, translateSort, IMPOSSIBLE, toId } = require('../utils/prismaCompat');
+const { getCompanyId } = require('../utils/prismaTenant');
+const { decimalToNumber } = require('../utils/decimalHelpers');
+const {
+  stockLevelToApi,
+  stockLevelTranslateCreate,
+  stockLevelTranslateUpdate,
+} = require('../utils/inventoryJournalMappers');
 
-  company_id: {
-    type:     mongoose.Schema.Types.ObjectId,
-    ref:      'Company',
-    required: true,
-  },
+const FIELD_MAP = {
+  _id: { target: 'id', isId: true },
+  id: { target: 'id', isId: true },
+  company_id: { target: 'companyId', isId: true },
+  companyId: { target: 'companyId', isId: true },
+  product_id: { target: 'productId', isId: true },
+  productId: { target: 'productId', isId: true },
+  warehouse_id: { target: 'warehouseId', isId: true },
+  warehouseId: { target: 'warehouseId', isId: true },
+  qty_on_hand: { target: 'qtyOnHand' },
+  qty_reserved: { target: 'qtyReserved' },
+  qty_on_order: { target: 'qtyOnOrder' },
+  avg_cost: { target: 'avgCost' },
+  total_value: { target: 'totalValue' },
+  last_movement_at: { target: 'lastMovementAt' },
+  last_movement_type: { target: 'lastMovementType' },
+  createdAt: { target: 'createdAt' },
+  updatedAt: { target: 'updatedAt' },
+};
 
-  product_id: {
-    type:     mongoose.Schema.Types.ObjectId,
-    ref:      'Product',
-    required: true,
-  },
+if (!mongoose.models.StockLevel) {
+  mongoose.model('StockLevel', new mongoose.Schema({}, { strict: false, collection: 'stocklevels' }));
+}
 
-  warehouse_id: {
-    type:     mongoose.Schema.Types.ObjectId,
-    ref:      'Warehouse',
-    required: true,
-  },
+function applyTenant(where, opts = {}) {
+  if (where === IMPOSSIBLE) return where;
+  if (opts.skipTenant) return where;
+  if (where && where.companyId !== undefined) return where;
+  const companyId = opts.companyId || getCompanyId();
+  if (!companyId) return where;
+  return { ...where, companyId: String(companyId) };
+}
 
-  // ── QUANTITY FIELDS ────────────────────────────────────────────────
+function wrapStockLevelDoc(apiDoc) {
+  if (!apiDoc || apiDoc.__mutable) return apiDoc;
+  const doc = { ...apiDoc, __mutable: true };
 
-  qty_on_hand: {
-    type:     Number,
-    required: true,
-    default:  0,
-    min:      0
-    // Physical units currently in this warehouse
-    // Updated on: GRN confirm, delivery note confirm,
-    //             stock transfer confirm, audit post,
-    //             purchase return confirm, credit note confirm
-  },
+  doc.toObject = () => {
+    const o = { ...doc };
+    ['save', 'toObject', 'toJSON', 'lean', '__mutable', 'applyMovement', 'reserve', 'releaseReservation', 'addOnOrder', 'reduceOnOrder'].forEach((k) => delete o[k]);
+    return o;
+  };
+  doc.lean = () => doc.toObject();
+  doc.toJSON = () => doc.toObject();
 
-  qty_reserved: {
-    type:    Number,
-    default: 0,
-    min:     0
-    // Units reserved for confirmed sales invoices not yet delivered
-    // Increases when: sales invoice confirmed
-    // Decreases when: delivery note confirmed OR invoice cancelled
-  },
+  doc.save = async function save() {
+    const payload = stockLevelTranslateUpdate({ $set: doc });
+    const row = await prisma.stockLevel.update({
+      where: { id: String(doc._id) },
+      data: payload,
+    });
+    const next = stockLevelToApi(row);
+    Object.keys(doc).forEach((k) => delete doc[k]);
+    Object.assign(doc, wrapStockLevelDoc(next));
+    return doc;
+  };
 
-  qty_on_order: {
-    type:    Number,
-    default: 0,
-    min:     0
-    // Units on approved but not yet received purchase orders
-    // Increases when: PO approved
-    // Decreases when: GRN confirmed (by received qty)
-  },
-
-  // qty_available is always computed — never stored
-  // qty_available = qty_on_hand - qty_reserved
-  // Use this virtual everywhere a dispatch check is needed
-
-  // ── COST FIELDS ───────────────────────────────────────────────────
-
-  avg_cost: {
-    type:    Number,
-    default: 0,
-    min:     0
-    // Weighted average cost per unit
-    // Recalculated on every GRN confirmation (WAC method)
-    // Formula: (old_qty × old_avg + recv_qty × recv_cost) / (old_qty + recv_qty)
-    // For FIFO products: avg_cost is maintained for valuation reporting
-    // but actual COGS uses StockLot costs — not this field
-  },
-
-  total_value: {
-    type:    Number,
-    default: 0
-    // qty_on_hand × avg_cost
-    // Updated whenever qty_on_hand or avg_cost changes
-    // Used by inventory valuation report and balance sheet
-  },
-
-  // ── AUDIT / COUNT FIELDS ──────────────────────────────────────────
-
-  last_counted_at: {
-    type:    Date,
-    default: null
-    // Set when a stock audit is posted for this product/warehouse
-  },
-
-  last_counted_by: {
-    type:    mongoose.Schema.Types.ObjectId,
-    ref:     'User',
-    default: null
-  },
-
-  last_movement_at: {
-    type:    Date,
-    default: null
-    // Set on every stock movement — used to detect dead stock
-  },
-
-  last_movement_type: {
-    type:    String,
-    enum:    [
-      'receipt',
-      'dispatch',
-      'transfer_in',
-      'transfer_out',
-      'adjustment_positive',
-      'adjustment_negative',
-      'return_in',
-      'return_out',
-      null
-    ],
-    default: null
-  }
-
-}, {
-  timestamps: true,
-  toJSON:     { virtuals: true },
-  toObject:   { virtuals: true }
-})
-
-// ── VIRTUAL ───────────────────────────────────────────────────────────
-
-// Always computed — never stored in DB
-// Use this everywhere you need to check available quantity
-stockLevelSchema.virtual('qty_available').get(function () {
-  return Math.max(0, this.qty_on_hand - this.qty_reserved)
-})
-
-// ── INDEXES ───────────────────────────────────────────────────────────
-
-// Primary lookup — one record per product per warehouse per company
-stockLevelSchema.index(
-  { company_id: 1, product_id: 1, warehouse_id: 1 },
-  { unique: true }
-)
-
-// Dashboard queries — stock value, warehouse breakdown
-stockLevelSchema.index({ company_id: 1, warehouse_id: 1 })
-
-// Low stock alert query
-stockLevelSchema.index({ company_id: 1, qty_on_hand: 1 })
-
-// Dead stock query — products with no recent movement
-stockLevelSchema.index({ company_id: 1, last_movement_at: 1 })
-
-// Valuation report
-stockLevelSchema.index({ company_id: 1, product_id: 1 })
-
-// ── PRE-SAVE HOOK ─────────────────────────────────────────────────────
-
-// Keep total_value in sync whenever qty or cost changes
-stockLevelSchema.pre('save', function (next) {
-  this.total_value = Math.round(this.qty_on_hand * this.avg_cost * 100) / 100
-  next()
-})
-
-stockLevelSchema.pre('findOneAndUpdate', function (next) {
-  const update = this.getUpdate()
-
-  // If either qty_on_hand or avg_cost is being updated,
-  // recompute total_value
-  const qty  = update.$set?.qty_on_hand
-  const cost = update.$set?.avg_cost
-
-  if (qty !== undefined || cost !== undefined) {
-    // We cannot access the full document here so we set a flag
-    // The controller/service must pass both values when updating
-    if (qty !== undefined && cost !== undefined) {
-      update.$set.total_value = Math.round(qty * cost * 100) / 100
+  doc.applyMovement = function applyMovement(movementType, qty, unitCost = null) {
+    const increase = ['receipt', 'transfer_in', 'adjustment_positive', 'return_in'];
+    const decrease = ['dispatch', 'transfer_out', 'adjustment_negative', 'return_out'];
+    if (increase.includes(movementType)) {
+      doc.qty_on_hand = Math.round((doc.qty_on_hand + qty) * 10000) / 10000;
+    } else if (decrease.includes(movementType)) {
+      doc.qty_on_hand = Math.round((doc.qty_on_hand - qty) * 10000) / 10000;
+      if (doc.qty_on_hand < 0) {
+        throw new Error(`STOCK_NEGATIVE: Movement would result in negative stock. Current: ${doc.qty_on_hand + qty}, Removing: ${qty}`);
+      }
+    } else {
+      throw new Error(`UNKNOWN_MOVEMENT_TYPE: ${movementType}`);
     }
-  }
+    doc.total_value = Math.round(doc.qty_on_hand * doc.avg_cost * 100) / 100;
+    doc.qty_available = Math.max(0, doc.qty_on_hand - doc.qty_reserved);
+    doc.last_movement_at = new Date();
+    doc.last_movement_type = movementType;
+    return doc;
+  };
 
-  next()
-})
+  doc.reserve = function reserve(qty) {
+    const available = doc.qty_on_hand - doc.qty_reserved;
+    if (available < qty) {
+      throw new Error(`INSUFFICIENT_STOCK: Cannot reserve ${qty}. Available: ${Math.round(available * 10000) / 10000}`);
+    }
+    doc.qty_reserved = Math.round((doc.qty_reserved + qty) * 10000) / 10000;
+    doc.qty_available = Math.max(0, doc.qty_on_hand - doc.qty_reserved);
+    return doc;
+  };
 
-// ── STATIC METHODS ────────────────────────────────────────────────────
+  doc.releaseReservation = function releaseReservation(qty) {
+    doc.qty_reserved = Math.round(Math.max(0, doc.qty_reserved - qty) * 10000) / 10000;
+    doc.qty_available = Math.max(0, doc.qty_on_hand - doc.qty_reserved);
+    return doc;
+  };
 
-// Get or create a stock level record for a product/warehouse combination
-// Called by StockService on every first receipt to a new location
-stockLevelSchema.statics.getOrCreate = async function (companyId, productId, warehouseId) {
-  const existing = await this.findOne({
-    company_id:   companyId,
-    product_id:   productId,
-    warehouse_id: warehouseId
-  })
+  doc.addOnOrder = function addOnOrder(qty) {
+    doc.qty_on_order = Math.round((doc.qty_on_order + qty) * 10000) / 10000;
+    return doc;
+  };
 
-  if (existing) return existing
+  doc.reduceOnOrder = function reduceOnOrder(qty) {
+    doc.qty_on_order = Math.round(Math.max(0, doc.qty_on_order - qty) * 10000) / 10000;
+    return doc;
+  };
 
-  return this.create({
-    company_id:   companyId,
-    product_id:   productId,
-    warehouse_id: warehouseId,
-    qty_on_hand:  0,
-    qty_reserved: 0,
-    qty_on_order: 0,
-    avg_cost:     0,
-    total_value:  0
-  })
+  return doc;
 }
 
-// Recalculate WAC avg_cost after a receipt
-// Call this inside the same transaction as the GRN confirmation
-stockLevelSchema.statics.recalculateWAC = async function (
-  companyId,
-  productId,
-  warehouseId,
-  receivedQty,
-  receivedCost,
-  session = null
-) {
-  const level = await this.findOne({
-    company_id:   companyId,
-    product_id:   productId,
-    warehouse_id: warehouseId
-  }).session(session)
+const model = makeCompatModel({
+  delegate: () => prisma.stockLevel,
+  fieldMap: FIELD_MAP,
+  toApi: (row) => wrapStockLevelDoc(stockLevelToApi(row)),
+  translateCreate: stockLevelTranslateCreate,
+  translateUpdate: stockLevelTranslateUpdate,
+  tenantField: 'companyId',
+  mutable: true,
+});
 
-  if (!level) throw new Error('STOCK_LEVEL_NOT_FOUND')
+model.getOrCreate = async function getOrCreate(companyId, productId, warehouseId) {
+  const cid = toId(companyId);
+  const pid = toId(productId);
+  const wid = toId(warehouseId);
+  let row = await prisma.stockLevel.findUnique({
+    where: { companyId_productId_warehouseId: { companyId: cid, productId: pid, warehouseId: wid } },
+  });
+  if (row) return wrapStockLevelDoc(stockLevelToApi(row));
+  row = await prisma.stockLevel.create({
+    data: {
+      ...(await stockLevelTranslateCreate({
+        company_id: cid,
+        product_id: pid,
+        warehouse_id: wid,
+        qty_on_hand: 0,
+        qty_reserved: 0,
+        qty_on_order: 0,
+        avg_cost: 0,
+        total_value: 0,
+      })),
+    },
+  });
+  return wrapStockLevelDoc(stockLevelToApi(row));
+};
 
-  const oldQty   = level.qty_on_hand
-  const oldAvg   = level.avg_cost
-  const newQty   = oldQty + receivedQty
-  const newAvg   = newQty > 0
-    ? ((oldQty * oldAvg) + (receivedQty * receivedCost)) / newQty
-    : receivedCost
+model.recalculateWAC = async function recalculateWAC(companyId, productId, warehouseId, receivedQty, receivedCost) {
+  const doc = await model.getOrCreate(companyId, productId, warehouseId);
+  const oldQty = doc.qty_on_hand;
+  const oldAvg = doc.avg_cost;
+  const newQty = oldQty + receivedQty;
+  const newAvg = newQty > 0 ? ((oldQty * oldAvg) + (receivedQty * receivedCost)) / newQty : receivedCost;
+  doc.qty_on_hand = Math.round(newQty * 10000) / 10000;
+  doc.avg_cost = Math.round(newAvg * 1000000) / 1000000;
+  doc.total_value = Math.round(doc.qty_on_hand * doc.avg_cost * 100) / 100;
+  doc.last_movement_at = new Date();
+  doc.last_movement_type = 'receipt';
+  return doc.save();
+};
 
-  level.qty_on_hand    = Math.round(newQty * 10000) / 10000
-  level.avg_cost       = Math.round(newAvg * 1000000) / 1000000
-  level.total_value    = Math.round(level.qty_on_hand * level.avg_cost * 100) / 100
-  level.last_movement_at   = new Date()
-  level.last_movement_type = 'receipt'
-
-  return level.save({ session })
-}
-
-// Validate there is enough available stock before any dispatch
-// Call this BEFORE starting a transaction
-stockLevelSchema.statics.validateAvailable = async function (
-  companyId,
-  productId,
-  warehouseId,
-  requiredQty
-) {
-  const level = await this.findOne({
-    company_id:   companyId,
-    product_id:   productId,
-    warehouse_id: warehouseId
-  }).lean()
-
-  if (!level) {
-    throw new Error(`STOCK_LEVEL_NOT_FOUND: No stock record for this product at this warehouse`)
+model.validateAvailable = async function validateAvailable(companyId, productId, warehouseId, requiredQty) {
+  const cid = toId(companyId);
+  const row = await prisma.stockLevel.findUnique({
+    where: {
+      companyId_productId_warehouseId: {
+        companyId: cid,
+        productId: toId(productId),
+        warehouseId: toId(warehouseId),
+      },
+    },
+  });
+  if (!row) {
+    throw new Error('STOCK_LEVEL_NOT_FOUND: No stock record for this product at this warehouse');
   }
-
-  const available = level.qty_on_hand - level.qty_reserved
-
+  const onHand = decimalToNumber(row.qtyOnHand, 0);
+  const reserved = decimalToNumber(row.qtyReserved, 0);
+  const available = onHand - reserved;
   if (available < requiredQty) {
     throw new Error(
-      `INSUFFICIENT_STOCK: Required ${requiredQty}, ` +
-      `available ${Math.round(available * 10000) / 10000} ` +
-      `(on hand ${level.qty_on_hand} minus reserved ${level.qty_reserved})`
-    )
+      `INSUFFICIENT_STOCK: Required ${requiredQty}, available ${Math.round(available * 10000) / 10000} (on hand ${onHand} minus reserved ${reserved})`,
+    );
   }
+  return true;
+};
 
-  return true
-}
-
-// ── INSTANCE METHODS ──────────────────────────────────────────────────
-
-// Apply a stock movement to this level record
-// Called by StockService inside a MongoDB session
-stockLevelSchema.methods.applyMovement = function (movementType, qty, unitCost = null) {
-
-  const increase = ['receipt', 'transfer_in', 'adjustment_positive', 'return_in']
-  const decrease = ['dispatch', 'transfer_out', 'adjustment_negative', 'return_out']
-
-  if (increase.includes(movementType)) {
-    this.qty_on_hand = Math.round((this.qty_on_hand + qty) * 10000) / 10000
-  } else if (decrease.includes(movementType)) {
-    this.qty_on_hand = Math.round((this.qty_on_hand - qty) * 10000) / 10000
-    if (this.qty_on_hand < 0) {
-      throw new Error(
-        `STOCK_NEGATIVE: Movement would result in negative stock. ` +
-        `Current: ${this.qty_on_hand + qty}, Removing: ${qty}`
-      )
-    }
-  } else {
-    throw new Error(`UNKNOWN_MOVEMENT_TYPE: ${movementType}`)
-  }
-
-  // Update total value
-  this.total_value         = Math.round(this.qty_on_hand * this.avg_cost * 100) / 100
-  this.last_movement_at    = new Date()
-  this.last_movement_type  = movementType
-
-  return this  // return this for chaining
-}
-
-// Reserve stock when a sales invoice is confirmed
-stockLevelSchema.methods.reserve = function (qty) {
-  const available = this.qty_on_hand - this.qty_reserved
-  if (available < qty) {
-    throw new Error(
-      `INSUFFICIENT_STOCK: Cannot reserve ${qty}. ` +
-      `Available: ${Math.round(available * 10000) / 10000}`
-    )
-  }
-  this.qty_reserved = Math.round((this.qty_reserved + qty) * 10000) / 10000
-  return this
-}
-
-// Release reservation when invoice is cancelled or delivery confirmed
-stockLevelSchema.methods.releaseReservation = function (qty) {
-  this.qty_reserved = Math.round(
-    Math.max(0, this.qty_reserved - qty) * 10000
-  ) / 10000
-  return this
-}
-
-// Track quantity on order from approved POs
-stockLevelSchema.methods.addOnOrder = function (qty) {
-  this.qty_on_order = Math.round((this.qty_on_order + qty) * 10000) / 10000
-  return this
-}
-
-stockLevelSchema.methods.reduceOnOrder = function (qty) {
-  this.qty_on_order = Math.round(
-    Math.max(0, this.qty_on_order - qty) * 10000
-  ) / 10000
-  return this
-}
-
-module.exports = mongoose.model('StockLevel', stockLevelSchema)
+module.exports = model;

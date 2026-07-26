@@ -112,6 +112,24 @@ async function validateProductCodes(companyId, product) {
     }),
   ]);
 
+  // Every code below is checked against reference data pulled from RRA. Without
+  // that sync, each lookup misses and "invalid code" would point at the wrong
+  // thing, so say what is really missing.
+  if (!itemClass || !pkgUnit || !qtyUnit) {
+    const [itemClassCount, codeCount] = await Promise.all([
+      EBMItemClass.countDocuments({ company: companyId }),
+      EBMCode.countDocuments({ company: companyId }),
+    ]);
+    if (!itemClassCount || !codeCount) {
+      const error = new Error(
+        "EBM reference codes have not been synced for this company. Sync EBM codes (EBM > Codes > Sync) before registering products.",
+      );
+      error.code = "EBM_CODES_NOT_SYNCED";
+      error.statusCode = 409;
+      throw error;
+    }
+  }
+
   if (!itemClass)
     throw new Error(`Invalid RRA item classification code: ${itemClassCd}`);
   if (!["A", "B", "C", "D"].includes(taxTyCd))

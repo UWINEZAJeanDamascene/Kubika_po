@@ -1,1241 +1,273 @@
-const mongoose = require("mongoose");
-const { aggregateWithTimeout } = require("../utils/mongoAggregation");
+/**
+ * BankAccount — PostgreSQL (Prisma) backed.
+ * Also registers BankTransaction, BankStatementLine, BankReconciliationMatch,
+ * BankReconciliation (legacy export pattern preserved).
+ */
 
-// Bank Reconciliation Session Schema (real-world reconciliation tracking)
-const bankReconciliationSchema = new mongoose.Schema(
-  {
-    bankAccount: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "BankAccount",
-      required: true,
-      index: true,
-    },
-    company: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Company",
-      required: true,
-      index: true,
-    },
-    // Statement period
-    statementDateStart: {
-      type: Date,
-      required: true,
-    },
-    statementDateEnd: {
-      type: Date,
-      required: true,
-    },
-    // Closing balance from the bank statement
-    statementClosingBalance: {
-      type: mongoose.Schema.Types.Decimal128,
-      required: true,
-      get: function (value) {
-        return value ? parseFloat(value.toString()) : 0;
-      },
-    },
-    // Book balance at the start of this reconciliation (computed from journal)
-    bookClosingBalance: {
-      type: mongoose.Schema.Types.Decimal128,
-      required: false,
-      default: null,
-      get: function (value) {
-        return value ? parseFloat(value.toString()) : 0;
-      },
-    },
-    // Difference at completion time (must be zero)
-    difference: {
-      type: mongoose.Schema.Types.Decimal128,
-      default: mongoose.Types.Decimal128.fromString("0"),
-      get: function (value) {
-        return value ? parseFloat(value.toString()) : 0;
-      },
-    },
-    // Status of this reconciliation session
-    status: {
-      type: String,
-      enum: ["draft", "in_progress", "completed", "cancelled"],
-      default: "draft",
-      index: true,
-    },
-    // Who started and completed
-    startedBy: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "User",
-      required: true,
-    },
-    completedBy: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "User",
-      default: null,
-    },
-    startedAt: {
-      type: Date,
-      default: Date.now,
-    },
-    completedAt: {
-      type: Date,
-      default: null,
-    },
-    // Reconciliation report data (snapshot at completion)
-    reportSnapshot: {
-      beginningBookBalance: {
-        type: mongoose.Schema.Types.Decimal128,
-        default: null,
-        get: function (value) {
-          return value ? parseFloat(value.toString()) : 0;
-        },
-      },
-      totalDepositsPerBooks: {
-        type: mongoose.Schema.Types.Decimal128,
-        default: null,
-        get: function (value) {
-          return value ? parseFloat(value.toString()) : 0;
-        },
-      },
-      totalChecksPerBooks: {
-        type: mongoose.Schema.Types.Decimal128,
-        default: null,
-        get: function (value) {
-          return value ? parseFloat(value.toString()) : 0;
-        },
-      },
-      endingBookBalance: {
-        type: mongoose.Schema.Types.Decimal128,
-        default: null,
-        get: function (value) {
-          return value ? parseFloat(value.toString()) : 0;
-        },
-      },
-      outstandingDeposits: {
-        type: mongoose.Schema.Types.Decimal128,
-        default: null,
-        get: function (value) {
-          return value ? parseFloat(value.toString()) : 0;
-        },
-      },
-      outstandingChecks: {
-        type: mongoose.Schema.Types.Decimal128,
-        default: null,
-        get: function (value) {
-          return value ? parseFloat(value.toString()) : 0;
-        },
-      },
-      adjustingEntriesTotal: {
-        type: mongoose.Schema.Types.Decimal128,
-        default: null,
-        get: function (value) {
-          return value ? parseFloat(value.toString()) : 0;
-        },
-      },
-      statementLinesCount: { type: Number, default: 0 },
-      matchedCount: { type: Number, default: 0 },
-      unmatchedStatementCount: { type: Number, default: 0 },
-      unmatchedJournalCount: { type: Number, default: 0 },
-    },
-    notes: {
-      type: String,
-      maxlength: 500,
-      default: null,
-    },
-  },
-  {
-    timestamps: { createdAt: "createdAt", updatedAt: "updatedAt" },
-  },
-);
+const mongoose = require('mongoose');
+const { prisma } = require('../lib/prisma');
+const { makeCompatModel } = require('../utils/prismaCompat');
+const { STANDARD_TENANT_FIELD_MAP, registerBareSchema } = require('../utils/masterDataCommon');
+const {
+  setBankTransactionRef,
+  attachBankAccountStatics,
+  wrapBankAccountDoc,
+  buildConstructorModel,
+  buildBankTransactionModel,
+  BankAccountDocProto,
+} = require('../utils/bankAccountMethods');
+const {
+  bankAccountToApi,
+  bankAccountTranslateCreate,
+  bankAccountTranslateUpdate,
+  bankTransactionToApi,
+  bankTransactionTranslateCreate,
+  bankTransactionTranslateUpdate,
+  bankStatementLineToApi,
+  bankStatementLineTranslateCreate,
+  bankStatementLineTranslateUpdate,
+  bankReconciliationMatchToApi,
+  bankReconciliationMatchTranslateCreate,
+  bankReconciliationMatchTranslateUpdate,
+  bankReconciliationToApi,
+  bankReconciliationTranslateCreate,
+  bankReconciliationTranslateUpdate,
+} = require('../utils/bankingMappers');
 
-bankReconciliationSchema.index({ bankAccount: 1, status: 1 });
-bankReconciliationSchema.index({ bankAccount: 1, statementDateEnd: -1 });
-bankReconciliationSchema.index({ company: 1, status: 1 });
+const BANK_ACCOUNT_FIELD_MAP = {
+  name: { target: 'name' },
+  accountNumber: { target: 'accountNumber' },
+  bankName: { target: 'bankName' },
+  currencyCode: { target: 'currencyCode' },
+  ledgerAccountId: { target: 'ledgerAccountId' },
+  openingBalance: { target: 'openingBalance' },
+  openingBalanceDate: { target: 'openingBalanceDate' },
+  isActive: { target: 'isActive' },
+  isDefault: { target: 'isDefault' },
+  isPrimary: { target: 'isDefault' },
+  accountType: { target: 'accountType' },
+  branch: { target: 'branch' },
+  swiftCode: { target: 'swiftCode' },
+  cachedBalance: { target: 'cachedBalance' },
+  cacheValid: { target: 'cacheValid' },
+  cacheLastComputed: { target: 'cacheLastComputed' },
+  targetBalance: { target: 'targetBalance' },
+  holderName: { target: 'holderName' },
+  lastReconciledAt: { target: 'lastReconciledAt' },
+  lastReconciledBalance: { target: 'lastReconciledBalance' },
+  notes: { target: 'notes' },
+  color: { target: 'color' },
+  icon: { target: 'icon' },
+  customFields: { target: 'customFields' },
+};
 
-// Bank Statement Line Schema (for reconciliation)
-const bankStatementLineSchema = new mongoose.Schema(
-  {
-    // Reconciliation session reference (null until assigned to a session)
-    reconciliationId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "BankReconciliation",
-      default: null,
-      index: true,
-    },
-    // Bank account reference
-    bankAccount: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "BankAccount",
-      required: true,
-      index: true,
-    },
-    // Transaction date
-    transactionDate: {
-      type: Date,
-      required: true,
-      index: true,
-    },
-    // Description from bank
-    description: {
-      type: String,
-      required: true,
-    },
-    // Money out (debit)
-    debitAmount: {
-      type: mongoose.Schema.Types.Decimal128,
-      default: 0,
-      get: function (value) {
-        return value ? parseFloat(value.toString()) : 0;
-      },
-    },
-    // Money in (credit)
-    creditAmount: {
-      type: mongoose.Schema.Types.Decimal128,
-      default: 0,
-      get: function (value) {
-        return value ? parseFloat(value.toString()) : 0;
-      },
-    },
-    // Running balance per statement (nullable - computed if not provided in CSV)
-    // Per spec: computed as running_balance = opening_balance + credit - debit
-    balance: {
-      type: mongoose.Schema.Types.Decimal128,
-      required: false, // Nullable - can be computed during import
-      get: function (value) {
-        return value ? parseFloat(value.toString()) : null;
-      },
-    },
-    // Reference number
-    reference: {
-      type: String,
-      maxlength: 150,
-      default: null,
-    },
-    // Status: unmatched, matched, ignored
-    status: {
-      type: String,
-      enum: ["unmatched", "matched", "ignored"],
-      default: "unmatched",
-      index: true,
-    },
-    // Is reconciled - TRUE when SUM(matched amounts) = statement line amount (exact match)
-    isReconciled: {
-      type: Boolean,
-      default: false,
-    },
-    // Total matched amount from junction table (for reconciliation check)
-    matchedAmount: {
-      type: mongoose.Schema.Types.Decimal128,
-      required: false,
-      default: null,
-      get: function (value) {
-        return value ? parseFloat(value.toString()) : null;
-      },
-    },
-    // When imported
-    importedAt: {
-      type: Date,
-      default: Date.now,
-    },
-    // Company (tenant)
-    company: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Company",
-      required: true,
-      index: true,
-    },
-  },
-  {
-    timestamps: { createdAt: "createdAt", updatedAt: "updatedAt" },
-  },
-);
+const BANK_TRANSACTION_FIELD_MAP = {
+  account: { target: 'bankAccountId', isId: true },
+  bankAccountId: { target: 'bankAccountId', isId: true },
+  companyId: { target: 'companyId', isId: true },
+  company: { target: 'companyId', isId: true },
+  type: { target: 'type' },
+  amount: { target: 'amount' },
+  date: { target: 'date' },
+  status: { target: 'status' },
+  journalEntryId: { target: 'journalEntryId', isId: true },
+  journalEntryLineId: { target: 'journalEntryLineId', isId: true },
+  reconciliationStatus: { target: 'reconciliationStatus' },
+  transactionType: { target: 'transactionType' },
+};
 
-// Transform to convert Decimal128 fields to numbers for JSON serialization
-bankStatementLineSchema.set("toJSON", {
-  transform: function (doc, ret) {
-    if (ret.debitAmount && ret.debitAmount.$numberDecimal) {
-      ret.debitAmount = parseFloat(ret.debitAmount.$numberDecimal);
+const BANK_STATEMENT_LINE_FIELD_MAP = {
+  bankAccount: { target: 'bankAccountId', isId: true },
+  bankAccountId: { target: 'bankAccountId', isId: true },
+  reconciliationId: { target: 'reconciliationId', isId: true },
+  transactionDate: { target: 'transactionDate' },
+  status: { target: 'status' },
+  isReconciled: { target: 'isReconciled' },
+};
+
+const BANK_RECON_MATCH_FIELD_MAP = {
+  sessionId: { target: 'sessionId', isId: true },
+  bookTransactionId: { target: 'bookTransactionId', isId: true },
+  statementTransactionId: { target: 'statementTransactionId', isId: true },
+  bankStatementLine: { target: 'bankStatementLineId', isId: true },
+  bankStatementLineId: { target: 'bankStatementLineId', isId: true },
+  journalEntry: { target: 'journalEntryId', isId: true },
+  journalEntryId: { target: 'journalEntryId', isId: true },
+  bankAccount: { target: 'bankAccountId', isId: true },
+  bankAccountId: { target: 'bankAccountId', isId: true },
+  companyId: { target: 'companyId', isId: true },
+  company: { target: 'companyId', isId: true },
+};
+
+const BANK_RECONCILIATION_FIELD_MAP = {
+  bankAccount: { target: 'bankAccountId', isId: true },
+  bankAccountId: { target: 'bankAccountId', isId: true },
+  status: { target: 'status' },
+  statementDateStart: { target: 'statementDateStart' },
+  statementDateEnd: { target: 'statementDateEnd' },
+  startedBy: { target: 'startedById', isId: true },
+  completedBy: { target: 'completedById', isId: true },
+};
+
+registerBareSchema('BankAccount', 'bankaccounts');
+registerBareSchema('BankTransaction', 'banktransactions');
+registerBareSchema('BankStatementLine', 'bankstatementlines');
+registerBareSchema('BankReconciliationMatch', 'bankreconciliationmatches');
+registerBareSchema('BankReconciliation', 'bankreconciliations');
+
+function wrapStatementLineDoc(apiDoc) {
+  if (!apiDoc || apiDoc.__mutable) return apiDoc;
+  const doc = { ...apiDoc, __mutable: true };
+  doc.save = async function save() {
+    if (doc.isNew || !doc._id) {
+      const createData = await bankStatementLineTranslateCreate(doc);
+      const row = await prisma.bankStatementLine.create({ data: createData });
+      Object.assign(doc, bankStatementLineToApi(row), { __mutable: true });
+      doc.isNew = false;
+      return doc;
     }
-    if (ret.creditAmount && ret.creditAmount.$numberDecimal) {
-      ret.creditAmount = parseFloat(ret.creditAmount.$numberDecimal);
-    }
-    if (ret.balance && ret.balance.$numberDecimal) {
-      ret.balance = parseFloat(ret.balance.$numberDecimal);
-    }
-    if (ret.matchedAmount && ret.matchedAmount.$numberDecimal) {
-      ret.matchedAmount = parseFloat(ret.matchedAmount.$numberDecimal);
-    }
-    return ret;
-  },
-});
-
-bankStatementLineSchema.set("toObject", {
-  transform: function (doc, ret) {
-    if (ret.debitAmount && ret.debitAmount.$numberDecimal) {
-      ret.debitAmount = parseFloat(ret.debitAmount.$numberDecimal);
-    }
-    if (ret.creditAmount && ret.creditAmount.$numberDecimal) {
-      ret.creditAmount = parseFloat(ret.creditAmount.$numberDecimal);
-    }
-    if (ret.balance && ret.balance.$numberDecimal) {
-      ret.balance = parseFloat(ret.balance.$numberDecimal);
-    }
-    if (ret.matchedAmount && ret.matchedAmount.$numberDecimal) {
-      ret.matchedAmount = parseFloat(ret.matchedAmount.$numberDecimal);
-    }
-    return ret;
-  },
-});
-
-// Index for reconciliation queries
-bankStatementLineSchema.index({ bankAccount: 1, transactionDate: 1 });
-bankStatementLineSchema.index({ bankAccount: 1, isReconciled: 1 });
-bankStatementLineSchema.index({ bankAccount: 1, status: 1 });
-bankStatementLineSchema.index({ reconciliationId: 1, status: 1 });
-
-// Bank Reconciliation Match Junction Table Schema
-// Supports many-to-one and one-to-many matching
-const bankReconciliationMatchSchema = new mongoose.Schema(
-  {
-    companyId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Company",
-      index: true,
-    },
-    sessionId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "BankReconciliationSession",
-      index: true,
-    },
-    bookTransactionId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "BankTransaction",
-      index: true,
-    },
-    statementTransactionId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "BankStatementTransaction",
-      index: true,
-    },
-    matchType: {
-      type: String,
-      enum: ["auto", "manual"],
-      default: "manual",
-    },
-    amount: {
-      type: Number,
-      min: 0,
-    },
-    notes: {
-      type: String,
-      default: null,
-    },
-    // Bank statement line reference
-    bankStatementLine: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "BankStatementLine",
-      index: true,
-    },
-    // Journal entry line reference (not entry - specifically the line)
-    journalEntryLineId: {
-      type: mongoose.Schema.Types.ObjectId,
-    },
-    // Journal entry reference (for easier querying)
-    journalEntry: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "JournalEntry",
-      index: true,
-    },
-    // Bank account reference
-    bankAccount: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "BankAccount",
-      index: true,
-    },
-    // Company (tenant)
-    company: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Company",
-      index: true,
-    },
-    // Who matched this
-    matchedBy: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "User",
-    },
-    // Amount matched in this specific match
-    matchedAmount: {
-      type: mongoose.Schema.Types.Decimal128,
-      required: false,
-      get: function (value) {
-        return value ? parseFloat(value.toString()) : 0;
-      },
-    },
-    // When matched
-    matchedAt: {
-      type: Date,
-      default: Date.now,
-    },
-  },
-  {
-    timestamps: { createdAt: "createdAt", updatedAt: "updatedAt" },
-  },
-);
-
-// Compound unique index - same match can't be created twice
-bankReconciliationMatchSchema.index(
-  { bankStatementLine: 1, journalEntryLineId: 1 },
-  { unique: true, sparse: true },
-);
-bankReconciliationMatchSchema.index(
-  { sessionId: 1, bookTransactionId: 1, statementTransactionId: 1 },
-  { unique: true, sparse: true },
-);
-
-// Bank Account Transaction Schema (for tracking all movements - existing)
-const bankTransactionSchema = new mongoose.Schema(
-  {
-    // Bank account reference (required to link transaction to specific account)
-    account: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "BankAccount",
-      required: [true, "Transaction must be linked to a bank account"],
-    },
-    bankAccountId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "BankAccount",
-      index: true,
-    },
-    // Transaction type
-    type: {
-      type: String,
-      enum: [
-        "deposit",
-        "withdrawal",
-        "transfer_in",
-        "transfer_out",
-        "adjustment",
-        "opening",
-        "closing",
-        "debit",
-        "credit",
-      ],
-      required: true,
-    },
-    // Amount
-    amount: {
-      type: Number,
-      required: true,
-      min: 0,
-    },
-    // Balance after transaction
-    balanceAfter: {
-      type: Number,
-      required: true,
-    },
-    balance: {
-      type: Number,
-      default: 0,
-    },
-    // Reference to related document
-    reference: {
-      type: mongoose.Schema.Types.Mixed,
-    },
-    referenceType: {
-      type: String,
-      enum: [
-        "Invoice",
-        "Expense",
-        "Purchase",
-        "PurchaseOrder",
-        "PurchaseReturn",
-        "GRN",
-        "PettyCashFloat",
-        "PettyCashExpense",
-        "PettyCashReplenishment",
-        "Loan",
-        "Payment",
-        "BankAccount",
-        "CashAccount",
-        null,
-      ],
-      default: null,
-    },
-    // Description
-    description: {
-      type: String,
-      trim: true,
-    },
-    // Date
-    date: {
-      type: Date,
-      default: Date.now,
-    },
-    // Payment method (for incoming payments)
-    paymentMethod: {
-      type: String,
-      enum: [
-        "cash",
-        "bank_transfer",
-        "cheque",
-        "mobile_money",
-        "card",
-        "bank",
-        "credit_card",
-        "petty_cash",
-        "payable",
-        "other",
-      ],
-      default: "bank_transfer",
-    },
-    // Reference/cheque number
-    referenceNumber: String,
-    // Status
-    status: {
-      type: String,
-      enum: ["pending", "completed", "failed", "reversed"],
-      default: "completed",
-    },
-    // Created by
-    createdBy: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "User",
-      required: true,
-    },
-    // Notes
-    notes: String,
-    // Attachments
-    attachments: [
-      {
-        name: String,
-        url: String,
-      },
-    ],
-    // Company (tenant) - required for multi-tenancy queries
-    company: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Company",
-      required: false,
-    },
-    companyId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Company",
-      index: true,
-    },
-    // Journal entry linked to this transaction (for traceability)
-    journalEntryId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "JournalEntry",
-      default: null,
-    },
-    journalEntryLineId: {
-      type: mongoose.Schema.Types.ObjectId,
-      default: null,
-      index: true,
-    },
-    transactionType: {
-      type: String,
-      enum: [
-        "customer_payment",
-        "supplier_payment",
-        "payroll",
-        "loan_receipt",
-        "loan_repayment",
-        "bank_transfer_in",
-        "bank_transfer_out",
-        "direct_purchase_payment",
-        "bank_charge",
-        "bank_interest",
-        "cash_deposit",
-        "cash_withdrawal",
-        "other",
-      ],
-      default: "other",
-      index: true,
-    },
-    sourceDocumentType: {
-      type: String,
-      enum: [
-        "invoice",
-        "credit_note",
-        "purchase_order",
-        "direct_purchase",
-        "payroll_run",
-        "loan",
-        "bank_transfer",
-        "journal_entry",
-        "other",
-      ],
-      default: "journal_entry",
-    },
-    sourceDocumentId: {
-      type: mongoose.Schema.Types.ObjectId,
-      default: null,
-    },
-    sourceReference: {
-      type: String,
-      default: null,
-    },
-    reconciliationStatus: {
-      type: String,
-      enum: ["unreconciled", "reconciled"],
-      default: "unreconciled",
-      index: true,
-    },
-    reconciledSessionId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "BankReconciliationSession",
-      default: null,
-      index: true,
-    },
-    isReversed: {
-      type: Boolean,
-      default: false,
-    },
-    reversalTransactionId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "BankTransaction",
-      default: null,
-    },
-  },
-  {
-    timestamps: true,
-  },
-);
-
-bankTransactionSchema.pre("validate", function (next) {
-  if (!this.bankAccountId && this.account) this.bankAccountId = this.account;
-  if (!this.account && this.bankAccountId) this.account = this.bankAccountId;
-  if (!this.companyId && this.company) this.companyId = this.company;
-  if (!this.company && this.companyId) this.company = this.companyId;
-  if ((this.balance == null || Number.isNaN(this.balance)) && this.balanceAfter != null) this.balance = this.balanceAfter;
-  if ((this.balanceAfter == null || Number.isNaN(this.balanceAfter)) && this.balance != null) this.balanceAfter = this.balance;
-  next();
-});
-
-bankTransactionSchema.index({ companyId: 1, bankAccountId: 1, date: 1, _id: 1 });
-bankTransactionSchema.index({ companyId: 1, journalEntryId: 1, journalEntryLineId: 1 }, { sparse: true });
-bankTransactionSchema.index({ companyId: 1, bankAccountId: 1, reconciliationStatus: 1 });
-
-// Bank Account Schema (updated per Module 3.2)
-const bankAccountSchema = new mongoose.Schema(
-  {
-    // Company reference
-    company: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Company",
-      required: [true, "Bank account must belong to a company"],
-      index: true,
-    },
-
-    // === Core Fields per Module 3.2 ===
-
-    // Account name (e.g. "Main Operating Account")
-    name: {
-      type: String,
-      required: [true, "Please provide an account name"],
-      trim: true,
-      maxlength: 150,
-    },
-
-    // Actual bank account number
-    accountNumber: {
-      type: String,
-      maxlength: 50,
-      default: null,
-      trim: true,
-    },
-
-    // Bank name
-    bankName: {
-      type: String,
-      maxlength: 100,
-      default: null,
-      trim: true,
-    },
-
-    // Currency code (ISO 4217)
-    currencyCode: {
-      type: String,
-      required: true,
-      default: "USD",
-      maxlength: 3,
-    },
-
-    // Ledger account ID (maps to 1100-series account)
-    ledgerAccountId: {
-      type: String, // Could be ObjectId ref to ChartOfAccounts or account code string
-      default: "1100",
-    },
-
-    // Opening balance at system go-live
-    openingBalance: {
-      type: mongoose.Schema.Types.Decimal128,
-      required: true,
-      default: 0,
-      get: function (value) {
-        return value ? parseFloat(value.toString()) : 0;
-      },
-    },
-
-    // Opening balance date
-    openingBalanceDate: {
-      type: Date,
-      required: true,
-      default: Date.now,
-    },
-
-    // Is active
-    isActive: {
-      type: Boolean,
-      required: true,
-      default: true,
-    },
-
-    // Is default (only one default allowed per company)
-    isDefault: {
-      type: Boolean,
-      required: true,
-      default: false,
-    },
-
-    // === Additional Existing Fields ===
-
-    // Account type (kept for backwards compatibility)
-    accountType: {
-      type: String,
-      enum: [
-        "bk_bank",
-        "equity_bank",
-        "im_bank",
-        "cogebanque",
-        "ecobank",
-        "mtn_momo",
-        "airtel_money",
-        "cash_in_hand",
-      ],
-      default: "bk_bank",
-    },
-
-    // Branch (for bank accounts)
-    branch: {
-      type: String,
-      trim: true,
-    },
-
-    // SWIFT/IBAN code
-    swiftCode: String,
-
-    // Cached balance - computed from journal entries per spec 3.3
-    // Uses dirty flag pattern: cacheValid=FALSE means recompute needed
-    cachedBalance: {
-      type: mongoose.Schema.Types.Decimal128,
-      default: 0,
-      get: function (value) {
-        return value ? parseFloat(value.toString()) : 0;
-      },
-    },
-    // Cache validity flag - TRUE means cachedBalance is valid, FALSE means recompute
-    cacheValid: {
-      type: Boolean,
-      default: false,
-    },
-    // Timestamp when cache was last computed
-    cacheLastComputed: {
-      type: Date,
-      default: null,
-    },
-
-    // Minimum/Target balance
-    targetBalance: {
-      type: mongoose.Schema.Types.Decimal128,
-      default: 0,
-      get: function (value) {
-        return value ? parseFloat(value.toString()) : 0;
-      },
-    },
-
-    // Account holder name (for mobile money)
-    holderName: String,
-
-    // Status for reconciliation
-    lastReconciledAt: Date,
-    lastReconciledBalance: {
-      type: mongoose.Schema.Types.Decimal128,
-      default: 0,
-      get: function (value) {
-        return value ? parseFloat(value.toString()) : 0;
-      },
-    },
-
-    // Notes
-    notes: String,
-
-    // Color for UI identification
-    color: {
-      type: String,
-      default: "#3B82F6",
-    },
-
-    // Icon for UI
-    icon: {
-      type: String,
-      default: "bank",
-    },
-
-    // === Interest Income Fields ===
-    interestAccountType: {
-      type: String,
-      enum: ["current", "savings", "fixed_deposit", "call_account"],
-      default: "current",
-    },
-    interestRate: {
-      type: Number,
-      default: 0,
-      min: 0,
-    },
-    interestCalculationMethod: {
-      type: String,
-      enum: ["simple", "compound_monthly", "compound_quarterly", "daily_average"],
-      default: "simple",
-    },
-    interestCreditFrequency: {
-      type: String,
-      enum: ["monthly", "quarterly", "annually"],
-      default: "monthly",
-    },
-    interestIncomeAccount: {
-      type: String,
-      default: "4300",
-      trim: true,
-    },
-    interestAccrualAccount: {
-      type: String,
-      default: "1350",
-      trim: true,
-    },
-    bankStatementReference: {
-      type: Boolean,
-      default: false,
-    },
-    interestStartDate: {
-      type: Date,
-      default: null,
-    },
-    lastInterestPostedDate: {
-      type: Date,
-      default: null,
-    },
-
-    // Created by (who created this account)
-    createdBy: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "User",
-    },
-    customFields: {
-      type: mongoose.Schema.Types.Mixed,
-      default: {},
-    },
-  },
-  {
-    timestamps: { createdAt: "createdAt", updatedAt: "updatedAt" },
-  },
-);
-
-// Indexes for efficient queries
-bankAccountSchema.index({ company: 1, isActive: 1 });
-bankAccountSchema.index({ company: 1, accountType: 1 });
-bankAccountSchema.index({ company: 1, isDefault: 1 });
-bankTransactionSchema.index({ account: 1, date: -1 });
-bankTransactionSchema.index({ company: 1, account: 1, date: -1 });
-bankTransactionSchema.index({ company: 1, reference: 1 });
-bankTransactionSchema.index({ company: 1, type: 1, date: -1 });
-
-// Transform for JSON serialization - ensures Decimal128 fields are converted to numbers
-bankTransactionSchema.set("toJSON", {
-  transform: function (doc, ret) {
-    // Convert Decimal128 fields to numbers
-    if (ret.amount && ret.amount.$numberDecimal) {
-      ret.amount = parseFloat(ret.amount.$numberDecimal);
-    }
-    if (ret.balanceAfter && ret.balanceAfter.$numberDecimal) {
-      ret.balanceAfter = parseFloat(ret.balanceAfter.$numberDecimal);
-    }
-    if (ret.debitAmount && ret.debitAmount.$numberDecimal) {
-      ret.debitAmount = parseFloat(ret.debitAmount.$numberDecimal);
-    }
-    if (ret.creditAmount && ret.creditAmount.$numberDecimal) {
-      ret.creditAmount = parseFloat(ret.creditAmount.$numberDecimal);
-    }
-    return ret;
-  },
-});
-bankTransactionSchema.set("toObject", {
-  transform: function (doc, ret) {
-    // Convert Decimal128 fields to numbers
-    if (ret.amount && ret.amount.$numberDecimal) {
-      ret.amount = parseFloat(ret.amount.$numberDecimal);
-    }
-    if (ret.balanceAfter && ret.balanceAfter.$numberDecimal) {
-      ret.balanceAfter = parseFloat(ret.balanceAfter.$numberDecimal);
-    }
-    if (ret.debitAmount && ret.debitAmount.$numberDecimal) {
-      ret.debitAmount = parseFloat(ret.debitAmount.$numberDecimal);
-    }
-    if (ret.creditAmount && ret.creditAmount.$numberDecimal) {
-      ret.creditAmount = parseFloat(ret.creditAmount.$numberDecimal);
-    }
-    return ret;
-  },
-});
-
-// Transform for JSON serialization - ensures Decimal128 fields are converted to numbers
-bankAccountSchema.set("toJSON", {
-  transform: function (doc, ret) {
-    // Convert Decimal128 fields to numbers
-    if (ret.openingBalance && ret.openingBalance.$numberDecimal) {
-      ret.openingBalance = parseFloat(ret.openingBalance.$numberDecimal);
-    }
-    if (ret.cachedBalance && ret.cachedBalance.$numberDecimal) {
-      ret.cachedBalance = parseFloat(ret.cachedBalance.$numberDecimal);
-    }
-    if (ret.targetBalance && ret.targetBalance.$numberDecimal) {
-      ret.targetBalance = parseFloat(ret.targetBalance.$numberDecimal);
-    }
-    return ret;
-  },
-});
-bankAccountSchema.set("toObject", {
-  transform: function (doc, ret) {
-    // Convert Decimal128 fields to numbers
-    if (ret.openingBalance && ret.openingBalance.$numberDecimal) {
-      ret.openingBalance = parseFloat(ret.openingBalance.$numberDecimal);
-    }
-    if (ret.cachedBalance && ret.cachedBalance.$numberDecimal) {
-      ret.cachedBalance = parseFloat(ret.cachedBalance.$numberDecimal);
-    }
-    if (ret.targetBalance && ret.targetBalance.$numberDecimal) {
-      ret.targetBalance = parseFloat(ret.targetBalance.$numberDecimal);
-    }
-    return ret;
-  },
-});
-
-// Pre-save middleware
-bankAccountSchema.pre("save", async function (next) {
-  if (this.isNew) {
-    // Per spec 3.3: Opening balance is stored, live balance computed from journal
-    // Initialize cache with opening balance (valid until first journal entry posts)
-    const openingBal = parseFloat(this.openingBalance?.toString() || "0");
-    this.cachedBalance = mongoose.Types.Decimal128.fromString(
-      openingBal.toString(),
-    );
-    this.cacheValid = true; // Opening balance is valid until journal entries exist
-    this.cacheLastComputed = new Date();
-
-    // Auto-set ledger account code based on account type if not provided
-    if (!this.ledgerAccountId) {
-      const typeToCode = {
-        bk_bank: "1100",
-        equity_bank: "1100",
-        im_bank: "1100",
-        cogebanque: "1100",
-        ecobank: "1100",
-        mtn_momo: "1200",
-        airtel_money: "1200",
-        cash_in_hand: "1000",
-      };
-      this.ledgerAccountId = typeToCode[this.accountType] || "1100";
-    }
-
-    // Set opening balance date if not provided
-    if (!this.openingBalanceDate) {
-      this.openingBalanceDate = new Date();
-    }
-  }
-
-  // Ensure only one default account per company
-  if (this.isDefault && this.isModified("isDefault")) {
-    await this.constructor.updateMany(
-      { company: this.company, _id: { $ne: this._id } },
-      { isDefault: false },
-    );
-  }
-
-  next();
-});
-
-// Static method to get total cash position (uses cached balance)
-bankAccountSchema.statics.getTotalCashPosition = async function (companyId) {
-  const accounts = await this.find({ company: companyId, isActive: true });
-
-  const result = {
-    total: 0,
-    byType: {
-      bk_bank: 0,
-      equity_bank: 0,
-      im_bank: 0,
-      cogebanque: 0,
-      ecobank: 0,
-      mtn_momo: 0,
-      airtel_money: 0,
-      cash_in_hand: 0,
-    },
-    accounts: [],
-  };
-
-  accounts.forEach((account) => {
-    // Use cached balance per spec 3.3
-    const balance = parseFloat(account.cachedBalance?.toString() || "0");
-    result.total += balance;
-    result.byType[account.accountType] += balance;
-    result.accounts.push({
-      _id: account._id,
-      name: account.name,
-      accountType: account.accountType,
-      balance: balance,
-      cacheValid: account.cacheValid,
+    const row = await prisma.bankStatementLine.update({
+      where: { id: String(doc._id) },
+      data: bankStatementLineTranslateUpdate({ $set: doc }),
     });
-  });
+    Object.assign(doc, bankStatementLineToApi(row), { __mutable: true });
+    return doc;
+  };
+  return doc;
+}
 
-  return result;
-};
-
-// Static method to invalidate cache for all accounts linked to a ledger account
-// Called by JournalService when journal entries are posted
-bankAccountSchema.statics.invalidateCacheForLedgerAccount = async function (
-  companyId,
-  ledgerAccountId,
-) {
-  return this.updateMany(
-    { company: companyId, ledgerAccountId: ledgerAccountId },
-    { cacheValid: false },
-  );
-};
-
-// Static method to get account by type
-bankAccountSchema.statics.getByType = async function (companyId, accountType) {
-  return this.find({ company: companyId, accountType, isActive: true });
-};
-
-// Static method to get default account
-bankAccountSchema.statics.getDefault = async function (companyId) {
-  return this.findOne({ company: companyId, isDefault: true, isActive: true });
-};
-
-// Static method to compute balance from BankTransaction records (account-specific).
-// This is the correct approach when multiple accounts share the same ledgerAccountId
-// (e.g. all defaulting to '1100') because BankTransaction.account is a direct ObjectId
-// reference to one specific account — never shared across accounts.
-bankAccountSchema.statics.computeBalanceFromTransactions = async function (
-  accountId,
-  openingBalance,
-) {
-  const BankTransaction = mongoose.model("BankTransaction");
-  const txAgg = await BankTransaction.aggregate([
-    { $match: { account: new mongoose.Types.ObjectId(String(accountId)) } },
-    {
-      $group: {
-        _id: null,
-        totalIn: {
-          $sum: {
-            $cond: [
-              { $in: ["$type", ["deposit", "transfer_in", "opening"]] },
-              "$amount",
-              0,
-            ],
-          },
-        },
-        totalOut: {
-          $sum: {
-            $cond: [
-              { $in: ["$type", ["withdrawal", "transfer_out", "closing"]] },
-              "$amount",
-              0,
-            ],
-          },
-        },
-      },
-    },
-  ]);
-  // Safely convert Decimal128 openingBalance to a plain number
-  const ob =
-    openingBalance && typeof openingBalance.toString === "function"
-      ? parseFloat(openingBalance.toString())
-      : Number(openingBalance) || 0;
-  return ob + (txAgg[0]?.totalIn || 0) - (txAgg[0]?.totalOut || 0);
-};
-
-// Method to add transaction
-// Note: Per spec 3.3, balance should be computed from journal, not stored
-// This method is kept for backwards compatibility - BankTransaction tracks movements
-// When transactions are added, cache is invalidated (must recompute from journal)
-bankAccountSchema.methods.addTransaction = async function (transactionData) {
-  console.log('[addTransaction] Starting - account:', this._id, 'name:', this.name, 'cachedBalance:', this.cachedBalance);
-  const BankTransaction = mongoose.model("BankTransaction");
-
-  if (transactionData.journalEntryId) {
-    const duplicate = await BankTransaction.findOne({
-      $and: [
-        { $or: [{ companyId: this.company }, { company: this.company }] },
-        { $or: [{ bankAccountId: this._id }, { account: this._id }] },
-      ],
-      journalEntryId: transactionData.journalEntryId,
-      amount: Number(transactionData.amount || 0),
-    });
-    if (duplicate) {
-      console.log('[addTransaction] Existing journal-linked bank transaction found:', duplicate._id);
-      return duplicate;
+function wrapReconMatchDoc(apiDoc) {
+  if (!apiDoc || apiDoc.__mutable) return apiDoc;
+  const doc = { ...apiDoc, __mutable: true };
+  doc.save = async function save() {
+    if (doc.isNew || !doc._id) {
+      const createData = await bankReconciliationMatchTranslateCreate(doc);
+      const row = await prisma.bankReconciliationMatch.create({ data: createData });
+      Object.assign(doc, bankReconciliationMatchToApi(row), { __mutable: true });
+      doc.isNew = false;
+      return doc;
     }
-  }
+    const row = await prisma.bankReconciliationMatch.update({
+      where: { id: String(doc._id) },
+      data: bankReconciliationMatchTranslateUpdate({ $set: doc }),
+    });
+    Object.assign(doc, bankReconciliationMatchToApi(row), { __mutable: true });
+    return doc;
+  };
+  return doc;
+}
 
-  // Use cached balance
-  const currentBal = parseFloat(this.cachedBalance?.toString() || "0");
-  console.log('[addTransaction] currentBal:', currentBal);
+const bankTransactionBase = makeCompatModel({
+  delegate: () => prisma.bankTransaction,
+  fieldMap: { ...STANDARD_TENANT_FIELD_MAP, ...BANK_TRANSACTION_FIELD_MAP },
+  toApi: bankTransactionToApi,
+  translateCreate: bankTransactionTranslateCreate,
+  translateUpdate: bankTransactionTranslateUpdate,
+  tenantField: 'companyId',
+  mutable: true,
+});
 
-  // Compute new balance BEFORE saving so balanceAfter is correct
-  let newBal = currentBal;
-  const txType = transactionData.type;
-  if (
-    txType === "deposit" ||
-    txType === "transfer_in"
-  ) {
-    newBal += transactionData.amount;
-  } else if (
-    txType === "withdrawal" ||
-    txType === "transfer_out" ||
-    txType === "closing"
-  ) {
-    newBal -= transactionData.amount;
-  } else if (txType === "adjustment") {
-    newBal =
-      transactionData.balanceAfter !== undefined
-        ? transactionData.balanceAfter
-        : currentBal;
-  }
-  console.log('[addTransaction] newBal after', txType, ':', newBal);
+const BankTransaction = buildBankTransactionModel(bankTransactionBase);
+setBankTransactionRef(BankTransaction);
 
-  const transaction = new BankTransaction({
-    ...transactionData,
-    account: this._id,
-    bankAccountId: this._id,
-    company: this.company,
-    companyId: this.company,
-    balanceAfter: newBal, // Now correctly AFTER the transaction
-    balance: newBal,
-  });
+const bankAccountBase = makeCompatModel({
+  delegate: () => prisma.bankAccount,
+  fieldMap: { ...STANDARD_TENANT_FIELD_MAP, ...BANK_ACCOUNT_FIELD_MAP },
+  toApi: (row) => wrapBankAccountDoc(bankAccountToApi(row)),
+  translateCreate: bankAccountTranslateCreate,
+  translateUpdate: bankAccountTranslateUpdate,
+  tenantField: 'companyId',
+  mutable: true,
+});
 
-  await transaction.save();
-  console.log('[addTransaction] Transaction saved:', transaction._id);
+function BankAccountDoc(data = {}) {
+  Object.assign(this, data);
+  this.isNew = !this._id;
+}
+BankAccountDoc.prototype = BankAccountDocProto;
 
-  // Per spec 3.3: Invalidate cache when transaction is added
-  // The balance must be recomputed from journal
-  this.cachedBalance = mongoose.Types.Decimal128.fromString(newBal.toString());
-  this.cacheValid = false; // Must recompute from journal
-  this.cacheLastComputed = null;
-  await this.save();
-  console.log('[addTransaction] Bank account saved with new cachedBalance:', newBal);
+function BankAccount(data) {
+  if (!(this instanceof BankAccount)) return new BankAccountDoc(data);
+  return BankAccountDoc.call(this, data);
+}
 
-  return transaction;
+Object.assign(BankAccount, bankAccountBase);
+BankAccount.prototype = BankAccountDocProto;
+BankAccount.modelName = 'BankAccount';
+
+BankAccount.create = async function create(data) {
+  const doc = new BankAccountDoc(data);
+  return doc.save();
 };
 
-// Method to get balance with caching per spec 3.3
-// Returns cached balance if valid, otherwise recomputes from journal
-bankAccountSchema.methods.getBalance = async function (JournalEntry, asOfDate) {
-  // If cache is valid, return cached balance
-  if (this.cacheValid) {
-    return {
-      balance: parseFloat(this.cachedBalance?.toString() || "0"),
-      cached: true,
-      computedAt: this.cacheLastComputed,
-    };
-  }
+const BankStatementLineBase = makeCompatModel({
+  delegate: () => prisma.bankStatementLine,
+  fieldMap: { ...STANDARD_TENANT_FIELD_MAP, ...BANK_STATEMENT_LINE_FIELD_MAP },
+  toApi: (row) => wrapStatementLineDoc(bankStatementLineToApi(row)),
+  translateCreate: bankStatementLineTranslateCreate,
+  translateUpdate: bankStatementLineTranslateUpdate,
+  tenantField: 'companyId',
+  mutable: true,
+});
 
-  // Cache invalid - must recompute from journal
-  const ledgerAccountId = this.ledgerAccountId || "1100";
-  const openingBalance = parseFloat(this.openingBalance?.toString() || "0");
-  const openingBalanceDate = this.openingBalanceDate || new Date(0);
+const BankStatementLine = buildConstructorModel({
+  name: 'BankStatementLine',
+  baseModel: BankStatementLineBase,
+  toApi: bankStatementLineToApi,
+  translateCreate: bankStatementLineTranslateCreate,
+  translateUpdate: bankStatementLineTranslateUpdate,
+  wrapDoc: wrapStatementLineDoc,
+  delegateName: 'bankStatementLine',
+});
 
-  // Build date query: entry_date >= opening_balance_date
-  const dateQuery = { $gte: openingBalanceDate };
-  if (asOfDate) {
-    dateQuery.$lte = new Date(asOfDate);
-  }
+const BankReconciliationMatchBase = makeCompatModel({
+  delegate: () => prisma.bankReconciliationMatch,
+  fieldMap: { ...STANDARD_TENANT_FIELD_MAP, ...BANK_RECON_MATCH_FIELD_MAP },
+  toApi: (row) => wrapReconMatchDoc(bankReconciliationMatchToApi(row)),
+  translateCreate: bankReconciliationMatchTranslateCreate,
+  translateUpdate: bankReconciliationMatchTranslateUpdate,
+  tenantField: 'companyId',
+  mutable: true,
+});
 
-  // Get all posted journal entries for this bank's ledger account
-  // Use aggregation to robustly compute DR and CR totals for the ledger account
-  const matchStage = {
-    company: this.company,
-    status: "posted",
-    date: dateQuery,
-  };
+const BankReconciliationMatch = buildConstructorModel({
+  name: 'BankReconciliationMatch',
+  baseModel: BankReconciliationMatchBase,
+  toApi: bankReconciliationMatchToApi,
+  translateCreate: bankReconciliationMatchTranslateCreate,
+  translateUpdate: bankReconciliationMatchTranslateUpdate,
+  wrapDoc: wrapReconMatchDoc,
+  delegateName: 'bankReconciliationMatch',
+});
 
-  const agg = await aggregateWithTimeout(
-    JournalEntry,
-    [
-      { $match: matchStage },
-      { $unwind: "$lines" },
-      { $match: { "lines.accountCode": ledgerAccountId } },
-      {
-        $group: {
-          _id: null,
-          totalDebits: {
-            $sum: { $toDouble: { $ifNull: ["$lines.debit", 0] } },
-          },
-          totalCredits: {
-            $sum: { $toDouble: { $ifNull: ["$lines.credit", 0] } },
-          },
-          journalCount: { $sum: 1 },
-        },
-      },
-    ],
-    "report",
-  ).allowDiskUse(true);
+const BankReconciliation = makeCompatModel({
+  delegate: () => prisma.bankReconciliation,
+  fieldMap: { ...STANDARD_TENANT_FIELD_MAP, ...BANK_RECONCILIATION_FIELD_MAP },
+  toApi: bankReconciliationToApi,
+  translateCreate: bankReconciliationTranslateCreate,
+  translateUpdate: bankReconciliationTranslateUpdate,
+  tenantField: 'companyId',
+  mutable: true,
+});
 
-  let totalDebits = 0;
-  let totalCredits = 0;
-  const journalEntryCount = agg && agg[0] ? agg[0].journalCount : 0;
-  if (agg && agg[0]) {
-    totalDebits = agg[0].totalDebits || 0;
-    totalCredits = agg[0].totalCredits || 0;
-  }
+attachBankAccountStatics(BankAccount);
 
-  // current_balance = DR - CR (opening balance is already in the journal via opening balance entry)
-  // Per spec 3.3: Balance is computed from journal entries, not stored separately
-  const computedBalance = totalDebits - totalCredits;
-  const now = new Date();
+if (!mongoose.models.BankTransaction) {
+  mongoose.model('BankTransaction', new mongoose.Schema({}, { strict: false, collection: 'banktransactions' }));
+}
+if (!mongoose.models.BankStatementLine) {
+  mongoose.model('BankStatementLine', new mongoose.Schema({}, { strict: false, collection: 'bankstatementlines' }));
+}
+if (!mongoose.models.BankReconciliationMatch) {
+  mongoose.model('BankReconciliationMatch', new mongoose.Schema({}, { strict: false, collection: 'bankreconciliationmatches' }));
+}
+if (!mongoose.models.BankReconciliation) {
+  mongoose.model('BankReconciliation', new mongoose.Schema({}, { strict: false, collection: 'bankreconciliations' }));
+}
 
-  // Update cache
-  this.cachedBalance = mongoose.Types.Decimal128.fromString(
-    computedBalance.toString(),
-  );
-  this.cacheValid = true;
-  this.cacheLastComputed = now;
-  await this.save();
-
-  return {
-    balance: computedBalance,
-    cached: false,
-    computedAt: now,
-    details: {
-      openingBalance,
-      totalDebits,
-      totalCredits,
-      journalEntryCount: journalEntryCount || 0,
-    },
-  };
-};
-
-// Create models
-const BankAccount = mongoose.model("BankAccount", bankAccountSchema);
-mongoose.model("BankTransaction", bankTransactionSchema);
-mongoose.model("BankStatementLine", bankStatementLineSchema);
-mongoose.model("BankReconciliationMatch", bankReconciliationMatchSchema);
-mongoose.model("BankReconciliation", bankReconciliationSchema);
-
-// Export BankAccount as the module default (consistent with other models)
-// Also attach related models as properties so callers can destructure:
-// const { BankAccount, BankTransaction, BankStatementLine, BankReconciliationMatch, BankReconciliation } = require('../models/BankAccount')
 module.exports = BankAccount;
 module.exports.BankAccount = BankAccount;
-module.exports.BankTransaction = mongoose.model("BankTransaction");
-module.exports.BankStatementLine = mongoose.model("BankStatementLine");
-module.exports.BankReconciliationMatch = mongoose.model(
-  "BankReconciliationMatch",
-);
-module.exports.BankReconciliation = mongoose.model("BankReconciliation");
+module.exports.BankTransaction = BankTransaction;
+module.exports.BankStatementLine = BankStatementLine;
+module.exports.BankReconciliationMatch = BankReconciliationMatch;
+module.exports.BankReconciliation = BankReconciliation;

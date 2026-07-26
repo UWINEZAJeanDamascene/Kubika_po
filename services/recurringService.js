@@ -2,11 +2,7 @@ const cron = require('node-cron');
 const RecurringInvoice = require('../models/RecurringInvoice');
 const RecurringInvoiceRun = require('../models/RecurringInvoiceRun');
 const Invoice = require('../models/Invoice');
-const Product = require('../models/Product');
-const Client = require('../models/Client');
-const StockMovement = require('../models/StockMovement');
-const JournalService = require('../services/journalService');
-const inventoryService = require('../services/inventoryService');
+const { confirmDraftInvoice } = require('./invoiceAutoConfirmService');
 
 function addMonthsSafe(date, months) {
   const d = new Date(date);
@@ -82,7 +78,7 @@ async function checkIdempotency(templateId, runDate) {
   endOfDay.setDate(endOfDay.getDate() + 1);
   
   const existing = await RecurringInvoiceRun.findOne({
-    template: templateId,
+    recurringInvoice: templateId,
     runDate: {
       $gte: startOfDay,
       $lt: endOfDay
@@ -105,7 +101,7 @@ async function alertFinanceTeam(companyId, template, errorMessage) {
 }
 
 async function generateForTemplate(templateId) {
-  const r = await RecurringInvoice.findById(templateId);
+  const r = await RecurringInvoice.findById(templateId).populate('lines.product');
   if (!r || r.status !== 'active') {
     throw new Error('Template not found or not active');
   }
@@ -155,203 +151,32 @@ async function generateForTemplate(templateId) {
     invoiceDate: runDate,
     dueDate: new Date(runDate.getTime() + 30 * 24 * 60 * 60 * 1000), // 30 days
     terms: '30 days',
-    // Use autoConfirm flag - if true, this triggers full confirmation during creation
-    autoConfirm: r.autoConfirm
   };
 
   let created = null;
-  let invoiceStatus = 'draft';
   let runStatus = 'success';
   let errorMessage = null;
 
   try {
-    // Create invoice - if autoConfirm is true, the pre-save hook will set status to 'confirmed'
     created = await Invoice.create(invoiceData);
-    
-    // Refresh to get the final status
-    created = await Invoice.findById(created._id);
-    invoiceStatus = created.status;
-    
-    // If autoConfirm is true, create journal entries (stock movements + dual journal)
-    if (r.autoConfirm && invoiceStatus === 'confirmed') {
+
+    if (r.autoConfirm) {
       try {
-        // Re-fetch invoice with populated lines
-        created = await Invoice.findById(created._id).populate('lines.product');
-        
-        // Calculate total COGS
-        let totalInvoiceCOGS = 0;
-        let hasStockableLines = false;
-        
-        // Process each line - deduct stock and calculate COGS
-        for (const line of created.lines) {
-          // Get product from line (already populated) or fetch separately
-          let product = line.product;
-          
-          if (!product && line.product) {
-            // If product is just an ObjectId, fetch it
-            product = await Product.findById(line.product);
-          }
-          if (!product) {
-            continue;
-          }
-          
-          // Check if product is stockable
-          const isStockable = product.isStockable !== false && product.isStockable !== undefined ? product.isStockable : true;
-          const qty = line.qty || line.quantity || 0;
-          
-          if (isStockable && qty > 0) {
-            hasStockableLines = true;
-            
-            // Get unit cost (FIFO or WAC)
-            let unitCost = 0;
-            if (product.costMethod === 'fifo') {
-              const InventoryBatch = require('../models/InventoryBatch');
-              const oldestLot = await InventoryBatch.findOne({
-                company: r.company,
-                product: product._id,
-                quantity: { $gt: 0 }
-              }).sort({ receivedDate: 1 });
-              
-              if (oldestLot) {
-                unitCost = parseFloat(oldestLot.unitCost && oldestLot.unitCost.toString ? oldestLot.unitCost.toString() : oldestLot.unitCost) || 0;
-              } else {
-                unitCost = parseFloat(product.cost && product.cost.toString ? product.cost.toString() : product.cost) || 0;
-              }
-            } else {
-              // WAC or default
-              unitCost = parseFloat(product.avgCost) || parseFloat(product.cost) || 0;
-            }
-            
-            const cogsAmount = qty * unitCost;
-            totalInvoiceCOGS += cogsAmount;
-            
-            // Update line with COGS info
-            line.unitCost = unitCost;
-            line.cogsAmount = cogsAmount;
-            
-            // Consume inventory
-            try {
-              await inventoryService.consume(r.company, product._id, qty, { method: product.costMethod || 'fifo' });
-            } catch (consumeErr) {
-              console.error('Error consuming inventory for line:', consumeErr.message);
-              // Continue with other lines
-            }
-            
-            // Update product stock
-            const previousStock = product.currentStock || 0;
-            const newStock = previousStock - qty;
-            product.currentStock = Math.max(0, newStock);
-            product.lastSaleDate = new Date();
-            await product.save();
-            
-            // Create stock movement
-            await StockMovement.create({
-              company: r.company,
-              product: product._id,
-              type: 'out',
-              reason: 'sale',
-              quantity: qty,
-              previousStock,
-              newStock,
-              unitCost,
-              totalCost: cogsAmount,
-              referenceType: 'invoice',
-              referenceNumber: created.referenceNo || created.invoiceNumber,
-              referenceDocument: created._id,
-              referenceModel: 'Invoice',
-              notes: `Recurring Invoice ${created.referenceNo || created.invoiceNumber} - Sale`,
-              performedBy: r.createdBy,
-              movementDate: new Date()
-            });
-          }
-        }
-        
-        // Save line updates with COGS
-        await created.save();
-        
-        // Update client outstanding balance
-        const client = await Client.findById(r.client);
-        if (client) {
-          client.outstandingBalance += parseFloat(created.roundedAmount) || 0;
-          await client.save();
-        }
-        
-        // Create revenue journal entry
-        try {
-          const revenueEntry = await JournalService.createInvoiceEntry(r.company, r.createdBy, {
-            _id: created._id,
-            invoiceNumber: created.referenceNo || created.invoiceNumber,
-            date: created.invoiceDate,
-            total: parseFloat(created.roundedAmount) || 0,
-            vatAmount: parseFloat(created.taxAmount) || 0
-          });
-          created.revenueJournalEntry = revenueEntry._id;
-        } catch (je) {
-          console.error('Error creating revenue journal entry:', je);
-        }
-        
-        // Create COGS journal entry - always try to create for confirmed invoices
-        // Even if we can't determine stockability, create the entry
-        try {
-          // Use product cost as fallback if totalInvoiceCOGS is 0
-          let cogsTotal = totalInvoiceCOGS;
-          if (cogsTotal <= 0 && created.lines.length > 0) {
-            // Try to get cost from product
-            const firstLine = created.lines[0];
-            if (firstLine.product) {
-              const prod = firstLine.product._id ? firstLine.product : await Product.findById(firstLine.product);
-              if (prod) {
-                cogsTotal = (prod.cost || prod.avgCost || 10) * (firstLine.qty || 1);
-              }
-            }
-          }
-          cogsTotal = cogsTotal > 0 ? cogsTotal : (created.roundedAmount || 100) * 0.3; // Default to 30% of total
-          
-          const cogsEntry = await JournalService.createSaleCOGSEntry(r.company, r.createdBy, {
-            invoiceId: created._id,
-            invoiceNumber: created.referenceNo || created.invoiceNumber,
-            date: created.invoiceDate,
-            totalCost: cogsTotal
-          });
-          created.cogsJournalEntry = cogsEntry._id;
-        } catch (je2) {
-          console.error('Error creating COGS journal entry:', je2);
-        }
-        
-        // Save invoice with journal entry references
-        created.stockDeducted = true;
-        await created.save();
-        
+        created = await confirmDraftInvoice(
+          r.company,
+          created._id,
+          r.createdBy,
+        );
       } catch (confirmErr) {
-        console.error('Error during auto-confirm process:', confirmErr);
-        errorMessage = 'Auto-confirm failed: ' + confirmErr.message;
         runStatus = 'failed';
-        
-        // Alert finance team
+        const code = confirmErr.code || '';
+        errorMessage = code === 'ERR_INSUFFICIENT_STOCK'
+          ? `INSUFFICIENT_STOCK: ${confirmErr.message}`
+          : `Auto-confirm failed: ${confirmErr.message}`;
+        console.error('Recurring invoice auto-confirm failed:', confirmErr.message);
         await alertFinanceTeam(r.company, r, errorMessage);
+        created = await Invoice.findById(created._id);
       }
-    }
-    
-    // Refresh to get final status
-    created = await Invoice.findById(created._id);
-    invoiceStatus = created.status;
-    
-    // If autoConfirm is true but invoice is still draft, it means confirmation failed
-    if (r.autoConfirm && invoiceStatus === 'draft') {
-      errorMessage = 'Auto-confirm failed: Invoice remains in draft status';
-      runStatus = 'failed';
-      
-      // Alert finance team
-      await alertFinanceTeam(r.company, r, errorMessage);
-    }
-    
-    // Check for insufficient stock error - look for the error code in the invoice
-    if (invoiceStatus === 'draft' && r.autoConfirm) {
-      errorMessage = 'INSUFFICIENT_STOCK: Invoice was not confirmed due to insufficient stock';
-      runStatus = 'failed';
-      
-      // Alert finance team
-      await alertFinanceTeam(r.company, r, errorMessage);
     }
 
     // Update next run date
@@ -376,7 +201,7 @@ async function generateForTemplate(templateId) {
   // Log the run
   try {
     await RecurringInvoiceRun.create({
-      template: r._id,
+      recurringInvoice: r._id,
       company: r.company,
       runDate: runDate,
       invoice: created ? created._id : null,

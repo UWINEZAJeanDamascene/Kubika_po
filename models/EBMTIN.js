@@ -1,51 +1,27 @@
-const mongoose = require('mongoose');
+/**
+ * EBMTIN — PostgreSQL (Prisma) backed (global RRA registry, no company).
+ */
 
-const ebmTINSchema = new mongoose.Schema({
-  tin: {
-    type: String,
-    required: true,
-    trim: true,
-    unique: true,
-    index: true,
-  },
-  taxpayerName: {
-    type: String,
-    required: true,
-    trim: true,
-    index: true,
-  },
-  statusCode: {
-    type: String,
-    trim: true,
-    default: null,
-  },
-  provinceName: {
-    type: String,
-    trim: true,
-    default: null,
-  },
-  districtName: {
-    type: String,
-    trim: true,
-    default: null,
-  },
-  active: {
-    type: Boolean,
-    default: true,
-    index: true,
-  },
-  source: {
-    type: mongoose.Schema.Types.Mixed,
-    default: {},
-  },
-  lastSyncedAt: {
-    type: Date,
-    required: true,
-    default: Date.now,
-  },
-}, { timestamps: true });
+const { buildGlobalModel } = require('../utils/masterDataCommon');
+const {
+  ebmTinToApi,
+  ebmTinTranslateCreate,
+  ebmTinTranslateUpdate,
+} = require('../utils/phase10Mappers');
 
-ebmTINSchema.index({ tin: 1, taxpayerName: 1 });
-ebmTINSchema.index({ taxpayerName: 'text', tin: 'text' });
+const FIELD_MAP = {
+  tin: { target: 'tin' },
+  taxpayerName: { target: 'taxpayerName' },
+  active: { target: 'active' },
+};
 
-module.exports = mongoose.model('EBMTIN', ebmTINSchema);
+module.exports = buildGlobalModel({
+  name: 'EBMTIN',
+  collection: 'ebmtins',
+  delegateName: 'ebmTin',
+  fieldMap: FIELD_MAP,
+  toApi: ebmTinToApi,
+  translateCreate: ebmTinTranslateCreate,
+  translateUpdate: ebmTinTranslateUpdate,
+  mutable: true,
+});

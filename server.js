@@ -44,8 +44,28 @@ let app;
 
 // Initialize server (async to wait for DB connection before starting schedulers)
 async function initializeServer() {
-  // Connect to MongoDB FIRST and wait for it
+  // Connect PostgreSQL (Prisma) — required: auth/tenancy runs on Postgres (Phase 1)
+  if (!process.env.DATABASE_URL) {
+    throw new Error(
+      'DATABASE_URL is required. Auth and tenancy run on PostgreSQL. ' +
+      'Set DATABASE_URL (e.g. postgresql://stock:stock@localhost:5432/stock_management?schema=public) in .env'
+    );
+  }
+  const { connectPrisma } = require('./lib/prisma');
+  await connectPrisma();
+
+  // Connect to MongoDB (still used by not-yet-migrated domains).
+  // When MONGODB_URI is unset, MongoDB is disabled and Mongo-backed routes
+  // fail fast; only the PostgreSQL-backed domains are served.
   await connectDB();
+
+  // With MongoDB disabled, background schedulers touching Mongo models reject
+  // asynchronously. Log instead of letting Node kill the process.
+  if (!config.db.uri) {
+    process.on('unhandledRejection', (reason) => {
+      console.warn('[mongo-disabled] Unhandled rejection:', reason && reason.message ? reason.message : reason);
+    });
+  }
 
     // Register tenant plugin before models are loaded so all models inherit it
   const mongoose = require('mongoose');
@@ -66,6 +86,14 @@ async function initializeServer() {
     console.warn('Tenant plugin could not be registered:', e && e.message ? e.message : e);
   }
 
+  // Populate() interception for refs migrated to PostgreSQL (User/Company/Role)
+  try {
+    const postgresRefPlugin = require('./plugins/postgresRefPlugin');
+    mongoose.plugin(postgresRefPlugin);
+  } catch (e) {
+    console.warn('Postgres ref plugin could not be registered:', e && e.message ? e.message : e);
+  }
+
   // Load all models to ensure they're registered with mongoose
   require('./models/IPWhitelist');
   require('./models/Role');
@@ -75,8 +103,6 @@ async function initializeServer() {
   require('./models/AuditLog');
   require('./models/JournalEntryLine');
   require('./models/JournalEntry');
-  require('./models/RefreshToken');
-  require('./models/UserSession');
   require('./models/AssetCategory');
   require('./models/Loan');
   require('./models/ChartOfAccount');
@@ -88,6 +114,15 @@ async function initializeServer() {
   require('./models/PayrollRun');
   require('./models/Timesheet');
   require('./models/PurchaseReturn');
+  require('./models/Invoice');
+  require('./models/Purchase');
+  require('./models/StockMovement');
+  require('./models/Product');
+  require('./models/Client');
+  require('./models/Supplier');
+  require('./models/CreditNote');
+  require('./models/ARReceipt');
+  require('./models/APPayment');
   require('./models/Testimonial');
   require('./models/DeliveryNote');
   require('./models/GoodsReceivedNote');
@@ -336,13 +371,15 @@ async function initializeServer() {
   apiRouter.use('/import', require('./src/routes/v1/import.routes'));
   apiRouter.use('/export', require('./src/routes/v1/export.routes'));
 
-  try {
-    const { markInterruptedMemoryJobs } = require('./services/importQueueService');
-    markInterruptedMemoryJobs().catch((error) => {
-      console.error('[Imports] Failed to mark interrupted memory fallback jobs:', error.message);
-    });
-  } catch (error) {
-    console.error('[Imports] Startup fallback check failed:', error.message);
+  if (config.db.uri) {
+    try {
+      const { markInterruptedMemoryJobs } = require('./services/importQueueService');
+      markInterruptedMemoryJobs().catch((error) => {
+        console.error('[Imports] Failed to mark interrupted memory fallback jobs:', error.message);
+      });
+    } catch (error) {
+      console.error('[Imports] Startup fallback check failed:', error.message);
+    }
   }
 
   app.use('/api', apiRouter);
@@ -446,7 +483,32 @@ async function initializeServer() {
 
   // Start background schedulers and workers (skip during tests and in Jest workers)
   // Jest sets NODE_ENV='test' and also sets JEST_WORKER_ID; guard both to be safe.
+  // These schedulers all read/write Mongo-backed domains (invoices, products,
+  // EBM, report snapshots) — skip them entirely while MongoDB is disabled.
+  if (!(NODE_ENV === 'test' || process.env.JEST_WORKER_ID) && !config.db.uri) {
+    console.log('⏭️  MongoDB disabled — skipping Mongo-backed schedulers (recurring invoices, notifications, EBM sync, report snapshots)');
+  }
+  // Prisma-backed currency infrastructure (independent of MongoDB)
   if (!(NODE_ENV === 'test' || process.env.JEST_WORKER_ID)) {
+    // Seed the standard currency list (idempotent, non-blocking)
+    try {
+      const CurrencyService = require('./services/CurrencyService');
+      CurrencyService.seedCurrencies().catch((err) =>
+        console.warn('Could not seed currencies:', err.message || err)
+      );
+    } catch (err) {
+      console.warn('Could not seed currencies:', err.message || err);
+    }
+
+    // Daily exchange-rate sync (external market rates -> exchange_rates table)
+    try {
+      const { startExchangeRateScheduler } = require('./services/exchangeRateScheduler');
+      startExchangeRateScheduler();
+    } catch (err) {
+      console.warn('Could not start exchange rate scheduler', err);
+    }
+  }
+  if (!(NODE_ENV === 'test' || process.env.JEST_WORKER_ID) && config.db.uri) {
     // Start recurring scheduler (non-blocking)
     try {
       const { startScheduler } = require('./services/recurringService');
@@ -587,6 +649,14 @@ async function initializeServer() {
         }
       } catch (e) {
         console.warn('Error closing mongoose connection during shutdown', e && e.message ? e.message : e);
+      }
+
+      // Close Prisma connection
+      try {
+        const { disconnectPrisma } = require('./lib/prisma');
+        await disconnectPrisma();
+      } catch (e) {
+        console.warn('Error closing Prisma connection during shutdown', e && e.message ? e.message : e);
       }
 
       // Close Redis client if available

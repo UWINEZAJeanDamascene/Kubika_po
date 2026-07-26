@@ -15,19 +15,9 @@ exports.getDepartments = async (req, res, next) => {
     const conditions = [];
 
     if (isActive !== undefined) {
-      const isActiveBool = isActive === 'true';
-      if (isActiveBool) {
-        // For active=true, include both explicitly true AND missing isActive (default to true)
-        conditions.push({
-          $or: [
-            { isActive: true },
-            { isActive: { $exists: false } }
-          ]
-        });
-      } else {
-        // For active=false, only get explicitly false
-        conditions.push({ isActive: false });
-      }
+      // Postgres column is non-nullable with default true, so a plain
+      // equality check is exact (no missing-field case like Mongo had).
+      conditions.push({ isActive: isActive === 'true' });
     }
 
     if (search) {

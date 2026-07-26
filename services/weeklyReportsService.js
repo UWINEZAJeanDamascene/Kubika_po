@@ -8,13 +8,17 @@ const Invoice = require('../models/Invoice');
 const SalesOrder = require('../models/SalesOrder');
 const Product = require('../models/Product');
 const Supplier = require('../models/Supplier');
+const Purchase = require('../models/Purchase');
 const PurchaseOrder = require('../models/PurchaseOrder');
 const GoodsReceivedNote = require('../models/GoodsReceivedNote');
 const ARReceipt = require('../models/ARReceipt');
 const APPayment = require('../models/APPayment');
 const JournalEntry = require('../models/JournalEntry');
 const ChartOfAccount = require('../models/ChartOfAccount');
-require('../models/BankAccount');
+const Payroll = require('../models/Payroll');
+const PayrollRun = require('../models/PayrollRun');
+const Employee = require('../models/Employee');
+const { BankAccount, BankTransaction } = require('../models/BankAccount');
 
 const toObjectId = (value) => new mongoose.Types.ObjectId(String(value));
 
@@ -40,6 +44,21 @@ const formatLocalDate = (date) => {
   const day = String(d.getDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
 };
+
+const CONFIRMED_INVOICE_STATUSES = ['fully_paid', 'partially_paid', 'confirmed'];
+const ACTIVE_SALES_ORDER_STATUSES = ['confirmed', 'picking', 'packed', 'delivered', 'invoiced', 'closed'];
+
+const invoiceMatchStage = (companyId, start, end) => ({
+  company: toObjectId(companyId),
+  invoiceDate: { $gte: start, $lte: end },
+  status: { $in: CONFIRMED_INVOICE_STATUSES },
+});
+
+const salesOrderMatchStage = (companyId, start, end) => ({
+  company: toObjectId(companyId),
+  orderDate: { $gte: start, $lte: end },
+  status: { $in: ACTIVE_SALES_ORDER_STATUSES },
+});
 
 class WeeklyReportsService {
   /**
@@ -81,23 +100,15 @@ class WeeklyReportsService {
   static async getWeeklySalesPerformance(companyId, weekStart) {
     const { start, end, prevStart, prevEnd } = this.getWeekRange(weekStart);
     
-    const Invoice = mongoose.model('Invoice');
-    const SalesOrder = mongoose.model('SalesOrder');
-    
     // Run this week and last week queries in parallel
     const [
       thisWeekInvoices, lastWeekInvoices,
+      thisWeekInvoiceItems, lastWeekInvoiceItems,
       thisWeekOrders, lastWeekOrders
     ] = await Promise.all([
       // This week invoices
       Invoice.aggregate([
-        {
-          $match: {
-            company: toObjectId(companyId),
-            invoiceDate: { $gte: start, $lte: end },
-            status: { $in: ['fully_paid', 'partially_paid', 'confirmed'] }
-          }
-        },
+        { $match: invoiceMatchStage(companyId, start, end) },
         {
           $group: {
             _id: null,
@@ -108,13 +119,7 @@ class WeeklyReportsService {
       ]),
       // Last week invoices
       Invoice.aggregate([
-        {
-          $match: {
-            company: toObjectId(companyId),
-            invoiceDate: { $gte: prevStart, $lte: prevEnd },
-            status: { $in: ['fully_paid', 'partially_paid', 'confirmed'] }
-          }
-        },
+        { $match: invoiceMatchStage(companyId, prevStart, prevEnd) },
         {
           $group: {
             _id: null,
@@ -123,19 +128,34 @@ class WeeklyReportsService {
           }
         }
       ]),
-      // This week orders for volume - count orders and sum quantities separately
-      SalesOrder.aggregate([
+      // Items sold this week (from invoice lines)
+      Invoice.aggregate([
+        { $match: invoiceMatchStage(companyId, start, end) },
+        { $unwind: { path: '$lines', preserveNullAndEmptyArrays: false } },
         {
-          $match: {
-            company: toObjectId(companyId),
-            orderDate: { $gte: start, $lte: end },
-            status: { $in: ['delivered', 'invoiced', 'closed'] }
+          $group: {
+            _id: null,
+            totalItems: { $sum: { $toDouble: { $ifNull: ['$lines.qty', 0] } } }
           }
-        },
+        }
+      ]),
+      // Items sold last week
+      Invoice.aggregate([
+        { $match: invoiceMatchStage(companyId, prevStart, prevEnd) },
+        { $unwind: { path: '$lines', preserveNullAndEmptyArrays: false } },
+        {
+          $group: {
+            _id: null,
+            totalItems: { $sum: { $toDouble: { $ifNull: ['$lines.qty', 0] } } }
+          }
+        }
+      ]),
+      // This week sales orders
+      SalesOrder.aggregate([
+        { $match: salesOrderMatchStage(companyId, start, end) },
         {
           $project: {
             _id: 1,
-            // Sum quantities from lines array (not items)
             totalQty: {
               $sum: {
                 $map: {
@@ -155,15 +175,9 @@ class WeeklyReportsService {
           }
         }
       ]),
-      // Last week orders
+      // Last week sales orders
       SalesOrder.aggregate([
-        {
-          $match: {
-            company: toObjectId(companyId),
-            orderDate: { $gte: prevStart, $lte: prevEnd },
-            status: { $in: ['delivered', 'invoiced', 'closed'] }
-          }
-        },
+        { $match: salesOrderMatchStage(companyId, prevStart, prevEnd) },
         {
           $project: {
             _id: 1,
@@ -192,14 +206,14 @@ class WeeklyReportsService {
       sales: thisWeekInvoices[0]?.totalSales || 0,
       invoices: thisWeekInvoices[0]?.invoiceCount || 0,
       orders: thisWeekOrders[0]?.totalOrders || 0,
-      items: thisWeekOrders[0]?.totalItems || 0
+      items: thisWeekInvoiceItems[0]?.totalItems || 0
     };
     
     const lastWeek = {
       sales: lastWeekInvoices[0]?.totalSales || 0,
       invoices: lastWeekInvoices[0]?.invoiceCount || 0,
       orders: lastWeekOrders[0]?.totalOrders || 0,
-      items: lastWeekOrders[0]?.totalItems || 0
+      items: lastWeekInvoiceItems[0]?.totalItems || 0
     };
     
     // Calculate percentage changes
@@ -228,8 +242,6 @@ class WeeklyReportsService {
    * Products below reorder point
    */
   static async getWeeklyInventoryReorder(companyId) {
-    const Product = mongoose.model('Product');
-    
     // Get all products and filter in JS to handle Decimal128 properly
     const allProducts = await Product.find({
       company: toObjectId(companyId),
@@ -441,7 +453,6 @@ class WeeklyReportsService {
    * Outstanding invoices grouped by age buckets
    */
   static async getWeeklyReceivablesAging(companyId) {
-    const Invoice = mongoose.model('Invoice');
     const today = new Date();
     
     // Get all outstanding invoices
@@ -527,26 +538,62 @@ class WeeklyReportsService {
    * Amounts owed to suppliers grouped by age buckets
    */
   static async getWeeklyPayablesAging(companyId) {
-    const Purchase = mongoose.model('Purchase');
     const today = new Date();
-    
-    // Get all unpaid purchases
-    const unpaidPurchases = await Purchase.find({
-      company: toObjectId(companyId),
-      status: { $in: ['partial', 'received'] },
-      balance: { $gt: 0 }
-    }, {
-      purchaseNumber: 1,
-      purchaseDate: 1,
-      supplierInvoiceDate: 1,
-      receivedDate: 1,
-      supplier: 1,
-      grandTotal: 1,
-      total: 1,
-      balance: 1
-    })
-    .populate('supplier', 'name')
-    .lean();
+
+    const [unpaidGrns, unpaidOrders] = await Promise.all([
+      GoodsReceivedNote.find({
+        company: toObjectId(companyId),
+        status: 'confirmed',
+        balance: { $gt: 0 }
+      }, {
+        referenceNo: 1,
+        receivedDate: 1,
+        supplier: 1,
+        totalAmount: 1,
+        balance: 1,
+        supplierInvoiceNo: 1
+      })
+        .populate('supplier', 'name')
+        .lean(),
+      PurchaseOrder.aggregate([
+        {
+          $match: {
+            company: toObjectId(companyId),
+            status: { $in: ['approved', 'partially_received', 'received'] },
+            balance: { $gt: 0 }
+          }
+        },
+        {
+          $lookup: {
+            from: 'suppliers',
+            localField: 'supplier',
+            foreignField: '_id',
+            as: 'supplierDoc'
+          }
+        }
+      ])
+    ]);
+
+    const payableItems = [
+      ...unpaidGrns.map((grn) => ({
+        purchaseId: grn._id,
+        purchaseNumber: grn.referenceNo,
+        supplierName: grn.supplier?.name || 'Unknown',
+        purchaseDate: grn.receivedDate,
+        dueDate: new Date(grn.receivedDate),
+        totalAmount: toNumber(grn.totalAmount),
+        balance: toNumber(grn.balance)
+      })),
+      ...unpaidOrders.map((po) => ({
+        purchaseId: po._id,
+        purchaseNumber: po.referenceNo || po.purchaseOrderNumber || 'PO',
+        supplierName: po.supplierDoc?.[0]?.name || 'Unknown',
+        purchaseDate: po.orderDate,
+        dueDate: new Date(po.expectedDeliveryDate || po.orderDate),
+        totalAmount: toNumber(po.totalAmount) || toNumber(po.total),
+        balance: toNumber(po.balance)
+      }))
+    ];
     
     // Age buckets
     const buckets = {
@@ -557,23 +604,23 @@ class WeeklyReportsService {
     };
     
     let totalPayable = 0;
-    
-    unpaidPurchases.forEach(p => {
-      const dueDate = new Date(p.supplierInvoiceDate || p.receivedDate || p.purchaseDate);
+
+    payableItems.forEach((p) => {
+      const dueDate = new Date(p.dueDate || p.purchaseDate);
       const daysOverdue = Math.floor((today - dueDate) / (1000 * 60 * 60 * 24));
-      
+
       const balance = toNumber(p.balance);
       totalPayable += balance;
-      
+
       const purchaseData = {
-        purchaseId: p._id,
+        purchaseId: p.purchaseId,
         purchaseNumber: p.purchaseNumber,
-        supplierName: p.supplier?.name || 'Unknown',
+        supplierName: p.supplierName,
         purchaseDate: p.purchaseDate,
         dueDate,
         daysOverdue: daysOverdue > 0 ? daysOverdue : 0,
-        totalAmount: toNumber(p.grandTotal) || toNumber(p.total),
-        balance: balance
+        totalAmount: toNumber(p.totalAmount),
+        balance
       };
       
       if (daysOverdue <= 7) {
@@ -596,7 +643,7 @@ class WeeklyReportsService {
       generatedAt: today.toISOString(),
       summary: {
         totalPayable,
-        totalPurchases: unpaidPurchases.length,
+        totalPurchases: payableItems.length,
         bucketTotals: {
           '0-7': buckets['0-7'].total,
           '8-14': buckets['8-14'].total,
@@ -614,8 +661,6 @@ class WeeklyReportsService {
    */
   static async getWeeklyCashFlow(companyId, weekStart) {
     const { start, end } = this.getWeekRange(weekStart);
-    
-    const BankTransaction = mongoose.model('BankTransaction');
     
     // Generate array of dates for the week
     const weekDates = [];
@@ -755,78 +800,143 @@ class WeeklyReportsService {
    * Shows expected payroll if in progress
    */
   static async getWeeklyPayrollPreview(companyId) {
-    const Payroll = mongoose.model('Payroll');
     const today = new Date();
-    
-    // Check if payroll is in progress for this period
-    const currentPayroll = await Payroll.findOne({
+    const inProgressStatuses = ['draft', 'calculated', 'review', 'pending_approval'];
+
+    const buildEmployeeRows = (records) => records.map((p) => {
+      const emp = p.employee && typeof p.employee === 'object' ? p.employee : {};
+      const salary = p.salary && typeof p.salary === 'object' ? p.salary : {};
+      const deductions = p.deductions && typeof p.deductions === 'object' ? p.deductions : {};
+      const contributions = p.contributions && typeof p.contributions === 'object' ? p.contributions : {};
+      const grossPay = toNumber(salary.grossSalary ?? salary.grossPay ?? p.netPay);
+      const paye = toNumber(deductions.paye);
+      const rssbEmployee = toNumber(deductions.rssbEmployeePension) + toNumber(deductions.rssbEmployeeMaternity);
+      const rssbEmployer = toNumber(contributions.rssbEmployerPension) + toNumber(contributions.rssbEmployerMaternity);
+      const totalDeductions = toNumber(deductions.totalDeductions) || (paye + rssbEmployee);
+      const netPay = toNumber(p.netPay);
+
+      return {
+        employeeId: emp.employeeId || p.employee_id || p._id,
+        name: `${emp.firstName || ''} ${emp.lastName || ''}`.trim() || 'Unknown',
+        employeeNumber: emp.employeeNumber || emp.employeeId || '',
+        department: emp.department || 'N/A',
+        grossPay,
+        paye,
+        rssbEmployee,
+        rssbEmployer,
+        totalDeductions,
+        netPay
+      };
+    });
+
+    let currentPayrollRun = await PayrollRun.findOne({
       company: toObjectId(companyId),
-      record_status: 'draft',
+      status: { $in: inProgressStatuses },
       pay_period_start: { $lte: today },
       pay_period_end: { $gte: today }
-    }).lean();
-    
-    if (!currentPayroll) {
-      // No payroll in progress - check for any payroll records to get employee info
+    })
+      .sort({ pay_period_start: -1 })
+      .lean();
+
+    if (!currentPayrollRun) {
+      currentPayrollRun = await PayrollRun.findOne({
+        company: toObjectId(companyId),
+        status: { $in: inProgressStatuses }
+      })
+        .sort({ updatedAt: -1 })
+        .lean();
+    }
+
+    if (currentPayrollRun) {
       const payrollRecords = await Payroll.find({
-      company: toObjectId(companyId)
-      }).limit(1).lean();
-      
-      if (payrollRecords.length === 0 || !payrollRecords[0].employee) {
+        company: toObjectId(companyId),
+        payroll_run_id: currentPayrollRun._id
+      }).lean();
+
+      if (payrollRecords.length > 0) {
+        const employees = buildEmployeeRows(payrollRecords);
         return {
           reportName: 'Weekly Payroll Preview',
-          payrollInProgress: false,
-          message: 'No payroll data available',
-          employeeCount: 0,
-          estimatedGrossPay: 0
+          payrollInProgress: true,
+          periodStart: formatLocalDate(currentPayrollRun.pay_period_start),
+          periodEnd: formatLocalDate(currentPayrollRun.pay_period_end),
+          employeeCount: employees.length,
+          estimatedGrossPay: employees.reduce((sum, e) => sum + e.grossPay, 0),
+          summary: {
+            employeeCount: employees.length,
+            grossPay: employees.reduce((sum, e) => sum + e.grossPay, 0),
+            paye: employees.reduce((sum, e) => sum + e.paye, 0),
+            rssbEmployee: employees.reduce((sum, e) => sum + e.rssbEmployee, 0),
+            rssbEmployer: employees.reduce((sum, e) => sum + e.rssbEmployer, 0),
+            totalDeductions: employees.reduce((sum, e) => sum + e.totalDeductions, 0),
+            netPay: employees.reduce((sum, e) => sum + e.netPay, 0)
+          },
+          employees
         };
       }
-      
+
+      return {
+        reportName: 'Weekly Payroll Preview',
+        payrollInProgress: true,
+        periodStart: formatLocalDate(currentPayrollRun.pay_period_start),
+        periodEnd: formatLocalDate(currentPayrollRun.pay_period_end),
+        message: 'Payroll run in progress with no calculated employee lines yet',
+        employeeCount: toNumber(currentPayrollRun.employee_count),
+        estimatedGrossPay: toNumber(currentPayrollRun.total_gross)
+      };
+    }
+
+    const activeEmployees = await Employee.find({
+      company: toObjectId(companyId),
+      status: 'active'
+    }, {
+      employeeId: 1,
+      firstName: 1,
+      lastName: 1,
+      department: 1,
+      currentSalary: 1
+    }).lean();
+
+    const estimatedGrossPay = activeEmployees.reduce((sum, employee) => {
+      const salary = employee.currentSalary;
+      if (salary && typeof salary === 'object') {
+        return sum + toNumber(salary.amount ?? salary.grossSalary ?? salary.baseSalary);
+      }
+      return sum + toNumber(salary);
+    }, 0);
+
+    if (activeEmployees.length === 0) {
       return {
         reportName: 'Weekly Payroll Preview',
         payrollInProgress: false,
-        message: 'No payroll currently in progress for this period',
+        message: 'No payroll data available',
         employeeCount: 0,
         estimatedGrossPay: 0
       };
     }
-    
-    // Payroll in progress - get all payroll records for this period
-    const payrollRecords = await Payroll.find({
-      company: toObjectId(companyId),
-      'period.year': currentPayroll.period.year,
-      'period.month': currentPayroll.period.month
-    }).lean();
-    
-    // Extract employee data from payroll records
-    const employees = payrollRecords.map(p => ({
-      employeeId: p.employee.employeeId,
-      name: `${p.employee.firstName} ${p.employee.lastName}`,
-      employeeNumber: p.employee.employeeNumber,
-      department: p.employee.department || 'N/A',
-      grossPay: p.salary?.grossSalary || 0,
-      paye: p.deductions.paye,
-      rssbEmployee: p.deductions.rssbEmployeePension + p.deductions.rssbEmployeeMaternity,
-      rssbEmployer: p.contributions?.rssbEmployerPension + p.contributions?.rssbEmployerMaternity || 0,
-      totalDeductions: p.deductions.totalDeductions,
-      netPay: p.netPay
-    }));
-    
+
     return {
       reportName: 'Weekly Payroll Preview',
-      payrollInProgress: true,
-      periodStart: formatLocalDate(currentPayroll.pay_period_start),
-      periodEnd: formatLocalDate(currentPayroll.pay_period_end),
-      summary: {
-        employeeCount: employees.length,
-        grossPay: employees.reduce((sum, e) => sum + e.grossPay, 0),
-        paye: employees.reduce((sum, e) => sum + e.paye, 0),
-        rssbEmployee: employees.reduce((sum, e) => sum + e.rssbEmployee, 0),
-        rssbEmployer: employees.reduce((sum, e) => sum + e.rssbEmployer, 0),
-        totalDeductions: employees.reduce((sum, e) => sum + e.totalDeductions, 0),
-        netPay: employees.reduce((sum, e) => sum + e.netPay, 0)
-      },
-      employees
+      payrollInProgress: false,
+      message: 'No payroll run in progress — estimated from active employee salaries',
+      employeeCount: activeEmployees.length,
+      estimatedGrossPay,
+      employees: activeEmployees.map((employee) => ({
+        employeeId: employee.employeeId || employee._id,
+        employeeNumber: employee.employeeId || '',
+        name: `${employee.firstName || ''} ${employee.lastName || ''}`.trim() || 'Unknown',
+        department: employee.department || 'N/A',
+        grossPay: toNumber(
+          employee.currentSalary && typeof employee.currentSalary === 'object'
+            ? employee.currentSalary.amount ?? employee.currentSalary.grossSalary
+            : employee.currentSalary
+        ),
+        paye: 0,
+        rssbEmployee: 0,
+        rssbEmployer: 0,
+        totalDeductions: 0,
+        netPay: 0
+      }))
     };
   }
 }

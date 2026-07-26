@@ -1,0 +1,1175 @@
+// Phase 10 — Fixed Assets + HR/Payroll + Budget + EBM
+//
+// ── Merge into Company model ─────────────────────────────────────────────
+// assetCategories            AssetCategory[]
+// fixedAssets                FixedAsset[]
+// depreciationEntries        DepreciationEntry[]
+// assetDisposalEvents        AssetDisposalEvent[]
+// assetStatusHistories       AssetStatusHistory[]
+// employees                  Employee[]
+// salaryHistories            SalaryHistory[]
+// payrolls                   Payroll[]
+// payrollRuns                PayrollRun[]
+// timesheets                 Timesheet[]
+// employeeAdvances           EmployeeAdvance[]
+// budgets                    Budget[]
+// budgetLines                BudgetLine[]
+// budgetWorkflowConfigs      BudgetWorkflowConfig[]
+// budgetActualConsumptions   BudgetActualConsumption[]
+// budgetTransfers            BudgetTransfer[]
+// budgetRevisions            BudgetRevision[]
+// budgetPeriodLocks          BudgetPeriodLock[]
+// budgetApprovals            BudgetApproval[]
+// budgetAlerts               BudgetAlert[]
+// encumbrances               Encumbrance[]
+// projects                   Project[]
+// ebmDevices                 EbmDevice[]
+// ebmCodes                   EbmCode[]
+// ebmItemClasses             EbmItemClass[]
+// ebmNotices                 EbmNotice[]
+// ebmImportedItems           EbmImportedItem[]
+// ebmUnmatchedPurchases      EbmUnmatchedPurchase[]
+// ebmSubmissionQueues        EbmSubmissionQueue[]
+// ebmAlerts                  EbmAlert[]
+// ebmSyncStates              EbmSyncState[]
+// budgetEntities             Budget[] @relation("BudgetEntity")
+
+// ── Phase 10 — Fixed Assets ────────────────────────────────────────────────
+
+model AssetCategory {
+  id                                  String    @id @db.Char(24)
+  companyId                           String    @map("company_id") @db.Char(24)
+  name                                String
+  description                         String?
+  defaultUsefulLifeMonths             Int       @map("default_useful_life_months")
+  defaultDepreciationMethod           String    @default("straight_line") @map("default_depreciation_method")
+  defaultDecliningRate                Decimal?  @map("default_declining_rate") @db.Decimal(19, 4)
+  defaultAssetAccountCode             String    @default("1700") @map("default_asset_account_code")
+  defaultAccumDepreciationAccountCode String?   @default("1810") @map("default_accum_depreciation_account_code")
+  defaultDepreciationExpenseAccountCode String? @default("5800") @map("default_depreciation_expense_account_code")
+  rraAssetClass                       String?   @map("rra_asset_class")
+  rraUsefulLifeYears                  Int?      @map("rra_useful_life_years")
+  rraDepreciationMethod               String?   @map("rra_depreciation_method")
+  rraDecliningRate                    Decimal?  @map("rra_declining_rate") @db.Decimal(19, 4)
+  parentCategoryId                    String?   @map("parent_category_id") @db.Char(24)
+  categoryCode                        String?   @map("category_code")
+  isComponentizable                   Boolean   @default(false) @map("is_componentizable")
+  isDepreciable                       Boolean   @default(true) @map("is_depreciable")
+  defaultDepreciationFrequency        String    @default("monthly") @map("default_depreciation_frequency")
+  isSystem                            Boolean   @default(false) @map("is_system")
+  isDeleted                           Boolean   @default(false) @map("is_deleted")
+  createdById                         String?   @map("created_by") @db.Char(24)
+  createdAt                           DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                           DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company        Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  parentCategory AssetCategory?  @relation("AssetCategoryTree", fields: [parentCategoryId], references: [id])
+  childCategories AssetCategory[] @relation("AssetCategoryTree")
+  fixedAssets    FixedAsset[]
+
+  @@unique([companyId, name])
+  @@index([companyId, isSystem])
+  @@map("asset_categories")
+}
+
+model FixedAsset {
+  id                              String    @id @db.Char(24)
+  companyId                       String    @map("company_id") @db.Char(24)
+  referenceNo                     String?   @map("reference_no")
+  name                            String
+  description                     String?
+  categoryId                      String?   @map("category_id") @db.Char(24)
+  assetAccountId                  String?   @map("asset_account_id") @db.Char(24)
+  assetAccountCode                String    @map("asset_account_code")
+  accumDepreciationAccountId      String?   @map("accum_depreciation_account_id") @db.Char(24)
+  accumDepreciationAccountCode    String    @map("accum_depreciation_account_code")
+  depreciationExpenseAccountId    String?   @map("depreciation_expense_account_id") @db.Char(24)
+  depreciationExpenseAccountCode  String    @map("depreciation_expense_account_code")
+  purchaseDate                    DateTime  @map("purchase_date") @db.Timestamptz(3)
+  purchaseCost                    Decimal   @map("purchase_cost") @db.Decimal(19, 2)
+  salvageValue                    Decimal   @default(0) @map("salvage_value") @db.Decimal(19, 2)
+  usefulLifeMonths                Int       @map("useful_life_months")
+  depreciationMethod              String    @default("straight_line") @map("depreciation_method")
+  decliningRate                   Decimal?  @map("declining_rate") @db.Decimal(19, 4)
+  status                          String    @default("in_transit")
+  inServiceDate                   DateTime? @map("in_service_date") @db.Timestamptz(3)
+  rraInServiceDate                DateTime? @map("rra_in_service_date") @db.Timestamptz(3)
+  isReadyForService               Boolean   @default(false) @map("is_ready_for_service")
+  disposalDate                    DateTime? @map("disposal_date") @db.Timestamptz(3)
+  disposalProceeds                Decimal?  @map("disposal_proceeds") @db.Decimal(19, 2)
+  disposalCosts                   Decimal?  @map("disposal_costs") @db.Decimal(19, 2)
+  disposalNetProceeds               Decimal?  @map("disposal_net_proceeds") @db.Decimal(19, 2)
+  disposalGainLoss                Decimal?  @map("disposal_gain_loss") @db.Decimal(19, 2)
+  disposalMethod                  String?   @map("disposal_method")
+  disposalNotes                   String?   @map("disposal_notes")
+  disposalAuthNumber              String?   @map("disposal_auth_number")
+  disposalCustomerId              String?   @map("disposal_customer_id") @db.Char(24)
+  disposalEventId                 String?   @unique @map("disposal_event_id") @db.Char(24)
+  disposalJournalEntryId          String?   @map("disposal_journal_entry_id") @db.Char(24)
+  accumulatedDepreciation         Decimal   @default(0) @map("accumulated_depreciation") @db.Decimal(19, 2)
+  netBookValue                    Decimal   @default(0) @map("net_book_value") @db.Decimal(19, 2)
+  supplierId                      String?   @map("supplier_id") @db.Char(24)
+  serialNumber                    String?   @map("serial_number")
+  location                        String?
+  departmentId                    String?   @map("department_id") @db.Char(24)
+  warrantyStartDate               DateTime? @map("warranty_start_date") @db.Timestamptz(3)
+  warrantyEndDate                 DateTime? @map("warranty_end_date") @db.Timestamptz(3)
+  insuredValue                    Decimal?  @map("insured_value") @db.Decimal(19, 2)
+  attachments                     Json      @default("[]")
+  depreciationFrequency           String    @default("monthly") @map("depreciation_frequency")
+  lastDepreciationPeriod          String?   @map("last_depreciation_period")
+  lastDepreciationDate            DateTime? @map("last_depreciation_date") @db.Timestamptz(3)
+  acquisitionMethod               String    @default("purchase") @map("acquisition_method")
+  donationFairValue               Decimal?  @map("donation_fair_value") @db.Decimal(19, 2)
+  constructionCompletionDate      DateTime? @map("construction_completion_date") @db.Timestamptz(3)
+  custodianId                     String?   @map("custodian_id") @db.Char(24)
+  isDeleted                       Boolean   @default(false) @map("is_deleted")
+  deletedAt                       DateTime? @map("deleted_at") @db.Timestamptz(3)
+  createdById                     String    @map("created_by") @db.Char(24)
+  createdAt                       DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                       DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company              Company               @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  category             AssetCategory?        @relation(fields: [categoryId], references: [id])
+  disposalEvent        AssetDisposalEvent?   @relation("FixedAssetDisposalEvent", fields: [disposalEventId], references: [id])
+  depreciationEntries  DepreciationEntry[]
+  disposalEvents       AssetDisposalEvent[]  @relation("DisposedAsset")
+  tradeInDisposals     AssetDisposalEvent[]  @relation("TradeInAsset")
+  statusHistories      AssetStatusHistory[]
+
+  @@unique([companyId, referenceNo])
+  @@index([companyId, status])
+  @@index([companyId, categoryId])
+  @@map("fixed_assets")
+}
+
+model DepreciationEntry {
+  id                  String    @id @db.Char(24)
+  companyId           String    @map("company_id") @db.Char(24)
+  assetId             String    @map("asset_id") @db.Char(24)
+  periodDate          DateTime  @map("period_date") @db.Timestamptz(3)
+  depreciationAmount  Decimal   @map("depreciation_amount") @db.Decimal(19, 2)
+  accumulatedBefore   Decimal   @map("accumulated_before") @db.Decimal(19, 2)
+  accumulatedAfter    Decimal   @map("accumulated_after") @db.Decimal(19, 2)
+  netBookValueAfter   Decimal   @map("net_book_value_after") @db.Decimal(19, 2)
+  journalEntryId      String    @map("journal_entry_id") @db.Char(24)
+  postedById          String    @map("posted_by") @db.Char(24)
+  isReversed          Boolean   @default(false) @map("is_reversed")
+  reversedById        String?   @map("reversed_by") @db.Char(24)
+  reversedAt          DateTime? @map("reversed_at") @db.Timestamptz(3)
+  isDeleted           Boolean   @default(false) @map("is_deleted")
+  deletedAt           DateTime? @map("deleted_at") @db.Timestamptz(3)
+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  asset   FixedAsset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, assetId, periodDate])
+  @@index([companyId, periodDate])
+  @@map("depreciation_entries")
+}
+
+model AssetDisposalEvent {
+  id                     String    @id @db.Char(24)
+  companyId              String    @map("company_id") @db.Char(24)
+  assetId                String    @map("asset_id") @db.Char(24)
+  disposalDate           DateTime  @map("disposal_date") @db.Timestamptz(3)
+  disposalMethod         String    @map("disposal_method")
+  grossProceeds          Decimal   @default(0) @map("gross_proceeds") @db.Decimal(19, 2)
+  disposalCosts          Decimal   @default(0) @map("disposal_costs") @db.Decimal(19, 2)
+  netProceeds            Decimal   @map("net_proceeds") @db.Decimal(19, 2)
+  originalCost           Decimal   @map("original_cost") @db.Decimal(19, 2)
+  accumulatedDepreciation Decimal  @map("accumulated_depreciation") @db.Decimal(19, 2)
+  netBookValue           Decimal   @map("net_book_value") @db.Decimal(19, 2)
+  gainLoss               Decimal   @map("gain_loss") @db.Decimal(19, 2)
+  gainLossType           String    @map("gain_loss_type")
+  disposalJournalEntryId String?   @map("disposal_journal_entry_id") @db.Char(24)
+  tradeInAssetId         String?   @map("trade_in_asset_id") @db.Char(24)
+  tradeInValue           Decimal?  @map("trade_in_value") @db.Decimal(19, 2)
+  soldToCustomerId       String?   @map("sold_to_customer_id") @db.Char(24)
+  saleInvoiceId          String?   @map("sale_invoice_id") @db.Char(24)
+  proceedsBankAccountId  String?   @map("proceeds_bank_account_id") @db.Char(24)
+  disposalAuthNumber     String?   @map("disposal_auth_number")
+  rraNotified            Boolean   @default(false) @map("rra_notified")
+  rraNotificationDate    DateTime? @map("rra_notification_date") @db.Timestamptz(3)
+  attachments            Json      @default("[]")
+  processedById          String    @map("processed_by") @db.Char(24)
+  processedAt            DateTime  @default(now()) @map("processed_at") @db.Timestamptz(3)
+  notes                  String?
+  isReversed             Boolean   @default(false) @map("is_reversed")
+  reversedAt             DateTime? @map("reversed_at") @db.Timestamptz(3)
+  reversedById           String?   @map("reversed_by") @db.Char(24)
+  reversalReason         String?   @map("reversal_reason")
+
+  company        Company     @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  asset          FixedAsset  @relation("DisposedAsset", fields: [assetId], references: [id], onDelete: Cascade)
+  tradeInAsset   FixedAsset? @relation("TradeInAsset", fields: [tradeInAssetId], references: [id])
+  linkedAsset    FixedAsset? @relation("FixedAssetDisposalEvent")
+
+  @@index([companyId, assetId])
+  @@index([companyId, disposalDate(sort: Desc)])
+  @@index([companyId, disposalMethod])
+  @@index([companyId, gainLossType])
+  @@map("asset_disposal_events")
+}
+
+model AssetStatusHistory {
+  id                    String   @id @db.Char(24)
+  companyId             String   @map("company_id") @db.Char(24)
+  assetId               String   @map("asset_id") @db.Char(24)
+  fromStatus            String   @map("from_status")
+  toStatus              String   @map("to_status")
+  changedAt             DateTime @default(now()) @map("changed_at") @db.Timestamptz(3)
+  changedById           String   @map("changed_by") @db.Char(24)
+  reason                String?
+  notes                 String?
+  supportingDocumentUrl String?  @map("supporting_document_url")
+  locationAtChange      String?  @map("location_at_change")
+  departmentIdAtChange  String?  @map("department_id_at_change") @db.Char(24)
+  custodianIdAtChange   String?  @map("custodian_id_at_change") @db.Char(24)
+  ipAddress             String?  @map("ip_address")
+  userAgent             String?  @map("user_agent")
+
+  company Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  asset   FixedAsset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, assetId, changedAt(sort: Desc)])
+  @@index([companyId, fromStatus, toStatus])
+  @@index([assetId, toStatus])
+  @@index([changedAt(sort: Desc)])
+  @@map("asset_status_histories")
+}
+
+// ── Phase 10 — HR / Payroll ────────────────────────────────────────────────
+
+model Employee {
+  id                      String    @id @db.Char(24)
+  companyId               String    @map("company_id") @db.Char(24)
+  employeeId              String    @map("employee_id")
+  status                  String    @default("active")
+  firstName               String    @map("first_name")
+  lastName                String    @map("last_name")
+  email                   String?
+  phone                   String?
+  dateOfBirth             DateTime? @map("date_of_birth") @db.Timestamptz(3)
+  gender                  String?
+  nationalId              String?   @map("national_id")
+  hireDate                DateTime? @map("hire_date") @db.Timestamptz(3)
+  terminationDate         DateTime? @map("termination_date") @db.Timestamptz(3)
+  employmentType          String    @default("full-time") @map("employment_type")
+  department              String?
+  departmentRefId         String?   @map("department_ref_id") @db.Char(24)
+  position                String?
+  location                String?
+  managerId               String?   @map("manager_id") @db.Char(24)
+  laborType               String?   @map("labor_type")
+  defaultDirectPercentage Float?    @map("default_direct_percentage")
+  costCenter              String?   @map("cost_center")
+  bankName                String?   @map("bank_name")
+  bankAccount             String?   @map("bank_account")
+  bankBranch              String?   @map("bank_branch")
+  mobileMoneyNumber       String?   @map("mobile_money_number")
+  taxStatus               String    @default("resident") @map("tax_status")
+  rssbRegistrationNumber  String?   @map("rssb_registration_number")
+  tinNumber               String?   @map("tin_number")
+  currentSalary           Json?     @map("current_salary")
+  createdById             String?   @map("created_by") @db.Char(24)
+  updatedById             String?   @map("updated_by") @db.Char(24)
+  createdAt               DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt               DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company         Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  manager         Employee?        @relation("EmployeeManager", fields: [managerId], references: [id])
+  subordinates    Employee[]       @relation("EmployeeManager")
+  salaryHistories SalaryHistory[]
+  payrolls        Payroll[]
+  timesheets      Timesheet[]
+  advances        EmployeeAdvance[]
+
+  @@unique([companyId, employeeId])
+  @@index([companyId, status])
+  @@index([companyId, department])
+  @@index([companyId, employmentType])
+  @@map("employees")
+}
+
+model SalaryHistory {
+  id                 String    @id @db.Char(24)
+  companyId          String    @map("company_id") @db.Char(24)
+  employeeId         String    @map("employee_id") @db.Char(24)
+  basicSalary        Decimal   @map("basic_salary") @db.Decimal(19, 2)
+  transportAllowance Decimal   @default(0) @map("transport_allowance") @db.Decimal(19, 2)
+  housingAllowance   Decimal   @default(0) @map("housing_allowance") @db.Decimal(19, 2)
+  otherAllowances    Decimal   @default(0) @map("other_allowances") @db.Decimal(19, 2)
+  currency           String    @default("RWF")
+  effectiveDate      DateTime  @map("effective_date") @db.Timestamptz(3)
+  endDate            DateTime? @map("end_date") @db.Timestamptz(3)
+  reason             String?
+  changedById        String?   @map("changed_by") @db.Char(24)
+  createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company  Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  employee Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, employeeId, effectiveDate(sort: Desc)])
+  @@index([companyId, employeeId, endDate])
+  @@map("salary_histories")
+}
+
+model Payroll {
+  id              String    @id @db.Char(24)
+  companyId       String    @map("company_id") @db.Char(24)
+  employeeRefId   String?   @map("employee_id") @db.Char(24)
+  employee        Json
+  salary          Json
+  deductions      Json      @default("{}")
+  netPay          Decimal   @default(0) @map("net_pay") @db.Decimal(19, 2)
+  laborAllocation Json      @default("{}") @map("labor_allocation")
+  contributions   Json      @default("{}")
+  period          Json
+  payrollRunId    String?   @map("payroll_run_id") @db.Char(24)
+  payPeriodStart  DateTime? @map("pay_period_start") @db.Timestamptz(3)
+  payPeriodEnd    DateTime? @map("pay_period_end") @db.Timestamptz(3)
+  recordStatus    String    @default("draft") @map("record_status")
+  payment         Json      @default("{}")
+  payslipGenerated Boolean  @default(false) @map("payslip_generated")
+  payslipDate     DateTime? @map("payslip_date") @db.Timestamptz(3)
+  notes           String?
+  createdById     String?   @map("created_by") @db.Char(24)
+  approvedById    String?   @map("approved_by") @db.Char(24)
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company    Company     @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  employeeMaster Employee? @relation(fields: [employeeRefId], references: [id])
+  payrollRun PayrollRun? @relation(fields: [payrollRunId], references: [id])
+
+  @@index([companyId, payrollRunId])
+  @@index([companyId, employeeRefId])
+  @@map("payrolls")
+}
+
+model PayrollRun {
+  id                       String    @id @db.Char(24)
+  companyId                String    @map("company_id") @db.Char(24)
+  referenceNo              String    @map("reference_no")
+  payPeriodStart           DateTime  @map("pay_period_start") @db.Timestamptz(3)
+  payPeriodEnd             DateTime  @map("pay_period_end") @db.Timestamptz(3)
+  paymentDate              DateTime  @map("payment_date") @db.Timestamptz(3)
+  status                   String    @default("draft")
+  totalGross               Decimal   @map("total_gross") @db.Decimal(19, 2)
+  totalTax                 Decimal   @map("total_tax") @db.Decimal(19, 2)
+  totalOtherDeductions     Decimal   @default(0) @map("total_other_deductions") @db.Decimal(19, 2)
+  totalNet                 Decimal   @map("total_net") @db.Decimal(19, 2)
+  bankAccountId            String    @map("bank_account_id") @db.Char(24)
+  salaryAccountId          String    @map("salary_account_id") @db.Char(24)
+  taxPayableAccountId      String    @map("tax_payable_account_id") @db.Char(24)
+  otherDeductionsAccountId String?   @map("other_deductions_account_id") @db.Char(24)
+  journalEntryId           String?   @map("journal_entry_id") @db.Char(24)
+  reversalJournalEntryId   String?   @map("reversal_journal_entry_id") @db.Char(24)
+  netPayJournalId          String?   @map("net_pay_journal_id") @db.Char(24)
+  payeRemitJournalId       String?   @map("paye_remit_journal_id") @db.Char(24)
+  rssbRemitJournalId       String?   @map("rssb_remit_journal_id") @db.Char(24)
+  notes                    String?
+  postedById               String?   @map("posted_by") @db.Char(24)
+  lines                    Json      @default("[]")
+  employeeCount            Int       @default(0) @map("employee_count")
+  remittance               Json      @default("{}")
+  bankTransfer             Json      @default("{}") @map("bank_transfer")
+  warnings                 Json      @default("[]")
+  createdAt                DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt                DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company  Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  payrolls Payroll[]
+
+  @@unique([companyId, referenceNo])
+  @@index([companyId, paymentDate(sort: Desc)])
+  @@index([companyId, status])
+  @@index([companyId, payPeriodStart, payPeriodEnd])
+  @@map("payroll_runs")
+}
+
+model Timesheet {
+  id                String    @id @db.Char(24)
+  companyId         String    @map("company_id") @db.Char(24)
+  employeeId        String    @map("employee_id") @db.Char(24)
+  employeeName      String    @map("employee_name")
+  periodMonth       Int       @map("period_month")
+  periodYear        Int       @map("period_year")
+  periodMonthName   String?   @map("period_month_name")
+  lines             Json      @default("[]")
+  totalHours        Decimal   @default(0) @map("total_hours") @db.Decimal(19, 2)
+  directHours       Decimal   @default(0) @map("direct_hours") @db.Decimal(19, 2)
+  indirectHours     Decimal   @default(0) @map("indirect_hours") @db.Decimal(19, 2)
+  directPercentage  Decimal   @default(0) @map("direct_percentage") @db.Decimal(19, 4)
+  indirectPercentage Decimal  @default(0) @map("indirect_percentage") @db.Decimal(19, 4)
+  status            String    @default("draft")
+  submittedAt       DateTime? @map("submitted_at") @db.Timestamptz(3)
+  approvedById      String?   @map("approved_by") @db.Char(24)
+  approvedAt        DateTime? @map("approved_at") @db.Timestamptz(3)
+  rejectionReason   String?   @map("rejection_reason")
+  createdById         String?   @map("created_by") @db.Char(24)
+  updatedById         String?   @map("updated_by") @db.Char(24)
+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company  Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  employee Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, employeeId, periodMonth, periodYear])
+  @@index([companyId, status])
+  @@map("timesheets")
+}
+
+model EmployeeAdvance {
+  id              String    @id @db.Char(24)
+  companyId       String    @map("company_id") @db.Char(24)
+  employeeId      String    @map("employee_id") @db.Char(24)
+  referenceNo     String    @map("reference_no")
+  description     String    @default("")
+  amount          Decimal   @db.Decimal(19, 2)
+  amountRepaid    Decimal   @default(0) @map("amount_repaid") @db.Decimal(19, 2)
+  balance         Decimal   @default(0) @db.Decimal(19, 2)
+  issueDate       DateTime  @default(now()) @map("issue_date") @db.Timestamptz(3)
+  dueDate         DateTime? @map("due_date") @db.Timestamptz(3)
+  status          String    @default("issued")
+  paymentMethod   String    @default("cash") @map("payment_method")
+  bankAccountId   String?   @map("bank_account_id") @db.Char(24)
+  journalEntryId  String?   @map("journal_entry_id") @db.Char(24)
+  repayments      Json      @default("[]")
+  notes           String    @default("")
+  createdById     String    @map("created_by") @db.Char(24)
+  updatedById     String?   @map("updated_by") @db.Char(24)
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company  Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  employee Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, referenceNo])
+  @@index([companyId, employeeId, status])
+  @@index([companyId, status, issueDate(sort: Desc)])
+  @@map("employee_advances")
+}
+
+// ── Phase 10 — Budget ──────────────────────────────────────────────────────
+
+model Budget {
+  id                   String    @id @db.Char(24)
+  companyId            String    @map("company_id") @db.Char(24)
+  name                 String
+  code                 String?
+  description          String    @default("")
+  purpose              String    @default("")
+  tags                 String[]  @default([])
+  category             String?
+  type                 String    @default("expense")
+  budgetCycle          String    @default("fixed_year") @map("budget_cycle")
+  fiscalYear           Int       @map("fiscal_year")
+  periodStart          DateTime? @map("period_start") @db.Timestamptz(3)
+  periodEnd            DateTime? @map("period_end") @db.Timestamptz(3)
+  periodType           String    @default("yearly") @map("period_type")
+  amount               Decimal   @default(0) @db.Decimal(19, 2)
+  departmentId         String?   @map("department_id") @db.Char(24)
+  ownerId              String?   @map("owner_id") @db.Char(24)
+  entityId             String?   @map("entity_id") @db.Char(24)
+  baseCurrency         String?   @map("base_currency")
+  exchangeRateType     String    @default("spot") @map("exchange_rate_type")
+  exchangeRate         Decimal   @default(1) @map("exchange_rate") @db.Decimal(19, 6)
+  allowMultiCurrency   Boolean   @default(false) @map("allow_multi_currency")
+  allocationMethod     String    @default("manual") @map("allocation_method")
+  status               String    @default("draft")
+  workflowId           String?   @map("workflow_id") @db.Char(24)
+  currentApprovalStep  Int       @default(0) @map("current_approval_step")
+  totalApprovalSteps   Int       @default(0) @map("total_approval_steps")
+  createdById          String    @map("created_by") @db.Char(24)
+  approvedById         String?   @map("approved_by") @db.Char(24)
+  approvedAt           DateTime? @map("approved_at") @db.Timestamptz(3)
+  lockedById           String?   @map("locked_by") @db.Char(24)
+  lockedAt             DateTime? @map("locked_at") @db.Timestamptz(3)
+  unlockedById         String?   @map("unlocked_by") @db.Char(24)
+  unlockedAt           DateTime? @map("unlocked_at") @db.Timestamptz(3)
+  rejectedById         String?   @map("rejected_by") @db.Char(24)
+  rejectedAt           DateTime? @map("rejected_at") @db.Timestamptz(3)
+  rejectionReason      String    @default("") @map("rejection_reason")
+  closedById           String?   @map("closed_by") @db.Char(24)
+  closedAt             DateTime? @map("closed_at") @db.Timestamptz(3)
+  closeNotes           String    @default("") @map("close_notes")
+  notes                String    @default("")
+  autoLock             Json      @default("{}") @map("auto_lock")
+  fiscalYearEnd        DateTime? @map("fiscal_year_end") @db.Timestamptz(3)
+  yearEndLock          Boolean   @default(false) @map("year_end_lock")
+  autoLocked           Boolean   @default(false) @map("auto_locked")
+  scenarioType         String    @default("base") @map("scenario_type")
+  scenarioName         String?   @map("scenario_name")
+  scenarioGroupId      String?   @map("scenario_group_id")
+  isPrimaryScenario    Boolean   @default(true) @map("is_primary_scenario")
+  parentBudgetId       String?   @map("parent_budget_id") @db.Char(24)
+  scenarioDescription  String    @default("") @map("scenario_description")
+  createdAt            DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt            DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company            Company                 @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  entity             Company?                @relation("BudgetEntity", fields: [entityId], references: [id])
+  workflow           BudgetWorkflowConfig?   @relation(fields: [workflowId], references: [id])
+  parentBudget       Budget?                 @relation("BudgetScenarioTree", fields: [parentBudgetId], references: [id])
+  childBudgets       Budget[]                @relation("BudgetScenarioTree")
+  lines              BudgetLine[]
+  actualConsumptions BudgetActualConsumption[]
+  transfers          BudgetTransfer[]
+  revisions          BudgetRevision[]
+  periodLock         BudgetPeriodLock?
+  approvals          BudgetApproval[]
+  alerts             BudgetAlert[]
+  encumbrances       Encumbrance[]
+
+  @@unique([companyId, fiscalYear, name, scenarioType])
+  @@index([companyId, status])
+  @@index([companyId, type])
+  @@index([companyId, departmentId])
+  @@index([companyId, ownerId])
+  @@index([companyId, entityId])
+  @@index([companyId, category])
+  @@index([companyId, periodStart, periodEnd])
+  @@index([companyId, scenarioGroupId])
+  @@index([companyId, parentBudgetId])
+  @@map("budgets")
+}
+
+model BudgetLine {
+  id               String   @id @db.Char(24)
+  companyId        String   @map("company_id") @db.Char(24)
+  budgetId         String   @map("budget_id") @db.Char(24)
+  accountId        String   @map("account_id") @db.Char(24)
+  category         String   @default("")
+  periodMonth      Int      @map("period_month")
+  periodYear       Int      @map("period_year")
+  budgetedAmount   Decimal  @default(0) @map("budgeted_amount") @db.Decimal(19, 2)
+  encumberedAmount Decimal  @default(0) @map("encumbered_amount") @db.Decimal(19, 2)
+  actualAmount     Decimal  @default(0) @map("actual_amount") @db.Decimal(19, 2)
+  notes            String   @default("")
+  projectId        String?  @map("project_id") @db.Char(24)
+  wbsCode          String?  @map("wbs_code")
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company            Company                   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  budget             Budget                    @relation(fields: [budgetId], references: [id], onDelete: Cascade)
+  project            Project?                  @relation(fields: [projectId], references: [id])
+  actualConsumptions BudgetActualConsumption[]
+  encumbrances       Encumbrance[]
+  transfersFrom      BudgetTransfer[]          @relation("TransferFromLine")
+  transfersTo        BudgetTransfer[]          @relation("TransferToLine")
+
+  @@index([companyId, budgetId, periodYear, periodMonth])
+  @@index([companyId, accountId, periodYear, periodMonth])
+  @@index([companyId, projectId, periodYear, periodMonth])
+  @@map("budget_lines")
+}
+
+model BudgetWorkflowConfig {
+  id              String   @id @db.Char(24)
+  companyId       String   @map("company_id") @db.Char(24)
+  name            String
+  description     String   @default("")
+  workflowType    String   @map("workflow_type")
+  minAmount       Decimal  @default(0) @map("min_amount") @db.Decimal(19, 2)
+  maxAmount       Decimal? @map("max_amount") @db.Decimal(19, 2)
+  departmentScope String   @default("all") @map("department_scope")
+  departmentIds   String[] @default([]) @map("department_ids")
+  steps           Json     @default("[]")
+  isActive        Boolean  @default(true) @map("is_active")
+  isDefault       Boolean  @default(false) @map("is_default")
+  priority        Int      @default(0)
+  settings        Json     @default("{}")
+  usageCount      Int      @default(0) @map("usage_count")
+  lastUsedAt      DateTime? @map("last_used_at") @db.Timestamptz(3)
+  createdById     String   @map("created_by") @db.Char(24)
+  updatedById     String?  @map("updated_by") @db.Char(24)
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company   Company          @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  budgets   Budget[]
+  approvals BudgetApproval[]
+
+  @@index([companyId, workflowType, isActive])
+  @@index([companyId, isDefault, workflowType])
+  @@index([companyId, priority(sort: Desc)])
+  @@map("budget_workflow_configs")
+}
+
+model BudgetActualConsumption {
+  id             String   @id @db.Char(24)
+  companyId      String   @map("company_id") @db.Char(24)
+  budgetId       String   @map("budget_id") @db.Char(24)
+  budgetLineId   String   @map("budget_line_id") @db.Char(24)
+  accountId      String   @map("account_id") @db.Char(24)
+  projectId      String?  @map("project_id") @db.Char(24)
+  wbsCode        String?  @map("wbs_code")
+  originType     String   @map("origin_type")
+  documentType   String   @map("document_type")
+  documentId     String   @map("document_id")
+  documentNumber String   @default("") @map("document_number")
+  documentDate   DateTime @default(now()) @map("document_date") @db.Timestamptz(3)
+  amount         Decimal  @default(0) @db.Decimal(19, 2)
+  sourceType     String   @default("") @map("source_type")
+  sourceId       String   @default("") @map("source_id")
+  sourceNumber   String   @default("") @map("source_number")
+  notes          String   @default("")
+  createdById    String?  @map("created_by") @db.Char(24)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company    Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  budget     Budget     @relation(fields: [budgetId], references: [id], onDelete: Cascade)
+  budgetLine BudgetLine @relation(fields: [budgetLineId], references: [id], onDelete: Cascade)
+  project    Project?   @relation(fields: [projectId], references: [id])
+
+  @@index([companyId, budgetId, budgetLineId, documentDate(sort: Desc)])
+  @@index([companyId, originType])
+  @@map("budget_actual_consumptions")
+}
+
+model BudgetTransfer {
+  id                   String    @id @db.Char(24)
+  companyId            String    @map("company_id") @db.Char(24)
+  budgetId             String    @map("budget_id") @db.Char(24)
+  fromLineId           String    @map("from_line_id") @db.Char(24)
+  fromAccountId        String    @map("from_account_id") @db.Char(24)
+  fromAccountCode      String    @map("from_account_code")
+  fromAccountName      String    @map("from_account_name")
+  toLineId             String    @map("to_line_id") @db.Char(24)
+  toAccountId          String    @map("to_account_id") @db.Char(24)
+  toAccountCode        String    @map("to_account_code")
+  toAccountName        String    @map("to_account_name")
+  amount               Decimal   @db.Decimal(19, 2)
+  transferDate         DateTime  @default(now()) @map("transfer_date") @db.Timestamptz(3)
+  reason               String
+  notes                String    @default("")
+  status               String    @default("pending")
+  requestedById        String    @map("requested_by") @db.Char(24)
+  requestedAt          DateTime  @default(now()) @map("requested_at") @db.Timestamptz(3)
+  approvedById         String?   @map("approved_by") @db.Char(24)
+  approvedAt           DateTime? @map("approved_at") @db.Timestamptz(3)
+  rejectedById         String?   @map("rejected_by") @db.Char(24)
+  rejectedAt           DateTime? @map("rejected_at") @db.Timestamptz(3)
+  rejectionReason      String    @default("") @map("rejection_reason")
+  executedById         String?   @map("executed_by") @db.Char(24)
+  executedAt           DateTime? @map("executed_at") @db.Timestamptz(3)
+  cancelledById        String?   @map("cancelled_by") @db.Char(24)
+  cancelledAt          DateTime? @map("cancelled_at") @db.Timestamptz(3)
+  cancellationReason   String    @default("") @map("cancellation_reason")
+  originalFromBudgeted Decimal?  @map("original_from_budgeted") @db.Decimal(19, 2)
+  originalToBudgeted   Decimal?  @map("original_to_budgeted") @db.Decimal(19, 2)
+  newFromBudgeted      Decimal?  @map("new_from_budgeted") @db.Decimal(19, 2)
+  newToBudgeted        Decimal?  @map("new_to_budgeted") @db.Decimal(19, 2)
+  createdAt            DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt            DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company  Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  budget   Budget     @relation(fields: [budgetId], references: [id], onDelete: Cascade)
+  fromLine BudgetLine @relation("TransferFromLine", fields: [fromLineId], references: [id])
+  toLine   BudgetLine @relation("TransferToLine", fields: [toLineId], references: [id])
+
+  @@index([companyId, budgetId, status])
+  @@index([companyId, status, requestedAt(sort: Desc)])
+  @@index([fromLineId])
+  @@index([toLineId])
+  @@map("budget_transfers")
+}
+
+model BudgetRevision {
+  id                  String   @id @db.Char(24)
+  companyId           String   @map("company_id") @db.Char(24)
+  budgetId            String   @map("budget_id") @db.Char(24)
+  revisionNumber      Int      @map("revision_number")
+  changeType          String   @map("change_type")
+  description         String
+  fieldChanges        Json     @default("[]") @map("field_changes")
+  beforeSnapshot      Json?    @map("before_snapshot")
+  afterSnapshot       Json?    @map("after_snapshot")
+  affectedLineId      String?  @map("affected_line_id") @db.Char(24)
+  amountImpact        Decimal  @default(0) @map("amount_impact") @db.Decimal(19, 2)
+  changedById         String   @map("changed_by") @db.Char(24)
+  changedAt           DateTime @default(now()) @map("changed_at") @db.Timestamptz(3)
+  ipAddress           String?  @map("ip_address")
+  userAgent           String?  @map("user_agent")
+  rolledBack          Boolean  @default(false) @map("rolled_back")
+  rolledBackById      String?  @map("rolled_back_by") @db.Char(24)
+  rolledBackAt        DateTime? @map("rolled_back_at") @db.Timestamptz(3)
+  rollbackReason      String?  @map("rollback_reason")
+  relatedDocumentType String?  @map("related_document_type")
+  relatedDocumentId   String?  @map("related_document_id") @db.Char(24)
+  comments            String?
+  tags                String[] @default([])
+  createdAt           DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  budget  Budget  @relation(fields: [budgetId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, budgetId, revisionNumber])
+  @@index([companyId, budgetId, changedAt(sort: Desc)])
+  @@index([companyId, changedById])
+  @@index([changeType])
+  @@map("budget_revisions")
+}
+
+model BudgetPeriodLock {
+  id            String   @id @db.Char(24)
+  companyId     String   @map("company_id") @db.Char(24)
+  budgetId      String   @unique @map("budget_id") @db.Char(24)
+  lockedPeriods Json     @default("[]") @map("locked_periods")
+  autoLock      Json     @default("{}") @map("auto_lock")
+  fiscalYearEnd Json     @default("{}") @map("fiscal_year_end")
+  yearEndLock   Json     @default("{}") @map("year_end_lock")
+  createdById   String?  @map("created_by") @db.Char(24)
+  updatedById   String?  @map("updated_by") @db.Char(24)
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  budget  Budget  @relation(fields: [budgetId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, budgetId])
+  @@map("budget_period_locks")
+}
+
+model BudgetApproval {
+  id                  String    @id @db.Char(24)
+  companyId           String    @map("company_id") @db.Char(24)
+  budgetId            String    @map("budget_id") @db.Char(24)
+  workflowType        String    @map("workflow_type")
+  workflowId          String?   @map("workflow_id") @db.Char(24)
+  relatedDocumentType String?   @map("related_document_type")
+  relatedDocumentId   String?   @map("related_document_id") @db.Char(24)
+  amount              Decimal   @default(0) @db.Decimal(19, 2)
+  workflowName        String    @map("workflow_name")
+  steps               Json      @default("[]")
+  currentStep         Int       @default(1) @map("current_step")
+  totalSteps          Int       @default(1) @map("total_steps")
+  status              String    @default("pending")
+  actions             Json      @default("[]")
+  requestedById       String    @map("requested_by") @db.Char(24)
+  requestedAt         DateTime  @default(now()) @map("requested_at") @db.Timestamptz(3)
+  requestComments     String    @default("") @map("request_comments")
+  finalApprovedById   String?   @map("final_approved_by") @db.Char(24)
+  finalApprovedAt     DateTime? @map("final_approved_at") @db.Timestamptz(3)
+  rejectedById        String?   @map("rejected_by") @db.Char(24)
+  rejectedAt          DateTime? @map("rejected_at") @db.Timestamptz(3)
+  rejectionReason     String    @default("") @map("rejection_reason")
+  changesRequestedById String?  @map("changes_requested_by") @db.Char(24)
+  changesRequestedAt  DateTime? @map("changes_requested_at") @db.Timestamptz(3)
+  changesRequired     String    @default("") @map("changes_required")
+  cancelledById       String?   @map("cancelled_by") @db.Char(24)
+  cancelledAt         DateTime? @map("cancelled_at") @db.Timestamptz(3)
+  cancellationReason  String    @default("") @map("cancellation_reason")
+  priority            String    @default("normal")
+  dueDate             DateTime? @map("due_date") @db.Timestamptz(3)
+  remindersSent       Int       @default(0) @map("reminders_sent")
+  lastReminderAt      DateTime? @map("last_reminder_at") @db.Timestamptz(3)
+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company  Company               @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  budget   Budget                @relation(fields: [budgetId], references: [id], onDelete: Cascade)
+  workflow BudgetWorkflowConfig? @relation(fields: [workflowId], references: [id])
+
+  @@index([companyId, budgetId, status])
+  @@index([companyId, status, priority, requestedAt(sort: Desc)])
+  @@index([companyId, workflowType, status])
+  @@index([workflowId, status])
+  @@index([requestedById, status])
+  @@index([relatedDocumentType, relatedDocumentId])
+  @@map("budget_approvals")
+}
+
+model BudgetAlert {
+  id               String    @id @db.Char(24)
+  companyId        String    @map("company_id") @db.Char(24)
+  budgetId         String?   @map("budget_id") @db.Char(24)
+  isEnabled        Boolean   @default(true) @map("is_enabled")
+  thresholds       Json      @default("{\"warning\":75,\"critical\":90,\"exceeded\":100}")
+  varianceTolerance Decimal  @default(5) @map("variance_tolerance") @db.Decimal(19, 4)
+  alertFrequency   String    @default("weekly") @map("alert_frequency")
+  lastAlertSent    DateTime? @map("last_alert_sent") @db.Timestamptz(3)
+  notifyUserIds    String[]  @default([]) @map("notify_user_ids")
+  notifyRoles      String[]  @default([]) @map("notify_roles")
+  channels         Json      @default("{\"in_app\":true,\"email\":true,\"sms\":false}")
+  alertTypes       Json      @default("{}") @map("alert_types")
+  accountOverrides Json      @default("[]") @map("account_overrides")
+  quietHours       Json      @default("{}") @map("quiet_hours")
+  createdById      String?   @map("created_by") @db.Char(24)
+  updatedById      String?   @map("updated_by") @db.Char(24)
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  budget  Budget? @relation(fields: [budgetId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, budgetId])
+  @@index([companyId, isEnabled])
+  @@map("budget_alerts")
+}
+
+model Encumbrance {
+  id                      String    @id @db.Char(24)
+  companyId               String    @map("company_id") @db.Char(24)
+  budgetId                String    @map("budget_id") @db.Char(24)
+  budgetLineId            String    @map("budget_line_id") @db.Char(24)
+  accountId               String    @map("account_id") @db.Char(24)
+  sourceType              String    @map("source_type")
+  sourceId                String    @map("source_id")
+  sourceNumber            String    @map("source_number")
+  description             String
+  encumberedAmount        Decimal   @default(0) @map("encumbered_amount") @db.Decimal(19, 2)
+  liquidatedAmount        Decimal   @default(0) @map("liquidated_amount") @db.Decimal(19, 2)
+  releasedAmount          Decimal   @default(0) @map("released_amount") @db.Decimal(19, 2)
+  remainingAmount         Decimal   @default(0) @map("remaining_amount") @db.Decimal(19, 2)
+  status                  String    @default("active")
+  encumbranceDate         DateTime  @default(now()) @map("encumbrance_date") @db.Timestamptz(3)
+  expectedLiquidationDate DateTime? @map("expected_liquidation_date") @db.Timestamptz(3)
+  liquidatedAt            DateTime? @map("liquidated_at") @db.Timestamptz(3)
+  releasedAt              DateTime? @map("released_at") @db.Timestamptz(3)
+  liquidations            Json      @default("[]")
+  notes                   String    @default("")
+  createdById             String    @map("created_by") @db.Char(24)
+  releasedById            String?   @map("released_by") @db.Char(24)
+  releaseReason           String    @default("") @map("release_reason")
+  createdAt               DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt               DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company    Company    @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  budget     Budget     @relation(fields: [budgetId], references: [id], onDelete: Cascade)
+  budgetLine BudgetLine @relation(fields: [budgetLineId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, budgetId, status])
+  @@index([companyId, accountId, status])
+  @@index([budgetLineId, status])
+  @@index([sourceType, sourceId])
+  @@index([encumbranceDate(sort: Desc)])
+  @@map("encumbrances")
+}
+
+model Project {
+  id               String    @id @db.Char(24)
+  companyId        String    @map("company_id") @db.Char(24)
+  projectCode      String    @map("project_code")
+  name             String
+  description      String    @default("")
+  parentId         String?   @map("parent_id") @db.Char(24)
+  wbsLevel         Int       @default(1) @map("wbs_level")
+  wbsCode          String    @map("wbs_code")
+  type             String    @default("project")
+  status           String    @default("planning")
+  priority         String    @default("medium")
+  budgetAllocated  Decimal   @default(0) @map("budget_allocated") @db.Decimal(19, 2)
+  budgetSpent      Decimal   @default(0) @map("budget_spent") @db.Decimal(19, 2)
+  budgetRemaining  Decimal   @default(0) @map("budget_remaining") @db.Decimal(19, 2)
+  startDate        DateTime? @map("start_date") @db.Timestamptz(3)
+  endDate          DateTime? @map("end_date") @db.Timestamptz(3)
+  actualStartDate  DateTime? @map("actual_start_date") @db.Timestamptz(3)
+  actualEndDate    DateTime? @map("actual_end_date") @db.Timestamptz(3)
+  departmentId     String?   @map("department_id") @db.Char(24)
+  clientId         String?   @map("client_id") @db.Char(24)
+  managerId        String?   @map("manager_id") @db.Char(24)
+  billingType      String    @default("none") @map("billing_type")
+  contractValue    Decimal   @default(0) @map("contract_value") @db.Decimal(19, 2)
+  progressPercent  Decimal   @default(0) @map("progress_percent") @db.Decimal(19, 4)
+  isActive         Boolean   @default(true) @map("is_active")
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company            Company                   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  parent             Project?                  @relation("ProjectTree", fields: [parentId], references: [id])
+  children           Project[]                 @relation("ProjectTree")
+  budgetLines        BudgetLine[]
+  actualConsumptions BudgetActualConsumption[]
+
+  @@unique([companyId, projectCode])
+  @@index([companyId, status])
+  @@index([companyId, type])
+  @@index([companyId, parentId])
+  @@index([companyId, wbsCode])
+  @@index([companyId, departmentId])
+  @@index([companyId, clientId])
+  @@index([companyId, isActive])
+  @@map("projects")
+}
+
+// ── Phase 10 — EBM / RRA VSDC ──────────────────────────────────────────────
+
+model EbmDevice {
+  id               String    @id @db.Char(24)
+  companyId        String    @map("company_id") @db.Char(24)
+  tin              String
+  branchId         String    @map("branch_id") @db.VarChar(2)
+  branchName       String?   @map("branch_name")
+  branchRefId      String?   @map("branch_ref_id") @db.Char(24)
+  deviceSerialNo   String    @map("device_serial_no")
+  status           String    @default("not_initialized")
+  initializedAt    DateTime? @map("initialized_at") @db.Timestamptz(3)
+  lastAttemptAt    DateTime? @map("last_attempt_at") @db.Timestamptz(3)
+  lastErrorMessage String?   @map("last_error_message")
+  initializedMode  String?   @map("initialized_mode")
+  lastAttemptMode  String?   @map("last_attempt_mode")
+  initResult       Json?     @map("init_result")
+  createdById      String?   @map("created_by") @db.Char(24)
+  updatedById      String?   @map("updated_by") @db.Char(24)
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, branchId, deviceSerialNo])
+  @@index([companyId, branchId])
+  @@index([companyId, status])
+  @@map("ebm_devices")
+}
+
+model EbmCode {
+  id            String   @id @db.Char(24)
+  companyId     String   @map("company_id") @db.Char(24)
+  codeClass     String   @map("code_class")
+  codeClassName String?  @map("code_class_name")
+  code          String
+  name          String?
+  description   String?
+  sortOrder     Int      @default(0) @map("sort_order")
+  active        Boolean  @default(true)
+  source        Json     @default("{}")
+  lastSyncedAt  DateTime @default(now()) @map("last_synced_at") @db.Timestamptz(3)
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, codeClass, code])
+  @@index([companyId, codeClass, active])
+  @@map("ebm_codes")
+}
+
+model EbmItemClass {
+  id             String   @id @db.Char(24)
+  companyId      String   @map("company_id") @db.Char(24)
+  itemClassCode  String   @map("item_class_code")
+  itemClassName  String   @map("item_class_name")
+  itemClassLevel Int?     @map("item_class_level")
+  parentCode     String?  @map("parent_code")
+  taxTypeCode    String?  @map("tax_type_code")
+  majorTarget    Boolean  @default(false) @map("major_target")
+  active         Boolean  @default(true)
+  source         Json     @default("{}")
+  lastSyncedAt   DateTime @default(now()) @map("last_synced_at") @db.Timestamptz(3)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, itemClassCode])
+  @@index([companyId, itemClassName])
+  @@index([companyId, parentCode])
+  @@map("ebm_item_classes")
+}
+
+// Global RRA taxpayer registry — no companyId
+model EbmTin {
+  id           String   @id @db.Char(24)
+  tin          String   @unique
+  taxpayerName String   @map("taxpayer_name")
+  statusCode   String?  @map("status_code")
+  provinceName String?  @map("province_name")
+  districtName String?  @map("district_name")
+  active       Boolean  @default(true)
+  source       Json     @default("{}")
+  lastSyncedAt DateTime @default(now()) @map("last_synced_at") @db.Timestamptz(3)
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@index([tin, taxpayerName])
+  @@index([active])
+  @@map("ebm_tins")
+}
+
+model EbmNotice {
+  id           String   @id @db.Char(24)
+  companyId    String   @map("company_id") @db.Char(24)
+  noticeNumber String   @map("notice_number")
+  title        String?
+  content      String?
+  noticeDate   String?  @map("notice_date")
+  active       Boolean  @default(true)
+  source       Json     @default("{}")
+  lastSyncedAt DateTime @default(now()) @map("last_synced_at") @db.Timestamptz(3)
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, noticeNumber])
+  @@index([companyId, noticeDate(sort: Desc)])
+  @@map("ebm_notices")
+}
+
+model EbmImportedItem {
+  id                  String    @id @db.Char(24)
+  companyId           String    @map("company_id") @db.Char(24)
+  branchId            String    @default("00") @map("branch_id") @db.VarChar(2)
+  importTaskCode      String    @map("import_task_code")
+  importDeclarationNo String?   @map("import_declaration_no")
+  importDate          DateTime? @map("import_date") @db.Timestamptz(3)
+  itemCode            String?   @map("item_code")
+  itemName            String    @map("item_name")
+  itemClassCode       String?   @map("item_class_code")
+  quantity            Decimal   @db.Decimal(19, 4)
+  unitCode            String?   @map("unit_code")
+  originCountryCode   String?   @map("origin_country_code")
+  supplierTin         String?   @map("supplier_tin")
+  supplierName        String?   @map("supplier_name")
+  unitCost            Decimal   @default(0) @map("unit_cost") @db.Decimal(19, 2)
+  taxTypeCode         String?   @map("tax_type_code")
+  taxRate             Decimal   @default(0) @map("tax_rate") @db.Decimal(19, 4)
+  raw                 Json      @default("{}")
+  confirmationStatus  String    @default("pending") @map("confirmation_status")
+  pulledAt            DateTime  @default(now()) @map("pulled_at") @db.Timestamptz(3)
+  confirmedAt         DateTime? @map("confirmed_at") @db.Timestamptz(3)
+  confirmedById       String?   @map("confirmed_by") @db.Char(24)
+  rejectedAt          DateTime? @map("rejected_at") @db.Timestamptz(3)
+  rejectedById        String?   @map("rejected_by") @db.Char(24)
+  rejectionReason     String?   @map("rejection_reason")
+  stockUpdated        Boolean   @default(false) @map("stock_updated")
+  stockUpdateError    String?   @map("stock_update_error")
+  confirmationError   String?   @map("confirmation_error")
+  productId           String?   @map("product_id") @db.Char(24)
+  warehouseId         String?   @map("warehouse_id") @db.Char(24)
+  supplierId          String?   @map("supplier_id") @db.Char(24)
+  purchaseOrderId     String?   @map("purchase_order_id") @db.Char(24)
+  grnId               String?   @map("grn_id") @db.Char(24)
+  rraConfirmedAt      DateTime? @map("rra_confirmed_at") @db.Timestamptz(3)
+  rraResult           Json?     @map("rra_result")
+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, branchId, importTaskCode])
+  @@index([companyId, confirmationStatus, importDate(sort: Desc)])
+  @@index([companyId, itemCode])
+  @@map("ebm_imported_items")
+}
+
+model EbmUnmatchedPurchase {
+  id                 String    @id @db.Char(24)
+  companyId          String    @map("company_id") @db.Char(24)
+  branchId           String    @map("branch_id") @db.VarChar(2)
+  supplierTin        String?   @map("supplier_tin")
+  supplierName       String?   @map("supplier_name")
+  sellerInvoiceNo    String    @map("seller_invoice_no")
+  invoiceDate        DateTime? @map("invoice_date") @db.Timestamptz(3)
+  totalAmount        Decimal   @default(0) @map("total_amount") @db.Decimal(19, 2)
+  taxAmount          Decimal   @default(0) @map("tax_amount") @db.Decimal(19, 2)
+  raw                Json      @default("{}")
+  status             String    @default("unmatched")
+  linkedDocumentType String?   @map("linked_document_type")
+  linkedDocumentId   String?   @map("linked_document_id") @db.Char(24)
+  reviewedById       String?   @map("reviewed_by") @db.Char(24)
+  reviewedAt         DateTime? @map("reviewed_at") @db.Timestamptz(3)
+  pulledAt           DateTime  @default(now()) @map("pulled_at") @db.Timestamptz(3)
+  createdAt          DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, branchId, supplierTin, sellerInvoiceNo])
+  @@index([companyId, branchId])
+  @@index([companyId, status, pulledAt(sort: Desc)])
+  @@map("ebm_unmatched_purchases")
+}
+
+model EbmSubmissionQueue {
+  id           String    @id @db.Char(24)
+  companyId    String    @map("company_id") @db.Char(24)
+  documentType String    @map("document_type")
+  documentId   String    @map("document_id") @db.Char(24)
+  endpoint     String
+  operationKey String    @default("default") @map("operation_key")
+  payload      Json
+  ebmStatus    String    @default("pending") @map("ebm_status")
+  retryCount   Int       @default(0) @map("retry_count")
+  maxRetries   Int       @default(5) @map("max_retries")
+  nextRetryAt  DateTime  @default(now()) @map("next_retry_at") @db.Timestamptz(3)
+  lastAttemptAt DateTime? @map("last_attempt_at") @db.Timestamptz(3)
+  lastError    Json      @default("{}") @map("last_error")
+  attempts     Json      @default("[]")
+  isRetryable  Boolean   @default(true) @map("is_retryable")
+  resolvedAt   DateTime? @map("resolved_at") @db.Timestamptz(3)
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  alerts  EbmAlert[]
+
+  @@unique([companyId, documentType, documentId, endpoint, operationKey])
+  @@index([companyId, documentType])
+  @@index([companyId, documentId])
+  @@index([ebmStatus, isRetryable, nextRetryAt])
+  @@map("ebm_submission_queues")
+}
+
+model EbmAlert {
+  id               String    @id @db.Char(24)
+  companyId        String    @map("company_id") @db.Char(24)
+  queueId          String    @map("queue_id") @db.Char(24)
+  documentType     String    @map("document_type")
+  documentId       String    @map("document_id") @db.Char(24)
+  endpoint         String
+  operationKey     String    @default("default") @map("operation_key")
+  attemptsMade     Int       @map("attempts_made")
+  lastErrorMessage String?   @map("last_error_message")
+  lastErrorCode    String?   @map("last_error_code")
+  lastHttpStatus   Int?      @map("last_http_status")
+  payload          Json?
+  abandonedAt      DateTime  @default(now()) @map("abandoned_at") @db.Timestamptz(3)
+  acknowledged     Boolean   @default(false)
+  acknowledgedAt   DateTime? @map("acknowledged_at") @db.Timestamptz(3)
+  acknowledgedById String?   @map("acknowledged_by") @db.Char(24)
+  resetAt          DateTime? @map("reset_at") @db.Timestamptz(3)
+  resetById        String?   @map("reset_by") @db.Char(24)
+  status           String    @default("open")
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company            @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  queue   EbmSubmissionQueue @relation(fields: [queueId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, acknowledged, abandonedAt(sort: Desc)])
+  @@index([queueId, status])
+  @@index([companyId, documentType])
+  @@map("ebm_alerts")
+}
+
+model EbmSyncState {
+  id                   String    @id @db.Char(24)
+  companyId            String    @map("company_id") @db.Char(24)
+  branchId             String    @map("branch_id") @db.VarChar(2)
+  syncType             String    @map("sync_type")
+  lastReqDt            String    @default("20000101000000") @map("last_req_dt")
+  lastSuccessfulSyncAt DateTime? @map("last_successful_sync_at") @db.Timestamptz(3)
+  lastAttemptAt        DateTime? @map("last_attempt_at") @db.Timestamptz(3)
+  lastErrorMessage     String?   @map("last_error_message")
+  mode                 String    @default("mock")
+  summary              Json      @default("{}")
+  createdAt            DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt            DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, branchId, syncType, mode])
+  @@index([companyId, syncType])
+  @@index([companyId, lastSuccessfulSyncAt])
+  @@map("ebm_sync_states")
+}

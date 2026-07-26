@@ -90,61 +90,76 @@ async function generateSKU(prefix, Model, companyId, fieldName = 'sku', digits =
   return `${pre}${sep}${seqStr}`;
 }
 
+/** Tests pin the year so generated numbers stay stable across runs. */
+function referenceYear() {
+  const isTestRun = process.env.NODE_ENV === 'test' || !!process.env.JEST_WORKER_ID;
+  return isTestRun ? 2024 : new Date().getFullYear();
+}
+
+function padSequence(value, digits = 5) {
+  return String(value).padStart(digits, '0');
+}
+
 /**
- * Generate a unique sequential number with year prefix
- * Uses a more robust approach with timestamp as final fallback
- * @param {string} prefix - Prefix for the number (e.g., 'INV', 'QUO', 'PO')
- * @param {mongoose.Model} Model - Mongoose model to check for uniqueness
- * @param {mongoose.Schema.Types.ObjectId} companyId - Company ID
- * @param {string} fieldName - Field name to check (e.g., 'invoiceNumber')
- * @returns {string} - Unique number
+ * Generate a unique sequential number with year prefix.
+ * Uses PostgreSQL `sequences` table when DATABASE_URL is set (Step 8);
+ * falls back to Mongo countDocuments when Mongo is still active.
  */
 async function generateUniqueNumber(prefix, Model, companyId, fieldName) {
+  const isTestRun = process.env.NODE_ENV === 'test' || !!process.env.JEST_WORKER_ID;
+  const year = referenceYear();
+
+  if (process.env.DATABASE_URL) {
+    const { nextSequence } = require('../../services/sequenceService');
+    const seqName = `${String(prefix).toLowerCase()}_${fieldName}`;
+    const seq = await nextSequence(companyId, seqName, { year });
+    return `${prefix}-${year}-${seq}`;
+  }
+
   let number = '';
   let exists = true;
   let attempts = 0;
   const maxAttempts = 20;
-  // In tests we want deterministic year/sequencing so acceptance tests
-  // that assert exact reference strings remain stable. When running under
-  // NODE_ENV=test use a fixed year and deterministic sequence.
-  const isTestRun = process.env.NODE_ENV === 'test' || !!process.env.JEST_WORKER_ID;
-  const year = isTestRun ? 2024 : new Date().getFullYear();
-  
+
   while (exists && attempts < maxAttempts) {
-    // Get count. In test runs avoid random offset so sequence starts at 00001.
     const count = await Model.countDocuments({ company: companyId });
     let sequence;
     if (isTestRun) {
       sequence = String(count + 1).padStart(5, '0');
     } else {
-      // Add small random offset in normal runs to reduce collision risk
       sequence = String(count + 1 + Math.floor(Math.random() * 100)).padStart(5, '0');
     }
     number = `${prefix}-${year}-${sequence}`;
-    
-    // Check if this number already exists for this company
+
     const existing = await Model.findOne({
       company: companyId,
-      [fieldName]: number
+      [fieldName]: number,
     }).lean();
-    
+
     exists = !!existing;
     attempts++;
   }
-  
+
   if (exists) {
-    // Fallback: use timestamp-based approach that's guaranteed unique
     const timestamp = Date.now().toString().slice(-8);
     number = `${prefix}-${year}-${timestamp}`;
   }
-  
+
   return number;
 }
 
 /**
- * Generate a unique sequential number WITHOUT year (e.g., REC-NNNNN)
+ * Generate a unique sequential number WITHOUT year (e.g., REC-NNNNN).
+ * Uses PostgreSQL sequences (year=0) when DATABASE_URL is set.
  */
 async function generateUniqueNumberNoYear(prefix, Model, companyId, fieldName) {
+  if (process.env.DATABASE_URL) {
+    const { nextGlobalSequence } = require('../../services/sequenceService');
+    const seqName = `${String(prefix).toLowerCase()}_${fieldName}`;
+    const seq = await nextGlobalSequence(companyId, seqName, 5);
+    return `${prefix}-${seq}`;
+  }
+
   let number = '';
   let exists = true;
   let attempts = 0;
@@ -173,5 +188,7 @@ module.exports = {
   generateShortSequentialCode,
   generateSKU,
   generateUniqueNumber,
-  generateUniqueNumberNoYear
+  generateUniqueNumberNoYear,
+  referenceYear,
+  padSequence
 };

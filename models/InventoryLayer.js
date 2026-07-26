@@ -1,22 +1,33 @@
-const mongoose = require('mongoose');
+/**
+ * InventoryLayer — PostgreSQL (Prisma) backed (FIFO layers).
+ */
 
-const inventoryLayerSchema = new mongoose.Schema({
-  company: { type: mongoose.Schema.Types.ObjectId, ref: 'Company', required: true, index: true },
-  product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true, index: true },
-  qtyReceived: { type: Number, required: true, min: 0 },
-  qtyRemaining: { type: Number, required: true, min: 0 },
-  unitCost: { type: Number, required: true, min: 0 },
-  receiptDate: { type: Date, default: Date.now },
-  sourceRef: {
-    sourceType: { type: String },
-    sourceId: { type: mongoose.Schema.Types.ObjectId }
-  },
-  createdBy: { type: mongoose.Schema.Types.ObjectId },
-  createdAt: { type: Date, default: Date.now }
+const { buildTenantModel } = require('../utils/masterDataCommon');
+const {
+  inventoryLayerToApi,
+  inventoryLayerTranslateCreate,
+  inventoryLayerTranslateUpdate,
+} = require('../utils/inventoryJournalMappers');
+
+const FIELD_MAP = {
+  _id: { target: 'id', isId: true },
+  id: { target: 'id', isId: true },
+  company: { target: 'companyId', isId: true },
+  companyId: { target: 'companyId', isId: true },
+  product: { target: 'productId', isId: true },
+  warehouse: { target: 'warehouseId', isId: true },
+  qtyRemaining: { target: 'qtyRemaining' },
+  receiptDate: { target: 'receiptDate' },
+  createdAt: { target: 'createdAt' },
+};
+
+module.exports = buildTenantModel({
+  name: 'InventoryLayer',
+  collection: 'inventorylayers',
+  delegateName: 'inventoryLayer',
+  fieldMap: FIELD_MAP,
+  toApi: inventoryLayerToApi,
+  translateCreate: inventoryLayerTranslateCreate,
+  translateUpdate: inventoryLayerTranslateUpdate,
+  mutable: true,
 });
-
-inventoryLayerSchema.index({ company: 1, product: 1, receiptDate: 1 });
-
-const InventoryLayer = mongoose.model('InventoryLayer', inventoryLayerSchema);
-
-module.exports = InventoryLayer;

@@ -99,14 +99,16 @@ class DeferredRevenueService {
     const item = await DeferredRevenue.findOne({ _id: itemId, company: companyId });
     if (!item) throw new Error('NOT_FOUND');
 
-    const recognition = item.recognitions.id(recognitionId);
+    const recognition = (item.recognitions || []).find((r) => String(r._id) === String(recognitionId));
     if (!recognition) throw new Error('RECOGNITION_NOT_FOUND');
     if (recognition.status === 'posted') throw new Error('ALREADY_POSTED');
 
     // Post journal entry: Dr Deferred Revenue / Cr Service Revenue
     const journalEntry = await this._postRecognitionJournal(companyId, userId, item, recognition);
-    recognition.journalEntryId = journalEntry._id;
+    recognition.journalEntryId = String(journalEntry._id);
     recognition.status = 'posted';
+    // The schedule is a JSON column, so reassign it for the change to persist.
+    item.recognitions = [...item.recognitions];
 
     item.totalRecognized += recognition.amount;
     item.remainingBalance = Math.max(0, item.totalAmount - item.totalRecognized);
@@ -253,8 +255,7 @@ class DeferredRevenueService {
       }
     }
 
-    item.set('recognitions', recognitions);
-    item.markModified('recognitions');
+    item.recognitions = recognitions;
   }
 }
 

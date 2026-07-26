@@ -1,11 +1,21 @@
 const TillSession = require('../models/TillSession');
-const { runInTransaction } = require('../services/transactionService');
+
+/** Mongoose enforced `min: 0` on both cash amounts; Postgres has no such constraint. */
+function parseAmount(value, field) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount < 0) {
+    const error = new Error(`${field} must be a number greater than or equal to 0`);
+    error.statusCode = 400;
+    throw error;
+  }
+  return amount;
+}
 
 exports.openTill = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const userId = req.user.id;
-    const { openingFloat } = req.body;
+    const openingFloat = req.body.openingFloat == null ? 0 : parseAmount(req.body.openingFloat, 'Opening float');
 
     const openExisting = await TillSession.findOne({ company: companyId, openedBy: userId, status: 'open' });
     if (openExisting) {
@@ -15,7 +25,7 @@ exports.openTill = async (req, res, next) => {
     const till = await TillSession.create({
       company: companyId,
       openedBy: userId,
-      openingFloat: Number(openingFloat) || 0,
+      openingFloat,
       status: 'open',
       openedAt: new Date(),
     });
@@ -38,27 +48,24 @@ exports.getActiveTill = async (req, res, next) => {
 };
 
 exports.closeTill = async (req, res, next) => {
-  const session = await runInTransaction(async (mongooseSession) => {
+  try {
     const companyId = req.user.company._id;
     const userId = req.user.id;
     const { closingCount } = req.body;
 
-    const till = await TillSession.findOne({ company: companyId, openedBy: userId, status: 'open' }).session(mongooseSession);
+    const changes = { status: 'closed', closedAt: new Date() };
+    if (closingCount != null) changes.closingCount = parseAmount(closingCount, 'Closing count');
+
+    const till = await TillSession.findOneAndUpdate(
+      { company: companyId, openedBy: userId, status: 'open' },
+      { $set: changes },
+    );
+
     if (!till) {
-      const error = new Error('No open till to close');
-      error.statusCode = 400;
-      throw error;
+      return res.status(400).json({ success: false, message: 'No open till to close' });
     }
 
-    till.status = 'closed';
-    till.closedAt = new Date();
-    if (closingCount != null) till.closingCount = Number(closingCount);
-    await till.save({ session: mongooseSession });
-    return till;
-  });
-
-  try {
-    return res.json({ success: true, data: session });
+    return res.json({ success: true, data: till });
   } catch (err) {
     next(err);
   }

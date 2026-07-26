@@ -10,9 +10,10 @@ const ebmService = require('./ebmService');
 const { EBM_DEVICE_STATUSES } = require('../models/EBMDevice');
 const EBMQueueService = require('./ebmQueueService');
 const { formatVsdcDate, formatVsdcDateTime, VSDC_ENDPOINTS } = require('./ebmService');
+const { EBM_SYNC_TYPES } = require('../constants/ebmSyncTypes');
 
 const FIRST_SYNC_DT = '20000101000000';
-const SYNC_TYPE = 'purchase_sales';
+const SYNC_TYPE = EBM_SYNC_TYPES.PURCHASE_SALES;
 
 function asArray(value) {
   return Array.isArray(value) ? value : [];
@@ -408,9 +409,8 @@ function buildPurchaseConfirmationPayload(doc, company, branchId) {
     bhfId: branchId,
     spplrTin: raw.spplrTin || raw.supplierTin || raw.splrTin || raw.sellerTin || doc.supplierTin || doc.supplier?.taxId,
     spplrNm: raw.spplrNm || raw.supplierName || raw.splrNm || doc.supplierName || doc.supplier?.name,
-    spplrInvcNo: sellerInvoiceNo,
     prcOrdCd: String(raw.prcOrdCd || doc.ebm?.prcOrdCd || doc.purchaseOrderCode || doc.purchaseCode || '').slice(0, 5),
-    invcNo: sellerInvoiceNo,
+    invcNo: toNumber(sellerInvoiceNo, 0) || toNumber(doc.ebm?.invcNo, 0) || toNumber(doc.referenceNo, 1),
     orgInvcNo: raw.orgInvcNo || 0,
     spplrBhfId: raw.spplrBhfId || raw.supplierBranchId || '',
     regTyCd: raw.regTyCd || 'M',

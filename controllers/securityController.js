@@ -1,4 +1,5 @@
-const User = require('../models/User');
+const { prisma } = require('../lib/prisma');
+const { toIdString } = require('../utils/objectId');
 const ActionLog = require('../models/ActionLog');
 const speakeasy = require('speakeasy');
 const qrcode = require('qrcode');
@@ -7,13 +8,14 @@ const sessionService = require('../services/sessionService');
 // Generate TOTP secret and QR for user to scan
 exports.setup2FA = async (req, res) => {
   try {
-    const user = await User.findById(req.user._id).select('+twoFASecret');
+    const user = await prisma.user.findUnique({ where: { id: toIdString(req.user._id) } });
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
 
     const secret = speakeasy.generateSecret({ name: `StockApp (${user.email})` });
-    user.twoFASecret = secret.base32;
-    user.twoFAConfirmed = false;
-    await user.save();
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { twoFASecret: secret.base32, twoFAConfirmed: false },
+    });
 
     const otpAuthUrl = secret.otpauth_url;
     const qr = await qrcode.toDataURL(otpAuthUrl);
@@ -28,15 +30,16 @@ exports.setup2FA = async (req, res) => {
 exports.verify2FA = async (req, res) => {
   try {
     const { token } = req.body;
-    const user = await User.findById(req.user._id).select('+twoFASecret');
+    const user = await prisma.user.findUnique({ where: { id: toIdString(req.user._id) } });
     if (!user || !user.twoFASecret) return res.status(400).json({ success: false, message: '2FA not configured' });
 
     const verified = speakeasy.totp.verify({ secret: user.twoFASecret, encoding: 'base32', token, window: 1 });
     if (!verified) return res.status(400).json({ success: false, message: 'Invalid token' });
 
-    user.twoFAEnabled = true;
-    user.twoFAConfirmed = true;
-    await user.save();
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { twoFAEnabled: true, twoFAConfirmed: true },
+    });
 
     res.status(200).json({ success: true, message: '2FA verified and enabled' });
   } catch (err) {
@@ -47,12 +50,12 @@ exports.verify2FA = async (req, res) => {
 
 exports.disable2FA = async (req, res) => {
   try {
-    const user = await User.findById(req.user._id).select('+twoFASecret');
+    const user = await prisma.user.findUnique({ where: { id: toIdString(req.user._id) } });
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
-    user.twoFAEnabled = false;
-    user.twoFASecret = null;
-    user.twoFAConfirmed = false;
-    await user.save();
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { twoFAEnabled: false, twoFASecret: null, twoFAConfirmed: false },
+    });
     res.status(200).json({ success: true, message: '2FA disabled' });
   } catch (err) {
     console.error(err);
@@ -65,8 +68,7 @@ exports.disable2FA = async (req, res) => {
 // @access  Private
 exports.getSecurityOverview = async (req, res) => {
   try {
-    const user = await User.findById(req.user.id)
-      .select('+twoFAEnabled +twoFAConfirmed +failed_login_attempts +locked_until +passwordChangedAt +mustChangePassword');
+    const user = await prisma.user.findUnique({ where: { id: toIdString(req.user.id) } });
 
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
 
@@ -74,11 +76,11 @@ exports.getSecurityOverview = async (req, res) => {
     const passwordDate = user.passwordChangedAt || user.createdAt;
 
     // Get current session info
-    const sessionInfo = await sessionService.getUserSessions(user._id.toString());
+    const sessionInfo = await sessionService.getUserSessions(user.id);
 
     // Count login history entries
     const loginHistoryCount = await ActionLog.countDocuments({
-      user: user._id,
+      user: user.id,
       action: { $in: ['login', 'login_failed', 'logout', 'password_changed'] }
     });
 
@@ -86,9 +88,9 @@ exports.getSecurityOverview = async (req, res) => {
       // Account security
       twoFAEnabled: user.twoFAEnabled || false,
       twoFAConfirmed: user.twoFAConfirmed || false,
-      isLocked: user.isLocked ? user.isLocked() : false,
-      lockedUntil: user.locked_until || null,
-      failedLoginAttempts: user.failed_login_attempts || 0,
+      isLocked: Boolean(user.lockedUntil && new Date() < user.lockedUntil),
+      lockedUntil: user.lockedUntil || null,
+      failedLoginAttempts: user.failedLoginAttempts || 0,
       mustChangePassword: user.mustChangePassword || false,
       passwordChangedAt: passwordDate,
 
@@ -239,7 +241,7 @@ exports.terminateAllSessions = async (req, res) => {
 // @access  Private
 exports.getPasswordStatus = async (req, res) => {
   try {
-    const user = await User.findById(req.user.id).select('+passwordChangedAt +mustChangePassword');
+    const user = await prisma.user.findUnique({ where: { id: toIdString(req.user.id) } });
 
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
 
@@ -275,24 +277,24 @@ exports.getPasswordStatus = async (req, res) => {
 // @access  Private
 exports.getLockStatus = async (req, res) => {
   try {
-    const user = await User.findById(req.user.id).select('+failed_login_attempts +locked_until');
+    const user = await prisma.user.findUnique({ where: { id: toIdString(req.user.id) } });
 
     if (!user) return res.status(404).json({ success: false, message: 'User not found' });
 
-    const isLocked = user.isLocked ? user.isLocked() : false;
+    const isLocked = Boolean(user.lockedUntil && new Date() < user.lockedUntil);
     let minutesRemaining = 0;
 
-    if (isLocked && user.locked_until) {
-      minutesRemaining = Math.max(0, Math.ceil((user.locked_until.getTime() - Date.now()) / (1000 * 60)));
+    if (isLocked && user.lockedUntil) {
+      minutesRemaining = Math.max(0, Math.ceil((user.lockedUntil.getTime() - Date.now()) / (1000 * 60)));
     }
 
     res.json({
       success: true,
       data: {
         isLocked,
-        lockedUntil: user.locked_until,
+        lockedUntil: user.lockedUntil,
         minutesRemaining,
-        failedLoginAttempts: user.failed_login_attempts || 0
+        failedLoginAttempts: user.failedLoginAttempts || 0
       }
     });
   } catch (err) {

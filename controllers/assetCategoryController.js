@@ -28,8 +28,9 @@ exports.getCategories = async (req, res) => {
     if (count === 0 && autoSeed !== 'false') {
       await AssetCategory.seedDefaults(companyId, req.user._id);
     }
+    await AssetCategory.syncDefaultAccounts(companyId);
 
-    const { page, limit, skip } = parsePagination(req.query);
+    const { page, limit, skip } = parsePagination(req.query, { defaultLimit: 100, maxLimit: 200 });
     const total = await AssetCategory.countDocuments(query);
     const categories = await AssetCategory.find(query)
       .sort({ isSystem: -1, name: 1 })

@@ -1,59 +1,33 @@
-const mongoose = require('mongoose');
+/**
+ * EBMCode — PostgreSQL (Prisma) backed (global delegate, company stored on row).
+ */
 
-const ebmCodeSchema = new mongoose.Schema({
-  company: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Company',
-    required: true,
-    index: true,
-  },
-  codeClass: {
-    type: String,
-    required: true,
-    trim: true,
-    index: true,
-  },
-  codeClassName: {
-    type: String,
-    trim: true,
-    default: null,
-  },
-  code: {
-    type: String,
-    required: true,
-    trim: true,
-  },
-  name: {
-    type: String,
-    trim: true,
-    default: null,
-  },
-  description: {
-    type: String,
-    trim: true,
-    default: null,
-  },
-  sortOrder: {
-    type: Number,
-    default: 0,
-  },
-  active: {
-    type: Boolean,
-    default: true,
-    index: true,
-  },
-  source: {
-    type: mongoose.Schema.Types.Mixed,
-    default: {},
-  },
-  lastSyncedAt: {
-    type: Date,
-    required: true,
-    default: Date.now,
-  },
-}, { timestamps: true });
+const { buildGlobalModel } = require('../utils/masterDataCommon');
+const {
+  ebmCodeToApi,
+  ebmCodeTranslateCreate,
+  ebmCodeTranslateUpdate,
+} = require('../utils/phase10Mappers');
 
-ebmCodeSchema.index({ company: 1, codeClass: 1, code: 1 }, { unique: true });
-ebmCodeSchema.index({ company: 1, codeClass: 1, active: 1 });
+const FIELD_MAP = {
+  company: { target: 'companyId', isId: true },
+  companyId: { target: 'companyId', isId: true },
+  codeClass: { target: 'codeClass' },
+  codeClassName: { target: 'codeClassName' },
+  code: { target: 'code' },
+  name: { target: 'name' },
+  sortOrder: { target: 'sortOrder' },
+  active: { target: 'active' },
+  lastSyncedAt: { target: 'lastSyncedAt' },
+};
 
-module.exports = mongoose.model('EBMCode', ebmCodeSchema);
+module.exports = buildGlobalModel({
+  name: 'EBMCode',
+  collection: 'ebmcodes',
+  delegateName: 'ebmCode',
+  fieldMap: FIELD_MAP,
+  toApi: ebmCodeToApi,
+  translateCreate: ebmCodeTranslateCreate,
+  translateUpdate: ebmCodeTranslateUpdate,
+  mutable: true,
+});

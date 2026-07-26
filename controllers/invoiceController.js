@@ -1062,41 +1062,8 @@ exports.confirmInvoice = async (req, res, next) => {
         hasStockableLines = true;
 
         // Step 2: Resolve COGS cost per line - FIFO or WAC (peek, NOT consume)
-        let unitCost = 0;
-
-        if (product.costMethod === "fifo") {
-          // FIFO: peek at oldest inventory layer cost (do NOT consume yet)
-          const InventoryLayer = require("../models/InventoryLayer");
-          const oldestLayer = await InventoryLayer.findOne({
-            company: companyId,
-            product: product._id,
-            qtyRemaining: { $gt: 0 },
-          }).sort({ receiptDate: 1 });
-
-          if (oldestLayer) {
-            unitCost =
-              parseFloat(
-                oldestLayer.unitCost && oldestLayer.unitCost.toString
-                  ? oldestLayer.unitCost.toString()
-                  : oldestLayer.unitCost,
-              ) || 0;
-          } else {
-            // No layers found - check if product has cost set directly
-            unitCost =
-              parseFloat(
-                product.cost && product.cost.toString
-                  ? product.cost.toString()
-                  : product.cost,
-              ) || 0;
-          }
-        } else if (product.costMethod === "wac") {
-          // WAC: use avg_cost from product
-          unitCost =
-            parseFloat(product.avgCost) || parseFloat(product.cost) || 0;
-        } else {
-          // Default or non-stockable
-          unitCost = parseFloat(product.cost) || 0;
-        }
+        const { resolveCogsUnitCost } = require("../utils/productCost");
+        const unitCost = await resolveCogsUnitCost(product, companyId);
 
         // Module 6 Step 5: If COGS cost is 0 for stockable product, it's an error
         if (unitCost === 0) {
@@ -1166,7 +1133,18 @@ exports.confirmInvoice = async (req, res, next) => {
       }
     }
 
-    // Save line updates with COGS
+    // Force a lines-array rewrite so unitCost/cogsAmount persist (in-place
+    // mutations keep the same array ref and are skipped by prismaCompat).
+    invoice.lines = invoice.lines.map((line) => {
+      const plain = typeof line.toObject === "function" ? line.toObject() : { ...line };
+      return {
+        ...plain,
+        product: line.product?._id || line.product,
+        warehouse: line.warehouse?._id || line.warehouse || plain.warehouse,
+        unitCost: line.unitCost,
+        cogsAmount: line.cogsAmount,
+      };
+    });
     await invoice.save();
 
     // Step 4: Post Entry A (Revenue Recognition) - Module 6
@@ -1220,6 +1198,7 @@ exports.confirmInvoice = async (req, res, next) => {
 
     // Step 5: Post Entry B (COGS Recognition) - Module 6
     // Only for stockable products
+    let cogsEntryId = null;
     if (hasStockableLines && totalInvoiceCOGS > 0) {
       try {
         const cogsEntry = await JournalService.createCOGSEntry(
@@ -1234,11 +1213,12 @@ exports.confirmInvoice = async (req, res, next) => {
             lines: invoice.lines
               .filter((l) => l.cogsAmount > 0)
               .map((l) => ({
-                productId: l.product._id,
+                productId: l.product._id || l.product,
                 cogsAmount: l.cogsAmount,
               })),
           },
         );
+        cogsEntryId = cogsEntry._id;
         invoice.cogsJournalEntry = cogsEntry._id;
       } catch (journalError) {
         console.error("Error creating COGS journal entry:", journalError);
@@ -1255,10 +1235,10 @@ exports.confirmInvoice = async (req, res, next) => {
     // Deduct stock for each line
     for (const line of invoice.lines) {
       const product = await Product.findOne({
-        _id: line.product._id,
+        _id: line.product._id || line.product,
         company: companyId,
       });
-      if (product && product.isStockable) {
+      if (product && product.isStockable !== false) {
         const qty = line.qty || line.quantity || 0;
         if (qty > 0) {
           const previousStock = product.currentStock || 0;
@@ -1297,13 +1277,29 @@ exports.confirmInvoice = async (req, res, next) => {
     invoice.stockDeducted = true;
     await invoice.save();
 
+    // Explicit header update — guarantees status persists even if a prior
+    // mutable save omitted fields from the Prisma payload.
+    await Invoice.findByIdAndUpdate(invoice._id, {
+      $set: {
+        status: "confirmed",
+        stockDeducted: true,
+        ...(revenueEntry?._id ? { revenueJournalEntry: revenueEntry._id } : {}),
+        ...(cogsEntryId ? { cogsJournalEntry: cogsEntryId } : {}),
+      },
+    });
+
     // Update client outstanding balance
     const client = await Client.findOne({
-      _id: invoice.client,
+      _id: invoice.client?._id || invoice.client,
       company: companyId,
     });
     if (client) {
-      client.outstandingBalance += invoice.roundedAmount || 0;
+      const addAmount =
+        Number(invoice.roundedAmount) ||
+        Number(invoice.totalAmount) ||
+        Number(invoice.grandTotal) ||
+        0;
+      client.outstandingBalance = (Number(client.outstandingBalance) || 0) + addAmount;
       await client.save();
     }
 
@@ -1331,18 +1327,14 @@ exports.confirmInvoice = async (req, res, next) => {
       console.error("Cache invalidation failed:", e);
     }
 
-    let responseInvoice = invoice;
-    try {
-      responseInvoice = await EBMSalesService.submitInvoice(invoice._id, {
-        companyId,
-      });
-    } catch (ebmError) {
-      console.error("EBM sales submission failed after invoice confirmation:", ebmError.message);
-      responseInvoice = ebmError.invoice || await Invoice.findOne({
-        _id: invoice._id,
-        company: companyId,
-      }).populate("client lines.product createdBy");
-    }
+    // Respond with the confirmed invoice immediately; EBM/RRA can run async
+    // so the Confirm button does not hang for several seconds.
+    const responseInvoice = await Invoice.findOne({
+      _id: invoice._id,
+      company: companyId,
+    }).populate("client lines.product createdBy");
+
+    EBMSalesService.submitInvoiceAsync(invoice._id, { companyId });
 
     res.json({
       success: true,
@@ -1376,6 +1368,34 @@ exports.verifyInvoiceCustomerTin = async (req, res, next) => {
     next(error);
   }
 };
+
+exports.submitInvoiceEbm = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const variant = String(req.body.variant || req.body.receiptType || 'sale').toLowerCase();
+    const invoice = await EBMSalesService.submitInvoiceVariant(req.params.id, companyId, {
+      isProforma: variant === 'proforma' || variant === 'p',
+      isCopy: variant === 'copy' || variant === 'c',
+      branchId: req.body.branchId || req.body.bhfId || null,
+    });
+    res.json({
+      success: true,
+      data: invoice,
+      message: `Invoice submitted to RRA as ${variant}`,
+    });
+  } catch (error) {
+    if (error.invoice) {
+      return res.status(error.statusCode || 422).json({
+        success: false,
+        message: error.message,
+        data: error.invoice,
+        code: error.code || null,
+        resultCd: error.resultCd || error.response?.resultCd || null,
+      });
+    }
+    next(error);
+  }
+};
 // @desc    Record payment for invoice
 // @route   POST /api/invoices/:id/payment
 // @access  Private (admin, stock_manager, sales)
@@ -1404,43 +1424,64 @@ exports.recordPayment = async (req, res, next) => {
       });
     }
 
-    const balance =
-      invoice.balance || parseFloat(invoice.amountOutstanding) || 0;
-    if (amount > balance) {
+    const payAmount = Number(amount);
+    if (!Number.isFinite(payAmount) || payAmount <= 0) {
       return res.status(400).json({
         success: false,
-        code: "ERR_PAYMENT_EXCEEDS_BALANCE",
-        message: "Payment amount exceeds invoice balance",
+        code: "ERR_INVALID_PAYMENT_AMOUNT",
+        message: "Payment amount must be a positive number",
       });
     }
 
-    // Add payment
-    invoice.payments.push({
-      amount,
+    const grandTotal = Number(
+      invoice.roundedAmount ?? invoice.totalAmount ?? invoice.grandTotal ?? 0,
+    );
+    const alreadyPaid = Number(invoice.amountPaid) || 0;
+    // Prefer total − paid as source of truth (avoids stale/string balance fields).
+    const outstanding = Math.round(Math.max(0, grandTotal - alreadyPaid) * 100) / 100;
+
+    if (outstanding <= 0) {
+      return res.status(400).json({
+        success: false,
+        code: "ERR_INVOICE_ALREADY_PAID",
+        message: "Invoice is already fully paid",
+      });
+    }
+
+    if (payAmount > outstanding + 0.009) {
+      return res.status(400).json({
+        success: false,
+        code: "ERR_PAYMENT_EXCEEDS_BALANCE",
+        message: `Payment amount exceeds invoice balance (outstanding: ${outstanding.toFixed(2)})`,
+      });
+    }
+
+    // Add payment (replace array so Json field persists on Prisma save)
+    const paymentEntry = {
+      amount: payAmount,
       paymentMethod,
-      reference,
-      notes,
-      recordedBy: req.user.id,
-    });
+      reference: reference || null,
+      notes: notes || null,
+      recordedBy: {
+        _id: req.user.id || req.user._id,
+        name: req.user.name || req.user.email || "User",
+      },
+      recordedAt: new Date().toISOString(),
+      paidDate: new Date().toISOString(),
+    };
+    invoice.payments = [...(Array.isArray(invoice.payments) ? invoice.payments : []), paymentEntry];
 
-    // Update amount paid - handle Decimal128
-    const currentPaid = parseFloat(invoice.amountPaid) || 0;
-    invoice.amountPaid = currentPaid + amount;
-
-    // Explicitly recalculate balance
-    const grandTotal =
-      invoice.roundedAmount || parseFloat(invoice.totalAmount) || 0;
-    invoice.balance = grandTotal - invoice.amountPaid;
-    if (invoice.balance < 0) invoice.balance = 0;
-
-    // Update amountOutstanding - Module 6
-    invoice.amountOutstanding = grandTotal - invoice.amountPaid;
+    const newPaid = Math.round((alreadyPaid + payAmount) * 100) / 100;
+    const newOutstanding = Math.round(Math.max(0, grandTotal - newPaid) * 100) / 100;
+    invoice.amountPaid = newPaid;
+    invoice.amountOutstanding = newOutstanding;
+    invoice.balance = newOutstanding;
 
     // Auto-confirm if stock not yet deducted and payment is made
     if (!invoice.stockDeducted && invoice.status === "draft") {
       for (const line of invoice.lines) {
         const product = await Product.findOne({
-          _id: line.product._id,
+          _id: line.product._id || line.product,
           company: companyId,
         });
 
@@ -1481,15 +1522,25 @@ exports.recordPayment = async (req, res, next) => {
       invoice.confirmedBy = req.user.id;
     }
 
+    // Payment status after any auto-confirm so we don't overwrite fully_paid
+    if (newOutstanding <= 0.009) {
+      invoice.status = "fully_paid";
+      invoice.paidDate = new Date();
+    } else if (newPaid > 0) {
+      invoice.status = "partially_paid";
+    }
+
     // Update client stats
     const client = await Client.findOne({
-      _id: invoice.client,
+      _id: invoice.client?._id || invoice.client,
       company: companyId,
     });
     if (client) {
-      client.totalPurchases += amount;
-      client.outstandingBalance -= amount;
-      if (client.outstandingBalance < 0) client.outstandingBalance = 0;
+      client.totalPurchases = (Number(client.totalPurchases) || 0) + payAmount;
+      client.outstandingBalance = Math.max(
+        0,
+        (Number(client.outstandingBalance) || 0) - payAmount,
+      );
       client.lastPurchaseDate = new Date();
       await client.save();
     }
@@ -1519,9 +1570,9 @@ exports.recordPayment = async (req, res, next) => {
 
       journalEntry = await JournalService.createInvoicePaymentEntry(companyId, req.user.id, {
         invoiceId: invoice._id,
-        invoiceNumber: invoice.invoiceNumber,
+        invoiceNumber: invoice.invoiceNumber || invoice.referenceNo,
         date: new Date(),
-        amount: amount,
+        amount: payAmount,
         paymentMethod: paymentMethod,
         bankAccountCode: bankAccountCode,
         bankAccountId: req.body.bankAccountId || null,
@@ -1547,18 +1598,18 @@ exports.recordPayment = async (req, res, next) => {
         if (bankAccount) {
           bankTransaction = await bankAccount.addTransaction({
             type: "deposit",
-            amount: amount,
-            description: `Payment received: Invoice #${invoice.invoiceNumber}`,
+            amount: payAmount,
+            description: `Payment received: Invoice #${invoice.invoiceNumber || invoice.referenceNo}`,
             date: new Date(),
-            referenceNumber: reference || invoice.invoiceNumber,
+            referenceNumber: reference || invoice.invoiceNumber || invoice.referenceNo,
             paymentMethod,
             status: "completed",
             reference: invoice._id,
             referenceType: "Invoice",
-            createdBy: req.user._id,
+            createdBy: req.user._id || req.user.id,
             notes:
               notes ||
-              `Payment for invoice ${invoice.invoiceNumber} from ${invoice.client?.name || "Customer"}`,
+              `Payment for invoice ${invoice.invoiceNumber || invoice.referenceNo} from ${invoice.client?.name || "Customer"}`,
             journalEntryId: journalEntry?._id || null,
           });
         }
@@ -1567,13 +1618,13 @@ exports.recordPayment = async (req, res, next) => {
           "Error creating bank transaction for invoice payment:",
           bankError,
         );
-        // Non-fatal â€” journal entry already posted
+        // Non-fatal — journal entry already posted
       }
     }
 
     // Notify payment recorded
     try {
-      await notifyPaymentReceived(companyId, invoice, amount);
+      await notifyPaymentReceived(companyId, invoice, payAmount);
     } catch (e) {
       console.error("notifyPaymentReceived failed", e);
     }
@@ -1590,7 +1641,7 @@ exports.recordPayment = async (req, res, next) => {
       const ARTrackingService = require("../services/arTrackingService");
       await ARTrackingService.recordPayment(
         invoice,
-        amount,
+        payAmount,
         paymentMethod,
         req.user.id,
       );
@@ -1600,16 +1651,17 @@ exports.recordPayment = async (req, res, next) => {
 
     // Auto-create ARReceipt and allocation for system-generated ledger record
     try {
+      const toMoney = (n) => (Math.round(Number(n) * 100) / 100).toFixed(2);
       const receipt = new ARReceipt({
         company: companyId,
-        client: invoice.client,
+        client: invoice.client?._id || invoice.client,
         receiptDate: new Date(),
         paymentMethod: paymentMethod,
         bankAccount: req.body.bankAccountId || null,
-        amountReceived: mongoose.Types.Decimal128.fromString(amount.toFixed(2)),
-        currencyCode: "RWF",
-        exchangeRate: mongoose.Types.Decimal128.fromString("1"),
-        reference: reference || `Payment for Invoice ${invoice.invoiceNumber}`,
+        amountReceived: toMoney(payAmount),
+        currencyCode: invoice.currencyCode || "RWF",
+        exchangeRate: "1",
+        reference: reference || `Payment for Invoice ${invoice.invoiceNumber || invoice.referenceNo}`,
         status: "posted",
         postedBy: req.user.id,
         postedAt: new Date(),
@@ -1622,20 +1674,25 @@ exports.recordPayment = async (req, res, next) => {
       const allocation = new ARReceiptAllocation({
         receipt: receipt._id,
         invoice: invoice._id,
-        amountAllocated: mongoose.Types.Decimal128.fromString(amount.toFixed(2)),
+        amountAllocated: toMoney(payAmount),
         company: companyId,
         createdBy: req.user.id,
       });
       await allocation.save();
     } catch (arReceiptError) {
       console.error("Error auto-creating AR receipt for invoice payment:", arReceiptError);
-      // Non-fatal â€” payment already recorded, journal entries posted
+      // Non-fatal — payment already recorded, journal entries posted
     }
+
+    const fresh = await Invoice.findOne({
+      _id: invoice._id,
+      company: companyId,
+    }).populate("client lines.product createdBy");
 
     res.json({
       success: true,
       message: "Payment recorded successfully",
-      data: invoice,
+      data: fresh || invoice,
       bankTransaction: bankTransaction,
     });
   } catch (error) {

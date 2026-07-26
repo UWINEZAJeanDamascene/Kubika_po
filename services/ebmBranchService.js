@@ -111,14 +111,29 @@ class EBMBranchService {
 
   static async ensureBranchRegistered({ companyId, branchId, mode }) {
     const normalizedBranchId = normalizeBranchId(branchId);
-    const ok = await this.isBranchRegistered(companyId, normalizedBranchId);
-    if (!ok) {
-      this.registerBranchById(companyId, normalizedBranchId).catch((err) => {
-        console.error('[EBMBranch] Background registration failed:', err.message);
-      });
-      const { EBMServiceError } = require('./ebmService');
+    const { EBMServiceError } = require('./ebmService');
+
+    const branch = await Warehouse.findOne({
+      company: companyId,
+      rraBranchId: normalizedBranchId,
+    }).lean();
+
+    if (!branch) {
       throw new EBMServiceError(
-        `EBM branch ${normalizedBranchId} is not registered with RRA for this tenant. Register the branch before submitting EBM transactions.`,
+        `No warehouse is mapped to RRA branch ${normalizedBranchId}. Open Warehouses, set the RRA Branch ID on the warehouse (use 00 for the head office), then register the branch.`,
+        { code: 'EBM_BRANCH_NOT_MAPPED', mode, retryable: false },
+      );
+    }
+
+    if (branch.ebmRegistrationStatus === REGISTERED) return;
+
+    // Register inline rather than in the background so the caller sees why it failed
+    // instead of a generic "not registered" that never resolves.
+    try {
+      await this.registerBranchById(companyId, normalizedBranchId);
+    } catch (error) {
+      throw new EBMServiceError(
+        `EBM branch ${normalizedBranchId} could not be registered with RRA: ${error.message}`,
         { code: 'EBM_BRANCH_NOT_REGISTERED', mode, retryable: false },
       );
     }

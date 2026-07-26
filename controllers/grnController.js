@@ -19,6 +19,154 @@ const EBMStockService = require("../services/ebmStockService");
 const DEFAULT_ACCOUNTS =
   require("../constants/chartOfAccounts").DEFAULT_ACCOUNTS;
 const StockLevel = require("../models/StockLevel");
+const { toIdString } = require("../utils/objectId");
+
+function resolveRefId(value) {
+  return toIdString(value);
+}
+
+function resolveCompanyId(req) {
+  return (
+    req.user?.company?._id ||
+    req.user?.company?.id ||
+    req.user?.company ||
+    req.company?._id ||
+    req.company?.id ||
+    req.headers['x-company-id'] ||
+    null
+  );
+}
+
+function resolveLineProductId(line) {
+  return toIdString(line?.product) || toIdString(line?.productId);
+}
+
+function normalizeGrnRefs(grn) {
+  if (!grn) return grn;
+  grn.warehouse = resolveRefId(grn.warehouse) || grn.warehouseId || grn.warehouse;
+  grn.purchaseOrder = resolveRefId(grn.purchaseOrder) || grn.purchaseOrderId || grn.purchaseOrder;
+  grn.supplier = resolveRefId(grn.supplier) || grn.supplierId || grn.supplier;
+  if (Array.isArray(grn.lines)) {
+    for (const line of grn.lines) {
+      line.product = resolveLineProductId(line);
+      if (line.purchaseOrderLine != null) {
+        line.purchaseOrderLine = resolveRefId(line.purchaseOrderLine);
+      }
+    }
+  }
+  return grn;
+}
+
+function computeGrnTotal(grn) {
+  let totalAmount = (grn.lines || []).reduce(
+    (sum, line) =>
+      sum + Number(line.qtyReceived || 0) * Number(line.unitCost || 0),
+    0,
+  );
+  const freightAmt = Number(grn.freight?.actualAmount) || 0;
+  const freightAbsorbed = grn.freight?.includeInInventoryCost;
+  if (freightAmt > 0 && !freightAbsorbed) {
+    totalAmount += freightAmt;
+  }
+  if (!totalAmount && grn.totalAmount != null && grn.totalAmount !== "") {
+    totalAmount = Number(grn.totalAmount) || 0;
+  }
+  return totalAmount;
+}
+
+function poReceiptTotals(po) {
+  const totalOrdered = (po.lines || []).reduce(
+    (sum, line) => sum + Number(line.qtyOrdered || 0),
+    0,
+  );
+  const totalReceived = (po.lines || []).reduce(
+    (sum, line) => sum + Number(line.qtyReceived || 0),
+    0,
+  );
+  return {
+    totalOrdered,
+    totalReceived,
+    hasRemaining: totalReceived < totalOrdered,
+  };
+}
+
+async function syncPoQtyReceivedFromConfirmedGrns(po, companyId, { excludeGrnId } = {}) {
+  for (const poLine of po.lines || []) {
+    poLine.qtyReceived = 0;
+  }
+
+  const confirmedGrns = await GoodsReceivedNote.find({
+    company: companyId,
+    purchaseOrder: resolveRefId(po._id) || po._id,
+    status: "confirmed",
+  });
+
+  for (const confirmedGrn of confirmedGrns) {
+    if (excludeGrnId && String(confirmedGrn._id) === String(excludeGrnId)) continue;
+    normalizeGrnRefs(confirmedGrn);
+    for (const line of confirmedGrn.lines || []) {
+      const poLine = po.lines.id(line.purchaseOrderLine);
+      if (poLine) {
+        poLine.qtyReceived =
+          Number(poLine.qtyReceived || 0) + Number(line.qtyReceived || 0);
+      }
+    }
+  }
+
+  const { totalOrdered, totalReceived, hasRemaining } = poReceiptTotals(po);
+  if (totalOrdered > 0) {
+    po.status = hasRemaining
+      ? totalReceived > 0
+        ? "partially_received"
+        : po.status === "approved"
+          ? "approved"
+          : "partially_received"
+      : "fully_received";
+  }
+
+  return po;
+}
+
+function assertPoOpenForGrn(po, actionLabel = "confirm GRN") {
+  const allowedStatuses = ["approved", "partially_received", "fully_received"];
+  if (!allowedStatuses.includes(po.status)) {
+    throw Object.assign(new Error(`PO must be approved to ${actionLabel}`), {
+      status: 409,
+    });
+  }
+
+  const { hasRemaining } = poReceiptTotals(po);
+  if (!hasRemaining) {
+    throw Object.assign(new Error("Purchase order is already fully received"), {
+      status: 409,
+    });
+  }
+}
+
+function assertGrnLinesWithinPoRemaining(po, grnLines) {
+  for (const line of grnLines || []) {
+    const poLine = po.lines.id(line.purchaseOrderLine);
+    if (!poLine) continue;
+    const remainingQty =
+      Number(poLine.qtyOrdered || 0) - Number(poLine.qtyReceived || 0);
+    const qtyReceived = Number(line.qtyReceived || 0);
+    if (qtyReceived > remainingQty) {
+      throw Object.assign(
+        new Error(
+          `Qty received (${qtyReceived}) exceeds remaining qty (${remainingQty}) for product`,
+        ),
+        { status: 400 },
+      );
+    }
+  }
+}
+
+function markPoLinesDirty(po) {
+  if (Array.isArray(po.lines)) {
+    po.lines = po.lines.map((line) => ({ ...line }));
+  }
+  return po;
+}
 
 const sendGRNEmail = async (grn, po, companyId) => {
   try {
@@ -64,13 +212,15 @@ exports.createGRN = async (req, res, next) => {
       return res
         .status(404)
         .json({ success: false, message: "Purchase order not found" });
-    if (po.status !== "approved" && po.status !== "partially_received")
+
+    await syncPoQtyReceivedFromConfirmedGrns(po, companyId);
+    try {
+      assertPoOpenForGrn(po, "create GRN");
+    } catch (err) {
       return res
-        .status(409)
-        .json({
-          success: false,
-          message: "PO must be approved before creating GRN",
-        });
+        .status(err.status || 409)
+        .json({ success: false, message: err.message });
+    }
 
     // Validate qtyReceived against remaining qty for each line and enrich with taxRate from PO
     const enrichedLines = [];
@@ -105,12 +255,16 @@ exports.createGRN = async (req, res, next) => {
         
         enrichedLines.push({
           ...line,
+          product: resolveLineProductId(line),
           taxRate: line.taxRate != null ? line.taxRate : poLine.taxRate || 0,
           manufactureDate: mfgDate,
           expiryDate: expDate,
         });
       } else {
-        enrichedLines.push(line);
+        enrichedLines.push({
+          ...line,
+          product: resolveLineProductId(line),
+        });
       }
     }
 
@@ -157,6 +311,7 @@ exports.createGRN = async (req, res, next) => {
       receivedDate: receivedDate ? new Date(receivedDate) : undefined,
       lines: enrichedLines,
       freight: freightPayload,
+      totalAmount: computeGrnTotal({ lines: enrichedLines, freight: freightPayload }),
       createdBy: req.user.id,
     });
 
@@ -181,6 +336,7 @@ exports.confirmGRN = async (req, res, next) => {
       findOpts,
     );
     if (!grn) throw Object.assign(new Error("GRN not found"), { status: 404 });
+    normalizeGrnRefs(grn);
     if (grn.status === "confirmed")
       throw Object.assign(new Error("GRN already confirmed"), { status: 400 });
 
@@ -193,10 +349,12 @@ exports.confirmGRN = async (req, res, next) => {
       throw Object.assign(new Error("Purchase order not found"), {
         status: 404,
       });
-    if (po.status !== "approved" && po.status !== "partially_received")
-      throw Object.assign(new Error("PO must be approved to confirm GRN"), {
-        status: 409,
-      });
+
+    await syncPoQtyReceivedFromConfirmedGrns(po, companyId, {
+      excludeGrnId: grn._id,
+    });
+    assertPoOpenForGrn(po, "confirm GRN");
+    assertGrnLinesWithinPoRemaining(po, grn.lines);
 
     // ── Freight validation ───────────────────────────────────────────
     const freight = grn.freight || {};
@@ -252,7 +410,7 @@ exports.confirmGRN = async (req, res, next) => {
       );
 
       if (!product) {
-        throw Object.assign(new Error(`Product not found: ${line.product}`), {
+        throw Object.assign(new Error(`Product not found: ${resolveLineProductId(line)}`), {
           status: 404,
         });
       }
@@ -572,6 +730,7 @@ exports.confirmGRN = async (req, res, next) => {
     );
     const wasFullyReceived = totalReceived >= totalOrdered;
     po.status = wasFullyReceived ? "fully_received" : "partially_received";
+    markPoLinesDirty(po);
     await po.save(useSession ? { session: sess } : {});
 
     // Liquidate encumbrances if PO is fully received
@@ -865,7 +1024,10 @@ exports.confirmGRN = async (req, res, next) => {
 // List GRNs with filters
 exports.listGRNs = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
+    const companyId = resolveCompanyId(req);
+    if (!companyId) {
+      return res.status(400).json({ success: false, message: 'Company context required' });
+    }
     const {
       supplier_id,
       status,
@@ -893,6 +1055,7 @@ exports.listGRNs = async (req, res, next) => {
       .populate("purchaseOrder", "referenceNo")
       .populate("supplier", "name code")
       .populate("warehouse", "name code")
+      .populate("lines.product", "name sku")
       .populate("createdBy", "name email")
       .sort({ createdAt: -1 })
       .skip(skip)
@@ -902,19 +1065,10 @@ exports.listGRNs = async (req, res, next) => {
     const total = await GoodsReceivedNote.countDocuments(query);
 
     // Calculate totalAmount for each GRN from lines (add freight if not absorbed)
-    const grnsWithTotal = grns.map((grn) => {
-      let totalAmount = grn.lines.reduce(
-        (sum, line) =>
-          sum + Number(line.qtyReceived) * Number(line.unitCost || 0),
-        0,
-      );
-      const freightAmt = Number(grn.freight?.actualAmount) || 0;
-      const freightAbsorbed = grn.freight?.includeInInventoryCost;
-      if (freightAmt > 0 && !freightAbsorbed) {
-        totalAmount += freightAmt;
-      }
-      return { ...grn, totalAmount };
-    });
+    const grnsWithTotal = grns.map((grn) => ({
+      ...grn,
+      totalAmount: computeGrnTotal(grn),
+    }));
 
     res.json({
       success: true,
@@ -968,7 +1122,7 @@ exports.updateGRN = async (req, res, next) => {
       grn.lines = [];
       for (const line of lines) {
         grn.lines.push({
-          product: line.product,
+          product: resolveLineProductId(line),
           qtyReceived: line.qtyReceived,
           unitCost: line.unitCost,
           taxRate: line.taxRate || 0,
@@ -1022,7 +1176,10 @@ exports.deleteGRN = async (req, res, next) => {
 // Get single GRN by ID
 exports.getGRN = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
+    const companyId = resolveCompanyId(req);
+    if (!companyId) {
+      return res.status(400).json({ success: false, message: 'Company context required' });
+    }
 
     const grn = await GoodsReceivedNote.findOne({
       _id: req.params.id,
@@ -1048,18 +1205,7 @@ exports.getGRN = async (req, res, next) => {
     }
 
     // Calculate totals from lines (includes freight when absorbed into unitCost)
-    let totalAmount = grn.lines.reduce(
-      (sum, line) =>
-        sum + Number(line.qtyReceived) * Number(line.unitCost || 0),
-      0,
-    );
-    // Add freight for separate-line scenario (not absorbed)
-    const freightAmt = Number(grn.freight?.actualAmount) || 0;
-    const freightAbsorbed = grn.freight?.includeInInventoryCost;
-    if (freightAmt > 0 && !freightAbsorbed) {
-      totalAmount += freightAmt;
-    }
-    grn.totalAmount = totalAmount;
+    grn.totalAmount = computeGrnTotal(grn);
 
     res.json({ success: true, data: grn });
   } catch (err) {

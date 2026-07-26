@@ -1,17 +1,33 @@
-const mongoose = require('mongoose');
+/**
+ * AccountMapping — PostgreSQL (Prisma) backed.
+ */
 
-const AccountMappingSchema = new mongoose.Schema({
-  company: { type: mongoose.Schema.Types.ObjectId, ref: 'Company', required: true },
-  module: { type: String, required: true },
-  key: { type: String, required: true },
-  // accountCode may be a single code (string), a comma-separated string,
-  // an array of codes, or a pattern/range (string). Store as Mixed to allow flexibility.
-  accountCode: { type: mongoose.Schema.Types.Mixed, required: true },
-  description: { type: String },
-  createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
-}, { timestamps: true });
+const { buildTenantModel } = require('../utils/masterDataCommon');
+const {
+  accountMappingToApi,
+  accountMappingTranslateCreate,
+  accountMappingTranslateUpdate,
+} = require('../utils/inventoryJournalMappers');
 
-// Unique mapping per company/module/key
-AccountMappingSchema.index({ company: 1, module: 1, key: 1 }, { unique: true });
+const FIELD_MAP = {
+  _id: { target: 'id', isId: true },
+  id: { target: 'id', isId: true },
+  company: { target: 'companyId', isId: true },
+  companyId: { target: 'companyId', isId: true },
+  module: { target: 'module' },
+  key: { target: 'key' },
+  accountCode: { target: 'accountCode' },
+  createdAt: { target: 'createdAt' },
+  updatedAt: { target: 'updatedAt' },
+};
 
-module.exports = mongoose.model('AccountMapping', AccountMappingSchema);
+module.exports = buildTenantModel({
+  name: 'AccountMapping',
+  collection: 'accountmappings',
+  delegateName: 'accountMapping',
+  fieldMap: FIELD_MAP,
+  toApi: accountMappingToApi,
+  translateCreate: accountMappingTranslateCreate,
+  translateUpdate: accountMappingTranslateUpdate,
+  mutable: true,
+});

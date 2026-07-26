@@ -91,7 +91,7 @@ class AnnualReportsService {
       mongoose.model('BankAccount')
     ]);
 
-    const Company = mongoose.model('Company');
+    const Company = require('../models/Company'); // Prisma-backed shim
     const company = await Company.findById(companyId);
 
     // ========== INCOME STATEMENT ==========
@@ -955,7 +955,7 @@ class AnnualReportsService {
 
     const Payroll = mongoose.model('Payroll');
     const PayrollRun = mongoose.model('PayrollRun');
-    const User = mongoose.model('User');
+    const User = require('../models/User'); // Prisma-backed shim
 
     // Get payroll runs for the year
     const payrollRuns = await PayrollRun.find({
@@ -1411,7 +1411,7 @@ class AnnualReportsService {
     const { start, end } = getYearRange(year);
 
     const AuditLog = mongoose.model('AuditLog');
-    const User = mongoose.model('User');
+    const User = require('../models/User'); // Prisma-backed shim
     const JournalEntry = mongoose.model('JournalEntry');
 
     // Get all users for this company

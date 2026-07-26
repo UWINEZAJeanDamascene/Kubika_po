@@ -10,9 +10,10 @@ const ebmService = require('./ebmService');
 const { EBM_DEVICE_STATUSES } = require('../models/EBMDevice');
 const { formatVsdcDateTime } = require('./ebmService');
 const { generateUniqueNumber } = require('../models/utils/autoIncrement');
+const { EBM_SYNC_TYPES } = require('../constants/ebmSyncTypes');
 
 const FIRST_SYNC_DT = '20000101000000';
-const SYNC_TYPE = 'imported_items';
+const SYNC_TYPE = EBM_SYNC_TYPES.IMPORTED_ITEMS;
 
 function asArray(value) {
   return Array.isArray(value) ? value : [];

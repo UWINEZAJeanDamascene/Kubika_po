@@ -1,6 +1,6 @@
 /**
- * RoleController - API endpoints for role management
- * 
+ * RoleController - API endpoints for role management (PostgreSQL / Prisma)
+ *
  * Endpoints:
  * GET    /api/roles              - List system roles + company custom roles
  * POST   /api/roles              - Create custom role for company (admin only)
@@ -9,7 +9,9 @@
  * GET    /api/roles/:id/permissions - Get all permissions for a role
  */
 
-const Role = require('../models/Role');
+const { prisma } = require('../lib/prisma');
+const { generateObjectId, toIdString } = require('../utils/objectId');
+const { roleToApi } = require('../utils/authMappers');
 const { parsePagination, paginationMeta } = require('../utils/pagination');
 
 const normalizePermissions = (permissions = []) => {
@@ -51,35 +53,29 @@ const normalizePermissions = (permissions = []) => {
  */
 exports.getRoles = async (req, res, next) => {
   try {
-    const company_id = req.query.company_id || req.company?._id || req.user?.company?._id || null;
+    const companyId = toIdString(
+      req.query.company_id || req.company?._id || req.user?.company?._id || req.user?.company || null
+    );
 
-    let query = {};
-
-    if (company_id) {
-      // Get system roles (company_id is null) + company's custom roles
-      query = {
-        $or: [
-          { company_id: null },
-          { company_id: company_id }
-        ]
-      };
-    } else {
-      // Just get system roles
-      query = { company_id: null };
-    }
+    // System roles have companyId null; include the company's custom roles when known
+    const where = companyId
+      ? { OR: [{ companyId: null }, { companyId }] }
+      : { companyId: null };
 
     const { page, limit, skip } = parsePagination(req.query, { defaultLimit: 50, maxLimit: 200 });
-    const total = await Role.countDocuments(query);
-    const roles = await Role.find(query)
-      .select('-__v')
-      .lean()
-      .sort({ is_system_role: -1, name: 1 })
-      .skip(skip)
-      .limit(limit);
+    const [total, roles] = await Promise.all([
+      prisma.role.count({ where }),
+      prisma.role.findMany({
+        where,
+        orderBy: [{ isSystemRole: 'desc' }, { name: 'asc' }],
+        skip,
+        take: limit,
+      }),
+    ]);
 
     res.json({
       success: true,
-      data: roles,
+      data: roles.map(roleToApi),
       count: roles.length,
       pagination: paginationMeta(page, limit, total),
     });
@@ -94,7 +90,7 @@ exports.getRoles = async (req, res, next) => {
  */
 exports.getRoleById = async (req, res, next) => {
   try {
-    const role = await Role.findById(req.params.id).lean();
+    const role = await prisma.role.findUnique({ where: { id: toIdString(req.params.id) } });
 
     if (!role) {
       return res.status(404).json({
@@ -106,7 +102,7 @@ exports.getRoleById = async (req, res, next) => {
 
     res.json({
       success: true,
-      data: role
+      data: roleToApi(role)
     });
   } catch (error) {
     next(error);
@@ -119,9 +115,10 @@ exports.getRoleById = async (req, res, next) => {
  */
 exports.getRolePermissions = async (req, res, next) => {
   try {
-    const role = await Role.findById(req.params.id)
-      .select('permissions name is_system_role')
-      .lean();
+    const role = await prisma.role.findUnique({
+      where: { id: toIdString(req.params.id) },
+      select: { id: true, name: true, isSystemRole: true, permissions: true },
+    });
 
     if (!role) {
       return res.status(404).json({
@@ -134,9 +131,9 @@ exports.getRolePermissions = async (req, res, next) => {
     res.json({
       success: true,
       data: {
-        role_id: role._id,
+        role_id: role.id,
         role_name: role.name,
-        is_system_role: role.is_system_role,
+        is_system_role: role.isSystemRole,
         permissions: role.permissions
       }
     });
@@ -148,13 +145,15 @@ exports.getRolePermissions = async (req, res, next) => {
 /**
  * Create a new custom role
  * POST /api/roles
- * 
+ *
  * Only admins can create custom roles for their company
  */
 exports.createRole = async (req, res, next) => {
   try {
     const { name, description, permissions, company_id } = req.body;
-    const effectiveCompanyId = company_id || req.company?._id || req.user?.company?._id || null;
+    const effectiveCompanyId = toIdString(
+      company_id || req.company?._id || req.user?.company?._id || req.user?.company || null
+    );
 
     // Validate required fields
     if (!name) {
@@ -165,13 +164,12 @@ exports.createRole = async (req, res, next) => {
       });
     }
 
-    // Check if role already exists for this company
-    const existingRole = await Role.findOne({
-      name: name.trim(),
-      $or: [
-        { company_id: effectiveCompanyId },
-        { company_id: null } // Can't create role with same name as system role
-      ]
+    // Check if role already exists for this company (or clashes with a system role)
+    const existingRole = await prisma.role.findFirst({
+      where: {
+        name: name.trim(),
+        OR: [{ companyId: effectiveCompanyId }, { companyId: null }],
+      },
     });
 
     if (existingRole) {
@@ -183,17 +181,20 @@ exports.createRole = async (req, res, next) => {
     }
 
     // Create the role (custom roles cannot be system roles)
-    const role = await Role.create({
-      name: name.trim(),
-      description: description || null,
-      permissions: normalizePermissions(permissions),
-      company_id: effectiveCompanyId,
-      is_system_role: false
+    const role = await prisma.role.create({
+      data: {
+        id: generateObjectId(),
+        name: name.trim(),
+        description: description || null,
+        permissions: normalizePermissions(permissions),
+        companyId: effectiveCompanyId,
+        isSystemRole: false,
+      },
     });
 
     res.status(201).json({
       success: true,
-      data: role,
+      data: roleToApi(role),
       message: 'Role created successfully'
     });
   } catch (error) {
@@ -204,16 +205,15 @@ exports.createRole = async (req, res, next) => {
 /**
  * Update an existing role
  * PUT /api/roles/:id
- * 
+ *
  * Cannot modify system roles
  */
 exports.updateRole = async (req, res, next) => {
   try {
-    const { id } = req.params;
+    const id = toIdString(req.params.id);
     const { name, description, permissions } = req.body;
 
-    // Find the role
-    const role = await Role.findById(id);
+    const role = await prisma.role.findUnique({ where: { id } });
 
     if (!role) {
       return res.status(404).json({
@@ -225,10 +225,12 @@ exports.updateRole = async (req, res, next) => {
 
     // Check if trying to change name to an existing role
     if (name && name.trim() !== role.name) {
-      const existingRole = await Role.findOne({
-        name: name.trim(),
-        company_id: role.company_id,
-        _id: { $ne: id }
+      const existingRole = await prisma.role.findFirst({
+        where: {
+          name: name.trim(),
+          companyId: role.companyId,
+          NOT: { id },
+        },
       });
 
       if (existingRole) {
@@ -243,16 +245,16 @@ exports.updateRole = async (req, res, next) => {
     // Prevent changing is_system_role flag (system roles must stay system, custom must stay custom)
     // This maintains data integrity while allowing edits to permissions
 
-    // Update fields
-    if (name) role.name = name.trim();
-    if (description !== undefined) role.description = description;
-    if (permissions) role.permissions = normalizePermissions(permissions);
+    const data = {};
+    if (name) data.name = name.trim();
+    if (description !== undefined) data.description = description;
+    if (permissions) data.permissions = normalizePermissions(permissions);
 
-    await role.save();
+    const updated = await prisma.role.update({ where: { id }, data });
 
     res.json({
       success: true,
-      data: role,
+      data: roleToApi(updated),
       message: 'Role updated successfully'
     });
   } catch (error) {
@@ -263,14 +265,14 @@ exports.updateRole = async (req, res, next) => {
 /**
  * Delete a role
  * DELETE /api/roles/:id
- * 
+ *
  * Cannot delete system roles
  */
 exports.deleteRole = async (req, res, next) => {
   try {
-    const { id } = req.params;
+    const id = toIdString(req.params.id);
 
-    const role = await Role.findById(id);
+    const role = await prisma.role.findUnique({ where: { id } });
 
     if (!role) {
       return res.status(404).json({
@@ -281,7 +283,7 @@ exports.deleteRole = async (req, res, next) => {
     }
 
     // Cannot delete system roles
-    if (role.is_system_role) {
+    if (role.isSystemRole) {
       return res.status(403).json({
         success: false,
         error: 'CANNOT_DELETE_SYSTEM_ROLE',
@@ -289,9 +291,7 @@ exports.deleteRole = async (req, res, next) => {
       });
     }
 
-    // TODO: Check if any users are assigned to this role before deleting
-    // For now, just delete
-    await role.deleteOne();
+    await prisma.role.delete({ where: { id } });
 
     res.json({
       success: true,

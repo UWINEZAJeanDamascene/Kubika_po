@@ -72,6 +72,9 @@ router.post('/ip-whitelist', authorize('platform_admin', 'admin'), async (req, r
     const entry = await IPWhitelist.create({ ip, description, company, enabled });
     res.status(201).json({ success: true, data: entry });
   } catch (err) {
+    if (err && err.code === 'P2002') {
+      return res.status(409).json({ success: false, message: 'This IP address is already whitelisted' });
+    }
     res.status(500).json({ success: false, message: 'Failed to create IP whitelist entry' });
   }
 });

@@ -1,5 +1,6 @@
 const APTrackingService = require('../services/apTrackingService');
 const APTransactionLedger = require('../models/APTransactionLedger');
+const { getAPTransactions } = require('../services/ledgerReadService');
 const GoodsReceivedNote = require('../models/GoodsReceivedNote');
 const Supplier = require('../models/Supplier');
 const mongoose = require('mongoose');
@@ -49,40 +50,27 @@ const apReconciliationController = {
         limit = 50
       } = req.query;
 
-      const query = { company: companyId };
-
-      if (supplierId) query.supplier = supplierId;
-      if (transactionType) query.transactionType = transactionType;
-      if (reconciliationStatus) query.reconciliationStatus = reconciliationStatus;
-      if (startDate || endDate) {
-        query.transactionDate = {};
-        if (startDate) query.transactionDate.$gte = new Date(startDate);
-        if (endDate) query.transactionDate.$lte = new Date(endDate);
-      }
-
-      const total = await APTransactionLedger.countDocuments(query);
-      const transactions = await APTransactionLedger.find(query)
-        .populate('supplier', 'name code')
-        .populate('grn', 'referenceNo grnNumber')
-        .populate('payment', 'referenceNo')
-        .sort({ transactionDate: -1, createdAt: -1 })
-        .skip((page - 1) * limit)
-        .limit(parseInt(limit));
+      const { items, total, pages, currentPage } = await getAPTransactions(
+        companyId,
+        {
+          supplierId,
+          transactionType,
+          startDate,
+          endDate,
+          reconciliationStatus,
+        },
+        { page, limit },
+      );
 
       res.json({
         success: true,
-        data: transactions.map(tx => ({
-          ...tx.toObject(),
-          amount: parseFloat(tx.amount || 0),
-          supplierBalanceAfter: parseFloat(tx.supplierBalanceAfter || 0),
-          grnBalanceAfter: tx.grnBalanceAfter ? parseFloat(tx.grnBalanceAfter) : null
-        })),
+        data: items,
         pagination: {
           total,
-          page: parseInt(page),
-          limit: parseInt(limit),
-          pages: Math.ceil(total / limit)
-        }
+          page: currentPage,
+          limit: parseInt(limit, 10),
+          pages,
+        },
       });
     } catch (error) {
       next(error);

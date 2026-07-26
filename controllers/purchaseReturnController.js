@@ -178,17 +178,26 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
       // Unit cost must match original GRN unit cost
       if (Number(line.unitCost) !== Number(grnLine.unitCost)) throw Object.assign(new Error('RETURN_PRICING_MISMATCH'), { status: 422 });
 
-      // Already returned qty across confirmed returns
-      const PurchaseReturnModel = require('../models/PurchaseReturn');
-      const agg = await PurchaseReturnModel.aggregate([
-        { $match: { company: companyId, 'lines.grnLine': new mongoose.Types.ObjectId(String(line.grnLine)), status: 'confirmed' } },
-        { $unwind: '$lines' },
-        { $match: { 'lines.grnLine': new mongoose.Types.ObjectId(String(line.grnLine)) } },
-        { $group: { _id: null, returned: { $sum: '$lines.qtyReturned' } } }
-      ]).session(sess);
-      const alreadyReturned = (agg[0] && agg[0].returned) || 0;
+      // Already returned qty across confirmed returns (Prisma shim has no aggregate().session())
+      const grnId = pr.grn?._id || pr.grn;
+      const confirmedReturns = await PurchaseReturn.find({
+        company: companyId,
+        status: 'confirmed',
+        grn: grnId,
+      }).lean();
+      const grnLineId = String(line.grnLine?._id || line.grnLine);
+      const alreadyReturned = (confirmedReturns || []).reduce((sum, ret) => {
+        const lines = Array.isArray(ret.lines) ? ret.lines : [];
+        return (
+          sum +
+          lines.reduce((lineSum, rl) => {
+            if (String(rl.grnLine?._id || rl.grnLine) !== grnLineId) return lineSum;
+            return lineSum + (Number(rl.qtyReturned) || 0);
+          }, 0)
+        );
+      }, 0);
 
-      if (line.qtyReturned + alreadyReturned > grnLine.qtyReceived + 1e-9) {
+      if (Number(line.qtyReturned) + alreadyReturned > Number(grnLine.qtyReceived) + 1e-9) {
         throw Object.assign(new Error('RETURN_EXCEEDS_RECEIVED'), { status: 422 });
       }
 

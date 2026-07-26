@@ -3,7 +3,7 @@ const Company = require('../models/Company');
 const Warehouse = require('../models/Warehouse');
 const ebmService = require('./ebmService');
 const { EBM_DEVICE_STATUSES } = require('../models/EBMDevice');
-const { EBM_MODES, EBMServiceError } = require('./ebmService');
+const { EBM_MODES, EBMServiceError, extractInitInfo } = require('./ebmService');
 const EBMFiscalSequenceService = require('./ebmFiscalSequenceService');
 
 function normalizeBranchId(value) {
@@ -73,11 +73,12 @@ class EBMDeviceService {
       }];
     }
 
-    return warehouses.map((warehouse, index) => ({
-      branchId: warehouse.isDefault ? '00' : normalizeBranchId(index),
-      branchName: warehouse.name || warehouse.code || `Branch ${normalizeBranchId(index)}`,
+    return warehouses.map((warehouse) => ({
+      branchId: warehouse.rraBranchId || (warehouse.isDefault ? '00' : null),
+      branchName: warehouse.name || warehouse.code || `Branch ${warehouse.rraBranchId || '00'}`,
       branchRef: warehouse._id,
-    }));
+      rraBranchId: warehouse.rraBranchId || null,
+    })).filter((branch) => branch.branchId);
   }
 
   static async getInitializationStatus(companyId) {
@@ -216,7 +217,7 @@ class EBMDeviceService {
       await EBMFiscalSequenceService.seedFromInitInfo(
         companyId,
         branchId,
-        response.data?.info || response.raw?.data?.info || response.raw?.info || {},
+        extractInitInfo(response.data || response.raw?.data || {}),
       );
 
       return {

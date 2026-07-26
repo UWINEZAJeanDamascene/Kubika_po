@@ -1,4 +1,5 @@
-const Role = require('../models/Role');
+const { prisma } = require('../lib/prisma');
+const { toIdString } = require('../utils/objectId');
 
 // Basic access control middleware factory
 // Usage: checkPermission('product', 'update') or checkPermission('invoice', 'read')
@@ -17,24 +18,33 @@ const checkPermission = (resource, action, field = null) => {
 
       // Resolve roles (legacy single role may still be used)
       let roleIds = [];
-      if (Array.isArray(req.user.roles) && req.user.roles.length) roleIds = req.user.roles;
+      if (Array.isArray(req.user.roles) && req.user.roles.length) {
+        roleIds = req.user.roles
+          .map((r) => toIdString(r && r._id ? r._id : r))
+          .filter(Boolean);
+      }
 
       // If no role refs, attempt to find by legacy role string
       if (!roleIds.length && req.user.role) {
-        // Try to resolve Role document with that name in same company
-        const roleDoc = await Role.findOne({ name: req.user.role, company: req.user.company });
-        if (roleDoc) roleIds = [roleDoc._id];
+        const companyId = toIdString(
+          req.user.company && req.user.company._id ? req.user.company._id : req.user.company
+        );
+        const roleDoc = await prisma.role.findFirst({
+          where: { name: req.user.role, ...(companyId ? { companyId } : {}) },
+        });
+        if (roleDoc) roleIds = [roleDoc.id];
       }
 
       if (!roleIds.length) {
         return res.status(403).json({ success: false, message: 'No role assigned' });
       }
 
-      const roles = await Role.find({ _id: { $in: roleIds } });
+      const roles = await prisma.role.findMany({ where: { id: { in: roleIds } } });
 
       for (const r of roles) {
-        for (const p of r.permissions || []) {
-          if (permsToCheck.includes(p)) return next();
+        const permissions = Array.isArray(r.permissions) ? r.permissions : [];
+        for (const p of permissions) {
+          if (typeof p === 'string' && permsToCheck.includes(p)) return next();
         }
       }
 

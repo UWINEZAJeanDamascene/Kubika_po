@@ -33,6 +33,7 @@ function sourceDocumentType(sourceType = "") {
 
 function transactionTypeFor(sourceType = "", movementType) {
   const source = String(sourceType || "").toLowerCase();
+  if (source.includes("opening")) return "opening";
   if (source.includes("bank_transfer")) return movementType === "debit" ? "bank_transfer_in" : "bank_transfer_out";
   if (source.includes("payroll")) return "payroll";
   if (source.includes("loan")) return movementType === "debit" ? "loan_receipt" : "loan_repayment";
@@ -45,6 +46,26 @@ function transactionTypeFor(sourceType = "", movementType) {
     return movementType === "debit" ? "customer_payment" : "other";
   }
   return "other";
+}
+
+function bankMovementType(sourceType = "", movementType) {
+  const source = String(sourceType || "").toLowerCase();
+  if (source.includes("opening")) return "opening";
+  if (source.includes("bank_transfer")) {
+    return movementType === "debit" ? "transfer_in" : "transfer_out";
+  }
+  if (movementType === "debit") return "deposit";
+  if (movementType === "credit") return "withdrawal";
+  return movementType;
+}
+
+function readableReference(entry, journalEntryId) {
+  return (
+    entry.sourceReference ||
+    entry.reference ||
+    entry.entryNumber ||
+    (journalEntryId ? `JE-${String(journalEntryId).slice(-8)}` : null)
+  );
 }
 
 function descriptionFor(entry, line, bankAccount, movementType, transactionType) {
@@ -71,8 +92,36 @@ async function bankAccountsForCompany(companyId, session = null) {
   return accounts;
 }
 
-async function getBankAccountForLine(companyId, accountCode, context = {}) {
+async function getBankAccountForLine(companyId, accountCode, context = {}, line = null, entry = null) {
   if (!accountCode) return null;
+
+  const source = String(entry?.sourceType || context.sourceType || "").toLowerCase();
+  if (source.includes("bank_transfer") && line) {
+    const fromId = normalizeId(
+      context.transferFromAccountId || context.sourceData?.transferFromAccountId,
+    );
+    const toId = normalizeId(
+      context.transferToAccountId || context.sourceData?.transferToAccountId,
+    );
+    if (fromId && toId) {
+      const debit = toNumber(line.debit);
+      const credit = toNumber(line.credit);
+      const targetId = debit > 0 ? toId : credit > 0 ? fromId : null;
+      if (targetId) {
+        const query = BankAccount.findOne({
+          _id: targetId,
+          company: companyId,
+          isActive: true,
+        });
+        if (context.session) query.session(context.session);
+        const account = await query.lean();
+        if (account && String(account.ledgerAccountId) === String(accountCode)) {
+          return account;
+        }
+      }
+    }
+  }
+
   if (context.bankAccountId) {
     const query = BankAccount.findOne({ _id: context.bankAccountId, company: companyId, isActive: true });
     if (context.session) query.session(context.session);
@@ -82,6 +131,7 @@ async function getBankAccountForLine(companyId, accountCode, context = {}) {
   const accounts = await bankAccountsForCompany(companyId, context.session);
   const matches = accounts.filter((account) => String(account.ledgerAccountId || "") === String(accountCode));
   if (matches.length === 0) return null;
+  if (matches.length === 1) return matches[0];
   return matches.find((account) => account.isDefault) || matches[0];
 }
 
@@ -126,6 +176,8 @@ async function createFromJournalLine(entry, line, bankAccount, context = {}) {
   const txType = transactionTypeFor(entry.sourceType, movementType);
   const sourceType = sourceDocumentType(entry.sourceType);
   const sourceId = id(entry.sourceId || context.sourceId);
+  const bankType = bankMovementType(entry.sourceType, movementType);
+  const ref = readableReference(entry, journalEntryId);
 
   const transaction = new BankTransaction({
     company: companyId,
@@ -135,14 +187,14 @@ async function createFromJournalLine(entry, line, bankAccount, context = {}) {
     journalEntryId,
     journalEntryLineId,
     date: entry.date || new Date(),
-    type: movementType,
+    type: bankType,
     amount,
     balance,
     balanceAfter: balance,
     description: descriptionFor(entry, line, bankAccount, movementType, txType),
-    reference: sourceId || journalEntryId,
-    referenceNumber: entry.sourceReference || entry.reference || entry.entryNumber,
-    sourceReference: entry.sourceReference || entry.reference || entry.entryNumber,
+    reference: ref,
+    referenceNumber: ref,
+    sourceReference: ref,
     transactionType: txType,
     sourceDocumentType: sourceType,
     sourceDocumentId: sourceId || null,
@@ -155,9 +207,32 @@ async function createFromJournalLine(entry, line, bankAccount, context = {}) {
 
 async function createFromJournalEntry(entry, context = {}) {
   if (!entry || !Array.isArray(entry.lines)) return [];
+
+  if (context.skipBankTransactions) return [];
+
+  const journalEntryId = id(entry._id);
+  const companyId = id(context.companyId || entry.company);
+  if (journalEntryId) {
+    const existingQuery = BankTransaction.findOne({
+      $and: [
+        { $or: [{ companyId }, { company: companyId }] },
+      ],
+      journalEntryId,
+    });
+    if (context.session) existingQuery.session(context.session);
+    const existing = await existingQuery;
+    if (existing) return [];
+  }
+
   const created = [];
   for (const line of entry.lines) {
-    const bankAccount = await getBankAccountForLine(context.companyId || entry.company, line.accountCode, context);
+    const bankAccount = await getBankAccountForLine(
+      companyId,
+      line.accountCode,
+      context,
+      line,
+      entry,
+    );
     if (!bankAccount) continue;
     const tx = await createFromJournalLine(entry, line, bankAccount, context);
     if (tx) created.push(tx);

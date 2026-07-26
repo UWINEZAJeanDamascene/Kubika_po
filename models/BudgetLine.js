@@ -1,118 +1,31 @@
-const mongoose = require("mongoose");
+/**
+ * BudgetLine — PostgreSQL (Prisma) backed.
+ */
 
-const budgetLineSchema = new mongoose.Schema(
-  {
-    company_id: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Company",
-      required: true,
-    },
-    budget_id: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Budget",
-      required: true,
-    },
-    account_id: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "ChartOfAccount",
-      required: true,
-    },
-    category: {
-      type: String,
-      trim: true,
-      default: "",
-    },
-    period_month: {
-      type: Number,
-      required: true,
-      min: 1,
-      max: 12,
-    },
-    period_year: {
-      type: Number,
-      required: true,
-    },
-    budgeted_amount: {
-      type: mongoose.Schema.Types.Decimal128,
-      required: true,
-      default: 0,
-    },
-    encumbered_amount: {
-      type: mongoose.Schema.Types.Decimal128,
-      default: 0,
-    },
-    actual_amount: {
-      type: mongoose.Schema.Types.Decimal128,
-      default: 0,
-    },
-    notes: {
-      type: String,
-      trim: true,
-      default: "",
-    },
-    // Project/Job-Level Budgeting fields
-    project_id: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Project",
-      default: null,
-      index: true,
-    },
-    wbs_code: {
-      type: String,
-      trim: true,
-      default: null,
-      index: true,
-    },
-  },
-  {
-    timestamps: true,
-    toJSON: {
-      transform: function(doc, ret) {
-        // Convert Decimal128 fields to numbers
-        ['budgeted_amount', 'encumbered_amount', 'actual_amount'].forEach(field => {
-          if (ret[field] && typeof ret[field] === 'object' && ret[field].$numberDecimal) {
-            ret[field] = parseFloat(ret[field].$numberDecimal);
-          } else if (ret[field] && typeof ret[field].toString === 'function') {
-            ret[field] = parseFloat(ret[field].toString());
-          }
-        });
-        return ret;
-      },
-    },
-  },
-);
+const { buildTenantModel } = require('../utils/masterDataCommon');
+const {
+  budgetLineToApi,
+  budgetLineTranslateCreate,
+  budgetLineTranslateUpdate,
+} = require('../utils/phase10Mappers');
 
-// Compound indexes for efficient queries
-budgetLineSchema.index({
-  company_id: 1,
-  budget_id: 1,
-  period_year: 1,
-  period_month: 1,
+const FIELD_MAP = {
+  company_id: { target: 'companyId', isId: true },
+  company: { target: 'companyId', isId: true },
+  budget_id: { target: 'budgetId', isId: true },
+  account_id: { target: 'accountId', isId: true },
+  period_month: { target: 'periodMonth' },
+  period_year: { target: 'periodYear' },
+  project_id: { target: 'projectId', isId: true },
+};
+
+module.exports = buildTenantModel({
+  name: 'BudgetLine',
+  collection: 'budgetlines',
+  delegateName: 'budgetLine',
+  fieldMap: FIELD_MAP,
+  toApi: budgetLineToApi,
+  translateCreate: budgetLineTranslateCreate,
+  translateUpdate: budgetLineTranslateUpdate,
+  mutable: true,
 });
-budgetLineSchema.index({
-  company_id: 1,
-  account_id: 1,
-  period_year: 1,
-  period_month: 1,
-});
-budgetLineSchema.index(
-  {
-    company_id: 1,
-    budget_id: 1,
-    account_id: 1,
-    project_id: 1,
-    period_month: 1,
-    period_year: 1,
-  },
-  { unique: true, partialFilterExpression: { project_id: { $exists: true } } },
-);
-
-// Index for querying budget lines by project
-budgetLineSchema.index({
-  company_id: 1,
-  project_id: 1,
-  period_year: 1,
-  period_month: 1,
-});
-
-module.exports = mongoose.model("BudgetLine", budgetLineSchema);

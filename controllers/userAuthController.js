@@ -5,8 +5,9 @@
  */
 
 const UserService = require('../services/UserService');
-const User = require('../models/User');
-const Company = require('../models/Company');
+const { prisma } = require('../lib/prisma');
+const { generateObjectId } = require('../utils/objectId');
+const passwordUtils = require('../utils/passwordUtils');
 const sessionService = require('../services/sessionService');
 
 // Generate JWT Token
@@ -435,7 +436,7 @@ exports.forceLogoutUser = async (req, res, next) => {
  */
 exports.checkPlatformAdminStatus = async (req, res, next) => {
   try {
-    const existingAdmin = await User.findOne({ role: 'platform_admin' });
+    const existingAdmin = await prisma.user.findFirst({ where: { role: 'platform_admin' } });
     res.json({
       success: true,
       needsSetup: !existingAdmin
@@ -490,7 +491,7 @@ exports.setupPlatformAdmin = async (req, res, next) => {
     }
 
     // Check if any platform admin already exists
-    const existingAdmin = await User.findOne({ role: 'platform_admin' });
+    const existingAdmin = await prisma.user.findFirst({ where: { role: 'platform_admin' } });
     if (existingAdmin) {
       return res.status(409).json({
         success: false,
@@ -499,34 +500,38 @@ exports.setupPlatformAdmin = async (req, res, next) => {
       });
     }
 
-    // Look up the Role document by name to link it to the user
-    const Role = require('../models/Role');
-    const roleDoc = await Role.findOne({ name: 'platform_admin', is_system_role: true });
+    // Look up the Role by name to link it to the user
+    const roleDoc = await prisma.role.findFirst({
+      where: { name: 'platform_admin', isSystemRole: true },
+    });
 
     // Create the platform admin user
-    const user = await User.create({
-      name: name.trim(),
-      email: email.toLowerCase().trim(),
-      password,
-      role: 'platform_admin',
-      roles: roleDoc ? [roleDoc._id] : [],
-      isActive: true,
-      failed_login_attempts: 0,
-      locked_until: null
+    const user = await prisma.user.create({
+      data: {
+        id: generateObjectId(),
+        name: name.trim(),
+        email: email.toLowerCase().trim(),
+        password: await passwordUtils.hash(password),
+        role: 'platform_admin',
+        isActive: true,
+        failedLoginAttempts: 0,
+        lockedUntil: null,
+        roles: roleDoc ? { create: [{ roleId: roleDoc.id }] } : undefined,
+      },
     });
 
     res.status(201).json({
       success: true,
       message: 'Platform administrator created successfully.',
       data: {
-        _id: user._id,
+        _id: user.id,
         name: user.name,
         email: user.email,
         role: user.role
       }
     });
   } catch (error) {
-    if (error.code === 'EMAIL_ALREADY_REGISTERED') {
+    if (error.code === 'EMAIL_ALREADY_REGISTERED' || error.code === 'P2002') {
       return res.status(409).json({
         success: false,
         message: 'Email already registered',

@@ -26,7 +26,15 @@ router.use(protect);
 router.use(sessionMiddleware);
 
 router.route('/')
-  .get(requirePermission('products', 'read'), cacheMiddleware({ type: 'product', ttl: 120 }), getProducts)
+  .get(
+    requirePermission('products', 'read'),
+    cacheMiddleware({
+      type: 'product',
+      ttl: 120,
+      skipCache: (req) => req.query.refresh === '1' || req.query.forPicker === '1',
+    }),
+    getProducts,
+  )
   .post(requirePermission('products', 'create'), logAction('product'), createProduct);
 
 router.get('/low-stock', requirePermission('products', 'read'), getLowStockProducts);

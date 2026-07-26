@@ -1,7 +1,9 @@
 const CompanyService = require('../services/CompanyService');
 const AuditLogService = require('../services/AuditLogService');
 const UserService = require('../services/UserService');
-const User = require('../models/User');
+const { prisma } = require('../lib/prisma');
+const { toIdString } = require('../utils/objectId');
+const passwordUtils = require('../utils/passwordUtils');
 const TokenService = require('../services/tokenService');
 const SubscriptionPlanService = require('../services/SubscriptionPlanService');
 const JournalService = require('../services/journalService');
@@ -553,29 +555,32 @@ exports.impersonateUser = async (req, res) => {
   try {
     const { id, userId } = req.params;
 
-    const user = await User.findById(userId).populate('company', 'name email');
+    const user = await prisma.user.findUnique({
+      where: { id: toIdString(userId) },
+      include: { company: { select: { id: true, name: true, email: true } } },
+    });
     if (!user) {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
 
     // Verify user belongs to the specified company
-    if (user.company?._id?.toString() !== id) {
+    if (user.companyId !== toIdString(id)) {
       return res.status(400).json({ success: false, message: 'User does not belong to this company' });
     }
 
     const memberships = [{
-      companyId: user.company?._id?.toString() || null,
+      companyId: user.companyId || null,
       role: user.role
     }];
 
-    const { access_token, refresh_token } = await TokenService.generateTokenPair(user._id.toString(), memberships);
+    const { access_token, refresh_token } = await TokenService.generateTokenPair(user.id, memberships);
 
     await AuditLogService.log({
-      companyId: user.company?._id || null,
+      companyId: user.companyId || null,
       userId: req.user._id,
       action: 'user.impersonated',
       entityType: 'user',
-      entityId: user._id,
+      entityId: user.id,
       changes: { impersonatedUserEmail: user.email }
     });
 
@@ -585,11 +590,13 @@ exports.impersonateUser = async (req, res) => {
         access_token,
         refresh_token,
         user: {
-          _id: user._id,
+          _id: user.id,
           name: user.name,
           email: user.email,
           role: user.role,
           company: user.company
+            ? { _id: user.company.id, name: user.company.name, email: user.company.email }
+            : null
         }
       }
     });
@@ -604,12 +611,12 @@ exports.forcePasswordReset = async (req, res) => {
   try {
     const { id, userId } = req.params;
 
-    const user = await User.findById(userId);
+    const user = await prisma.user.findUnique({ where: { id: toIdString(userId) } });
     if (!user) {
       return res.status(404).json({ success: false, message: 'User not found' });
     }
 
-    if (user.company?.toString() !== id) {
+    if (user.companyId !== toIdString(id)) {
       return res.status(400).json({ success: false, message: 'User does not belong to this company' });
     }
 
@@ -620,17 +627,21 @@ exports.forcePasswordReset = async (req, res) => {
       tempPassword += charset.charAt(Math.floor(Math.random() * charset.length));
     }
 
-    user.password = tempPassword;
-    user.mustChangePassword = true;
-    user.tempPassword = true;
-    await user.save();
+    await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        password: await passwordUtils.hash(tempPassword),
+        mustChangePassword: true,
+        tempPassword: true,
+      },
+    });
 
     await AuditLogService.log({
-      companyId: user.company || null,
+      companyId: user.companyId || null,
       userId: req.user._id,
       action: 'user.force_password_reset',
       entityType: 'user',
-      entityId: user._id,
+      entityId: user.id,
       changes: { targetEmail: user.email }
     });
 
@@ -639,7 +650,7 @@ exports.forcePasswordReset = async (req, res) => {
       message: 'Password reset successfully',
       data: {
         tempPassword,
-        user: { _id: user._id, name: user.name, email: user.email }
+        user: { _id: user.id, name: user.name, email: user.email }
       }
     });
   } catch (error) {
@@ -867,7 +878,7 @@ exports.recordOwnerCapital = async (req, res) => {
 /** GET /api/companies/platform-security-stats — platform_admin */
 exports.getPlatformSecurityStats = async (req, res) => {
   try {
-    const User = require('../models/User');
+    // Action/audit logs and IP whitelist are still Mongo-backed until their own migration phase
     const ActionLog = require('../models/ActionLog');
     const AuditLog = require('../models/AuditLog');
     const IPWhitelist = require('../models/IPWhitelist');
@@ -893,10 +904,10 @@ exports.getPlatformSecurityStats = async (req, res) => {
       recentFailedLogins,
       userActivityTrend
     ] = await Promise.all([
-      User.countDocuments(),
-      User.countDocuments({ isActive: true }),
-      User.countDocuments({ locked_until: { $gte: now } }),
-      User.countDocuments({ twoFAEnabled: true }),
+      prisma.user.count(),
+      prisma.user.count({ where: { isActive: true } }),
+      prisma.user.count({ where: { lockedUntil: { gte: now } } }),
+      prisma.user.count({ where: { twoFAEnabled: true } }),
       ActionLog.countDocuments(),
       ActionLog.countDocuments({ action: 'login', createdAt: { $gte: todayStart } }),
       ActionLog.countDocuments({ action: 'login_failed', createdAt: { $gte: todayStart } }),

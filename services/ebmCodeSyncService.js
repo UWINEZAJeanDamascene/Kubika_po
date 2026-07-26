@@ -1,4 +1,5 @@
 const Company = require('../models/Company');
+const Client = require('../models/Client');
 const EBMDevice = require('../models/EBMDevice');
 const EBMCode = require('../models/EBMCode');
 const EBMItemClass = require('../models/EBMItemClass');
@@ -8,14 +9,9 @@ const EBMSyncState = require('../models/EBMSyncState');
 const ebmService = require('./ebmService');
 const { EBM_DEVICE_STATUSES } = require('../models/EBMDevice');
 const { formatVsdcDateTime } = require('./ebmService');
+const { EBM_SYNC_TYPES, EBM_CODE_SYNC_TYPES } = require('../constants/ebmSyncTypes');
 
-const SYNC_TYPES = Object.freeze({
-  STANDARD_CODES: 'standard_codes',
-  ITEM_CLASSES: 'item_classes',
-  TINS: 'tins',
-  BRANCHES: 'branches',
-  NOTICES: 'notices',
-});
+const SYNC_TYPES = EBM_SYNC_TYPES;
 
 const FIRST_SYNC_DT = '20000101000000';
 
@@ -100,7 +96,7 @@ class EBMCodeSyncService {
     };
 
     const results = [];
-    for (const syncType of Object.values(SYNC_TYPES)) {
+    for (const syncType of EBM_CODE_SYNC_TYPES) {
       try {
         const result = await this.syncType(companyId, branchId, syncType, basePayload, { full });
         results.push(result);
@@ -135,7 +131,7 @@ class EBMCodeSyncService {
           result = await this.syncItemClasses(companyId, { ...basePayload, lastReqDt });
           break;
         case SYNC_TYPES.TINS:
-          result = await this.syncTINs({ ...basePayload, lastReqDt });
+          result = await this.syncTINs(companyId, { ...basePayload, lastReqDt });
           break;
         case SYNC_TYPES.BRANCHES:
           result = await this.syncBranches(companyId, { ...basePayload, lastReqDt });
@@ -231,23 +227,28 @@ class EBMCodeSyncService {
     return { upserted: write.upsertedCount || 0, matched: write.matchedCount || 0, resultDt: response.resultDt };
   }
 
-  static async syncTINs(payload) {
-    const response = await ebmService.selectCustomer(payload);
-    const tins = asArray(response.data?.custList || response.data?.customerList || response.data?.tinList);
-    const ops = tins.map((item) => {
-      const tin = String(item.tin || item.custTin || '').trim();
+  static async syncTINs(companyId) {
+    const clients = await Client.find({
+      company: companyId,
+      taxId: { $regex: /^\d{9}$/ },
+      isActive: { $ne: false },
+    }).select('taxId name ebmTinVerification').lean();
+
+    const ops = clients.map((client) => {
+      const tin = String(client.taxId || '').trim();
+      const verification = client.ebmTinVerification || {};
       return {
         updateOne: {
           filter: { tin },
           update: {
             $set: {
               tin,
-              taxpayerName: item.taxprNm || item.custNm || item.name || tin,
-              statusCode: item.taxprSttsCd || item.statusCode || null,
-              provinceName: item.prvncNm || null,
-              districtName: item.dstrtNm || null,
-              active: activeFrom(item.useYn || item.active),
-              source: item,
+              taxpayerName: verification.taxpayerName || client.name || tin,
+              statusCode: verification.statusCode || (verification.status === 'valid' ? 'A' : null),
+              provinceName: verification.provinceName || null,
+              districtName: verification.districtName || null,
+              active: verification.status !== 'invalid',
+              source: verification.source || { source: 'local_client_cache' },
               lastSyncedAt: new Date(),
             },
           },
@@ -257,7 +258,13 @@ class EBMCodeSyncService {
     }).filter((op) => op.updateOne.filter.tin);
 
     const write = ops.length ? await EBMTIN.bulkWrite(ops) : {};
-    return { upserted: write.upsertedCount || 0, matched: write.matchedCount || 0, resultDt: response.resultDt };
+    return {
+      upserted: write.upsertedCount || 0,
+      matched: write.matchedCount || 0,
+      resultDt: formatVsdcDateTime(),
+      skippedApi: true,
+      message: 'TIN directory synced from locally verified client records. Use customer TIN verify for live RRA lookup.',
+    };
   }
 
   static async syncBranches(companyId, payload) {

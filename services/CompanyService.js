@@ -1,7 +1,8 @@
 const mongoose = require('mongoose');
-const Company = require('../models/Company');
-const Role = require('../models/Role');
-const User = require('../models/User');
+const { prisma } = require('../lib/prisma');
+const { generateObjectId, toIdString } = require('../utils/objectId');
+const { companyToApi, companyInputToPrisma, userToApi } = require('../utils/authMappers');
+const passwordUtils = require('../utils/passwordUtils');
 const AuditLogService = require('./AuditLogService');
 const ChartOfAccount = require('../models/ChartOfAccount');
 const SubscriptionPlanService = require('./SubscriptionPlanService');
@@ -165,6 +166,7 @@ function escapeHtml(value) {
     .replace(/"/g, '&quot;');
 }
 
+/** row = legacy snake_case company shape (see utils/authMappers companyToApi) */
 function serializeCompany(row) {
   const featureAccess = buildFeatureAccess(row.subscription_plan || 'starter', row.feature_access || {});
   const enabledModules = FEATURE_KEYS.filter((key) => featureAccess[key]);
@@ -222,6 +224,28 @@ function serializeCompany(row) {
   };
 }
 
+async function seedChartOfAccounts(companyId, createdByUserId) {
+  // Chart of accounts is still Mongo-backed until the finance migration phase.
+  try {
+    const accounts = Object.entries(CHART_OF_ACCOUNTS).map(([code, account]) => ({
+      company: companyId,
+      code,
+      name: account.name,
+      type: account.type,
+      subtype: account.subtype,
+      normal_balance: account.normalBalance,
+      allow_direct_posting: account.allowDirectPosting,
+      isActive: true,
+      createdBy: createdByUserId || null,
+    }));
+    await ChartOfAccount.insertMany(accounts);
+    console.log(`Seeded ${accounts.length} chart of accounts for company ${companyId}`);
+  } catch (seedError) {
+    console.error('Error seeding chart of accounts:', seedError);
+    // Don't fail company creation if seeding fails
+  }
+}
+
 class CompanyService {
 
   /**
@@ -235,54 +259,38 @@ class CompanyService {
       throw new Error('INVALID_COMPANY_CODE: must be 2-10 uppercase alphanumeric characters');
     }
 
-    const existing = await Company.findOne({ code: data.code.toUpperCase() });
+    const code = data.code.toUpperCase();
+    const existing = await prisma.company.findUnique({ where: { code } });
     if (existing) throw new Error('COMPANY_CODE_TAKEN');
 
-    const company = await Company.create({
-      ...data,
-      code: data.code.toUpperCase(),
-      created_by: createdByUserId
+    const company = await prisma.company.create({
+      data: {
+        id: generateObjectId(),
+        ...companyInputToPrisma(data),
+        code,
+        createdById: createdByUserId ? toIdString(createdByUserId) : null,
+      },
     });
 
     // Log the creation
     await AuditLogService.log({
-      companyId: company._id,
+      companyId: company.id,
       userId: createdByUserId,
       action: 'company.create',
       entityType: 'company',
-      entityId: company._id,
+      entityId: company.id,
       changes: data
     });
 
-    // Seed chart of accounts for the new company
-    try {
-      const accounts = Object.entries(CHART_OF_ACCOUNTS).map(([code, account]) => ({
-        company: company._id,
-        code,
-        name: account.name,
-        type: account.type,
-        subtype: account.subtype,
-        normal_balance: account.normalBalance,
-        allow_direct_posting: account.allowDirectPosting,
-        isActive: true,
-        createdBy: createdByUserId,
-      }));
-      await ChartOfAccount.insertMany(accounts);
-      console.log(`Seeded ${accounts.length} chart of accounts for company ${company._id}`);
-    } catch (seedError) {
-      console.error('Error seeding chart of accounts:', seedError);
-      // Don't fail company creation if seeding fails
-    }
+    await seedChartOfAccounts(company.id, createdByUserId);
 
-    return company;
+    return companyToApi(company);
   }
 
   /**
    * Public self-service registration (pending platform approval)
    */
   static async registerPublicCompany({ company: c, admin: a }) {
-    const User = require('../models/User');
-
     const emailCompany = (c.email || '').toLowerCase().trim();
     const emailAdmin = (a.email || '').toLowerCase().trim();
 
@@ -295,14 +303,16 @@ class CompanyService {
       throw err;
     }
 
-    const dupCompany = await Company.findOne({ email: emailCompany });
+    const dupCompany = await prisma.company.findFirst({ where: { email: emailCompany } });
     if (dupCompany) {
       const err = new Error('COMPANY_EMAIL_ALREADY_REGISTERED');
       err.code = 'COMPANY_EMAIL_ALREADY_REGISTERED';
       throw err;
     }
 
-    const platformAdminEmail = await User.findOne({ email: emailAdmin, role: 'platform_admin' });
+    const platformAdminEmail = await prisma.user.findFirst({
+      where: { email: emailAdmin, role: 'platform_admin' },
+    });
     if (platformAdminEmail) {
       const err = new Error('EMAIL_NOT_AVAILABLE');
       err.code = 'EMAIL_NOT_AVAILABLE';
@@ -310,59 +320,49 @@ class CompanyService {
     }
 
     const selectedPlan = (c.subscription_plan || 'starter').toString().trim();
-    const company = await Company.create({
-      name: c.name.trim(),
-      email: emailCompany,
-      phone: c.phone || '',
-      address: c.address || {},
-      industry: c.industry || '',
-      base_currency: c.base_currency || 'RWF',
-      registration_number: c.registration_number || '',
-      tax_identification_number: c.tax_identification_number || '',
-      approvalStatus: 'pending',
-      isActive: false,
-      subscription_plan: selectedPlan,
-      subscription_status: 'active',
-      feature_access: buildFeatureAccess(selectedPlan),
-      registration_rejection_reason: null
+    const company = await prisma.company.create({
+      data: {
+        id: generateObjectId(),
+        name: c.name.trim(),
+        code: `C${generateObjectId().slice(-8).toUpperCase()}`.slice(0, 10),
+        email: emailCompany,
+        phone: c.phone || '',
+        address: c.address || {},
+        industry: c.industry || '',
+        baseCurrency: c.base_currency || 'RWF',
+        registrationNumber: c.registration_number || '',
+        taxIdentificationNumber: c.tax_identification_number || '',
+        approvalStatus: 'pending',
+        isActive: false,
+        subscriptionPlan: selectedPlan,
+        subscriptionStatus: 'active',
+        featureAccess: buildFeatureAccess(selectedPlan),
+        registrationRejectionReason: null,
+      },
     });
 
-    // Seed chart of accounts for the new company
-    try {
-      const accounts = Object.entries(CHART_OF_ACCOUNTS).map(([code, account]) => ({
-        company: company._id,
-        code,
-        name: account.name,
-        type: account.type,
-        subtype: account.subtype,
-        normal_balance: account.normalBalance,
-        allow_direct_posting: account.allowDirectPosting,
-        isActive: true,
-        createdBy: null,
-      }));
-      await ChartOfAccount.insertMany(accounts);
-      console.log(`Seeded ${accounts.length} chart of accounts for registered company ${company._id}`);
-    } catch (seedError) {
-      console.error('Error seeding chart of accounts for registered company:', seedError);
-    }
+    await seedChartOfAccounts(company.id, null);
 
     try {
-      // Look up the admin Role document to link it to the user
-      const adminRole = await Role.findOne({ name: 'admin', is_system_role: true });
+      // Look up the admin Role to link it to the user
+      const adminRole = await prisma.role.findFirst({ where: { name: 'admin', isSystemRole: true } });
 
-      const user = await User.create({
-        name: a.name.trim(),
-        email: emailAdmin,
-        password: a.password,
-        company: company._id,
-        role: 'admin',
-        roles: adminRole ? [adminRole._id] : [],
-        isActive: true
+      const user = await prisma.user.create({
+        data: {
+          id: generateObjectId(),
+          name: a.name.trim(),
+          email: emailAdmin,
+          password: await passwordUtils.hash(a.password),
+          companyId: company.id,
+          role: 'admin',
+          isActive: true,
+          roles: adminRole ? { create: [{ roleId: adminRole.id }] } : undefined,
+        },
       });
-      return { company, user };
+      return { company: companyToApi(company), user: userToApi(user) };
     } catch (e) {
-      await Company.deleteOne({ _id: company._id });
-      if (e.code === 11000) {
+      await prisma.company.delete({ where: { id: company.id } }).catch(() => {});
+      if (e.code === 'P2002') {
         const err = new Error('DUPLICATE_USER_EMAIL_FOR_COMPANY');
         err.code = 'DUPLICATE_USER_EMAIL_FOR_COMPANY';
         throw err;
@@ -372,33 +372,38 @@ class CompanyService {
   }
 
   static async listCompaniesByApprovalStatus(status) {
-    const list = await Company.find({ approvalStatus: status })
-      .sort({ createdAt: -1 })
-      .lean();
-    return list.map(serializeCompany);
+    const list = await prisma.company.findMany({
+      where: { approvalStatus: status },
+      orderBy: { createdAt: 'desc' },
+    });
+    return list.map((row) => serializeCompany(companyToApi(row)));
   }
 
   static async getPlatformDashboard() {
     const now = new Date();
     const soon = new Date(now.getTime() + 14 * 24 * 60 * 60 * 1000);
 
-    const [companies, usersByCompany] = await Promise.all([
-      Company.find({}).sort({ createdAt: -1 }).lean(),
-      User.aggregate([
-        { $match: { company: { $ne: null } } },
-        { $group: { _id: '$company', users: { $sum: 1 }, activeUsers: { $sum: { $cond: ['$isActive', 1, 0] } } } }
-      ])
+    const [companies, usersByCompany, activeUsersByCompany] = await Promise.all([
+      prisma.company.findMany({ orderBy: { createdAt: 'desc' } }),
+      prisma.user.groupBy({
+        by: ['companyId'],
+        where: { companyId: { not: null } },
+        _count: { _all: true },
+      }),
+      prisma.user.groupBy({
+        by: ['companyId'],
+        where: { companyId: { not: null }, isActive: true },
+        _count: { _all: true },
+      }),
     ]);
 
-    const userMap = new Map(usersByCompany.map((row) => [String(row._id), row]));
-    const normalized = companies.map((company) => {
-      const usage = userMap.get(String(company._id)) || { users: 0, activeUsers: 0 };
-      return {
-        ...serializeCompany(company),
-        users: usage.users,
-        activeUsers: usage.activeUsers
-      };
-    });
+    const userMap = new Map(usersByCompany.map((row) => [String(row.companyId), row._count._all]));
+    const activeMap = new Map(activeUsersByCompany.map((row) => [String(row.companyId), row._count._all]));
+    const normalized = companies.map((company) => ({
+      ...serializeCompany(companyToApi(company)),
+      users: userMap.get(company.id) || 0,
+      activeUsers: activeMap.get(company.id) || 0,
+    }));
 
     const stats = normalized.reduce((acc, company) => {
       acc.total += 1;
@@ -440,61 +445,61 @@ class CompanyService {
   }
 
   static async updatePlatformAccess(companyId, payload, reviewerUserId) {
-    const company = await Company.findById(companyId);
+    const company = await prisma.company.findUnique({ where: { id: toIdString(companyId) } });
     if (!company) throw new Error('COMPANY_NOT_FOUND');
 
-    const plan = payload.subscription_plan || company.subscription_plan || 'starter';
+    const plan = payload.subscription_plan || company.subscriptionPlan || 'starter';
     const hasNextBillingDate = Object.prototype.hasOwnProperty.call(payload, 'next_billing_date');
-    const billingAmount = payload.billing_amount === undefined ? company.billing_amount : Number(payload.billing_amount);
+    const billingAmount = payload.billing_amount === undefined ? company.billingAmount : Number(payload.billing_amount);
     const update = {
       subscription_plan: plan,
-      subscription_status: payload.subscription_status || company.subscription_status,
-      billing_cycle: payload.billing_cycle || company.billing_cycle,
-      billing_amount: Number.isFinite(billingAmount) && billingAmount >= 0 ? billingAmount : company.billing_amount,
-      next_billing_date: hasNextBillingDate ? payload.next_billing_date : company.next_billing_date,
-      feature_access: buildFeatureAccess(plan, payload.feature_access || company.feature_access || {}),
-      subscription_modules: Array.isArray(payload.subscription_modules) ? payload.subscription_modules : company.subscription_modules,
-      platform_notes: payload.platform_notes === undefined ? company.platform_notes : payload.platform_notes
+      subscription_status: payload.subscription_status || company.subscriptionStatus,
+      billing_cycle: payload.billing_cycle || company.billingCycle,
+      billing_amount: Number.isFinite(billingAmount) && billingAmount >= 0 ? billingAmount : company.billingAmount,
+      next_billing_date: hasNextBillingDate ? payload.next_billing_date : company.nextBillingDate,
+      feature_access: buildFeatureAccess(plan, payload.feature_access || company.featureAccess || {}),
+      subscription_modules: Array.isArray(payload.subscription_modules) ? payload.subscription_modules : company.subscriptionModules,
+      platform_notes: payload.platform_notes === undefined ? company.platformNotes : payload.platform_notes
     };
 
+    let isActive = company.isActive;
     if (['suspended', 'cancelled'].includes(update.subscription_status)) {
-      update.isActive = false;
+      isActive = false;
     } else if (['active'].includes(update.subscription_status) && company.approvalStatus === 'approved') {
-      update.isActive = true;
+      isActive = true;
     }
 
-    // Use .set() for Mixed fields so Mongoose tracks changes reliably
-    company.set('subscription_plan', update.subscription_plan);
-    company.set('subscription_status', update.subscription_status);
-    company.set('billing_cycle', update.billing_cycle);
-    company.set('billing_amount', update.billing_amount);
-    company.set('next_billing_date', update.next_billing_date);
-    company.set('feature_access', update.feature_access);
-    company.set('subscription_modules', update.subscription_modules);
-    company.set('platform_notes', update.platform_notes);
-    company.set('isActive', update.isActive);
-
-    // Mark Mixed fields as modified so Mongoose persists nested changes
-    company.markModified('feature_access');
-    company.markModified('subscription_modules');
-
-    await company.save();
+    const saved = await prisma.company.update({
+      where: { id: company.id },
+      data: {
+        subscriptionPlan: update.subscription_plan,
+        subscriptionStatus: update.subscription_status,
+        billingCycle: update.billing_cycle,
+        billingAmount: update.billing_amount,
+        nextBillingDate: update.next_billing_date ? new Date(update.next_billing_date) : null,
+        featureAccess: update.feature_access,
+        subscriptionModules: update.subscription_modules,
+        platformNotes: update.platform_notes,
+        isActive,
+      },
+    });
 
     await AuditLogService.log({
-      companyId: company._id,
+      companyId: company.id,
       userId: reviewerUserId,
       action: 'company.platform_access_update',
       entityType: 'company',
-      entityId: company._id,
-      changes: update
+      entityId: company.id,
+      changes: { ...update, isActive }
     });
 
-    return serializeCompany(company.toObject());
+    return serializeCompany(companyToApi(saved));
   }
 
   static async sendPaymentReminder(companyId, payload, reviewerUserId) {
-    const company = await Company.findById(companyId);
-    if (!company) throw new Error('COMPANY_NOT_FOUND');
+    const companyRow = await prisma.company.findUnique({ where: { id: toIdString(companyId) } });
+    if (!companyRow) throw new Error('COMPANY_NOT_FOUND');
+    const company = companyToApi(companyRow);
 
     const subject = payload.subject || `Payment reminder for ${company.name}`;
     const message = payload.message || 'Your subscription payment is coming due. Please arrange payment to keep your platform access active.';
@@ -585,24 +590,31 @@ class CompanyService {
 </html>`
     );
 
-    company.last_payment_reminder_at = new Date();
-    await company.save();
+    const saved = await prisma.company.update({
+      where: { id: companyRow.id },
+      data: { lastPaymentReminderAt: new Date() },
+    });
 
     await AuditLogService.log({
-      companyId: company._id,
+      companyId: companyRow.id,
       userId: reviewerUserId,
       action: 'company.payment_reminder_sent',
       entityType: 'company',
-      entityId: company._id,
+      entityId: companyRow.id,
       changes: { subject, sent }
     });
 
-    return { sent, company: serializeCompany(company.toObject()) };
+    return { sent, company: serializeCompany(companyToApi(saved)) };
   }
 
   static async broadcastPlatformUpdate(payload, reviewerUserId) {
-    const filter = payload.companyIds?.length ? { _id: { $in: payload.companyIds } } : { approvalStatus: 'approved', isActive: true };
-    const companies = await Company.find(filter).select('name email last_platform_message_at').lean();
+    const where = payload.companyIds?.length
+      ? { id: { in: payload.companyIds.map(toIdString) } }
+      : { approvalStatus: 'approved', isActive: true };
+    const companies = await prisma.company.findMany({
+      where,
+      select: { id: true, name: true, email: true, lastPlatformMessageAt: true },
+    });
     const recipients = companies.map((company) => company.email).filter(Boolean);
     if (!recipients.length) return { sent: false, recipients: 0, failed: 0 };
 
@@ -703,9 +715,12 @@ class CompanyService {
     // Update last_platform_message_at only for successfully notified companies
     const notifiedIds = companies
       .filter((c) => c.email && !errors.some((e) => e.email === c.email))
-      .map((c) => c._id);
+      .map((c) => c.id);
     if (notifiedIds.length) {
-      await Company.updateMany({ _id: { $in: notifiedIds } }, { $set: { last_platform_message_at: new Date() } });
+      await prisma.company.updateMany({
+        where: { id: { in: notifiedIds } },
+        data: { lastPlatformMessageAt: new Date() },
+      });
     }
 
     await AuditLogService.log({
@@ -721,25 +736,30 @@ class CompanyService {
   }
 
   static async approveCompanyById(companyId, reviewerUserId) {
-    const company = await Company.findById(companyId);
+    const company = await prisma.company.findUnique({ where: { id: toIdString(companyId) } });
     if (!company) throw new Error('COMPANY_NOT_FOUND');
     if (company.approvalStatus !== 'pending') {
       throw new Error('COMPANY_NOT_PENDING');
     }
-    company.set('approvalStatus', 'approved');
-    company.set('isActive', true);
-    company.set('registration_rejection_reason', null);
-    company.set('feature_access', buildFeatureAccess(company.subscription_plan || 'starter'));
-    company.markModified('feature_access');
-    await company.save();
+
+    const featureAccess = buildFeatureAccess(company.subscriptionPlan || 'starter');
+    const saved = await prisma.company.update({
+      where: { id: company.id },
+      data: {
+        approvalStatus: 'approved',
+        isActive: true,
+        registrationRejectionReason: null,
+        featureAccess,
+      },
+    });
 
     await AuditLogService.log({
-      companyId: company._id,
+      companyId: company.id,
       userId: reviewerUserId,
       action: 'company.registration_approved',
       entityType: 'company',
-      entityId: company._id,
-      changes: { approvalStatus: 'approved', feature_access: company.feature_access }
+      entityId: company.id,
+      changes: { approvalStatus: 'approved', feature_access: featureAccess }
     });
 
     // Send approval email
@@ -748,7 +768,9 @@ class CompanyService {
       console.log('[CompanyApproval] Checking config:', { emailNotif: config.features?.emailNotifications, gmailUser: !!config.email?.gmailUser });
       if (config.features?.emailNotifications && config.email?.gmailUser) {
         const emailService = require('./emailService');
-        const adminUser = await User.findOne({ company: companyId, role: 'admin' });
+        const adminUser = await prisma.user.findFirst({
+          where: { companyId: company.id, role: 'admin' },
+        });
         console.log('[CompanyApproval] Sending to:', company.email, 'Admin:', adminUser?.name);
         await emailService.sendApprovalEmail(
           company.email,
@@ -763,27 +785,33 @@ class CompanyService {
       console.error('[CompanyApproval] Failed to send approval email:', emailErr.message);
     }
 
-    return company;
+    return companyToApi(saved);
   }
 
   static async rejectCompanyById(companyId, reason, reviewerUserId) {
-    const company = await Company.findById(companyId);
+    const company = await prisma.company.findUnique({ where: { id: toIdString(companyId) } });
     if (!company) throw new Error('COMPANY_NOT_FOUND');
     if (company.approvalStatus !== 'pending') {
       throw new Error('COMPANY_NOT_PENDING');
     }
-    company.approvalStatus = 'rejected';
-    company.isActive = false;
-    company.registration_rejection_reason = (reason || 'No reason provided').trim();
-    await company.save();
+
+    const rejectionReason = (reason || 'No reason provided').trim();
+    const saved = await prisma.company.update({
+      where: { id: company.id },
+      data: {
+        approvalStatus: 'rejected',
+        isActive: false,
+        registrationRejectionReason: rejectionReason,
+      },
+    });
 
     await AuditLogService.log({
-      companyId: company._id,
+      companyId: company.id,
       userId: reviewerUserId,
       action: 'company.registration_rejected',
       entityType: 'company',
-      entityId: company._id,
-      changes: { approvalStatus: 'rejected', reason: company.registration_rejection_reason }
+      entityId: company.id,
+      changes: { approvalStatus: 'rejected', reason: rejectionReason }
     });
 
     // Send rejection email
@@ -791,7 +819,9 @@ class CompanyService {
       const config = require('../src/config/environment').getConfig();
       if (config.features?.emailNotifications && config.email?.gmailUser) {
         const emailService = require('./emailService');
-        const adminUser = await User.findOne({ company: companyId, role: 'admin' });
+        const adminUser = await prisma.user.findFirst({
+          where: { companyId: company.id, role: 'admin' },
+        });
         await emailService.sendRejectionEmail(
           company.email,
           company.name,
@@ -804,22 +834,22 @@ class CompanyService {
       console.error('[CompanyRejection] Failed to send rejection email:', emailErr.message);
     }
 
-    return company;
+    return companyToApi(saved);
   }
 
   /**
    * Get company by ID
    */
   static async getById(companyId) {
-    const company = await Company.findById(companyId);
+    const company = await prisma.company.findUnique({ where: { id: toIdString(companyId) } });
     if (!company) throw new Error('COMPANY_NOT_FOUND');
-    return company;
+    return companyToApi(company);
   }
 
   static async getProfileById(companyId) {
-    const company = await Company.findById(companyId).lean();
+    const company = await prisma.company.findUnique({ where: { id: toIdString(companyId) } });
     if (!company) throw new Error('COMPANY_NOT_FOUND');
-    return serializeCompany(company);
+    return serializeCompany(companyToApi(company));
   }
 
   /**
@@ -827,25 +857,26 @@ class CompanyService {
    */
   static async getAll(options = {}) {
     const { page = 1, limit = 20, isActive } = options;
-    const query = {};
-    
+    const where = {};
+
     if (isActive !== undefined) {
-      query.is_active = isActive;
+      where.isActive = isActive;
     }
 
     const skip = (page - 1) * limit;
-    
+
     const [companies, total] = await Promise.all([
-      Company.find(query)
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(limit)
-        .lean(),
-      Company.countDocuments(query)
+      prisma.company.findMany({
+        where,
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take: limit,
+      }),
+      prisma.company.count({ where }),
     ]);
 
     return {
-      companies,
+      companies: companies.map(companyToApi),
       pagination: {
         page,
         limit,
@@ -878,21 +909,21 @@ class CompanyService {
           }
         }
       } catch (e) {
+        if (String(e.message).startsWith('FISCAL_YEAR_LOCKED')) throw e;
         // AccountingPeriod may not exist yet, continue
       }
     }
 
-    // Get old data for audit
-    const oldCompany = await Company.findById(companyId);
-    if (!oldCompany) throw new Error('COMPANY_NOT_FOUND');
-
-    const company = await Company.findByIdAndUpdate(
-      companyId,
-      { $set: data },
-      { new: true, runValidators: true }
-    );
-
-    if (!company) throw new Error('COMPANY_NOT_FOUND');
+    let company;
+    try {
+      company = await prisma.company.update({
+        where: { id: toIdString(companyId) },
+        data: companyInputToPrisma(data),
+      });
+    } catch (e) {
+      if (e.code === 'P2025') throw new Error('COMPANY_NOT_FOUND');
+      throw e;
+    }
 
     // Log the update
     await AuditLogService.log({
@@ -904,20 +935,23 @@ class CompanyService {
       changes: data
     });
 
-    return company;
+    return companyToApi(company);
   }
 
   /**
    * Upload/update company logo
    */
   static async uploadLogo(companyId, logoUrl, userId) {
-    const company = await Company.findByIdAndUpdate(
-      companyId,
-      { $set: { logo_url: logoUrl } },
-      { new: true }
-    ).lean();
-
-    if (!company) throw new Error('COMPANY_NOT_FOUND');
+    let company;
+    try {
+      company = await prisma.company.update({
+        where: { id: toIdString(companyId) },
+        data: { logoUrl },
+      });
+    } catch (e) {
+      if (e.code === 'P2025') throw new Error('COMPANY_NOT_FOUND');
+      throw e;
+    }
 
     await AuditLogService.log({
       companyId,
@@ -928,21 +962,21 @@ class CompanyService {
       changes: { logo_url: logoUrl }
     });
 
-    return company;
+    return companyToApi(company);
   }
 
   /**
    * Get setup status
    */
   static async getSetupStatus(companyId) {
-    const company = await Company.findById(companyId);
+    const company = await prisma.company.findUnique({ where: { id: toIdString(companyId) } });
     if (!company) throw new Error('COMPANY_NOT_FOUND');
 
     return {
-      setup_completed: company.setup_completed,
-      setup_steps_completed: company.setup_steps_completed,
-      subscription_plan: company.subscription_plan,
-      trial_ends_at: company.trial_ends_at
+      setup_completed: company.setupCompleted,
+      setup_steps_completed: company.setupStepsCompleted || {},
+      subscription_plan: company.subscriptionPlan,
+      trial_ends_at: company.trialEndsAt
     };
   }
 
@@ -962,23 +996,21 @@ class CompanyService {
       throw new Error('INVALID_SETUP_STEP');
     }
 
-    const update = { [`setup_steps_completed.${step}`]: true };
-    const company = await Company.findByIdAndUpdate(
-      companyId,
-      { $set: update },
-      { new: true }
-    );
-
+    const company = await prisma.company.findUnique({ where: { id: toIdString(companyId) } });
     if (!company) throw new Error('COMPANY_NOT_FOUND');
 
-    // Check if all steps done
-    const allDone = Object.values(company.setup_steps_completed).every(v => v === true);
-    if (allDone) {
-      await Company.findByIdAndUpdate(companyId, { $set: { setup_completed: true } });
-      company.setup_completed = true;
-    }
+    const steps = { ...(company.setupStepsCompleted || {}), [step]: true };
+    const allDone = Object.values(steps).every((v) => v === true);
 
-    return company;
+    const saved = await prisma.company.update({
+      where: { id: company.id },
+      data: {
+        setupStepsCompleted: steps,
+        ...(allDone ? { setupCompleted: true } : {}),
+      },
+    });
+
+    return companyToApi(saved);
   }
 
   /**
@@ -988,8 +1020,9 @@ class CompanyService {
     const now = new Date();
     const sixMonthsAgo = new Date(now.getFullYear(), now.getMonth() - 5, 1);
 
-    // Aggregate companies
-    const companies = await Company.find({ approvalStatus: 'approved' }).lean();
+    const companies = (await prisma.company.findMany({
+      where: { approvalStatus: 'approved' },
+    })).map(companyToApi);
 
     // MRR calculation — normalize to monthly
     const monthlyAmount = (amount, cycle) => {
@@ -1027,7 +1060,11 @@ class CompanyService {
     });
 
     // Growth trend: new companies per month (last 6 months)
-    const allCompanies = await Company.find({ createdAt: { $gte: sixMonthsAgo } }).sort({ createdAt: 1 }).lean();
+    const allCompanies = await prisma.company.findMany({
+      where: { createdAt: { gte: sixMonthsAgo } },
+      orderBy: { createdAt: 'asc' },
+      select: { createdAt: true },
+    });
     const growthTrend = {};
     for (let i = 0; i < 6; i++) {
       const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
@@ -1042,34 +1079,38 @@ class CompanyService {
       }
     });
 
-    // Churn trend: companies that moved to suspended/cancelled in last 6 months (from audit logs)
-    const churnLogs = await mongoose.model('AuditLog').find({
-      action: { $in: ['company.update', 'company.platform_access_updated'] },
-      createdAt: { $gte: sixMonthsAgo },
-      'changes.subscription_status': { $in: ['suspended', 'cancelled'] }
-    }).sort({ createdAt: 1 }).lean();
-
+    // Churn trend: companies that moved to suspended/cancelled in last 6 months
+    // (audit logs are still Mongo-backed until their own migration phase)
     const churnTrend = {};
     for (let i = 0; i < 6; i++) {
       const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
       const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
       churnTrend[key] = 0;
     }
-    churnLogs.forEach((log) => {
-      const d = new Date(log.createdAt);
-      const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-      if (churnTrend.hasOwnProperty(key)) {
-        churnTrend[key] = (churnTrend[key] || 0) + 1;
-      }
-    });
+    try {
+      const churnLogs = await mongoose.model('AuditLog').find({
+        action: { $in: ['company.update', 'company.platform_access_updated'] },
+        createdAt: { $gte: sixMonthsAgo },
+        'changes.subscription_status': { $in: ['suspended', 'cancelled'] }
+      }).sort({ createdAt: 1 }).lean();
+
+      churnLogs.forEach((log) => {
+        const d = new Date(log.createdAt);
+        const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+        if (churnTrend.hasOwnProperty(key)) {
+          churnTrend[key] = (churnTrend[key] || 0) + 1;
+        }
+      });
+    } catch (e) {
+      console.error('Churn trend lookup failed:', e.message);
+    }
 
     // Active tenant count over time (cumulative approved up to each month)
     const activeTenantTrend = [];
     for (let i = 5; i >= 0; i--) {
       const d = new Date(now.getFullYear(), now.getMonth() - i + 1, 1);
-      const count = await Company.countDocuments({
-        approvalStatus: 'approved',
-        createdAt: { $lt: d }
+      const count = await prisma.company.count({
+        where: { approvalStatus: 'approved', createdAt: { lt: d } },
       });
       const key = `${d.getFullYear()}-${String(d.getMonth()).padStart(2, '0')}`;
       activeTenantTrend.push({ month: key, count });
@@ -1102,13 +1143,16 @@ class CompanyService {
    * Delete company (soft delete)
    */
   static async delete(companyId, userId) {
-    const company = await Company.findByIdAndUpdate(
-      companyId,
-      { $set: { is_active: false } },
-      { new: true }
-    ).lean();
-
-    if (!company) throw new Error('COMPANY_NOT_FOUND');
+    let company;
+    try {
+      company = await prisma.company.update({
+        where: { id: toIdString(companyId) },
+        data: { isActive: false },
+      });
+    } catch (e) {
+      if (e.code === 'P2025') throw new Error('COMPANY_NOT_FOUND');
+      throw e;
+    }
 
     await AuditLogService.log({
       companyId,
@@ -1118,14 +1162,17 @@ class CompanyService {
       entityId: companyId
     });
 
-    return company;
+    return companyToApi(company);
   }
 }
 
-// Load plans from database on startup
-(async () => {
-  await loadPlanFeatures();
-})();
+// Load plans from database on startup. Subscription plans still live in
+// MongoDB — when it is disabled, keep the built-in defaults silently.
+if (process.env.MONGODB_URI) {
+  (async () => {
+    await loadPlanFeatures();
+  })();
+}
 
 CompanyService.loadPlanFeatures = loadPlanFeatures;
 module.exports = CompanyService;

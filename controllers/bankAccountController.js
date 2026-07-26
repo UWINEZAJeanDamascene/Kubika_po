@@ -17,6 +17,44 @@ const { DEFAULT_ACCOUNTS, CHART_OF_ACCOUNTS } = require("../constants/chartOfAcc
 // 3500 = Opening Balance Equity (allows direct posting for opening balance entries)
 const OPENING_BALANCE_EQUITY_CODE = DEFAULT_ACCOUNTS.openingBalanceEquity || "3500";
 
+const BANK_INFLOW_TYPES = new Set(["deposit", "transfer_in", "opening", "debit"]);
+const BANK_OUTFLOW_TYPES = new Set(["withdrawal", "transfer_out", "closing", "credit"]);
+
+function isLikelyObjectId(value) {
+  return typeof value === "string" && /^[a-f0-9]{24}$/i.test(value);
+}
+
+function normalizeBankTransactionForApi(tx) {
+  const plain = tx?.toObject ? tx.toObject() : { ...tx };
+  let type = plain.type;
+
+  if (plain.transactionType === "bank_transfer_in") type = "transfer_in";
+  else if (plain.transactionType === "bank_transfer_out") type = "transfer_out";
+  else if (type === "debit") type = "deposit";
+  else if (type === "credit") type = "withdrawal";
+  else if (
+    type === "other" &&
+    String(plain.description || "").toLowerCase().includes("opening balance")
+  ) {
+    type = "opening";
+  }
+
+  const reference =
+    plain.referenceNumber ||
+    plain.sourceReference ||
+    (plain.reference && !isLikelyObjectId(plain.reference) ? plain.reference : null) ||
+    null;
+
+  return {
+    ...plain,
+    type,
+    reference,
+    referenceNumber: plain.referenceNumber || reference,
+    sourceReference: plain.sourceReference || reference,
+    isInflow: BANK_INFLOW_TYPES.has(plain.type) || type === "opening" || type === "deposit" || type === "transfer_in",
+  };
+}
+
 /**
  * Robust date parsing helper supporting multiple formats
  * DD/MM/YYYY, MM/DD/YYYY, YYYY-MM-DD, DD-MM-YYYY, etc.
@@ -126,13 +164,11 @@ exports.getBankAccounts = async (req, res, next) => {
 
     let accounts = await BankAccount.find(query)
       .populate("createdBy", "name email")
-      .sort({ isPrimary: -1, name: 1 })
+      .sort({ isDefault: -1, name: 1 })
       .skip((page - 1) * limit)
       .limit(parseInt(limit));
 
     // Compute per-account balance from BankTransaction records.
-    // BankTransaction has account: ObjectId (account-specific), so multiple accounts
-    // sharing the same ledgerAccountId (e.g. '1100') each get their own balance.
     accounts = await Promise.all(
       accounts.map(async (account) => {
         const accObj = account.toObject();
@@ -140,45 +176,10 @@ exports.getBankAccounts = async (req, res, next) => {
           account.openingBalance?.toString() || "0",
         );
 
-        // Sum inflows and outflows from BankTransaction (account-specific)
-        const txAgg = await BankTransaction.aggregate([
-          {
-            $match: {
-              $and: [
-                { $or: [{ companyId }, { company: companyId }] },
-                { $or: [{ bankAccountId: account._id }, { account: account._id }] },
-              ],
-            },
-          },
-          {
-            $group: {
-              _id: null,
-              totalIn: {
-                $sum: {
-                  $cond: [
-                    { $in: ["$type", ["deposit", "transfer_in", "debit", "opening"]] },
-                    "$amount",
-                    0,
-                  ],
-                },
-              },
-              totalOut: {
-                $sum: {
-                  $cond: [
-                    {
-                      $in: ["$type", ["withdrawal", "transfer_out", "credit", "closing"]],
-                    },
-                    "$amount",
-                    0,
-                  ],
-                },
-              },
-            },
-          },
-        ]);
-
-        const computedBalance =
-          openingBalance + (txAgg[0]?.totalIn || 0) - (txAgg[0]?.totalOut || 0);
+        const computedBalance = await BankAccount.computeBalanceFromTransactions(
+          account._id,
+          openingBalance,
+        );
 
         return {
           ...accObj,
@@ -242,37 +243,10 @@ exports.getBankAccount = async (req, res, next) => {
       account.openingBalance?.toString() || "0",
     );
 
-    const txAgg = await BankTransaction.aggregate([
-      { $match: { account: account._id } },
-      {
-        $group: {
-          _id: null,
-          totalIn: {
-            $sum: {
-              $cond: [
-                { $in: ["$type", ["deposit", "transfer_in"]] },
-                "$amount",
-                0,
-              ],
-            },
-          },
-          totalOut: {
-            $sum: {
-              $cond: [
-                {
-                  $in: ["$type", ["withdrawal", "transfer_out", "closing"]],
-                },
-                "$amount",
-                0,
-              ],
-            },
-          },
-        },
-      },
-    ]);
-
-    const computedBalance =
-      openingBalance + (txAgg[0]?.totalIn || 0) - (txAgg[0]?.totalOut || 0);
+    const computedBalance = await BankAccount.computeBalanceFromTransactions(
+      account._id,
+      openingBalance,
+    );
 
     const accountData = account.toObject();
     accountData.cachedBalance = computedBalance;
@@ -338,17 +312,9 @@ exports.createBankAccount = async (req, res, next) => {
             JournalService.createCreditLine(OPENING_BALANCE_EQUITY_CODE, openingBal, `Opening balance: ${account.name}`),
           ],
           isAutoGenerated: true,
+          bankAccountId: account._id,
         });
-        // Create bank transaction record for opening balance
-        await account.addTransaction({
-          type: "opening",
-          amount: openingBal,
-          description: `Opening balance`,
-          referenceNumber: `OPENING-${account.accountNumber || account._id}`,
-          createdBy: req.user._id,
-          status: "completed",
-          journalEntryId: je._id,
-        });
+        // Bank transaction is created automatically from the journal entry.
       } catch (journalError) {
         console.error("Failed to create opening balance journal entry:", journalError.message);
         // Non-fatal - account is created but GL won't reflect opening balance
@@ -527,7 +493,7 @@ exports.getAccountTransactions = async (req, res, next) => {
       total,
       pages: Math.ceil(total / limit),
       totals,
-      data: transactions,
+      data: transactions.map(normalizeBankTransactionForApi),
       source: "bank_transactions",
     });
   } catch (error) {
@@ -801,6 +767,8 @@ exports.transfer = async (req, res, next) => {
           JournalService.createCreditLine(fromLedger, amount, narration),
         ],
         isAutoGenerated: true,
+        transferFromAccountId: from._id,
+        transferToAccountId: to._id,
       });
     } catch (journalError) {
       return res.status(500).json({
@@ -977,11 +945,16 @@ exports.transferToCash = async (req, res, next) => {
           ),
         ],
         isAutoGenerated: true,
+        skipBankTransactions: true,
+        transferFromAccountId: from._id,
+        transferToAccountId: to._id,
       });
 
-      // Link journal entry to transaction
-      withdrawal.journalEntry = je._id;
+      // Link journal entry to both transfer transactions
+      withdrawal.journalEntryId = je._id;
       await withdrawal.save({ validateBeforeSave: false });
+      deposit.journalEntryId = je._id;
+      await deposit.save({ validateBeforeSave: false });
 
     } catch (journalError) {
       // Attempt to reverse both transactions

@@ -173,7 +173,9 @@ exports.getCreditNote = async (req, res, next) => {
     const note = await CreditNote.findOne({
       _id: req.params.id,
       company: companyId,
-    }).populate("invoice client createdBy payments.refundedBy");
+    })
+      .populate("invoice client createdBy")
+      .populate("lines.product");
     if (!note)
       return res.status(404).json({ success: false, message: "Not found" });
     res.json({ success: true, data: note });
@@ -1677,21 +1679,106 @@ exports.confirmCreditNote = async (req, res, next) => {
       "lines.product lines.returnToWarehouse createdBy confirmedBy invoice client revenueReversalEntry cogsReversalEntry",
     );
 
+    const refundRsnCd =
+      req.body.refundRsnCd || req.body.rfdRsnCd || creditNote.ebm?.rfdRsnCd;
+    let responseNote = creditNote;
+    if (refundRsnCd) {
+      try {
+        responseNote = await EBMSalesService.submitCreditNote(creditNote._id, {
+          companyId,
+          refundRsnCd,
+        });
+        await responseNote.populate(
+          "lines.product lines.returnToWarehouse createdBy confirmedBy invoice client revenueReversalEntry cogsReversalEntry",
+        );
+      } catch (ebmError) {
+        console.error(
+          "EBM credit note submission failed after confirmation:",
+          ebmError.message,
+        );
+        responseNote =
+          ebmError.creditNote ||
+          (await CreditNote.findOne({
+            _id: creditNote._id,
+            company: companyId,
+          }).populate(
+            "lines.product lines.returnToWarehouse createdBy confirmedBy invoice client revenueReversalEntry cogsReversalEntry",
+          ));
+      }
+    }
+
     // Send email notification for confirm
     if (req.body.sendEmail) {
       const company = await Company.findById(companyId);
-      const client = await Client.findById(creditNote.client);
-      await sendCreditNoteEmail(creditNote, company, client, 'confirmed');
+      const client = await Client.findById(responseNote.client);
+      await sendCreditNoteEmail(responseNote, company, client, 'confirmed');
     }
 
-    console.log("DEBUG: Sending response with status:", creditNote.status);
+    console.log("DEBUG: Sending response with status:", responseNote.status);
     res.json({
       success: true,
       message: "Credit note confirmed successfully",
-      data: creditNote,
+      data: responseNote,
     });
   } catch (err) {
     console.error("Error confirming credit note:", err);
+    next(err);
+  }
+};
+
+// Submit or retry RRA EBM for a confirmed credit note
+exports.submitCreditNoteEbm = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const note = await CreditNote.findOne({
+      _id: req.params.id,
+      company: companyId,
+    });
+    if (!note) {
+      return res.status(404).json({ success: false, message: "Credit note not found" });
+    }
+    if (note.status !== "confirmed" && note.status !== "issued") {
+      return res.status(400).json({
+        success: false,
+        message: "Only confirmed or issued credit notes can be submitted to EBM",
+      });
+    }
+    if (note.ebm?.ebmStatus === "submitted") {
+      return res.json({ success: true, data: note, message: "Already submitted to EBM" });
+    }
+
+    const refundRsnCd =
+      req.body.refundRsnCd || req.body.rfdRsnCd || note.ebm?.rfdRsnCd;
+    if (!refundRsnCd) {
+      return res.status(400).json({
+        success: false,
+        code: "ERR_EBM_REFUND_REASON_REQUIRED",
+        message: "RRA refund reason code is required before submitting this credit note to EBM.",
+      });
+    }
+
+    let responseNote;
+    try {
+      responseNote = await EBMSalesService.submitCreditNote(note._id, {
+        companyId,
+        refundRsnCd,
+      });
+    } catch (ebmError) {
+      console.error("EBM credit note submission failed:", ebmError.message);
+      responseNote =
+        ebmError.creditNote ||
+        (await CreditNote.findOne({ _id: note._id, company: companyId })
+          .populate("invoice client lines.product createdBy"));
+      return res.status(502).json({
+        success: false,
+        message: ebmError.message || "EBM submission failed",
+        data: responseNote,
+      });
+    }
+
+    await responseNote.populate("invoice client lines.product createdBy");
+    res.json({ success: true, data: responseNote });
+  } catch (err) {
     next(err);
   }
 };

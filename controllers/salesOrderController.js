@@ -3,7 +3,6 @@ const Client = require('../models/Client');
 const Product = require('../models/Product');
 const Warehouse = require('../models/Warehouse');
 const Company = require('../models/Company');
-const mongoose = require('mongoose');
 const emailService = require('../services/emailService');
 const EBMProductService = require('../services/ebmProductService');
 
@@ -32,6 +31,36 @@ const sendSOEmail = async (so, action, companyId) => {
 // Error codes
 const ERR_SALES_ORDER_NOT_FOUND = 'ERR_SALES_ORDER_NOT_FOUND';
 const ERR_INVALID_STATUS_TRANSITION = 'ERR_INVALID_STATUS_TRANSITION';
+
+const toNumber = (value) => {
+  const n = parseFloat(value);
+  return Number.isFinite(n) ? n : 0;
+};
+
+/**
+ * Price the lines and roll them up into the header totals. Quantities, prices,
+ * discounts and tax rates come from the request; everything else is derived, so
+ * a client that posts no totals still gets a correctly valued order.
+ */
+const priceLines = (lines = []) => {
+  let subtotal = 0;
+  let taxAmount = 0;
+
+  const priced = lines.map((line) => {
+    const qty = toNumber(line.qty);
+    const unitPrice = toNumber(line.unitPrice);
+    const gross = qty * unitPrice;
+    const net = gross - gross * (toNumber(line.discountPct) / 100);
+    const lineTax = net * (toNumber(line.taxRate) / 100);
+
+    subtotal += net;
+    taxAmount += lineTax;
+
+    return { ...line, qty, unitPrice, lineTax, lineTotal: net + lineTax };
+  });
+
+  return { lines: priced, totals: { subtotal, taxAmount, totalAmount: subtotal + taxAmount } };
+};
 
 // @desc    Get all sales orders
 // @route   GET /api/sales-orders
@@ -132,7 +161,7 @@ exports.getSalesOrder = async (req, res, next) => {
 exports.createSalesOrder = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { client, lines, orderDate, expectedDate, deliveryAddress, shippingMethod, terms, notes, quotation, currencyCode } = req.body;
+    const { client, lines, orderDate, expectedDate, deliveryAddress, shippingMethod, terms, notes, quotation, currencyCode, exchangeRate } = req.body;
     
     // Validate client exists
     const clientDoc = await Client.findOne({ _id: client, company: companyId });
@@ -179,18 +208,22 @@ exports.createSalesOrder = async (req, res, next) => {
       });
     }
     
+    const priced = priceLines(processedLines);
+
     const salesOrder = await SalesOrder.create({
       company: companyId,
       client,
       quotation: quotation || null,
       orderDate: orderDate || new Date(),
       expectedDate: expectedDate || null,
-      lines: processedLines,
+      lines: priced.lines,
+      ...priced.totals,
       deliveryAddress: deliveryAddress || clientDoc.address,
       shippingMethod: shippingMethod || null,
       terms: terms || null,
       notes: notes || null,
-      currencyCode: currencyCode || 'USD',
+      currencyCode: currencyCode || 'RWF',
+      exchangeRate: exchangeRate || 1,
       createdBy: req.user.id,
       clientTin: clientDoc.tin
     });
@@ -219,7 +252,7 @@ exports.createSalesOrder = async (req, res, next) => {
 exports.updateSalesOrder = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { lines, orderDate, expectedDate, deliveryAddress, shippingMethod, terms, notes, currencyCode } = req.body;
+    const { lines, orderDate, expectedDate, deliveryAddress, shippingMethod, terms, notes, currencyCode, exchangeRate } = req.body;
     
     let salesOrder = await SalesOrder.findOne({ _id: req.params.id, company: companyId });
     
@@ -264,7 +297,11 @@ exports.updateSalesOrder = async (req, res, next) => {
           status: 'pending'
         });
       }
-      salesOrder.lines = processedLines;
+      const priced = priceLines(processedLines);
+      salesOrder.lines = priced.lines;
+      salesOrder.subtotal = priced.totals.subtotal;
+      salesOrder.taxAmount = priced.totals.taxAmount;
+      salesOrder.totalAmount = priced.totals.totalAmount;
     }
     
     // Update other fields
@@ -275,6 +312,7 @@ exports.updateSalesOrder = async (req, res, next) => {
     if (terms !== undefined) salesOrder.terms = terms;
     if (notes !== undefined) salesOrder.notes = notes;
     if (currencyCode) salesOrder.currencyCode = currencyCode;
+    if (exchangeRate) salesOrder.exchangeRate = exchangeRate;
     
     await salesOrder.save();
     await salesOrder.populate('client lines.product createdBy');
@@ -333,10 +371,10 @@ exports.deleteSalesOrder = async (req, res, next) => {
 exports.confirmSalesOrder = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    
+
     const salesOrder = await SalesOrder.findOne({ _id: req.params.id, company: companyId })
       .populate('lines.product');
-    
+
     if (!salesOrder) {
       return res.status(404).json({
         success: false,
@@ -344,8 +382,7 @@ exports.confirmSalesOrder = async (req, res, next) => {
         message: 'Sales order not found'
       });
     }
-    
-    // Validate status transition
+
     if (!salesOrder.canTransitionTo('confirmed')) {
       return res.status(400).json({
         success: false,
@@ -353,31 +390,33 @@ exports.confirmSalesOrder = async (req, res, next) => {
         message: `Cannot confirm sales order with status: ${salesOrder.status}`
       });
     }
-    
-    // Check stock availability and reserve
+
     const backorderItems = [];
-    const linesUpdate = [];
-    
-    for (let i = 0; i < salesOrder.lines.length; i++) {
-      const line = salesOrder.lines[i];
+    const updatedLines = [];
+
+    for (const line of salesOrder.lines || []) {
       const product = line.product;
-      if (!product || !product.isStockable) continue;
-      
-      // Parse Decimal128 values properly
-      const qtyNeeded = parseFloat(line.get('qty')) || 0;
-      const currentStock = product.currentStock ? parseFloat(product.currentStock.toString()) : 0;
-      const reservedQty = product.reservedQuantity ? parseFloat(product.reservedQuantity.toString()) : 0;
+      const nextLine = { ...line };
+
+      if (nextLine.product && typeof nextLine.product === 'object') {
+        nextLine.product = nextLine.product._id || nextLine.product.id;
+      }
+
+      if (!product || !product.isStockable) {
+        updatedLines.push(nextLine);
+        continue;
+      }
+
+      const qtyNeeded = toNumber(line.qty);
+      const currentStock = toNumber(product.currentStock);
+      const reservedQty = toNumber(product.reservedQuantity);
       const availableStock = currentStock - reservedQty;
-      
-      console.log(`Debug - Line ${i}: qtyNeeded=${qtyNeeded}, currentStock=${currentStock}, reservedQty=${reservedQty}, availableStock=${availableStock}`);
-      
+
       let qtyToReserve = 0;
       let lineStatus = 'pending';
-      
+
       if (availableStock < qtyNeeded) {
-        // Not enough stock - mark as backorder or partial
         if (availableStock > 0) {
-          // Partial fulfillment possible
           qtyToReserve = availableStock;
           lineStatus = 'reserved';
           backorderItems.push({
@@ -386,7 +425,6 @@ exports.confirmSalesOrder = async (req, res, next) => {
             reason: 'Insufficient stock'
           });
         } else {
-          // No stock available
           backorderItems.push({
             lineId: line.lineId,
             remainingQty: qtyNeeded,
@@ -394,88 +432,43 @@ exports.confirmSalesOrder = async (req, res, next) => {
           });
         }
       } else {
-        // Full reservation possible
         qtyToReserve = qtyNeeded;
         lineStatus = 'reserved';
       }
-      
-      // Update product reserved quantity
+
       if (qtyToReserve > 0) {
-        await Product.findByIdAndUpdate(product._id, {
+        await Product.findByIdAndUpdate(product._id || product.id, {
           $inc: { reservedQuantity: qtyToReserve }
         });
       }
-      
-      // Build update for this line
-      linesUpdate.push({
-        index: i,
-        qtyReserved: mongoose.Types.Decimal128.fromString(qtyToReserve.toString()),
-        status: lineStatus
-      });
+
+      nextLine.qtyReserved = qtyToReserve;
+      nextLine.status = lineStatus;
+      updatedLines.push(nextLine);
     }
-    
-    // Reload the document to get fresh data
-    const freshSO = await SalesOrder.findById(salesOrder._id).lean();
-    
-    // Get current lines and update them
-    const updatedLines = freshSO.lines.map((line, idx) => {
-      const lineUpd = linesUpdate.find(l => l.index === idx);
-      if (lineUpd) {
-        return {
-          ...line,
-          qtyReserved: lineUpd.qtyReserved,
-          status: lineUpd.status
-        };
-      }
-      return line;
-    });
-    
-    // Use raw MongoDB update to bypass Mongoose subdocument issues
-    const db = mongoose.connection.db;
-    const collection = db.collection('salesorders');
-    
-    console.log('Debug - linesUpdate:', JSON.stringify(linesUpdate, null, 2));
-    console.log('Debug - updatedLines:', JSON.stringify(updatedLines, null, 2));
-    
-    const updateResult = await collection.updateOne(
-      { _id: new mongoose.Types.ObjectId(salesOrder._id) },
-      {
-        $set: {
-          lines: updatedLines,
-          status: 'confirmed',
-          confirmedBy: new mongoose.Types.ObjectId(req.user.id),
-          confirmedDate: new Date(),
-          stockReserved: true,
-          reservationDate: new Date(),
-          ...(backorderItems.length > 0 && {
-            isBackorder: true,
-            backorderItems: backorderItems
-          })
-        }
-      }
-    );
-    
-    console.log('Debug - MongoDB update result:', updateResult);
-    
-    // Fetch the updated document
-    const finalSO = await SalesOrder.findById(salesOrder._id);
-    
-    // Send email notification
+
+    // New array reference so Prisma shim rewrites line rows on save()
+    salesOrder.lines = updatedLines;
+    salesOrder.status = 'confirmed';
+    salesOrder.stockReserved = true;
+    if (backorderItems.length > 0) {
+      salesOrder.isBackorder = true;
+    }
+
+    await salesOrder.save();
+
+    const finalSO = await SalesOrder.findById(salesOrder._id).populate('lines.product');
+
     const sendEmailOnConfirm = req.body.sendEmail || false;
     if (sendEmailOnConfirm) {
       await sendSOEmail(finalSO, 'confirmed', companyId);
     }
-    
+
     res.status(200).json({
       success: true,
       message: 'Sales order confirmed successfully',
       data: finalSO,
-      backorderItems: backorderItems.length > 0 ? backorderItems : undefined,
-      debug: {
-        linesUpdateCount: linesUpdate.length,
-        firstLineUpdate: linesUpdate[0] || null,
-        mongoResult: updateResult
-      }
+      backorderItems: backorderItems.length > 0 ? backorderItems : undefined
     });
   } catch (error) {
     console.error('Confirm Sales Order Error:', error);

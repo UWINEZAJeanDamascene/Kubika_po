@@ -6,6 +6,7 @@ const Company = require('../models/Company');
 const ChartOfAccount = require('../models/ChartOfAccount');
 const JournalEntry = require('../models/JournalEntry');
 const Loan = require('../models/Loan');
+const { isMongoConnected } = require('../utils/mongoConnection');
 
 /**
  * Financial Ratios Service — IAS/IFRS Compliant
@@ -169,10 +170,17 @@ class FinancialRatiosService {
     const interestCoverage = financeCosts > 0 ? operatingProfit / financeCosts : null;
 
     // ── DEBT METRICS (from loan data) ─────────────────────────────
-    const activeLoans = await Loan.find({
-      company: new mongoose.Types.ObjectId(companyId),
-      status: { $in: ['active', 'partially_repaid'] }
-    });
+    let activeLoans = [];
+    if (isMongoConnected()) {
+      try {
+        activeLoans = await Loan.find({
+          company: new mongoose.Types.ObjectId(companyId),
+          status: { $in: ['active', 'partially_repaid'] }
+        });
+      } catch (_err) {
+        activeLoans = [];
+      }
+    }
 
     const totalBorrowings = activeLoans.reduce((sum, loan) => sum + (loan.outstandingBalance || 0), 0);
     const weightedInterestRate = totalBorrowings > 0

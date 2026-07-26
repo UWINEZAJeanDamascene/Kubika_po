@@ -175,7 +175,6 @@ function buildItemPayload(product, values, itemSeq) {
     qtyUnitCd: ebm.qtyUnitCd,
     qty: Math.abs(qty),
     itemExprDt: formatOptionalVsdcDate(values.expiryDate),
-    bhfTinTyCd: values.bhfTinTyCd || "",
     prc: unitPrice,
     splyAmt: amounts.splyAmt,
     totDcAmt: discountAmount,

@@ -121,7 +121,10 @@ function buildConfig() {
     // Database Configuration
     // =====================
     db: {
-      uri: process.env.MONGODB_URI || 'mongodb://localhost:27017/stock-management',
+      // No fallback: when MONGODB_URI is unset, MongoDB is disabled and only
+      // the PostgreSQL-backed domains (auth/tenancy) are available.
+      uri: process.env.MONGODB_URI || null,
+      postgresUrl: process.env.DATABASE_URL || null,
       maxPoolSize: number(process.env.MONGODB_MAX_POOL_SIZE, 50),
       minPoolSize: number(process.env.MONGODB_MIN_POOL_SIZE, 0),
       serverSelectionTimeoutMs: number(process.env.MONGODB_SERVER_SELECTION_TIMEOUT_MS, 30000),

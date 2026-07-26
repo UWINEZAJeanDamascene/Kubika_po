@@ -65,7 +65,7 @@ describe('EBM purchase confirmation payload', () => {
     expect(payload).toMatchObject({
       tin: '999991130',
       bhfId: '00',
-      invcNo: '77',
+      invcNo: 77,
       spplrTin: '999999999',
       spplrNm: 'Supplier Name',
       spplrBhfId: '00',
@@ -152,7 +152,7 @@ describe('EBM purchase confirmation payload', () => {
     );
 
     expect(payload).toMatchObject({
-      invcNo: '88',
+      invcNo: 88,
       spplrTin: '999999999',
       spplrNm: 'Local Supplier',
       totItemCnt: 1,

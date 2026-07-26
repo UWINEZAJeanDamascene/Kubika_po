@@ -46,7 +46,11 @@ const cacheMiddleware = (options = {}) => {
         const params = {
           path: req.path,
           query: req.query,
-          companyId: req.company?._id?.toString() || req.query.companyId,
+          companyId:
+            req.company?._id?.toString()
+            || req.user?.company?._id?.toString()
+            || (typeof req.user?.company === 'string' ? req.user.company : undefined)
+            || req.query.companyId,
         };
         cacheKey = cacheService.generateKey(type, params);
       }

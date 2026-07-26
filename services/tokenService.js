@@ -1,6 +1,6 @@
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
-const User = require('../models/User');
+const { prisma } = require('../lib/prisma');
 const SessionService = require('./sessionService');
 
 // Import centralized configuration
@@ -19,7 +19,7 @@ const REFRESH_EXPIRE = config.jwt.refreshExpiresIn;
 /**
  * Refresh-token rotation (RFC 6819 style):
  * - Each successful POST /api/auth/refresh issues a NEW refresh_token and invalidates the previous
- *   one by replacing `user.refresh_token_hash` (see refreshWithRotation).
+ *   one by replacing the stored refresh token hash (see refreshWithRotation).
  * - Reusing an old refresh token fails validation and revokes all sessions for that user.
  */
 
@@ -30,56 +30,61 @@ function sha256(plain) {
 function membershipsForUser(user) {
   return [
     {
-      companyId: user.company?.toString(),
+      companyId: user.companyId ? String(user.companyId) : undefined,
       role: user.role,
     },
   ];
 }
 
+function signTokenPair(userId, memberships) {
+  const access_token = jwt.sign(
+    { id: userId, userId, memberships },
+    JWT_SECRET,
+    { expiresIn: ACCESS_EXPIRE },
+  );
+  const refresh_token = jwt.sign(
+    { userId, type: 'refresh', jti: crypto.randomBytes(16).toString('hex') },
+    JWT_SECRET,
+    { expiresIn: REFRESH_EXPIRE },
+  );
+  return { access_token, refresh_token };
+}
+
 class TokenService {
   /**
-   * Build access + refresh JWTs; set refresh_token_hash on user (never store raw refresh).
-   * Caller must save the user document.
+   * Build access + refresh JWTs and persist the refresh token hash on the user
+   * row (never store the raw refresh token).
    */
-  static buildTokenPair(user, memberships) {
-    const userId = user._id.toString();
-    const access_token = jwt.sign(
-      { id: userId, userId, memberships },
-      JWT_SECRET,
-      { expiresIn: ACCESS_EXPIRE },
-    );
-    const refresh_token = jwt.sign(
-      { userId, type: 'refresh', jti: crypto.randomBytes(16).toString('hex') },
-      JWT_SECRET,
-      { expiresIn: REFRESH_EXPIRE },
-    );
-    user.refresh_token_hash = sha256(refresh_token);
-    user.refresh_token = null;
-    return { access_token, refresh_token };
+  static async issueTokensForUser(userId, memberships) {
+    const pair = signTokenPair(String(userId), memberships);
+    await prisma.user.update({
+      where: { id: String(userId) },
+      data: { refreshTokenHash: sha256(pair.refresh_token), refreshToken: null },
+    });
+    return pair;
   }
 
   /**
-   * Persist hash and return pair (e.g. for tests or token re-issue without full login).
+   * Persist hash and return pair (e.g. for impersonation or token re-issue
+   * without a full login).
    */
   static async generateTokenPair(userId, memberships) {
-    const user = await User.findById(userId).select('+refresh_token +refresh_token_hash');
+    const user = await prisma.user.findUnique({ where: { id: String(userId) } });
     if (!user) {
       const err = new Error('User not found');
       err.code = 'USER_NOT_FOUND';
       throw err;
     }
-    const pair = this.buildTokenPair(user, memberships);
-    await user.save({ validateBeforeSave: false });
-    return pair;
+    return this.issueTokensForUser(user.id, memberships);
   }
 
   static _storedRefreshMatches(user, refreshPlain) {
     const presented = sha256(refreshPlain);
-    if (user.refresh_token_hash) {
-      return presented === user.refresh_token_hash;
+    if (user.refreshTokenHash) {
+      return presented === user.refreshTokenHash;
     }
-    if (user.refresh_token) {
-      return user.refresh_token === refreshPlain;
+    if (user.refreshToken) {
+      return user.refreshToken === refreshPlain;
     }
     return false;
   }
@@ -105,7 +110,7 @@ class TokenService {
       throw err;
     }
 
-    const user = await User.findById(decoded.userId).select('+refresh_token +refresh_token_hash');
+    const user = await prisma.user.findUnique({ where: { id: String(decoded.userId) } });
     if (!user) {
       const err = new Error('Invalid refresh token');
       err.code = 'INVALID_REFRESH_TOKEN';
@@ -121,11 +126,10 @@ class TokenService {
     }
 
     const memberships = membershipsForUser(user);
-    const { access_token, refresh_token } = this.buildTokenPair(user, memberships);
-    await user.save({ validateBeforeSave: false });
+    const { access_token, refresh_token } = await this.issueTokensForUser(user.id, memberships);
 
     try {
-      await SessionService.registerAccessToken(user._id.toString(), access_token);
+      await SessionService.registerAccessToken(user.id, access_token);
     } catch (e) {
       console.error('Registering refreshed access token failed:', e);
     }
@@ -134,14 +138,11 @@ class TokenService {
   }
 
   static async revokeAllForUser(userId) {
-    const user = await User.findById(userId).select('+refresh_token +refresh_token_hash');
-    if (!user) return;
-
-    user.refresh_token = null;
-    user.refresh_token_hash = null;
-    await user.save({ validateBeforeSave: false });
-
-    await SessionService.deleteAllSessions(userId.toString());
+    await prisma.user.updateMany({
+      where: { id: String(userId) },
+      data: { refreshToken: null, refreshTokenHash: null },
+    });
+    await SessionService.deleteAllSessions(String(userId));
   }
 }
 

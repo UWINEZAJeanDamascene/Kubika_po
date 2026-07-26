@@ -9,6 +9,7 @@ const Loan = require('../../models/Loan')
 const { PettyCashFloat } = require('../../models/PettyCash')
 const dateHelpers = require('../../utils/dateHelpers')
 const dashboardCache = require('../DashboardCacheService')
+const { isMongoConnected } = require('../../utils/mongoConnection')
 
 class ExecutiveDashboardService {
 
@@ -356,14 +357,26 @@ class ExecutiveDashboardService {
 
   // Get upcoming debt payments (next 30 days)
   static async _getUpcomingDebtPayments(companyId) {
+    const empty = {
+      totalUpcoming: 0,
+      totalAmount: 0,
+      payments: [],
+    };
+    if (!isMongoConnected()) return empty;
+
+    let activeLoans = [];
+    try {
+      activeLoans = await Loan.find({
+        company: companyId,
+        status: { $in: ['active', 'partially_repaid'] },
+        repaymentType: { $in: ['amortized', 'interest_only'] }
+      }).select('name loanNumber outstandingBalance interestRate startDate endDate repaymentType paymentFrequency installmentAmount').lean();
+    } catch (_err) {
+      return empty;
+    }
+
     const today = new Date()
     const thirtyDaysFromNow = new Date(today.getTime() + 30 * 24 * 60 * 60 * 1000)
-
-    const activeLoans = await Loan.find({
-      company: companyId,
-      status: { $in: ['active', 'partially_repaid'] },
-      repaymentType: { $in: ['amortized', 'interest_only'] }
-    }).select('name loanNumber outstandingBalance interestRate startDate endDate repaymentType paymentFrequency installmentAmount').lean()
 
     const upcomingPayments = []
 

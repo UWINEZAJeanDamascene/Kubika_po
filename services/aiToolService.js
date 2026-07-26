@@ -35,7 +35,6 @@ const ARReceipt = require('../models/ARReceipt');
 const APPayment = require('../models/APPayment');
 const Budget = require('../models/Budget');
 const Department = require('../models/Department');
-const CompanyUser = require('../models/CompanyUser');
 const AuditLog = require('../models/AuditLog');
 const AccountingPeriod = require('../models/AccountingPeriod');
 const Notification = require('../models/Notification');
@@ -786,10 +785,16 @@ async function getDepartments(companyId, opts = {}) {
 async function getCompanyUsers(companyId, opts = {}) {
   opts = opts || {};
   const { role = '', limit = 50 } = opts;
-  const q = { company: companyId };
-  if (role) q.role = role;
-  const users = await CompanyUser.find(q).limit(Number(limit)).lean();
-  return { count: users.length, users: users.map(u => ({ id: u._id, name: u.name, email: u.email, role: u.role, status: u.status })) };
+  const { prisma } = require('../lib/prisma');
+  const users = await prisma.user.findMany({
+    where: { companyId: String(companyId), ...(role ? { role } : {}) },
+    take: Number(limit),
+    select: { id: true, name: true, email: true, role: true, isActive: true },
+  });
+  return {
+    count: users.length,
+    users: users.map(u => ({ id: u.id, name: u.name, email: u.email, role: u.role, status: u.isActive ? 'active' : 'inactive' })),
+  };
 }
 
 async function getNotifications(companyId, opts = {}) {

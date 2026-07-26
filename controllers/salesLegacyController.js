@@ -280,6 +280,7 @@ exports.createDirectSale = async (req, res, next) => {
           } catch (consumeErr) {
             console.error(`[createDirectSale] inventoryService.consume failed:`, consumeErr);
             if (consumeErr && consumeErr.code === 'INSUFFICIENT_STOCK') {
+              consumeErr.productName = product.name;
               throw consumeErr;
             }
             // Fallback to average cost for other errors
@@ -316,6 +317,7 @@ exports.createDirectSale = async (req, res, next) => {
         totalCOGS += cogsAmount;
 
         // Create stock movement record
+        const stockBefore = Number(product.currentStock || 0);
         await StockMovement.create([{
           company: companyId,
           product: product._id,
@@ -323,10 +325,13 @@ exports.createDirectSale = async (req, res, next) => {
           type: 'out',
           reason: 'sale',
           quantity: quantity,
+          previousStock: stockBefore,
+          newStock: stockBefore - quantity,
           unitCost: unitCost,
           totalCost: cogsAmount,
-          sourceType: 'invoice',
-          sourceId: invoice._id,
+          referenceType: 'invoice',
+          referenceDocument: invoice._id,
+          referenceModel: 'Invoice',
           referenceNumber: invoice.referenceNo,
           notes: `Direct sale - Invoice ${invoice.referenceNo}`,
           performedBy: req.user.id,
@@ -550,10 +555,16 @@ exports.createDirectSale = async (req, res, next) => {
 
   } catch (error) {
     if (error && error.code === 'INSUFFICIENT_STOCK') {
+      // The on-hand check already passed, so this is a costing gap: the product
+      // has stock but no purchase/opening-stock cost layers covering it.
+      const product = error.productName ? ` for ${error.productName}` : '';
+      const costed = error.costedQty != null && error.requested != null
+        ? ` Only ${error.costedQty} of ${error.requested} units have a recorded cost.`
+        : '';
       return res.status(409).json({
         success: false,
         code: 'ERR_INSUFFICIENT_STOCK',
-        message: 'Insufficient stock to complete POS sale'
+        message: `Cannot cost the sale${product}.${costed} Record opening stock or a purchase for it, then retry.`
       });
     }
     next(error);

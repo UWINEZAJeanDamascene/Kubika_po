@@ -28,6 +28,36 @@ const isApprover = (user) => {
   return role === 'admin' || role === 'stock_manager';
 };
 
+function getQuotationPublicMeta(quotation) {
+  const ca = quotation?.customerAction && typeof quotation.customerAction === 'object'
+    ? quotation.customerAction
+    : {};
+  const expiresRaw = quotation?.publicTokenExpiresAt || ca.publicTokenExpiresAt;
+  return {
+    publicAcceptToken: quotation?.publicAcceptToken || ca.publicAcceptToken || null,
+    publicRejectToken: quotation?.publicRejectToken || ca.publicRejectToken || null,
+    publicTokenExpiresAt: expiresRaw ? new Date(expiresRaw) : null,
+    customerAction: ca,
+  };
+}
+
+function mergeQuotationCustomerAction(existing, patch) {
+  const base = existing && typeof existing === 'object' ? { ...existing } : {};
+  return { ...base, ...patch };
+}
+
+function tokenMatchesQuotation(quotation, token, expectedAction) {
+  const meta = getQuotationPublicMeta(quotation);
+  if (expectedAction === 'accept') return meta.publicAcceptToken === token;
+  if (expectedAction === 'reject') return meta.publicRejectToken === token;
+  return false;
+}
+
+function isQuotationTokenExpired(quotation) {
+  const { publicTokenExpiresAt } = getQuotationPublicMeta(quotation);
+  return publicTokenExpiresAt ? publicTokenExpiresAt < new Date() : false;
+}
+
 const generateActionToken = (quotationId, action) => {
   const secret = process.env.JWT_SECRET || 'dev-secret-for-downloads';
   return jwt.sign({ qid: quotationId, action }, secret, { expiresIn: '7d' });
@@ -43,9 +73,8 @@ const fetchQuotationByToken = async (token, expectedAction) => {
     .populate('createdBy')
     .populate('company');
   if (!quotation) throw new Error('Quotation not found');
-  if (expectedAction === 'accept' && quotation.publicAcceptToken !== token) throw new Error('Invalid token for quotation');
-  if (expectedAction === 'reject' && quotation.publicRejectToken !== token) throw new Error('Invalid token for quotation');
-  if (quotation.publicTokenExpiresAt && quotation.publicTokenExpiresAt < new Date()) throw new Error('Token expired');
+  if (!tokenMatchesQuotation(quotation, token, expectedAction)) throw new Error('Invalid token for quotation');
+  if (isQuotationTokenExpired(quotation)) throw new Error('Token expired');
   return quotation;
 };
 
@@ -241,10 +270,10 @@ exports.publicAcceptQuotation = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Invalid or expired token' });
     }
     const quotation = await Quotation.findById(payload.qid);
-    if (!quotation || quotation.publicAcceptToken !== token) {
+    if (!quotation || !tokenMatchesQuotation(quotation, token, 'accept')) {
       return res.status(400).json({ success: false, message: 'Invalid token for quotation' });
     }
-    if (quotation.publicTokenExpiresAt && quotation.publicTokenExpiresAt < new Date()) {
+    if (isQuotationTokenExpired(quotation)) {
       return res.status(400).json({ success: false, message: 'Token expired' });
     }
     if (quotation.status !== 'sent') {
@@ -526,10 +555,10 @@ exports.publicRejectQuotation = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Invalid or expired token' });
     }
     const quotation = await Quotation.findById(payload.qid);
-    if (!quotation || quotation.publicRejectToken !== token) {
+    if (!quotation || !tokenMatchesQuotation(quotation, token, 'reject')) {
       return res.status(400).json({ success: false, message: 'Invalid token for quotation' });
     }
-    if (quotation.publicTokenExpiresAt && quotation.publicTokenExpiresAt < new Date()) {
+    if (isQuotationTokenExpired(quotation)) {
       return res.status(400).json({ success: false, message: 'Token expired' });
     }
     if (!['sent', 'pending_approval', 'draft'].includes(quotation.status)) {
@@ -537,14 +566,14 @@ exports.publicRejectQuotation = async (req, res, next) => {
     }
 
     quotation.status = 'rejected';
-    quotation.customerAction = {
+    quotation.customerAction = mergeQuotationCustomerAction(quotation.customerAction, {
       action: 'rejected',
       name: req.body.name || null,
       email: req.body.email || null,
       comment: req.body.comment || null,
       ip: req.ip,
       actedAt: new Date(),
-    };
+    });
     await quotation.save();
 
     res.json({ success: true, message: 'Quotation rejected', data: quotation });
@@ -553,91 +582,6 @@ exports.publicRejectQuotation = async (req, res, next) => {
   }
 };
 
-
-const sendQuotationEmail = async (quotation, company, action, recipientEmail) => {
-  try {
-    const config = require('../src/config/environment').getConfig();
-    if (!config.features?.emailNotifications || !config.email?.gmailUser) {
-      return;
-    }
-
-    const client = await Client.findById(quotation.client);
-    const clientEmail = recipientEmail || client?.contact?.email || client?.email;
-    if (!clientEmail) {
-      console.warn('[Quotation] No client email found');
-      return;
-    }
-
-    const qWithProducts = await Quotation.findById(quotation._id).populate('lines.product', 'name');
-
-    const actionText = { sent: 'Sent', accepted: 'Accepted', rejected: 'Rejected', expired: 'Expired' }[action] || 'Updated';
-    const subject = `Quotation ${qWithProducts.quotationNumber || qWithProducts.referenceNo} - ${actionText}`;
-
-    const lines = qWithProducts.lines || [];
-    let itemsHtml = '';
-    if (lines.length > 0) {
-      itemsHtml = lines.map(line => `
-        <tr>
-          <td style="padding:10px; border-bottom:1px solid #ddd;">${line.product?.name || line.productName || 'Item'}</td>
-          <td style="padding:10px; border-bottom:1px solid #ddd; text-align:center;">${line.quantity || 0}</td>
-          <td style="padding:10px; border-bottom:1px solid #ddd; text-align:right;">${quotation.currencyCode || 'USD'} ${(line.unitPrice || 0).toFixed(2)}</td>
-          <td style="padding:10px; border-bottom:1px solid #ddd; text-align:right;">${quotation.currencyCode || 'USD'} ${(line.lineTotal || 0).toFixed(2)}</td>
-        </tr>
-      `).join('');
-    }
-
-    const statusColor = action === 'accepted' ? '#10b981' : action === 'rejected' ? '#ef4444' : action === 'expired' ? '#f59e0b' : '#7c3aed';
-
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
-    const acceptUrl = quotation.publicAcceptToken
-      ? `${frontendUrl}/quotations/public/${quotation.publicAcceptToken}/accept`
-      : `${frontendUrl}/quotations/${quotation._id}`;
-    const rejectUrl = quotation.publicRejectToken
-      ? `${frontendUrl}/quotations/public/${quotation.publicRejectToken}/reject`
-      : `${frontendUrl}/quotations/${quotation._id}`;
-
-    const html = `
-      <div style="font-family:Arial,sans-serif; max-width:600px; margin:0 auto;">
-        <div style="background:${statusColor}; padding:30px; border-radius:10px 10px 0 0;">
-          <h1 style="color:white; margin:0; text-align:center;">📄 Quotation ${actionText}</h1>
-        </div>
-        <div style="background:#f9f9f9; padding:30px; border:1px solid #ddd; border-top:none; border-radius:0 0 10px 10px;">
-          <h2 style="color:${statusColor}; margin:0 0 5px;">${qWithProducts.quotationNumber || qWithProducts.referenceNo || ''}</h2>
-          <p style="color:#666; margin:5px 0;">Date: ${new Date(qWithProducts.quotationDate || qWithProducts.createdAt).toLocaleDateString()}</p>
-          <p style="color:#666; margin:5px 0;">Status: <strong>${actionText}</strong></p>
-          <div style="background:white; padding:15px; border-radius:8px; margin:20px 0;">
-            <strong>Customer:</strong><br/>${client?.name || 'Customer'}
-          </div>
-          <table style="width:100%; border-collapse:collapse; margin:20px 0;">
-            <thead>
-              <tr style="background:${statusColor}; color:white;">
-                <th style="padding:12px; text-align:left;">Product</th>
-                <th style="padding:12px; text-align:center;">Qty</th>
-                <th style="padding:12px; text-align:right;">Unit Price</th>
-                <th style="padding:12px; text-align:right;">Total</th>
-              </tr>
-            </thead>
-            <tbody>${itemsHtml}</tbody>
-          </table>
-          <div style="text-align:right; margin:20px 0;">
-            <p style="margin:5px 0; font-size:18px; font-weight:bold; color:${statusColor};">Total: ${quotation.currencyCode || 'USD'} ${(qWithProducts.totalAmount || qWithProducts.grandTotal || 0).toFixed(2)}</p>
-          </div>
-          ${qWithProducts.validUntil ? `<p style="color:#666;">Valid until: ${new Date(qWithProducts.validUntil).toLocaleDateString()}</p>` : ''}
-          <div style="text-align:center; margin-top:30px; display:flex; gap:12px; justify-content:center;">
-            <a href="${acceptUrl}" style="background:#10b981; color:white; padding:12px 18px; text-decoration:none; border-radius:8px; display:inline-block;">Accept</a>
-            <a href="${rejectUrl}" style="background:#ef4444; color:white; padding:12px 18px; text-decoration:none; border-radius:8px; display:inline-block;">Reject</a>
-            <a href="${frontendUrl}/quotations/${quotation._id}" style="background:${statusColor}; color:white; padding:12px 18px; text-decoration:none; border-radius:8px; display:inline-block;">View</a>
-          </div>
-          <hr style="border:none; border-top:1px solid #ddd; margin:30px 0;"/>
-          <p style="font-size:12px; color:#888; text-align:center;">KUBIKA system — Manage Your Stock From Supply to Final Sale</p>
-        </div>
-      </div>`;
-
-    await emailService.sendEmail(clientEmail, subject, html);
-  } catch (err) {
-    console.error('[Quotation] Email failed:', err.message);
-  }
-};
 
 // @desc    Validate products on quotation (check is_active)
 // @access  Private
@@ -1104,22 +1048,42 @@ exports.sendQuotation = async (req, res, next) => {
     }
 
     quotation.status = 'sent';
-    // generate public accept/reject tokens (7d expiry)
-    quotation.publicAcceptToken = generateActionToken(quotation._id.toString(), 'accept');
-    quotation.publicRejectToken = generateActionToken(quotation._id.toString(), 'reject');
-    quotation.publicTokenExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    const acceptToken = generateActionToken(quotation._id.toString(), 'accept');
+    const rejectToken = generateActionToken(quotation._id.toString(), 'reject');
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+    quotation.customerAction = mergeQuotationCustomerAction(quotation.customerAction, {
+      publicAcceptToken: acceptToken,
+      publicRejectToken: rejectToken,
+      publicTokenExpiresAt: expiresAt.toISOString(),
+    });
     await quotation.save();
 
-    // Send email notification
+    const refreshed = await Quotation.findOne({ _id: quotation._id, company: companyId })
+      .populate('client')
+      .populate('lines.product');
+
+    let emailSent = null;
     if (req.body.sendEmail) {
       const company = await Company.findById(companyId);
-      await sendQuotationEmail(quotation, company, 'sent');
+      const client = refreshed?.client
+        ? (typeof refreshed.client === 'object' ? refreshed.client : await Client.findById(refreshed.client))
+        : await Client.findById(refreshed?.client || quotation.client);
+      emailSent = await emailService.sendQuotationEmail(
+        refreshed || quotation,
+        company,
+        client,
+        'sent',
+        req.body.recipientEmail,
+      );
     }
 
     res.json({
       success: true,
-      message: 'Quotation sent successfully',
-      data: quotation
+      message: emailSent === false && req.body.sendEmail
+        ? 'Quotation sent, but the email could not be delivered. Check the client email address and mail settings.'
+        : 'Quotation sent successfully',
+      data: refreshed || quotation,
+      emailSent,
     });
   } catch (error) {
     next(error);
@@ -1192,7 +1156,8 @@ exports.acceptQuotation = async (req, res, next) => {
     // Send email notification
     if (req.body.sendEmail) {
       const company = await Company.findById(companyId);
-      await sendQuotationEmail(quotation, company, 'accepted');
+      const client = await Client.findById(quotation.client);
+      await emailService.sendQuotationEmail(quotation, company, client, 'accepted');
     }
 
     res.json({
@@ -1242,7 +1207,8 @@ exports.rejectQuotation = async (req, res, next) => {
     // Send email notification
     if (req.body.sendEmail) {
       const company = await Company.findById(companyId);
-      await sendQuotationEmail(quotation, company, 'rejected');
+      const client = await Client.findById(quotation.client);
+      await emailService.sendQuotationEmail(quotation, company, client, 'rejected');
     }
 
     res.json({

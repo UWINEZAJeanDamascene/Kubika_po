@@ -134,25 +134,43 @@ function enhanceDeliveryNotes(deliveryNotes) {
     const lines =
       note.lines && note.lines.length > 0 ? note.lines : note.items || [];
 
-    // Compute grandTotal: sum of unitCost * qtyToDeliver (or deliveredQty if qtyToDeliver not set)
+    // Sales value first (lineTotal / unitPrice), fall back to unitCost for COGS-only DNs
     let grandTotal = 0;
     if (Array.isArray(lines)) {
       for (const line of lines) {
-        const qty =
-          line.qtyToDeliver !== undefined
+        const qty = Number(
+          line.qtyToDeliver !== undefined && line.qtyToDeliver !== null
             ? line.qtyToDeliver
-            : line.deliveredQty || 0;
-        const unitCost = line.unitCost || 0;
-        const qtyNum = Number(qty) || 0;
-        const unitCostNum = Number(unitCost) || 0;
-        grandTotal += qtyNum * unitCostNum;
+            : (line.quantity ?? line.deliveredQty ?? 0),
+        ) || 0;
+        const lineTotal = Number(line.lineTotal);
+        const unitPrice = Number(line.unitPrice) || 0;
+        const unitCost = Number(line.unitCost) || 0;
+        if (Number.isFinite(lineTotal) && lineTotal > 0) {
+          grandTotal += lineTotal;
+        } else if (unitPrice > 0) {
+          grandTotal += qty * unitPrice;
+        } else {
+          grandTotal += qty * unitCost;
+        }
+
+        // Frontend detail table reads description / quantity
+        if (!line.description) {
+          line.description = line.productName
+            || (line.product && typeof line.product === 'object' ? line.product.name : '')
+            || '';
+        }
+        if (line.quantity === undefined || line.quantity === null) {
+          line.quantity = qty;
+        }
+        if (!line.unit && line.product && typeof line.product === 'object') {
+          line.unit = line.product.unit || 'pcs';
+        }
       }
     }
-    // Round to 2 decimal places
     grandTotal = Math.round(grandTotal * 100) / 100;
-    note.grandTotal = grandTotal;
-
-    // Items count
+    note.grandTotal = note.grandTotal || grandTotal;
+    note.totalAmount = note.totalAmount || note.grandTotal;
     note.itemsCount = Array.isArray(lines) ? lines.length : 0;
 
     // Ensure legacy `items` shape is available for frontend (backwards compatibility)
@@ -165,8 +183,7 @@ function enhanceDeliveryNotes(deliveryNotes) {
         note.items = lines.map((l) => ({
           _id: l._id,
           product: l.product || null,
-          description: l.productName || l.description || "",
-          // Prefer qtyToDeliver, then orderedQty, then quantity, then deliveredQty
+          description: l.description || l.productName || "",
           quantity:
             l.qtyToDeliver !== undefined && l.qtyToDeliver !== null
               ? Number(l.qtyToDeliver)
@@ -178,6 +195,8 @@ function enhanceDeliveryNotes(deliveryNotes) {
                     ? Number(l.deliveredQty)
                     : 0,
           unit: l.unit || (l.product && l.product.unit) || "pcs",
+          unitPrice: Number(l.unitPrice) || 0,
+          lineTotal: Number(l.lineTotal) || 0,
         }));
       } catch (e) {
         // Non-fatal - leave items as-is if mapping fails
@@ -185,13 +204,13 @@ function enhanceDeliveryNotes(deliveryNotes) {
     }
 
     // Tracking number alias (trackingNo -> trackingNumber)
-    note.trackingNumber = note.trackingNo;
+    note.trackingNumber = note.trackingNumber || note.trackingNo || null;
 
-    // Currency code: Prefer invoice.currencyCode, else default to 'USD'
+    // Currency: invoice override, else company default RWF (not USD)
     if (note.invoice && note.invoice.currencyCode) {
       note.currencyCode = note.invoice.currencyCode;
-    } else {
-      note.currencyCode = "USD";
+    } else if (!note.currencyCode) {
+      note.currencyCode = "RWF";
     }
   }
 
@@ -408,13 +427,15 @@ exports.createDeliveryNote = async (req, res, next) => {
         deliveryLines.push({
           invoiceLineId: line.invoiceLineId,
           product: invoiceLine.product,
-          productName: invoiceLine.description,
-          productCode: invoiceLine.itemCode,
+          productName: invoiceLine.description || invoiceLine.productName,
+          productCode: invoiceLine.itemCode || invoiceLine.productCode,
           unit: invoiceLine.unit,
           orderedQty: invoiceQty, // Original ordered qty
           qtyToDeliver: qtyToDeliver,
           deliveredQty: 0,
           pendingQty: qtyToDeliver,
+          unitPrice: toNumber(invoiceLine.unitPrice),
+          lineTotal: qtyToDeliver * toNumber(invoiceLine.unitPrice),
           unitCost:
             invoiceQty > 0
               ? (invoiceLine.cogsAmount && invoiceLine.cogsAmount.toString
@@ -437,13 +458,15 @@ exports.createDeliveryNote = async (req, res, next) => {
           deliveryLines.push({
             invoiceLineId: invoiceLine._id,
             product: invoiceLine.product,
-            productName: invoiceLine.description,
-            productCode: invoiceLine.itemCode,
+            productName: invoiceLine.description || invoiceLine.productName,
+            productCode: invoiceLine.itemCode || invoiceLine.productCode,
             unit: invoiceLine.unit,
             orderedQty: invoiceQty,
             qtyToDeliver: remainingQty,
             deliveredQty: 0,
             pendingQty: remainingQty,
+            unitPrice: toNumber(invoiceLine.unitPrice),
+            lineTotal: remainingQty * toNumber(invoiceLine.unitPrice),
             unitCost:
               invoiceQty > 0
                 ? (invoiceLine.cogsAmount && invoiceLine.cogsAmount.toString
@@ -710,25 +733,30 @@ exports.confirmDelivery = async (req, res, next) => {
 
       const trackingType = product.trackingType || "none";
 
-      // If product is stockable, ensure estimated unit cost from invoice exists and is > 0
+      // If product is stockable, ensure we can resolve a COGS unit cost (> 0)
       const isStockable = product.isStockable !== false;
       if (isStockable) {
-        const invoiceLine = invoice.lines.id(line.invoiceLineId);
-        const estimatedUnitCost =
-          invoiceLine &&
-          invoiceLine.unitCost !== undefined &&
-          invoiceLine.unitCost !== null
-            ? invoiceLine.unitCost.toString
-              ? Number(invoiceLine.unitCost.toString())
-              : Number(invoiceLine.unitCost)
-            : invoiceLine && invoiceLine.cogsAmount
-              ? (invoiceLine.cogsAmount.toString
-                  ? Number(invoiceLine.cogsAmount.toString())
-                  : Number(invoiceLine.cogsAmount)) /
-                Number(invoiceLine.quantity || 1)
+        const invoiceLineForCost = invoice.lines.id(line.invoiceLineId);
+        let estimatedUnitCost =
+          invoiceLineForCost &&
+          invoiceLineForCost.unitCost !== undefined &&
+          invoiceLineForCost.unitCost !== null
+            ? invoiceLineForCost.unitCost.toString
+              ? Number(invoiceLineForCost.unitCost.toString())
+              : Number(invoiceLineForCost.unitCost)
+            : invoiceLineForCost && invoiceLineForCost.cogsAmount
+              ? (invoiceLineForCost.cogsAmount.toString
+                  ? Number(invoiceLineForCost.cogsAmount.toString())
+                  : Number(invoiceLineForCost.cogsAmount)) /
+                Number(invoiceLineForCost.quantity || 1)
               : 0;
 
-        if (estimatedUnitCost === 0) {
+        if (!estimatedUnitCost) {
+          const { resolveCogsUnitCost } = require("../utils/productCost");
+          estimatedUnitCost = await resolveCogsUnitCost(product, companyId);
+        }
+
+        if (!estimatedUnitCost) {
           return res.status(500).json({
             success: false,
             code: ERR_COST_LOOKUP_FAILED,
@@ -1592,9 +1620,24 @@ exports.createInvoiceFromDeliveryNote = async (req, res, next) => {
     }
 
     if (deliveryNote.invoice) {
-      return res.status(400).json({
-        success: false,
-        message: "Invoice has already been created from this delivery note",
+      const existingId = deliveryNote.invoice._id || deliveryNote.invoice;
+      const existingInvoice = await Invoice.findOne({
+        _id: existingId,
+        company: companyId,
+      })
+        .populate("client createdBy lines.product");
+
+      if (confirmDelivery && deliveryNote.status === "draft") {
+        deliveryNote.status = "confirmed";
+        deliveryNote.confirmedBy = req.user.id;
+        deliveryNote.confirmedDate = new Date();
+        await deliveryNote.save();
+      }
+
+      return res.status(200).json({
+        success: true,
+        message: "Invoice already exists for this delivery note",
+        data: existingInvoice,
       });
     }
 
@@ -1633,6 +1676,7 @@ exports.createInvoiceFromDeliveryNote = async (req, res, next) => {
           taxCode,
           taxRate,
           taxAmount,
+          lineTax: taxAmount,
           lineSubtotal: subtotal,
           lineTotal: totalWithTax,
           warehouse: deliveryNote.warehouse,
@@ -1647,6 +1691,25 @@ exports.createInvoiceFromDeliveryNote = async (req, res, next) => {
       });
     }
 
+    const headerSubtotal = processedLines.reduce((s, l) => s + Number(l.lineSubtotal || 0), 0);
+    const headerTax = processedLines.reduce((s, l) => s + Number(l.lineTax || 0), 0);
+    const headerTotal = processedLines.reduce((s, l) => s + Number(l.lineTotal || 0), 0);
+
+    // Prefer company base currency, then DN currency, then RWF
+    let currencyCode = deliveryNote.currencyCode || "RWF";
+    try {
+      const Company = require("../models/Company");
+      const company = await Company.findById(companyId).select("baseCurrency currencyCode currency");
+      currencyCode =
+        company?.baseCurrency ||
+        company?.currencyCode ||
+        company?.currency ||
+        deliveryNote.currencyCode ||
+        "RWF";
+    } catch (_) {
+      /* keep fallback */
+    }
+
     // Create invoice with links to Sales Order and Delivery Note
     const invoice = await Invoice.create({
       company: companyId,
@@ -1655,6 +1718,13 @@ exports.createInvoiceFromDeliveryNote = async (req, res, next) => {
       deliveryNote: deliveryNote._id,
       quotation: deliveryNote.quotation,
       lines: processedLines,
+      currencyCode,
+      currency: currencyCode,
+      subtotal: headerSubtotal,
+      taxAmount: headerTax,
+      totalAmount: headerTotal,
+      grandTotal: headerTotal,
+      amountOutstanding: headerTotal,
       terms: terms || "",
       notes: notes || deliveryNote.notes,
       createdBy: req.user.id,

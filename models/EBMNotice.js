@@ -1,49 +1,27 @@
-const mongoose = require('mongoose');
+/**
+ * EBMNotice — PostgreSQL (Prisma) backed.
+ */
 
-const ebmNoticeSchema = new mongoose.Schema({
-  company: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Company',
-    required: true,
-    index: true,
-  },
-  noticeNumber: {
-    type: String,
-    required: true,
-    trim: true,
-  },
-  title: {
-    type: String,
-    trim: true,
-    default: null,
-  },
-  content: {
-    type: String,
-    trim: true,
-    default: null,
-  },
-  noticeDate: {
-    type: String,
-    trim: true,
-    default: null,
-  },
-  active: {
-    type: Boolean,
-    default: true,
-    index: true,
-  },
-  source: {
-    type: mongoose.Schema.Types.Mixed,
-    default: {},
-  },
-  lastSyncedAt: {
-    type: Date,
-    required: true,
-    default: Date.now,
-  },
-}, { timestamps: true });
+const { buildTenantModel } = require('../utils/masterDataCommon');
+const {
+  ebmNoticeToApi,
+  ebmNoticeTranslateCreate,
+  ebmNoticeTranslateUpdate,
+} = require('../utils/phase10Mappers');
 
-ebmNoticeSchema.index({ company: 1, noticeNumber: 1 }, { unique: true });
-ebmNoticeSchema.index({ company: 1, noticeDate: -1 });
+const FIELD_MAP = {
+  noticeNumber: { target: 'noticeNumber' },
+  active: { target: 'active' },
+  noticeDate: { target: 'noticeDate' },
+};
 
-module.exports = mongoose.model('EBMNotice', ebmNoticeSchema);
+module.exports = buildTenantModel({
+  name: 'EBMNotice',
+  collection: 'ebmnotices',
+  delegateName: 'ebmNotice',
+  fieldMap: FIELD_MAP,
+  toApi: ebmNoticeToApi,
+  translateCreate: ebmNoticeTranslateCreate,
+  translateUpdate: ebmNoticeTranslateUpdate,
+  mutable: true,
+});

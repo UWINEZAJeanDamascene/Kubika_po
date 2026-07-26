@@ -1,13 +1,34 @@
-const mongoose = require('mongoose');
+/**
+ * Period (legacy) — PostgreSQL (Prisma) backed.
+ */
 
-const periodSchema = new mongoose.Schema({
-  company: { type: mongoose.Schema.Types.ObjectId, ref: 'Company', required: true },
-  name: { type: String, trim: true },
-  startDate: { type: Date, required: true },
-  endDate: { type: Date, required: true },
-  status: { type: String, enum: ['open', 'closed'], default: 'open' }
-}, { timestamps: true });
+const { buildTenantModel } = require('../utils/masterDataCommon');
+const {
+  periodToApi,
+  periodTranslateCreate,
+  periodTranslateUpdate,
+} = require('../utils/inventoryJournalMappers');
 
-periodSchema.index({ company: 1, startDate: 1, endDate: 1 });
+const FIELD_MAP = {
+  _id: { target: 'id', isId: true },
+  id: { target: 'id', isId: true },
+  company: { target: 'companyId', isId: true },
+  companyId: { target: 'companyId', isId: true },
+  name: { target: 'name' },
+  startDate: { target: 'startDate' },
+  endDate: { target: 'endDate' },
+  status: { target: 'status' },
+  createdAt: { target: 'createdAt' },
+  updatedAt: { target: 'updatedAt' },
+};
 
-module.exports = mongoose.model('Period', periodSchema);
+module.exports = buildTenantModel({
+  name: 'Period',
+  collection: 'periods',
+  delegateName: 'period',
+  fieldMap: FIELD_MAP,
+  toApi: periodToApi,
+  translateCreate: periodTranslateCreate,
+  translateUpdate: periodTranslateUpdate,
+  mutable: true,
+});

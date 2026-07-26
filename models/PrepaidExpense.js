@@ -1,120 +1,41 @@
-const mongoose = require('mongoose');
+/**
+ * PrepaidExpense model — PostgreSQL (Prisma) backed.
+ *
+ * Mutable so prepaidExpenseService can keep using `prepaid.save()` while it
+ * walks the amortization schedule.
+ */
 
-const amortizationSchema = new mongoose.Schema({
-  amount: { type: Number, required: true, min: 0.01 },
-  date: { type: Date, required: true },
-  description: { type: String, trim: true, default: '' },
-  journalEntryId: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'JournalEntry',
-    default: null
-  },
-  status: {
-    type: String,
-    enum: ['pending', 'posted', 'reversed'],
-    default: 'pending'
-  },
-  createdAt: { type: Date, default: Date.now }
-}, { _id: true });
+const { buildTenantModel } = require('../utils/masterDataCommon');
+const {
+  prepaidExpenseToApi,
+  prepaidExpenseTranslateCreate,
+  prepaidExpenseTranslateUpdate,
+} = require('../utils/deferralMappers');
 
-const prepaidExpenseSchema = new mongoose.Schema({
-  company: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Company',
-    required: true,
-    index: true
-  },
-  referenceNo: {
-    type: String,
-    required: true,
-    trim: true
-  },
-  vendor: {
-    type: String,
-    trim: true,
-    default: ''
-  },
-  description: {
-    type: String,
-    required: true,
-    trim: true
-  },
-  totalAmount: {
-    type: Number,
-    required: true,
-    min: 0.01
-  },
-  expenseAccountCode: {
-    type: String,
-    required: true,
-    trim: true
-  },
-  paymentMethod: {
-    type: String,
-    enum: ['cash', 'bank_transfer', 'mobile_money', 'cheque', 'petty_cash'],
-    required: true,
-    default: 'cash'
-  },
-  bankAccountId: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'BankAccount',
-    default: null
-  },
-  startDate: {
-    type: Date,
-    required: true
-  },
-  endDate: {
-    type: Date,
-    required: true
-  },
-  frequency: {
-    type: String,
-    enum: ['monthly', 'quarterly', 'annually'],
-    required: true,
-    default: 'monthly'
-  },
-  status: {
-    type: String,
-    enum: ['active', 'fully_amortized', 'cancelled'],
-    default: 'active'
-  },
-  journalEntryId: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'JournalEntry',
-    default: null
-  },
-  amortizations: [amortizationSchema],
-  remainingBalance: {
-    type: Number,
-    default: 0
-  },
-  totalAmortized: {
-    type: Number,
-    default: 0
-  },
-  notes: {
-    type: String,
-    trim: true,
-    default: ''
-  },
-  createdBy: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User'
-  },
-  createdAt: {
-    type: Date,
-    default: Date.now
-  },
-  updatedAt: {
-    type: Date,
-    default: Date.now
-  }
-}, {
-  timestamps: true
+const FIELD_MAP = {
+  referenceNo: { target: 'referenceNo' },
+  vendor: { target: 'vendor' },
+  description: { target: 'description' },
+  status: { target: 'status' },
+  frequency: { target: 'frequency' },
+  paymentMethod: { target: 'paymentMethod' },
+  expenseAccountCode: { target: 'expenseAccountCode' },
+  bankAccountId: { target: 'bankAccountId', isId: true },
+  journalEntryId: { target: 'journalEntryId', isId: true },
+  startDate: { target: 'startDate' },
+  endDate: { target: 'endDate' },
+  totalAmount: { target: 'totalAmount' },
+  remainingBalance: { target: 'remainingBalance' },
+  totalAmortized: { target: 'totalAmortized' },
+};
+
+module.exports = buildTenantModel({
+  name: 'PrepaidExpense',
+  collection: 'prepaidexpenses',
+  delegateName: 'prepaidExpense',
+  fieldMap: FIELD_MAP,
+  toApi: prepaidExpenseToApi,
+  translateCreate: prepaidExpenseTranslateCreate,
+  translateUpdate: prepaidExpenseTranslateUpdate,
+  mutable: true,
 });
-
-// Compound index for unique reference per company
-prepaidExpenseSchema.index({ company: 1, referenceNo: 1 }, { unique: true });
-
-module.exports = mongoose.model('PrepaidExpense', prepaidExpenseSchema);
