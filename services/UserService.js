@@ -220,7 +220,7 @@ class UserService {
       );
     } catch (e) {
       console.error('Session creation on login failed (tokens still issued):', e);
-    });
+    }
 
     const loginUser = userToApi({ ...user, lastLogin });
     loginUser.permissions = await permissionsForLoginUser(user);
