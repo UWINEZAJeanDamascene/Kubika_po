@@ -208,57 +208,43 @@ exports.getPayrollRecords = async (req, res, next) => {
     const companyId = req.user.company._id;
     const { month, year, status, search } = req.query;
 
-    const query = { company: companyId };
+    const mongoQuery = { company: companyId };
 
     if (month && year) {
-      query["period.month"] = parseInt(month);
-      query["period.year"] = parseInt(year);
+      const payPeriodStart = new Date(parseInt(year), parseInt(month) - 1, 1);
+      const payPeriodEnd = new Date(parseInt(year), parseInt(month), 0);
+      mongoQuery.pay_period_start = { gte: payPeriodStart, lte: payPeriodEnd };
     } else if (year) {
-      query["period.year"] = parseInt(year);
+      const payPeriodStart = new Date(parseInt(year), 0, 1);
+      const payPeriodEnd = new Date(parseInt(year), 11, 31);
+      mongoQuery.pay_period_start = { gte: payPeriodStart, lte: payPeriodEnd };
     }
 
-    if (status) query["record_status"] = status;
-
-    if (search) {
-      query.$or = [
-        { "employee.firstName": { $regex: search, $options: "i" } },
-        { "employee.lastName": { $regex: search, $options: "i" } },
-        { "employee.employeeId": { $regex: search, $options: "i" } },
-      ];
-    }
+    if (status) mongoQuery.record_status = status;
 
     const { page, limit, skip } = parsePagination(req.query);
-    const [total, summaryAgg, payrollRecords] = await Promise.all([
-      Payroll.countDocuments(query),
-      Payroll.aggregate([
-        { $match: query },
-        {
-          $group: {
-            _id: null,
-            totalGrossSalary: { $sum: { $ifNull: ["$salary.grossSalary", 0] } },
-            totalNetPay: { $sum: { $ifNull: ["$netPay", 0] } },
-            totalPAYE: { $sum: { $ifNull: ["$deductions.paye", 0] } },
-            totalRSSB: {
-              $sum: {
-                $add: [
-                  { $ifNull: ["$deductions.rssbEmployeePension", 0] },
-                  { $ifNull: ["$deductions.rssbEmployeeMaternity", 0] },
-                ],
-              },
-            },
-            employeeCount: { $sum: 1 },
-          },
-        },
-      ]),
-      Payroll.find(query)
+
+    const [total, payrollRecords] = await Promise.all([
+      Payroll.countDocuments(mongoQuery),
+      Payroll.find(mongoQuery)
         .populate("createdBy", "name email")
         .populate("approvedBy", "name email")
-        .sort({ "period.year": -1, "period.month": -1, "employee.lastName": 1 })
+        .sort({ payPeriodStart: -1, createdAt: -1 })
         .skip(skip)
         .limit(limit),
     ]);
 
-    const s = summaryAgg[0] || {};
+    let totalGrossSalary = 0;
+    let totalNetPay = 0;
+    let totalPAYE = 0;
+    let totalRSSB = 0;
+
+    for (const p of payrollRecords) {
+      totalGrossSalary += p.salary?.grossSalary || 0;
+      totalNetPay += p.netPay || 0;
+      totalPAYE += p.deductions?.paye || 0;
+      totalRSSB += (p.deductions?.rssbEmployeePension || 0) + (p.deductions?.rssbEmployeeMaternity || 0);
+    }
 
     res.json({
       success: true,
@@ -266,11 +252,11 @@ exports.getPayrollRecords = async (req, res, next) => {
       data: payrollRecords,
       pagination: paginationMeta(page, limit, total),
       summary: {
-        totalGrossSalary: Math.round((s.totalGrossSalary || 0) * 100) / 100,
-        totalNetPay: Math.round((s.totalNetPay || 0) * 100) / 100,
-        totalPAYE: Math.round((s.totalPAYE || 0) * 100) / 100,
-        totalRSSB: Math.round((s.totalRSSB || 0) * 100) / 100,
-        employeeCount: s.employeeCount || 0,
+        totalGrossSalary: Math.round(totalGrossSalary * 100) / 100,
+        totalNetPay: Math.round(totalNetPay * 100) / 100,
+        totalPAYE: Math.round(totalPAYE * 100) / 100,
+        totalRSSB: Math.round(totalRSSB * 100) / 100,
+        employeeCount: payrollRecords.length,
       },
     });
   } catch (error) {
@@ -345,7 +331,7 @@ exports.createPayroll = async (req, res, next) => {
       }
 
       // Get effective salary for the period
-      let effectiveSalary = await SalaryHistory.getEffectiveSalary(emp._id, payPeriodStart);
+      let effectiveSalary = await SalaryHistory.getEffectiveSalary(emp._id, payPeriodStart, companyId);
 
       // Fallback: if no salary history but manual salary data provided, use it directly
       if (!effectiveSalary && salary && typeof salary.basicSalary === "number") {
@@ -850,12 +836,21 @@ exports.getPayrollSummary = async (req, res, next) => {
     const { year } = req.query;
 
     const query = { company: companyId };
-    if (year) query["period.year"] = parseInt(year);
+    let payPeriodStartFilter = null;
+    if (year) {
+      payPeriodStartFilter = {
+        gte: new Date(parseInt(year), 0, 1),
+        lte: new Date(parseInt(year), 11, 31),
+      };
+    }
 
     // Get all payroll for the year
-    const payrollRecords = await Payroll.find(query).sort({
-      "period.year": -1,
-      "period.month": -1,
+    const payrollRecords = await Payroll.find({
+      ...query,
+      ...(payPeriodStartFilter ? { pay_period_start: payPeriodStartFilter } : {}),
+    }).sort({
+      payPeriodStart: -1,
+      createdAt: -1,
     });
 
     // Group by month
@@ -1130,7 +1125,7 @@ exports.generatePayroll = async (req, res, next) => {
         }
 
         // Get effective salary for the period
-        const effectiveSalary = await SalaryHistory.getEffectiveSalary(emp._id, payPeriodStart);
+        const effectiveSalary = await SalaryHistory.getEffectiveSalary(emp._id, payPeriodStart, companyId);
         if (!effectiveSalary) {
           errors.push({
             employeeId: emp.employeeId,

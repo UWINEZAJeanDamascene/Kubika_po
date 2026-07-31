@@ -95,9 +95,9 @@ router.get('/period-comparison',
 router.post('/cache/clear',
   attachCompanyId,
   authorize('settings', 'update'),
-  (req, res) => {
+  async (req, res) => {
     try {
-      dashboardCache.invalidate(req.companyId)
+      await dashboardCache.invalidate(req.companyId)
       res.json({ success: true, message: 'Dashboard cache cleared' })
     } catch (err) {
       res.status(500).json({ error: err.message })

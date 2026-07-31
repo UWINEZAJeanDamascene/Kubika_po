@@ -78,9 +78,9 @@ exports.getTimesheets = async (req, res, next) => {
     if (status) filter.status = status;
     if (period) {
       const [y, m] = period.split('-').map(Number);
-      if (y && m) { filter['period.year'] = y; filter['period.month'] = m; }
+      if (y && m) { filter.periodMonth = m; filter.periodYear = y; }
     }
-    const ts = await Timesheet.find(filter).sort({ 'period.year': -1, 'period.month': -1 }).populate('employee', 'firstName lastName employeeId laborType');
+    const ts = await Timesheet.find(filter).sort({ periodYear: -1, periodMonth: -1 }).populate('employee', 'firstName lastName employeeId laborType');
     res.json({ success: true, count: ts.length, data: ts });
   } catch (e) { next(e); }
 };

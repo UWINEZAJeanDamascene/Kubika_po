@@ -115,45 +115,53 @@ exports.createDirectSale = async (req, res, next) => {
       });
     }
 
-    // Build invoice lines with product validation and stock checking
+     // Batch-load all products in a single query with select projection
+    const productIds = items.map((it) => it.productId);
+    const productsMap = new Map();
+    try {
+      const productsBatch = await Product.find({
+        _id: { $in: productIds },
+        company: companyId,
+      })
+        .select('name sku sellingPrice unit taxRate taxCode currentStock isStockable averageCost trackingType')
+        .lean();
+      productsBatch.forEach((p) => productsMap.set(p._id.toString(), p));
+    } catch (batchErr) {
+      console.warn('[createDirectSale] Batch product load failed:', batchErr.message);
+    }
+
+    // Validate all items and build invoice lines
     const invoiceLines = [];
-    const stockUpdates = []; // Track stock updates for transaction
-    
+    const stockUpdates = [];
+    const missingProducts = [];
+
     for (const item of items) {
-      const product = await Product.findOne({ 
-        _id: item.productId, 
-        company: companyId 
-      });
-      
+      const product = productsMap.get(item.productId);
       if (!product) {
-        return res.status(400).json({
-          success: false,
-          message: `Product not found: ${item.productId}`
-        });
+        missingProducts.push(item.productId);
+        continue;
       }
 
       const quantity = Number(item.quantity) || 1;
       const unitPrice = Number(item.unitPrice) || product.sellingPrice || 0;
       const discountPct = Number(item.discountPct) || 0;
-      
-      // Check stock availability for stockable products
+
       const isStockable = product.isStockable !== false;
       if (isStockable) {
-        const availableStock = product.currentStock || 0;
+        const availableStock = Number(product.currentStock) || 0;
         if (availableStock < quantity) {
           return res.status(409).json({
             success: false,
             code: 'ERR_INSUFFICIENT_STOCK',
-            message: `Insufficient stock for ${product.name}. Available: ${availableStock}, Required: ${quantity}`
+            message: `Insufficient stock for ${product.name}. Available: ${availableStock}, Required: ${quantity}`,
           });
         }
       }
 
-      // Calculate line totals
       const subtotal = quantity * unitPrice;
       const discountAmount = subtotal * (discountPct / 100);
       const netAmount = subtotal - discountAmount;
-      const taxRate = Number(item.taxRate) || product.taxRate || 0;
+      const taxRate = Number(item.taxRate) || Number(product.taxRate) || 0;
       const taxCode = item.taxCode || product.taxCode || (taxRate > 0 ? 'B' : 'A');
       const taxAmount = netAmount * (taxRate / 100);
       const lineTotal = netAmount + taxAmount;
@@ -172,21 +180,27 @@ exports.createDirectSale = async (req, res, next) => {
         taxAmount: taxAmount,
         lineSubtotal: subtotal,
         lineTotal: lineTotal,
-        warehouse: warehouseId
+        warehouse: warehouseId,
       });
 
-      // Track stock update
       if (isStockable) {
         stockUpdates.push({
-          product: product,
-          quantity: quantity,
-          warehouse: warehouseId,
+          product,
+          quantity,
+          warehouseId,
           lineData: {
             productName: product.name,
-            unitCost: product.averageCost || 0
-          }
+            unitCost: Number(product.averageCost) || 0,
+          },
         });
       }
+    }
+
+    if (missingProducts.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: `Products not found: ${missingProducts.join(', ')}`,
+      });
     }
 
     // Calculate totals
@@ -246,29 +260,24 @@ exports.createDirectSale = async (req, res, next) => {
       invoice = invoice[0];
 
       // 2. Deduct stock using proper inventory service (WAC/FIFO)
-      console.log('[createDirectSale] Processing stock updates:', stockUpdates.length);
+      const stockMovementCreates = [];
+      const productUpdates = [];
+
       for (const stockUpdate of stockUpdates) {
-        const { product, quantity, warehouse, lineData } = stockUpdate;
-        
+        const { product, quantity, warehouse } = stockUpdate;
         const trackingType = product.trackingType || 'none';
         let unitCost = 0;
         let cogsAmount = 0;
-        
-        console.log(`[createDirectSale] Processing product ${product.name}, trackingType: ${trackingType}, qty: ${quantity}`);
 
-        // For 'none' or 'batch' tracking, use FIFO consumption from layers + decrement currentStock
-        // For 'serial', we need special handling (not fully implemented here)
         if (trackingType === 'none' || trackingType === 'batch') {
           try {
             const consumeResult = await inventoryService.consume(
               companyId,
               product._id,
               quantity,
-              { method: 'fifo', warehouse: warehouse, session }
+              { method: 'fifo', warehouse, session }
             );
-            console.log(`[createDirectSale] consumeResult:`, consumeResult);
-            
-            // Calculate weighted average cost from allocations
+
             if (consumeResult.allocations && consumeResult.allocations.length > 0) {
               const totalQty = consumeResult.allocations.reduce((sum, a) => sum + a.qty, 0);
               const totalCost = consumeResult.allocations.reduce((sum, a) => sum + (a.amount || a.qty * a.unitCost), 0);
@@ -278,56 +287,38 @@ exports.createDirectSale = async (req, res, next) => {
             }
             cogsAmount = consumeResult.totalCost || (unitCost * quantity);
           } catch (consumeErr) {
-            console.error(`[createDirectSale] inventoryService.consume failed:`, consumeErr);
             if (consumeErr && consumeErr.code === 'INSUFFICIENT_STOCK') {
               consumeErr.productName = product.name;
               throw consumeErr;
             }
-            // Fallback to average cost for other errors
             unitCost = product.averageCost || 0;
             cogsAmount = unitCost * quantity;
           }
-          
-          // IMPORTANT: Always decrement Product.currentStock
-          console.log(`[createDirectSale] Decrementing currentStock for ${product.name} by ${quantity}`);
-          const updateResult = await Product.findByIdAndUpdate(
-            product._id,
-            { 
-              $inc: { currentStock: -quantity },
-              lastSaleDate: new Date()
-            },
-            { session }
-          );
-          console.log(`[createDirectSale] Product update result:`, updateResult ? 'success' : 'failed');
         } else if (trackingType === 'serial') {
-          // For serial tracking, use average cost and decrement stock
           unitCost = product.averageCost ? Number(product.averageCost.toString()) : 0;
           cogsAmount = unitCost * quantity;
-          
-          await Product.findByIdAndUpdate(
-            product._id,
-            { 
-              $inc: { currentStock: -quantity },
-              lastSaleDate: new Date()
-            },
-            { session }
-          );
         }
 
         totalCOGS += cogsAmount;
 
-        // Create stock movement record
-        const stockBefore = Number(product.currentStock || 0);
-        await StockMovement.create([{
+        const stockBefore = Number(product.currentStock) || 0;
+        productUpdates.push({
+          updateOne: {
+            filter: { _id: product._id, company: companyId },
+            update: { $inc: { currentStock: -quantity }, lastSaleDate: new Date() },
+          },
+        });
+
+        stockMovementCreates.push({
           company: companyId,
           product: product._id,
-          warehouse: warehouse,
+          warehouse,
           type: 'out',
           reason: 'sale',
-          quantity: quantity,
+          quantity,
           previousStock: stockBefore,
           newStock: stockBefore - quantity,
-          unitCost: unitCost,
+          unitCost,
           totalCost: cogsAmount,
           referenceType: 'invoice',
           referenceDocument: invoice._id,
@@ -335,8 +326,16 @@ exports.createDirectSale = async (req, res, next) => {
           referenceNumber: invoice.referenceNo,
           notes: `Direct sale - Invoice ${invoice.referenceNo}`,
           performedBy: req.user.id,
-          movementDate: new Date()
-        }], { session });
+          movementDate: new Date(),
+        });
+      }
+
+      // Batch update products and stock movements
+      if (productUpdates.length > 0) {
+        await Product.bulkWrite(productUpdates, { session });
+      }
+      if (stockMovementCreates.length > 0) {
+        await StockMovement.insertMany(stockMovementCreates, { session });
       }
 
       // 3. Post Journal Entries
@@ -370,26 +369,24 @@ exports.createDirectSale = async (req, res, next) => {
         let debitAccount;
         const bankPaymentMethods = ['bank_transfer', 'cheque', 'mobile_money'];
         
-        console.log('[createDirectSale] paymentMethod:', paymentMethod, 'bankAccountId:', bankAccountId, 'amountPaid:', amountPaid, 'grandTotal:', grandTotal);
-        
-        if (amountPaid >= grandTotal) {
-          if (bankPaymentMethods.includes(paymentMethod) && bankAccountId) {
-            // Use bank account for bank payments
-            const bankAccount = await BankAccount.findOne({
-              _id: bankAccountId,
-              company: companyId,
-              isActive: true,
-            });
-            console.log('[createDirectSale] Found bank account:', bankAccount ? bankAccount.name : 'NOT FOUND', 'ledgerAccountId:', bankAccount?.ledgerAccountId);
-            if (bankAccount && bankAccount.ledgerAccountId) {
-              debitAccount = bankAccount.ledgerAccountId;
-            } else {
-              debitAccount = await JournalService.getMappedAccountCode(
-                companyId, 'cash', 'cashAtBank', 
-                DEFAULT_ACCOUNTS.cashAtBank || '1100'
-              );
-            }
-          } else if (paymentMethod === 'cash' || paymentMethod === 'card') {
+         if (amountPaid >= grandTotal) {
+           if (bankPaymentMethods.includes(paymentMethod) && bankAccountId) {
+             const bankAccount = await BankAccount.findOne({
+               _id: bankAccountId,
+               company: companyId,
+               isActive: true,
+             })
+               .select('_id ledgerAccountId name')
+               .lean();
+             if (bankAccount && bankAccount.ledgerAccountId) {
+               debitAccount = bankAccount.ledgerAccountId;
+             } else {
+               debitAccount = await JournalService.getMappedAccountCode(
+                 companyId, 'cash', 'cashAtBank',
+                 DEFAULT_ACCOUNTS.cashAtBank || '1100'
+               );
+             }
+           } else if (paymentMethod === 'cash' || paymentMethod === 'card') {
             debitAccount = await JournalService.getMappedAccountCode(
               companyId, 'cash', 'cashOnHand',
               DEFAULT_ACCOUNTS.cashOnHand || '1000'

@@ -25,7 +25,7 @@ if (!config.jwt.secret) {
   throw new Error('FATAL: JWT_SECRET environment variable is required. Please set it in your .env file.');
 }
 const MAX_LOGIN_ATTEMPTS = 5;
-const LOCK_DURATION_MINUTES = 30;
+const LOCK_DURATION_MINUTES = 0; // DISABLED: was 30 — re-enable by setting back to 30
 const MIN_PASSWORD_LENGTH = 8;
 
 const USER_ERRORS = {
@@ -210,15 +210,15 @@ class UserService {
       });
 
     const companyIdStr = user.companyId ? String(user.companyId) : null;
-    // Redis session persistence is useful for revocation, but it must not hold
-    // the authentication response hostage when the cache is slow or unavailable.
-    void SessionService.createSession(
-      user.id,
-      companyIdStr,
-      user.role,
-      accessToken,
-      { email: user.email, name: user.name }
-    ).catch((e) => {
+    try {
+      await SessionService.createSession(
+        user.id,
+        companyIdStr,
+        user.role,
+        accessToken,
+        { email: user.email, name: user.name }
+      );
+    } catch (e) {
       console.error('Session creation on login failed (tokens still issued):', e);
     });
 
@@ -229,7 +229,6 @@ class UserService {
       access_token: accessToken,
       refresh_token: refreshToken,
       userId: user.id,
-      user: loginUser,
       memberships: [{
         companyId: companyIdStr || undefined,
         role: user.role,

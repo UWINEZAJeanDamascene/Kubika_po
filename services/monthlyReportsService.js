@@ -1432,13 +1432,14 @@ class MonthlyReportsService {
    * 11. Monthly Payroll Summary
    * Employee-level detail: gross pay, PAYE, RSSB, deductions, net pay, employer costs
    */
-  static async getPayrollSummary(companyId, year, month) {
-    const payrollRecords = await Payroll.find({
-      company: toObjectId(companyId),
-      'period.year': year,
-      'period.month': month,
-      record_status: { $in: ['draft', 'finalised', 'paid'] }
-    });
+static async getPayrollSummary(companyId, year, month) {
+     const payPeriodStart = new Date(year, month - 1, 1);
+     const payPeriodEnd = new Date(year, month, 0);
+     const payrollRecords = await Payroll.find({
+       company: companyId,
+       payPeriodStart: { gte: payPeriodStart, lte: payPeriodEnd },
+       record_status: { $in: ['draft', 'finalised', 'paid'] }
+     });
 
     const employees = payrollRecords.map(p => ({
       employeeId: p._id,
@@ -1741,7 +1742,7 @@ class MonthlyReportsService {
     ]);
 
     // Get actual expenses from multiple sources: Expense, Purchase (paid), Payroll
-    const [expenseAgg, purchaseAgg, payrollAgg] = await Promise.all([
+    const [expenseAgg, purchaseAgg] = await Promise.all([
       // Direct expenses
       Expense.aggregate([
         { $match: { company: new mongoose.Types.ObjectId(companyId), expense_date: { $gte: start, $lte: end } } },
@@ -1758,19 +1759,15 @@ class MonthlyReportsService {
         },
         { $group: { _id: 'Purchases', actual: { $sum: { $toDouble: { $ifNull: ['$grandTotal', '$total', 0] } } } } }
       ]),
-      // Payroll expenses
-      Payroll.aggregate([
-        { 
-          $match: { 
-            company: new mongoose.Types.ObjectId(companyId), 
-            'period.year': year,
-            'period.month': month,
-            record_status: { $in: ['draft', 'finalised', 'paid'] }
-          } 
-        },
-        { $group: { _id: 'Payroll', actual: { $sum: { $toDouble: '$netPay' } } } }
-      ])
     ]);
+
+    // Payroll expenses — Prisma-backed, cannot use aggregate
+    const payrollRecords = await Payroll.find({
+      company: companyId,
+      payPeriodStart: { gte: start, lte: end },
+      record_status: { $in: ['draft', 'finalised', 'paid'] }
+    });
+    const payrollAgg = [{ _id: 'Payroll', actual: payrollRecords.reduce((s, p) => s + (p.netPay || 0), 0) }];
 
     // Merge all expense sources - assign default category for null/undefined
     const actualExpenses = [];

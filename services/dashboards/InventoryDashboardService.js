@@ -12,7 +12,7 @@ const RECENT_MOVEMENTS_LIMIT = 10;
 
 class InventoryDashboardService {
   static async get(companyId) {
-    const cached = dashboardCache.get(companyId, "inventory");
+     const cached = await dashboardCache.get(companyId, "inventory");
     if (cached) return cached;
 
     const [
@@ -65,7 +65,7 @@ class InventoryDashboardService {
       recent_movements: recentMovements,
     };
 
-    dashboardCache.set(companyId, "inventory", result);
+    await dashboardCache.set(companyId, "inventory", result);
     return result;
   }
 

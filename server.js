@@ -193,6 +193,7 @@ async function initializeServer() {
   app.get('/api/health', cors(), healthController.systemHealth);
   app.get('/health', cors(), healthController.systemHealth);
   app.get('/api/health/accounting', protect, requireCompanyHeader, healthController.accountingHealth);
+  app.get('/api/health/redis', cors(), healthController.redisHealth);
   app.post('/api/health/gc', cors(), healthController.gcHint);
 
   // CORS - must run BEFORE rate limiters so that rate-limited responses

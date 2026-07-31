@@ -14,8 +14,7 @@ const { isMongoConnected } = require('../../utils/mongoConnection')
 class ExecutiveDashboardService {
 
   static async get(companyId) {
-    // Check cache first
-    const cached = dashboardCache.get(companyId, 'executive')
+    const cached = await dashboardCache.get(companyId, 'executive')
     if (cached) {
       // If there's any new posted journal entry created after the cached
       // result was generated, consider the cache stale and recompute.
@@ -144,7 +143,7 @@ class ExecutiveDashboardService {
     result.outstanding_ar_count = outstandingAR.count || 0
     result.overdue_ar = dateHelpers.round2(overdueAR.total || 0)
 
-    dashboardCache.set(companyId, 'executive', result)
+     await dashboardCache.set(companyId, 'executive', result)
     return result
   }
 

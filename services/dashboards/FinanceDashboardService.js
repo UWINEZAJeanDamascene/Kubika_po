@@ -19,7 +19,7 @@ class FinanceDashboardService {
    * Cache invalidates with other dashboards when journals post (see journalService).
    */
   static async get(companyId) {
-    const cached = dashboardCache.get(companyId, 'finance')
+    const cached = await dashboardCache.get(companyId, 'finance')
     if (cached) return cached
 
     const thisMonth = dateHelpers.currentMonth()
@@ -65,7 +65,7 @@ class FinanceDashboardService {
       cash_flow_30_days: cashFlow30Days
     }
 
-    dashboardCache.set(companyId, 'finance', result)
+     dashboardCache.set(companyId, 'finance', result)
     return result
   }
 

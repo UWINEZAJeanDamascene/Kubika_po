@@ -99,6 +99,36 @@ function buildProductInclude(populate = []) {
   return Object.keys(inc).length ? inc : undefined;
 }
 
+const PRISMA_TO_DB = {
+  createdAt: 'created_at',
+  updatedAt: 'updated_at',
+  name: 'name',
+  sku: 'sku',
+  currentStock: 'current_stock',
+  sellingPrice: 'selling_price',
+  costPrice: 'cost_price',
+  lowStockThreshold: 'low_stock_threshold',
+  averageCost: 'average_cost',
+  isActive: 'is_active',
+  isArchived: 'is_archived',
+};
+
+function toDbColumn(field) {
+  return PRISMA_TO_DB[field] || field;
+}
+
+function buildExprWhere(expr) {
+  const op = Object.keys(expr)[0];
+  switch (op) {
+    case '$lte': return 'p."current_stock" <= p."low_stock_threshold"';
+    case '$lt': return 'p."current_stock" < p."low_stock_threshold"';
+    case '$gte': return 'p."current_stock" >= p."low_stock_threshold"';
+    case '$gt': return 'p."current_stock" > p."low_stock_threshold"';
+    case '$eq': return 'p."current_stock" = p."low_stock_threshold"';
+    default: return 'true';
+  }
+}
+
 async function productCustomFind(filter, opts, { many = false } = {}) {
   const { $expr, $or, $text, ...rest } = filter;
   const where = applyTenant(translateFilter(rest, FIELD_MAP), opts);
@@ -126,19 +156,38 @@ async function productCustomFind(filter, opts, { many = false } = {}) {
     }
   }
 
+  if ($expr) {
+    const explicitLimit = opts.limit != null ? Number(opts.limit) : 50;
+    const explicitSkip = opts.skip != null ? Number(opts.skip) : 0;
+
+    const sortField = translateSort(opts.sort, FIELD_MAP);
+    const sortOrder = sortField && sortField[0] ? (sortField[0].order || 'asc') : 'asc';
+    const rawOrderColumn = sortField && Object.keys(sortField[0])[0] ? Object.keys(sortField[0])[0] : 'createdAt';
+    const orderColumn = toDbColumn(rawOrderColumn);
+
+    const exprWhere = buildExprWhere($expr);
+    const rows = await prisma.$queryRaw(
+      `SELECT p.* FROM products p WHERE p."companyId" = $1 AND ${exprWhere} AND (NULLIF($2, 'null') IS NULL OR p."isArchived" = $2) AND (NULLIF($3, 'null') IS NULL OR p."isActive" = $3) AND (NULLIF($4, 'null') IS NULL OR p."categoryId" = $4) AND (NULLIF($5, 'null') IS NULL OR p."supplierId" = $5) ORDER BY p."${orderColumn}" ${sortOrder} LIMIT ${explicitLimit + explicitSkip + 500}`,
+      where.companyId,
+      where.isArchived,
+      where.isActive,
+      where.categoryId,
+      where.supplierId,
+    );
+
+    const filtered = rows.filter((row) => matchesExpr(row, $expr));
+    const sliced = filtered.slice(explicitSkip, explicitSkip + explicitLimit);
+
+    return many ? sliced : (sliced[0] || null);
+  }
+
   let rows = await prisma.product.findMany({
     where,
     orderBy: translateSort(opts.sort, FIELD_MAP),
-    take: $expr ? undefined : (opts.limit || undefined),
-    skip: $expr ? undefined : (opts.skip || undefined),
+    take: opts.limit || undefined,
+    skip: opts.skip || undefined,
     include: buildProductInclude(opts.populate),
   });
-
-  if ($expr) {
-    rows = rows.filter((row) => matchesExpr(row, $expr));
-    if (opts.skip) rows = rows.slice(Number(opts.skip));
-    if (opts.limit) rows = rows.slice(0, Number(opts.limit));
-  }
 
   return many ? rows : (rows[0] || null);
 }

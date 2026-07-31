@@ -282,6 +282,11 @@ function translateFilter(filter, fieldMap) {
 function translateSort(sort, fieldMap = {}) {
   function mapField(field) {
     if (field === '_id') return 'id';
+    if (field.includes('.')) {
+      const m = fieldMap[field];
+      if (m && m.target) return m.target;
+      return null;
+    }
     const m = fieldMap[field];
     if (m && m.target) return m.target;
     return field;
@@ -291,12 +296,16 @@ function translateSort(sort, fieldMap = {}) {
     return sort.split(/\s+/).filter(Boolean).map((token) => {
       const desc = token.startsWith('-');
       const field = token.replace(/^-/, '');
-      return { [mapField(field)]: desc ? 'desc' : 'asc' };
-    });
+      const mapped = mapField(field);
+      if (!mapped) return null;
+      return { [mapped]: desc ? 'desc' : 'asc' };
+    }).filter(Boolean);
   }
-  return Object.entries(sort).map(([field, dir]) => ({
-    [mapField(field)]: dir === -1 || dir === 'desc' ? 'desc' : 'asc',
-  }));
+  return Object.entries(sort).map(([field, dir]) => {
+    const mapped = mapField(field);
+    if (!mapped) return null;
+    return { [mapped]: dir === -1 || dir === 'desc' ? 'desc' : 'asc' };
+  }).filter(Boolean);
 }
 
 function coerceQueryScalar(value) {
