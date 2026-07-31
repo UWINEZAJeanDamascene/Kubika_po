@@ -1,5 +1,7 @@
 const healthService = require('../services/healthService');
 const { getHealthReport } = require('../services/accountingHealthService');
+const { redisClient, isRedisConfigured } = require('../config/redis');
+const redisCache = require('../utils/redisCache');
 const v8 = require('v8');
 
 const FALLBACK_VERSION = () => {
@@ -41,6 +43,33 @@ exports.accountingHealth = async (req, res, next) => {
     });
   } catch (err) {
     next(err);
+  }
+};
+
+// GET /api/health/redis
+exports.redisHealth = async (req, res) => {
+  const start = Date.now();
+  try {
+    const health = await redisCache.healthCheck();
+    const ttlTestKey = 'health:redis:ttl:test';
+    let ttlOk = false;
+    if (health.connected) {
+      await redisCache.set(ttlTestKey, { ok: true }, 10);
+      const got = await redisCache.get(ttlTestKey);
+      ttlOk = got && got.ok === true;
+      await redisCache.del(ttlTestKey);
+    }
+    const payload = {
+      ...health,
+      ping_ms: Date.now() - start,
+      operations: {
+        set_get_delete: ttlOk,
+      },
+    };
+    const status = health.connected && ttlOk ? 200 : 503;
+    res.status(status).json(payload);
+  } catch (e) {
+    res.status(503).json({ configured: true, connected: false, error: e.message });
   }
 };
 

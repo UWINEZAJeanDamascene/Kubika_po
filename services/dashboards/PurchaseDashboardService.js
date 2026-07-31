@@ -25,7 +25,7 @@ const MS_PER_DAY = 1000 * 60 * 60 * 24
 
 class PurchaseDashboardService {
   static async get(companyId) {
-    const cached = dashboardCache.get(companyId, 'purchase')
+    const cached = await dashboardCache.get(companyId, 'purchase')
     if (cached) return cached
 
     const thisMonth = dateHelpers.currentMonth()
@@ -66,7 +66,7 @@ class PurchaseDashboardService {
       purchase_returns: purchaseReturns
     }
 
-    dashboardCache.set(companyId, 'purchase', result)
+    await dashboardCache.set(companyId, 'purchase', result)
     return result
   }
 

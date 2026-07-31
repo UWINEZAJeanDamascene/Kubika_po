@@ -5,7 +5,7 @@ const dashboardCache = require('../DashboardCacheService')
 
 class RatiosWidgetService {
   static async get(companyId) {
-    const cached = dashboardCache.get(companyId, 'ratios')
+    const cached = await dashboardCache.get(companyId, 'ratios')
     if (cached) return cached
 
     const company = await Company.findById(companyId).lean()
@@ -56,7 +56,7 @@ class RatiosWidgetService {
       }
     }
 
-    dashboardCache.set(companyId, 'ratios', result, '', 5 * 60 * 1000)
+    await dashboardCache.set(companyId, 'ratios', result, '', 5 * 60 * 1000)
     return result
   }
 

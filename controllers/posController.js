@@ -10,6 +10,7 @@ const JournalService = require('../services/journalService');
 const emailService = require('../services/emailService');
 const EBMProductService = require('../services/ebmProductService');
 const EBMSalesService = require('../services/ebmSalesService');
+const slowQueryMonitor = require('../utils/slowQueryMonitor');
 const {
   extractPayloadTotals,
   formatReceiptDate,
@@ -18,6 +19,15 @@ const {
   lineTaxDetails,
   taxTypeLabel,
 } = require('../utils/pdfUtils');
+
+async function timedQuery(label, fn) {
+  const start = Date.now();
+  try {
+    return await fn();
+  } finally {
+    slowQueryMonitor.record(label, Date.now() - start);
+  }
+}
 
 const sendPOSEmail = async (invoice, company, client, action = 'created') => {
   try {
@@ -52,8 +62,7 @@ exports.createSale = async (req, res, next) => {
     const companyId = req.user.company._id;
     const { items = [], payments = [], clientId, clientInfo, drawerId, notes } = req.body;
 
-    // Load company settings to get default tax rate when POS doesn't provide one
-    const company = await Company.findById(companyId).lean();
+    const company = await timedQuery('pos_createSale_company', () => Company.findById(companyId).lean());
     const defaultTaxRate = company?.settings?.taxRate ?? 0;
     const defaultTaxCode = (defaultTaxRate > 0 ? 'B' : 'A');
 
@@ -62,30 +71,40 @@ exports.createSale = async (req, res, next) => {
     }
     await EBMProductService.assertProductsRegistered(companyId, items.map((item) => item.product));
 
+    const productIds = items.map((item) => item.product);
+    const productsMap = new Map();
+    if (productIds.length > 0) {
+      const products = await timedQuery('pos_createSale_products_batch', () =>
+        Product.find({ _id: { $in: productIds }, company: companyId }).select('name sku taxCode taxRate unit').lean()
+      );
+      products.forEach((p) => productsMap.set(p._id.toString(), p));
+    }
+
     // Resolve or create walk-in client
     let client = null;
     if (clientId) {
-      client = await Client.findOne({ _id: clientId, company: companyId });
+      client = await timedQuery('pos_createSale_client', () => Client.findOne({ _id: clientId, company: companyId }));
     }
 
     if (!client) {
-      // Find or create a generic Walk-in client per company
-      client = await Client.findOne({ company: companyId, code: 'WALKIN' });
+      client = await timedQuery('pos_createSale_walkin', () => Client.findOne({ company: companyId, code: 'WALKIN' }));
       if (!client) {
-        client = await Client.create({
-          company: companyId,
-          name: (clientInfo && clientInfo.name) || 'Walk-in Customer',
-          code: 'WALKIN',
-          type: 'individual',
-          contact: clientInfo?.contact || {}
-        });
+        client = await timedQuery('pos_createSale_walkin_create', () =>
+          Client.create({
+            company: companyId,
+            name: (clientInfo && clientInfo.name) || 'Walk-in Customer',
+            code: 'WALKIN',
+            type: 'individual',
+            contact: clientInfo?.contact || {}
+          })
+        );
       }
     }
 
     // Build invoice items - ensure product references and calculate simple subtotals
     const invoiceItems = [];
     for (const it of items) {
-      const product = await Product.findOne({ _id: it.product, company: companyId });
+      const product = productsMap.get(it.product.toString());
       if (!product) return res.status(400).json({ success: false, message: 'Invalid product in items' });
 
       const quantity = it.quantity || 1;
@@ -148,34 +167,51 @@ exports.createSale = async (req, res, next) => {
     }
 
     // Saving will compute totals via pre-save hook
-    await invoice.save();
+    await timedQuery('pos_createSale_invoice_save', () => invoice.save());
 
     // Deduct stock for each sold item AND create stock movement records
+    const productUpdates = [];
+    const stockMovementCreates = [];
+
+    const stockProductIds = invoiceItems.map(it => it.product);
+    const stockProductsMap = new Map();
+    if (stockProductIds.length > 0) {
+      const stockProducts = await timedQuery('pos_createSale_stock_products', () =>
+        Product.find({ _id: { $in: stockProductIds } }).select('currentStock').lean()
+      );
+      stockProducts.forEach(p => stockProductsMap.set(p._id.toString(), Number(p.currentStock) || 0));
+    }
+
     for (const it of invoiceItems) {
-      try {
-        const prod = await Product.findById(it.product);
-        if (prod) {
-          const qtySold = it.quantity || 0;
-          const previousStock = prod.currentStock || 0;
-          prod.currentStock = Math.max(0, previousStock - qtySold);
-          prod.lastSaleDate = new Date();
-          await prod.save();
-          
-          // Create stock movement record
-          await StockMovement.create({
-            company: companyId,
-            product: prod._id,
-            type: 'sale',
-            quantity: -qtySold,
-            reference: invoice.invoiceNumber,
-            notes: `POS Sale - ${invoice.invoiceNumber}`,
-            createdBy: req.user.id
-          });
-        }
-      } catch (err) {
-        // non-fatal
-        console.warn('Failed to update product stock', err.message);
-      }
+      const previousStock = stockProductsMap.get(it.product.toString()) ?? 0;
+      const qtySold = it.quantity || 0;
+      const newStock = Math.max(0, previousStock - qtySold);
+
+      productUpdates.push({
+        updateOne: {
+          filter: { _id: it.product },
+          update: { $inc: { currentStock: -qtySold }, lastSaleDate: new Date() },
+        },
+      });
+
+      stockMovementCreates.push({
+        company: companyId,
+        product: it.product,
+        type: 'sale',
+        quantity: -qtySold,
+        previousStock,
+        newStock,
+        reference: invoice.invoiceNumber,
+        notes: `POS Sale - ${invoice.invoiceNumber}`,
+        createdBy: req.user.id,
+      });
+    }
+
+    if (productUpdates.length > 0) {
+      await timedQuery('pos_createSale_stock_bulkWrite', () => Product.bulkWrite(productUpdates));
+    }
+    if (stockMovementCreates.length > 0) {
+      await timedQuery('pos_createSale_stock_movements', () => StockMovement.insertMany(stockMovementCreates));
     }
 
     // Record cash transactions in drawer when payment method is cash
@@ -336,7 +372,7 @@ exports.createSale = async (req, res, next) => {
 exports.addPayment = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const invoice = await Invoice.findOne({ _id: req.params.id, company: companyId });
+    const invoice = await timedQuery('pos_addPayment_findInvoice', () => Invoice.findOne({ _id: req.params.id, company: companyId }));
     if (!invoice) return res.status(404).json({ success: false, message: 'Sale not found' });
 
     const { amount, paymentMethod, reference, notes, drawerId, bankAccountId } = req.body;
@@ -359,10 +395,10 @@ exports.addPayment = async (req, res, next) => {
     // Drawer record
     if (drawerId && paymentMethod === 'cash') {
       try {
-        let drawer = await CashDrawer.findOne({ company: companyId, drawerId });
+        let drawer = await timedQuery('pos_addPayment_drawer', () => CashDrawer.findOne({ company: companyId, drawerId }));
         if (drawer && drawer.status === 'open') {
           drawer.transactions.push({ type: 'sale', amount, paymentMethod, reference, notes, recordedBy: req.user.id });
-          await drawer.save();
+          await timedQuery('pos_addPayment_drawer_save', () => drawer.save());
         }
       } catch (err) {
         console.warn('Drawer record failed', err.message);
@@ -373,11 +409,13 @@ exports.addPayment = async (req, res, next) => {
     const bankPaymentMethods = ['bank_transfer', 'cheque', 'mobile_money'];
     if (bankPaymentMethods.includes(paymentMethod) && bankAccountId) {
       try {
-        const bankAccount = await BankAccount.findOne({
-          _id: bankAccountId,
-          company: companyId,
-          isActive: true
-        });
+        const bankAccount = await timedQuery('pos_addPayment_bankAccount', () =>
+          BankAccount.findOne({
+            _id: bankAccountId,
+            company: companyId,
+            isActive: true
+          })
+        );
         if (bankAccount) {
           await bankAccount.addTransaction({
             type: 'deposit',
@@ -400,12 +438,12 @@ exports.addPayment = async (req, res, next) => {
 
     // Update client totals to reflect POS payment
     try {
-      const clientDoc = await Client.findOne({ _id: invoice.client, company: companyId });
+      const clientDoc = await timedQuery('pos_addPayment_client', () => Client.findOne({ _id: invoice.client, company: companyId }));
       if (clientDoc) {
         clientDoc.totalPurchases = (clientDoc.totalPurchases || 0) + amount;
         clientDoc.outstandingBalance = Math.max(0, (clientDoc.outstandingBalance || 0) - amount);
         clientDoc.lastPurchaseDate = new Date();
-        await clientDoc.save();
+        await timedQuery('pos_addPayment_client_save', () => clientDoc.save());
       }
     } catch (e) {
       console.warn('Failed updating client after POS payment', e.message);
@@ -424,9 +462,9 @@ exports.openDrawer = async (req, res, next) => {
     const { drawerId, openingBalance = 0, notes } = req.body;
     if (!drawerId) return res.status(400).json({ success: false, message: 'drawerId required' });
 
-    let drawer = await CashDrawer.findOne({ company: companyId, drawerId });
+    let drawer = await timedQuery('pos_openDrawer_find', () => CashDrawer.findOne({ company: companyId, drawerId }));
     if (!drawer) {
-      drawer = await CashDrawer.create({ company: companyId, drawerId, openingBalance, status: 'open', openedBy: req.user.id, openedAt: new Date(), notes });
+      drawer = await timedQuery('pos_openDrawer_create', () => CashDrawer.create({ company: companyId, drawerId, openingBalance, status: 'open', openedBy: req.user.id, openedAt: new Date(), notes }));
     } else {
       drawer.status = 'open';
       drawer.openingBalance = openingBalance;
@@ -434,7 +472,7 @@ exports.openDrawer = async (req, res, next) => {
       drawer.openedAt = new Date();
       drawer.notes = notes || drawer.notes;
       drawer.transactions = drawer.transactions || [];
-      await drawer.save();
+      await timedQuery('pos_openDrawer_save', () => drawer.save());
     }
 
     res.json({ success: true, data: drawer });
@@ -450,7 +488,7 @@ exports.closeDrawer = async (req, res, next) => {
     const { drawerId, closingBalance = 0, notes } = req.body;
     if (!drawerId) return res.status(400).json({ success: false, message: 'drawerId required' });
 
-    const drawer = await CashDrawer.findOne({ company: companyId, drawerId });
+    const drawer = await timedQuery('pos_closeDrawer_find', () => CashDrawer.findOne({ company: companyId, drawerId }));
     if (!drawer) return res.status(404).json({ success: false, message: 'Drawer not found' });
 
     drawer.status = 'closed';
@@ -458,7 +496,7 @@ exports.closeDrawer = async (req, res, next) => {
     drawer.closedBy = req.user.id;
     drawer.closedAt = new Date();
     drawer.notes = notes || drawer.notes;
-    await drawer.save();
+    await timedQuery('pos_closeDrawer_save', () => drawer.save());
 
     res.json({ success: true, data: drawer });
   } catch (error) {
@@ -473,7 +511,7 @@ exports.getDrawer = async (req, res, next) => {
     const drawerId = req.params.drawerId;
     if (!drawerId) return res.status(400).json({ success: false, message: 'drawerId required' });
 
-    const drawer = await CashDrawer.findOne({ company: companyId, drawerId }).populate('transactions.recordedBy', 'name email');
+    const drawer = await timedQuery('pos_getDrawer', () => CashDrawer.findOne({ company: companyId, drawerId }).populate('transactions.recordedBy', 'name email'));
     if (!drawer) return res.status(404).json({ success: false, message: 'Drawer not found' });
 
     res.json({ success: true, data: drawer });
@@ -486,14 +524,14 @@ exports.getDrawer = async (req, res, next) => {
 exports.getReceipt = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const invoice = await Invoice.findOne({ _id: req.params.id, company: companyId })
+    const invoice = await timedQuery('pos_getReceipt_invoice', () => Invoice.findOne({ _id: req.params.id, company: companyId })
       .populate('client', 'name contact code taxId type')
       .populate('createdBy', 'name email')
-      .populate('lines.product', 'name sku unit ebm');
+      .populate('lines.product', 'name sku unit ebm'));
 
     if (!invoice) return res.status(404).json({ success: false, message: 'Sale not found' });
 
-    const company = await Company.findById(companyId).lean();
+    const company = await timedQuery('pos_getReceipt_company', () => Company.findById(companyId).lean());
     const qrPng = await generateQrPng(invoice.ebm, { width: 110 });
     const data = invoice.toObject({ virtuals: true });
     data.ebm = data.ebm || {};

@@ -5,9 +5,19 @@
  * Endpoint: POST /api/v1/bank-accounts/:id/statement/import
  */
 
-const BankAccount = require('../../models/BankAccount'); 
+const BankAccount = require('../../models/BankAccount');
 const CsvParser = require('../imports/parsers/CsvParser');
 const OfxParser = require('../imports/parsers/OfxParser');
+const slowQueryMonitor = require('../../utils/slowQueryMonitor');
+
+async function timedQuery(label, fn) {
+  const start = Date.now();
+  try {
+    return await fn();
+  } finally {
+    slowQueryMonitor.record(label, Date.now() - start);
+  }
+}
 
 /**
  * Import bank statement
@@ -32,11 +42,15 @@ exports.importStatement = async (req, res, next) => {
       });
     }
 
-    // Get bank account
-    const bankAccount = await BankAccount.findOne({
-      _id: bankAccountId,
-      company: companyId
-    });
+    // Get bank account with select projection
+    const bankAccount = await timedQuery('bankStmt_findAccount', () =>
+      BankAccount.findOne({
+        _id: bankAccountId,
+        company: companyId
+      })
+        .select('_id name company openingBalance isActive')
+        .lean()
+    );
 
     if (!bankAccount) {
       return res.status(404).json({
@@ -59,10 +73,10 @@ exports.importStatement = async (req, res, next) => {
       
       // Map CSV to standardized format
       transactions = parsed.rows.map(row => ({
-        transactionDate: this.parseDate(row.date || row.transaction_date || row.post_date),
+        transactionDate: parseDate(row.date || row.transaction_date || row.post_date),
         description: row.description || row.narration || row.memo || '',
-        debitAmount: parseFloat(row.debit || row.withdrawal || row.amount < 0 ? Math.abs(row.amount) : 0) || 0,
-        creditAmount: parseFloat(row.credit || row.deposit || row.amount > 0 ? row.amount : 0) || 0,
+        debitAmount: parseFloat(row.debit || row.withdrawal || (row.amount < 0 ? Math.abs(row.amount) : 0)) || 0,
+        creditAmount: parseFloat(row.credit || row.deposit || (row.amount > 0 ? row.amount : 0)) || 0,
         reference: row.reference || row.cheque_number || row.ref || ''
       }));
     }

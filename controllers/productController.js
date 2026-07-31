@@ -11,11 +11,21 @@ const ChartOfAccount = require('../models/ChartOfAccount');
 const { notifyLowStock, notifyOutOfStock, notifyStockReceived } = require('../services/notificationHelper');
 const cacheService = require('../services/cacheService');
 const { parsePagination, paginationMeta } = require('../utils/pagination');
+const slowQueryMonitor = require('../utils/slowQueryMonitor');
 const {
   slimProductForHistory,
   buildProductHistoryChanges,
   enrichProductHistory,
 } = require('../utils/productHistoryHelpers');
+
+async function timedQuery(label, fn) {
+  const start = Date.now();
+  try {
+    return await fn();
+  } finally {
+    slowQueryMonitor.record(label, Date.now() - start);
+  }
+}
 
 async function validateProductAccounts(body, companyId) {
   const errors = {};
@@ -130,14 +140,27 @@ exports.getProducts = async (req, res, next) => {
 
     const sortField = ALLOWED_PRODUCT_SORT_FIELDS.has(String(sortBy)) ? sortBy : 'createdAt';
 
-    const total = await Product.countDocuments(query);
-    const products = await Product.find(query)
+    const PRODUCT_LIST_SELECT = '-history -ebm -customFields';
+
+    const hasComplexFilter = !!(query.$or || query.$expr || query.$text);
+    const productQuery = Product.find(query)
+      .select(PRODUCT_LIST_SELECT)
       .populate('category', 'name')
       .populate('supplier', 'name code')
       .populate('createdBy', 'name email')
       .sort({ [sortField]: order === 'desc' ? -1 : 1 })
       .skip(skip)
       .limit(limit);
+
+    const [products, total] = hasComplexFilter
+      ? await Promise.all([
+          timedQuery('getProducts complex find', () => productQuery),
+          timedQuery('getProducts complex count', () => Product.countDocuments(query)),
+        ])
+      : await Promise.all([
+          timedQuery('getProducts find', () => productQuery),
+          timedQuery('getProducts count', () => Product.countDocuments(query)),
+        ]);
 
     // Backfill: if averageCost is 0 but costPrice is set, use costPrice and persist
     const backfillOps = [];
@@ -150,7 +173,9 @@ exports.getProducts = async (req, res, next) => {
       return obj;
     });
     if (backfillOps.length > 0) {
-      Product.bulkWrite(backfillOps).catch(err => console.error('Average cost backfill error:', err));
+      Product.bulkWrite(backfillOps).catch((err) => {
+        slowQueryMonitor.record('getProducts backfill', 0, { error: err.message });
+      });
     }
 
     res.json({
@@ -175,41 +200,34 @@ exports.getProduct = async (req, res, next) => {
   try {
     const company = req.user && req.user.company;
     const companyId = (company && company._id) ? company._id : company;
-    
-    let product;
-    try {
-      product = await Product.findOne({ _id: req.params.id, company: companyId })
-        .populate('category', 'name')
-        .populate('supplier', 'name code email phone address')
-        .populate('preferredSupplier', 'name code')
-        .populate('defaultWarehouse', 'name code')
-        .populate('createdBy', 'name email')
-        .populate('history.changedBy', 'name email');
-    } catch (popErr) {
-      // If related models/schemas are not registered in the test environment, fallback to basic find
-      product = await Product.findOne({ _id: req.params.id, company: companyId })
-        .populate('category', 'name')
-        .populate('supplier', 'name code email phone address')
-        .populate('preferredSupplier', 'name code')
-        .populate('defaultWarehouse', 'name code location')
-        .populate('createdBy', 'name email')
-        .populate('history.changedBy', 'name email');
-    }
+
+    const product = await Product.findOne({ _id: req.params.id, company: companyId })
+      .select('-history -ebm -customFields')
+      .populate('category', 'name')
+      .populate('supplier', 'name code')
+      .populate('preferredSupplier', 'name code')
+      .populate('defaultWarehouse', 'name code')
+      .populate('createdBy', 'name email')
+      .lean();
 
     if (!product) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Product not found' 
+      return res.status(404).json({
+        success: false,
+        message: 'Product not found'
       });
     }
 
-    // Compute current stock using latest StockMovement newStock where possible
-    // Use non-throwing lookup for latest stock movement
-    const latest = await StockMovement.findOne({ company: companyId, product: product._id }).sort({ movementDate: -1 }).lean().catch(() => null);
-    const totalStock = latest ? latest.newStock : (product.currentStock || 0);
-    const ret = product.toJSON();
-    ret.currentStock = totalStock;
-    return res.json({ success: true, data: ret });
+    const latest = await timedQuery('getProduct latestStockMovement', () =>
+      StockMovement.findOne({ company: companyId, product: product._id })
+        .select('newStock')
+        .sort({ movementDate: -1 })
+        .lean()
+        .catch(() => null),
+    );
+
+    product.currentStock = latest ? latest.newStock : (product.currentStock || 0);
+
+    return res.json({ success: true, data: product });
   } catch (error) {
     next(error);
   }
@@ -610,45 +628,58 @@ exports.getProductLifecycle = async (req, res, next) => {
   try {
     const company = req.user && req.user.company;
     const companyId = (company && company._id) ? company._id : company;
-    
+
+    const page = Math.max(1, parseInt(String(req.query.page || '1'), 10));
+    const limit = Math.min(100, parseInt(String(req.query.limit || '50'), 10));
+    const skip = (page - 1) * limit;
+
     const product = await Product.findOne({ _id: req.params.id, company: companyId })
+      .select('-history -ebm -customFields')
       .populate('category', 'name')
       .populate('history.changedBy', 'name email');
 
     if (!product) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Product not found' 
+      return res.status(404).json({
+        success: false,
+        message: 'Product not found',
       });
     }
 
-    // Get all stock movements
-    const stockMovements = await StockMovement.find({ product: req.params.id, company: companyId })
-      .populate('supplier', 'name code')
-      .populate('performedBy', 'name email')
-      .sort({ movementDate: -1 });
-
-    // Get all quotations containing this product
-    const quotations = await Quotation.find({ 'items.product': req.params.id, company: companyId })
-      .populate('client', 'name code')
-      .populate('createdBy', 'name email')
-      .sort({ createdAt: -1 });
-
-    // Get all invoices containing this product
-    const invoices = await Invoice.find({ 'items.product': req.params.id, company: companyId })
-      .populate('client', 'name code')
-      .populate('createdBy', 'name email')
-      .sort({ createdAt: -1 });
+    const [stockMovements, stockTotal, quotations, invoices] = await Promise.all([
+      timedQuery('getProductLifecycle stockMovements', () =>
+        StockMovement.find({ product: req.params.id, company: companyId })
+          .select('-company')
+          .populate('supplier', 'name code')
+          .populate('performedBy', 'name email')
+          .sort({ movementDate: -1 })
+          .skip(skip)
+          .limit(limit),
+      ),
+      StockMovement.countDocuments({ product: req.params.id, company: companyId }),
+      Quotation.find({ 'items.product': req.params.id, company: companyId })
+        .select('-company')
+        .populate('client', 'name code')
+        .populate('createdBy', 'name email')
+        .sort({ createdAt: -1 })
+        .limit(20),
+      Invoice.find({ 'items.product': req.params.id, company: companyId })
+        .select('-company')
+        .populate('client', 'name code')
+        .populate('createdBy', 'name email')
+        .sort({ createdAt: -1 })
+        .limit(20),
+    ]);
 
     res.json({
       success: true,
       data: {
         product,
         stockMovements,
+        stockTotal,
         quotations,
         invoices,
-        timeline: buildTimeline(product, stockMovements, quotations, invoices)
-      }
+        timeline: buildTimeline(product, stockMovements, quotations, invoices),
+      },
     });
   } catch (error) {
     next(error);
@@ -708,19 +739,39 @@ exports.getLowStockProducts = async (req, res, next) => {
   try {
     const company = req.user && req.user.company;
     const companyId = (company && company._id) ? company._id : company;
-    
+
+    const page = Math.max(1, parseInt(String(req.query.page || '1'), 10));
+    const limit = Math.min(100, parseInt(String(req.query.limit || '50'), 10));
+    const skip = (page - 1) * limit;
+
     const products = await Product.find({
       company: companyId,
       isArchived: false,
       $expr: { $lte: ['$currentStock', '$lowStockThreshold'] }
     })
+      .select('-history -ebm -customFields')
       .populate('category', 'name')
-      .sort({ currentStock: 1 });
+      .sort({ currentStock: 1 })
+      .skip(skip)
+      .limit(limit);
+
+    const total = await Product.countDocuments({
+      company: companyId,
+      isArchived: false,
+      $expr: { $lte: ['$currentStock', '$lowStockThreshold'] },
+    });
 
     res.json({
       success: true,
       count: products.length,
-      data: products
+      total,
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.ceil(total / limit) || 0,
+      },
+      data: products,
     });
   } catch (error) {
     next(error);

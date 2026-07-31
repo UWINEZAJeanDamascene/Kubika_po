@@ -48,44 +48,7 @@ class AuditService {
     }
   }
 
-  /**
-   * Validate segregation of duties for expense approval
-   * Ensures creator cannot approve their own expense
-   * @param {string} expenseId - Expense ID
-   * @param {string} approverId - User ID attempting to approve
-   * @returns {Object} - { valid: boolean, reason: string }
-   */
-  static async validateSegregation(expenseId, approverId) {
-    try {
-      const expense = await Expense.findById(expenseId);
-      if (!expense) {
-        return { valid: false, reason: 'Expense not found' };
-      }
-
-      // Rule: Creator cannot approve their own expense
-      if (expense.posted_by?.toString() === approverId.toString()) {
-        return {
-          valid: false,
-          reason: 'Segregation of duties: Creator cannot approve their own expense'
-        };
-      }
-
-      // Rule: Same user cannot create and approve
-      if (expense.createdBy?.toString() === approverId.toString()) {
-        return {
-          valid: false,
-          reason: 'Segregation of duties: Different user required for approval'
-        };
-      }
-
-      return { valid: true };
-    } catch (error) {
-      console.error('[AuditService] Segregation validation error:', error);
-      return { valid: false, reason: 'Validation error occurred' };
-    }
-  }
-
-  /**
+/**
    * Validate segregation of duties for expense posting
    * Ensures different user posts than who approved
    * @param {string} expenseId - Expense ID

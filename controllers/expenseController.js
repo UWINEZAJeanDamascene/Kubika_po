@@ -933,24 +933,6 @@ exports.approveExpense = async (req, res, next) => {
         });
     }
 
-    // Segregation of Duties: Creator cannot approve their own expense
-    if (expense.posted_by?.toString() === userId.toString()) {
-      return res.status(403).json({
-        success: false,
-        message: "Segregation of duties: You cannot approve your own expense. Another user must review and approve.",
-        code: "SEGREGATION_OF_DUTIES"
-      });
-    }
-
-    // Segregation of Duties: Same user cannot create and approve
-    if (expense.createdBy?.toString() === userId.toString()) {
-      return res.status(403).json({
-        success: false,
-        message: "Segregation of duties: Expense creator cannot approve. Another user must review.",
-        code: "SEGREGATION_OF_DUTIES"
-      });
-    }
-
     expense.status = "approved";
     expense.approvedBy = userId;
     expense.approvedAt = new Date();

@@ -100,7 +100,7 @@ exports.getEmployeeById = async (req, res, next) => {
       employee_id: employee._id,
     })
       .select("period salary grossSalary deductions netPay record_status createdAt")
-      .sort({ "period.year": -1, "period.month": -1 })
+      .sort({ payPeriodStart: -1 })
       .limit(6)
       .lean();
 

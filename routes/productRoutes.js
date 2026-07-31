@@ -37,7 +37,7 @@ router.route('/')
   )
   .post(requirePermission('products', 'create'), logAction('product'), createProduct);
 
-router.get('/low-stock', requirePermission('products', 'read'), getLowStockProducts);
+router.get('/low-stock', requirePermission('products', 'read'), cacheMiddleware({ type: 'product', ttl: 120, skipCache: (req) => req.query.refresh === '1' }), getLowStockProducts);
 
 // Check low stock and send notifications
 router.post('/check-low-stock', requirePermission('products', 'read'), checkLowStockAndNotify);
@@ -50,10 +50,10 @@ router.route('/:id')
 router.put('/:id/archive', requirePermission('products', 'delete'), logAction('product'), archiveProduct);
 router.put('/:id/restore', requirePermission('products', 'update'), logAction('product'), restoreProduct);
 router.post('/:id/ebm/register', requirePermission('products', 'update'), logAction('product'), registerProductWithEBM);
-router.get('/:id/reorder-analysis', requirePermission('products', 'read'), analyzeReorder);
+router.get('/:id/reorder-analysis', requirePermission('products', 'read'), cacheMiddleware({ type: 'product', ttl: 180, keyGenerator: (req) => cacheMiddlewareKey(req) }), analyzeReorder);
 router.post('/:id/auto-reorder', requirePermission('products', 'update'), logAction('product'), triggerAutoReorder);
-router.get('/:id/history', requirePermission('products', 'read'), getProductHistory);
-router.get('/:id/lifecycle', requirePermission('products', 'read'), getProductLifecycle);
+router.get('/:id/history', requirePermission('products', 'read'), cacheMiddleware({ type: 'product', ttl: 300, keyGenerator: (req) => cacheMiddlewareKey(req) }), getProductHistory);
+router.get('/:id/lifecycle', requirePermission('products', 'read'), cacheMiddleware({ type: 'product', ttl: 180, keyGenerator: (req) => cacheMiddlewareKey(req) }), getProductLifecycle);
 // Barcode and QR code endpoints
 router.get('/:id/barcode', requirePermission('products', 'read'), require('../controllers/productController').getProductBarcode);
 router.get('/:id/qrcode', requirePermission('products', 'read'), require('../controllers/productController').getProductQRCode);

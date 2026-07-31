@@ -45,8 +45,8 @@ class LaborAllocationService {
     const timesheet = await Timesheet.findOne({
       company: companyId,
       employee: emp._id,
-      'period.month': month,
-      'period.year': year,
+      periodMonth: month,
+      periodYear: year,
       status: 'approved'
     }).lean();
 
@@ -181,8 +181,8 @@ class LaborAllocationService {
       const timesheet = await Timesheet.findOne({
         company: companyId,
         employee: emp._id,
-        'period.month': month,
-        'period.year': year,
+        periodMonth: month,
+        periodYear: year,
         status: 'approved'
       }).lean();
 

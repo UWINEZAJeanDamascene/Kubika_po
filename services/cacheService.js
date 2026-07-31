@@ -306,7 +306,7 @@ class CacheService {
     }
     try {
       const dashboardCache = require('./DashboardCacheService');
-      dashboardCache.invalidate(companyId);
+      await dashboardCache.invalidate(companyId);
     } catch (e) {
       console.error('Dashboard cache invalidation failed:', e);
     }

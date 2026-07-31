@@ -871,6 +871,9 @@ model Product {
   @@index([companyId, name])
   @@index([companyId, currentStock])
   @@index([supplierId])
+  @@index([companyId, isArchived, isActive])
+  @@index([companyId, isActive, isArchived])
+  @@index([companyId, categoryId, isActive])
   @@map("products")
 }
 

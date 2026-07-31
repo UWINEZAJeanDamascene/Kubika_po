@@ -4,7 +4,7 @@ const ExecutiveDashboardService = require('./ExecutiveDashboardService')
 
 class PeriodComparisonService {
   static async get(companyId) {
-    const cached = dashboardCache.get(companyId, 'period_comparison')
+    const cached = await dashboardCache.get(companyId, 'period_comparison')
     if (cached) return cached
 
     const thisMonth = dateHelpers.currentMonth()
@@ -50,7 +50,7 @@ class PeriodComparisonService {
       }
     }
 
-    dashboardCache.set(companyId, 'period_comparison', result)
+    await dashboardCache.set(companyId, 'period_comparison', result)
     return result
   }
 

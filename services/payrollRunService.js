@@ -267,11 +267,12 @@ class PayrollRunService {
 
   // ── PREVIEW JOURNAL ENTRY ─────────────────────────────────────────────
   static async preview(companyId, data) {
+    const payPeriodStart = data.pay_period_start;
+    const payPeriodEnd = new Date(payPeriodStart.getFullYear(), payPeriodStart.getMonth() + 1, 0);
     const payrollRecords = await Payroll.find({
       company: companyId,
       record_status: "finalised",
-      "period.month": data.pay_period_start.getMonth() + 1,
-      "period.year": data.pay_period_start.getFullYear(),
+      pay_period_start: { gte: payPeriodStart, lte: payPeriodEnd },
     });
 
     if (payrollRecords.length === 0) {
@@ -352,39 +353,32 @@ class PayrollRunService {
    * calendar month that has at least one finalised, unassigned Payroll record.
    * Used by the UI to populate the month/year picker before creating a run.
    */
-  static async getAvailablePeriods(companyId) {
-    const results = await Payroll.aggregate([
-      {
-        $match: {
-          company: new (require("mongoose").Types.ObjectId)(companyId),
-          record_status: "finalised",
-          $or: [
-            { payroll_run_id: null },
-            { payroll_run_id: { $exists: false } }
-          ]
-        },
-      },
-      {
-        $group: {
-          _id: { month: "$period.month", year: "$period.year" },
-          count: { $sum: 1 },
-          totalGross: { $sum: { $ifNull: ["$salary.grossSalary", 0] } },
-          totalNet: { $sum: { $ifNull: ["$netPay", 0] } },
-        },
-      },
-      {
-        $project: {
-          _id: 0,
-          month: "$_id.month",
-          year: "$_id.year",
-          count: 1,
-          totalGross: 1,
-          totalNet: 1,
-        },
-      },
-      { $sort: { year: -1, month: -1 } },
-    ]);
-    return results;
+static async getAvailablePeriods(companyId) {
+    const records = await Payroll.find({
+      company: companyId,
+      record_status: "finalised",
+      payroll_run_id: null,
+    });
+
+    const periodMap = new Map();
+    for (const p of records) {
+      const month = p.period?.month;
+      const year = p.period?.year;
+      if (!month || !year) continue;
+      const key = `${year}-${String(month).padStart(2, "0")}`;
+      const existing = periodMap.get(key);
+      const gross = p.salary?.grossSalary || 0;
+      const net = p.netPay || 0;
+      if (existing) {
+        existing.count += 1;
+        existing.totalGross += gross;
+        existing.totalNet += net;
+      } else {
+        periodMap.set(key, { month, year, count: 1, totalGross: gross, totalNet: net });
+      }
+    }
+
+    return Array.from(periodMap.values()).sort((a, b) => b.year - a.year || b.month - a.month);
   }
 
   // ── CREATE FROM FINALISED RECORDS ─────────────────────────────────────
@@ -413,11 +407,13 @@ class PayrollRunService {
     }).select("_id").lean();
     const blockedIds = postedRunIds.map((r) => r._id.toString());
 
+    const payPeriodStart = new Date(filterYear, filterMonth - 1, 1);
+    const payPeriodEnd = new Date(filterYear, filterMonth, 0);
+
     const payrollRecords = await Payroll.find({
       company: companyId,
       record_status: "finalised",
-      "period.month": filterMonth,
-      "period.year": filterYear,
+      pay_period_start: { gte: payPeriodStart, lte: payPeriodEnd },
       $or: [
         { payroll_run_id: null },
         { payroll_run_id: { $exists: false } },

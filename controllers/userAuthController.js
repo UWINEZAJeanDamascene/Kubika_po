@@ -85,7 +85,7 @@ exports.login = async (req, res, next) => {
 
     res.json({
       success: true,
-      token: result.access_token, // Backward compatibility
+      token: result.access_token,
       access_token: result.access_token,
       refresh_token: result.refresh_token,
       userId: result.userId,

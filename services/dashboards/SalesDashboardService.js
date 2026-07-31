@@ -25,7 +25,7 @@ const INVOICE_STATUS_ORDER = [
 
 class SalesDashboardService {
   static async get(companyId) {
-    const cached = dashboardCache.get(companyId, 'sales')
+    const cached = await dashboardCache.get(companyId, 'sales')
     if (cached) return cached
 
     const thisMonth = dateHelpers.currentMonth()
@@ -69,7 +69,7 @@ class SalesDashboardService {
       collection_rate: collectionRate
     }
 
-    dashboardCache.set(companyId, 'sales', result)
+    await dashboardCache.set(companyId, 'sales', result)
     return result
   }
 
