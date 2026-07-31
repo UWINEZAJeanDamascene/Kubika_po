@@ -55,11 +55,15 @@ class TokenService {
    * Build access + refresh JWTs and persist the refresh token hash on the user
    * row (never store the raw refresh token).
    */
-  static async issueTokensForUser(userId, memberships) {
+  static async issueTokensForUser(userId, memberships, additionalUserData = {}) {
     const pair = signTokenPair(String(userId), memberships);
     await prisma.user.update({
       where: { id: String(userId) },
-      data: { refreshTokenHash: sha256(pair.refresh_token), refreshToken: null },
+      data: {
+        ...additionalUserData,
+        refreshTokenHash: sha256(pair.refresh_token),
+        refreshToken: null,
+      },
     });
     return pair;
   }

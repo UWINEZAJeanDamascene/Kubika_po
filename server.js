@@ -194,13 +194,8 @@ async function initializeServer() {
   app.get('/api/health/accounting', protect, requireCompanyHeader, healthController.accountingHealth);
   app.post('/api/health/gc', cors(), healthController.gcHint);
 
-  // Rate limiting with Redis (distributed)
-  const rateLimiters = createRateLimiters();
-  app.use('/api/auth', rateLimiters.auth);
-  app.use('/api/v1/auth', rateLimiters.auth);
-  app.use('/api/', rateLimiters.api);
-
-  // CORS - Production: use CORS_ORIGINS env (comma-separated). Dev: allow localhost/vercel/render.
+  // CORS - must run BEFORE rate limiters so that rate-limited responses
+  // (429) include proper CORS headers instead of failing the browser fetch.
   const corsOptions = {
     origin: function (origin, callback) {
       if (!origin) return callback(null, true); // Allow no-origin (server-to-server)
@@ -224,13 +219,8 @@ async function initializeServer() {
 
       // Hardcoded production whitelist (exact matches only in production)
       const hardcoded = [
-        'https://stock-management-frontend.vercel.app',
-        'https://your-frontend.vercel.app',
-        'https://stock-frontend-topaz-alpha.vercel.app',
-        'https://stock-tenancy-bnd.vercel.app',
-        'https://kubika-system.vercel.app',
-        'https://kubikasystem-bnd.onrender.com',
-        'https://stock-management-frontend-ten.vercel.app/'
+        'http://localhost:5173',
+        'http://localhost:3000',
       ];
       if (hardcoded.includes(origin)) return callback(null, true);
 
@@ -241,6 +231,13 @@ async function initializeServer() {
   };
   app.use(cors(corsOptions));
 
+  // Parse request bodies before the general API limiter.
+  app.use(express.json({ limit: '10mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+  // The global API limiter is disabled so dashboard requests are not blocked
+  // by shared Redis state.
+
   // Response compression (gzip/deflate); skip tiny payloads and health checks
   app.use(compression({
     threshold: 1024,
@@ -249,10 +246,6 @@ async function initializeServer() {
       return compression.filter(req, res);
     }
   }));
-
-  // Body parser - increased limit for CSV imports
-  app.use(express.json({ limit: '10mb' }));
-  app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
   // Serve uploaded files
   const path = require('path');

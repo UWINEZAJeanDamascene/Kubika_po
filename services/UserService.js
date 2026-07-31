@@ -85,6 +85,26 @@ function collectPermissions(set, permissions) {
   }
 }
 
+async function permissionsForLoginUser(user) {
+  const permissionsSet = new Set();
+
+  if (user.role === 'admin' || user.role === 'platform_admin') {
+    permissionsSet.add('*');
+  }
+
+  const linkedRoles = (user.roles || []).map((entry) => entry.role).filter(Boolean);
+  if (linkedRoles.length > 0) {
+    for (const role of linkedRoles) {
+      collectPermissions(permissionsSet, role.permissions);
+    }
+  } else if (user.role && user.role !== 'admin' && user.role !== 'platform_admin') {
+    const legacyRole = await findSystemRole(user.role);
+    if (legacyRole) collectPermissions(permissionsSet, legacyRole.permissions);
+  }
+
+  return Array.from(permissionsSet);
+}
+
 class UserService {
   /**
    * Register a new user
@@ -139,6 +159,10 @@ class UserService {
         email: String(email).toLowerCase(),
         ...(companyId ? { companyId: toIdString(companyId) } : {}),
       },
+      include: {
+        company: true,
+        roles: { include: { role: true } },
+      },
     });
 
     if (!user) {
@@ -170,36 +194,42 @@ class UserService {
       }
     }
 
-    // Reset failed login attempts + record last login
-    await prisma.user.update({
-      where: { id: user.id },
-      data: { failedLoginAttempts: 0, lockedUntil: null, lastLogin: new Date() },
-    });
-
+    // Persist the login state and refresh-token hash in one database write.
+    // The token service accepts the additional fields so a cold Neon connection
+    // is not paid for twice on every successful login.
+    const lastLogin = new Date();
     const memberships = [{
       companyId: user.companyId ? String(user.companyId) : undefined,
       role: user.role,
     }];
     const { access_token: accessToken, refresh_token: refreshToken } =
-      await TokenService.issueTokensForUser(user.id, memberships);
+      await TokenService.issueTokensForUser(user.id, memberships, {
+        failedLoginAttempts: 0,
+        lockedUntil: null,
+        lastLogin,
+      });
 
     const companyIdStr = user.companyId ? String(user.companyId) : null;
-    try {
-      await SessionService.createSession(
-        user.id,
-        companyIdStr,
-        user.role,
-        accessToken,
-        { email: user.email, name: user.name }
-      );
-    } catch (e) {
+    // Redis session persistence is useful for revocation, but it must not hold
+    // the authentication response hostage when the cache is slow or unavailable.
+    void SessionService.createSession(
+      user.id,
+      companyIdStr,
+      user.role,
+      accessToken,
+      { email: user.email, name: user.name }
+    ).catch((e) => {
       console.error('Session creation on login failed (tokens still issued):', e);
-    }
+    });
+
+    const loginUser = userToApi({ ...user, lastLogin });
+    loginUser.permissions = await permissionsForLoginUser(user);
 
     return {
       access_token: accessToken,
       refresh_token: refreshToken,
       userId: user.id,
+      user: loginUser,
       memberships: [{
         companyId: companyIdStr || undefined,
         role: user.role,

@@ -89,6 +89,7 @@ exports.login = async (req, res, next) => {
       access_token: result.access_token,
       refresh_token: result.refresh_token,
       userId: result.userId,
+      user: result.user,
       memberships: result.memberships
     });
   } catch (error) {

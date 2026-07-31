@@ -28,7 +28,6 @@ services:
       - key: EMAIL_FROM_NAME
         value: KUBIKA system
       - key: FRONTEND_URL
-        value: https://kubika-system.vercel.app
       - key: CORS_ORIGINS
-        value: https://kubika-system.vercel.app
+        sync: false
     autoDeploy: true

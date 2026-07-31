@@ -145,9 +145,13 @@ const cacheInvalidationMiddleware = (options = {}) => {
  * Adds session data to request object and updates activity on every request
  */
 const sessionMiddleware = async (req, res, next) => {
-  // Skip for public routes
-  if (req.path.startsWith('/api/auth/login') || 
-      req.path.startsWith('/api/auth/register')) {
+  // Authentication middleware performs the authoritative JWT/database checks.
+  // Redis session enrichment is not needed for auth endpoints and can add
+  // several network round trips to the login -> /me flow.
+  if (req.path.startsWith('/api/auth/login') ||
+      req.path.startsWith('/api/auth/register') ||
+      req.path.startsWith('/api/auth/me') ||
+      req.path.startsWith('/api/auth/refresh')) {
     return next();
   }
 

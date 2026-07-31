@@ -58,6 +58,7 @@ async function scanKeys(pattern) {
  * @param {Object} options.handler - Custom handler for rate limit exceeded
  * @param {boolean} options.skipSuccessfulRequests - Skip counting successful requests
  * @param {boolean} options.skipFailedRequests - Skip counting failed requests
+ * @param {Function} options.skip - Skip the limiter for matching requests
  * @param {string} options.limitBy - Field to limit by (ip, user, company, or custom)
  */
 const createRateLimiter = (options = {}) => {
@@ -69,6 +70,7 @@ const createRateLimiter = (options = {}) => {
     handler = null,
     skipSuccessfulRequests = false,
     skipFailedRequests = false,
+    skip = null,
     limitBy = 'ip',
     // Legacy options for backward compatibility
     windowMs: _windowMs,
@@ -85,6 +87,10 @@ const createRateLimiter = (options = {}) => {
 
   return async (req, res, next) => {
     try {
+      // Browser CORS preflight requests do not represent API usage.
+      if (req.method === 'OPTIONS') return next();
+      if (typeof skip === 'function' && skip(req)) return next();
+
       // Generate key based on limitBy option
       let key;
 
@@ -215,6 +221,7 @@ const createRateLimiters = () => {
       windowMs: 15 * 60 * 1000, // 15 minutes
       max: 10, // 10 attempts
       keyPrefix: 'ratelimit:auth',
+      skip: (req) => req.method === 'GET',
       keyGenerator: (req) => {
         const ip = req.ip || req.connection?.remoteAddress || 'unknown';
         const raw =
@@ -238,6 +245,7 @@ const createRateLimiters = () => {
       max: 100, // 100 requests per minute
       keyPrefix: 'ratelimit:api',
       limitBy: 'user',
+      skip: (req) => req.path.startsWith('/auth') || req.path.startsWith('/v1/auth'),
     }),
 
     // Stricter limiter for write operations
