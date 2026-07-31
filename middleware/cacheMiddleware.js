@@ -161,7 +161,8 @@ const sessionMiddleware = async (req, res, next) => {
   if (req.path.startsWith('/api/auth/login') ||
       req.path.startsWith('/api/auth/register') ||
       req.path.startsWith('/api/auth/me') ||
-      req.path.startsWith('/api/auth/refresh')) {
+      req.path.startsWith('/api/auth/refresh') ||
+      req.path.startsWith('/api/dashboard')) {
     return next();
   }
 

@@ -3,12 +3,11 @@ const { aggregateWithTimeout } = require('../../utils/mongoAggregation')
 const BankAccount = require('../../models/BankAccount')
 const Budget = require('../../models/Budget')
 const BudgetLine = require('../../models/BudgetLine')
-const JournalEntry = require('../../models/JournalEntry')
 const ChartOfAccount = require('../../models/ChartOfAccount')
 const GoodsReceivedNote = require('../../models/GoodsReceivedNote')
-const { PettyCashFloat } = require('../../models/PettyCash')
 const dateHelpers = require('../../utils/dateHelpers')
 const dashboardCache = require('../DashboardCacheService')
+const journalAgg = require('../journalAggregationService')
 
 /** Days ahead for GRN / AP “due soon” list — aligned with product default */
 const UPCOMING_PAYMENT_DAYS = 14
@@ -65,7 +64,7 @@ class FinanceDashboardService {
       cash_flow_30_days: cashFlow30Days
     }
 
-     dashboardCache.set(companyId, 'finance', result)
+     await dashboardCache.set(companyId, 'finance', result)
     return result
   }
 
@@ -87,36 +86,11 @@ class FinanceDashboardService {
    * Net balance (DR − CR) per account code for cash-style asset accounts.
    */
   static async _journalBalancesForAccountCodes(companyId, codes) {
-    const unique = [...new Set(codes.filter(Boolean).map(String))]
-    if (unique.length === 0) return {}
-
-    const result = await aggregateWithTimeout(JournalEntry, [
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          status: 'posted'
-        }
-      },
-      { $unwind: '$lines' },
-      {
-        $match: {
-          'lines.accountCode': { $in: unique }
-        }
-      },
-      {
-        $group: {
-          _id: '$lines.accountCode',
-          total_dr: { $sum: { $toDouble: { $ifNull: ['$lines.debit', 0] } } },
-          total_cr: { $sum: { $toDouble: { $ifNull: ['$lines.credit', 0] } } }
-        }
-      }
-    ], 'dashboard')
-
-    const map = {}
-    for (const row of result) {
-      map[row._id] = (row.total_dr || 0) - (row.total_cr || 0)
-    }
-    return map
+    const rows = await journalAgg.sumLinesByAccountCode(companyId, {
+      accountCodes: codes,
+      excludeSourceType: 'opening_balance',
+    })
+    return journalAgg.balancesMapFromRows(rows)
   }
 
   static async _getBankBalances(companyId) {
@@ -247,36 +221,18 @@ class FinanceDashboardService {
       }
     }
 
-    const marginMs = 24 * 60 * 60 * 1000
-    const qFrom = new Date(period.start.getTime() - marginMs)
-    const qTo = new Date(period.end.getTime() + marginMs)
-
-    const agg = await aggregateWithTimeout(JournalEntry, [
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          status: 'posted',
-          date: { $gte: qFrom, $lte: qTo }
-        }
-      },
-      { $unwind: '$lines' },
-      {
-        $match: {
-          'lines.accountCode': { $in: codes }
-        }
-      },
-      {
-        $group: {
-          _id: '$lines.accountCode',
-          total_dr: { $sum: { $toDouble: { $ifNull: ['$lines.debit', 0] } } },
-          total_cr: { $sum: { $toDouble: { $ifNull: ['$lines.credit', 0] } } }
-        }
-      }
-    ], 'dashboard')
+    const range = journalAgg.withDateMargin(period.start, period.end)
+    const agg = await journalAgg.sumLinesByAccountCode(companyId, {
+      ...range,
+      accountCodes: codes,
+    })
 
     const actualByCode = {}
     for (const row of agg) {
-      actualByCode[row._id] = row
+      actualByCode[row.accountCode] = {
+        total_dr: Number(row.totalDebit) || 0,
+        total_cr: Number(row.totalCredit) || 0,
+      }
     }
 
     const lines = budgetLines.map((bl) => {
@@ -329,36 +285,16 @@ class FinanceDashboardService {
     }
 
     const codes = taxAccounts.map((a) => a.code).filter(Boolean)
-    const agg = await aggregateWithTimeout(JournalEntry, [
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          status: 'posted'
-        }
-      },
-      { $unwind: '$lines' },
-      {
-        $match: {
-          'lines.accountCode': { $in: codes }
-        }
-      },
-      {
-        $group: {
-          _id: '$lines.accountCode',
-          total_dr: { $sum: { $toDouble: { $ifNull: ['$lines.debit', 0] } } },
-          total_cr: { $sum: { $toDouble: { $ifNull: ['$lines.credit', 0] } } }
-        }
-      }
-    ], 'dashboard')
+    const agg = await journalAgg.sumLinesByAccountCode(companyId, { accountCodes: codes })
 
     let outputVat = 0
     let inputVat = 0
 
     for (const row of agg) {
-      const account = taxAccounts.find((a) => a.code === row._id)
+      const account = taxAccounts.find((a) => a.code === row.accountCode)
       if (!account) continue
-      outputVat += row.total_cr || 0
-      inputVat += row.total_dr || 0
+      outputVat += Number(row.totalCredit) || 0
+      inputVat += Number(row.totalDebit) || 0
     }
 
     return {
@@ -379,6 +315,7 @@ class FinanceDashboardService {
       'tax_settlement'
     ]
 
+    const { PettyCashFloat } = require('../../models/PettyCash')
     const [banks, petty] = await Promise.all([
       BankAccount.find({ company: companyId, isActive: true }).select('ledgerAccountId').lean(),
       PettyCashFloat.find({ company: companyId, isActive: true }).select('ledgerAccountId').lean()
@@ -405,41 +342,22 @@ class FinanceDashboardService {
       }
     }
 
-    const marginMs = 24 * 60 * 60 * 1000
-    const qFrom = new Date(period.start.getTime() - marginMs)
-    const qTo = new Date(period.end.getTime() + marginMs)
-
-    const rows = await aggregateWithTimeout(JournalEntry, [
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          status: 'posted',
-          date: { $gte: qFrom, $lte: qTo }
-        }
-      },
-      { $unwind: '$lines' },
-      {
-        $match: {
-          'lines.accountCode': { $in: cashCodes }
-        }
-      },
-      {
-        $group: {
-          _id: '$sourceType',
-          cash_in: { $sum: { $toDouble: { $ifNull: ['$lines.debit', 0] } } },
-          cash_out: { $sum: { $toDouble: { $ifNull: ['$lines.credit', 0] } } }
-        }
-      }
-    ], 'dashboard')
+    const range = journalAgg.withDateMargin(period.start, period.end)
+    const rows = await journalAgg.sumCashLinesBySourceType(
+      companyId,
+      cashCodes,
+      range.dateFrom,
+      range.dateTo,
+    )
 
     let totalInflows = 0
     let totalOutflows = 0
     const bySource = []
 
     for (const row of rows) {
-      const st = row._id
-      const cin = row.cash_in || 0
-      const cout = row.cash_out || 0
+      const st = row.sourceType
+      const cin = Number(row.totalDebit) || 0
+      const cout = Number(row.totalCredit) || 0
       if (OPERATING_INFLOW_TYPES.includes(st)) {
         totalInflows += cin
       } else if (OPERATING_OUTFLOW_TYPES.includes(st)) {

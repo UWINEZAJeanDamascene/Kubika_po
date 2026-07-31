@@ -2,7 +2,7 @@ const redisCache = require('../utils/redisCache');
 const { isRedisConfigured } = require('../config/redis');
 
 const CACHE_PREFIX = 'dashboard:';
-const DEFAULT_TTL_SECONDS = 60;
+const DEFAULT_TTL_SECONDS = Number(process.env.DASHBOARD_CACHE_TTL_SECONDS || 300);
 
 class DashboardCacheService {
   constructor() {
