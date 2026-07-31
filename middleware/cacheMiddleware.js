@@ -7,6 +7,16 @@ const env = require('../src/config/environment');
 const config = env.getConfig();
 const JWT_SECRET = config.jwt.secret;
 
+/** Cap slow Redis calls so post-login requests are not blocked for seconds each. */
+const REDIS_SESSION_TIMEOUT_MS = Number(process.env.REDIS_SESSION_TIMEOUT_MS || 2000);
+
+function withRedisTimeout(promise, fallback) {
+  return Promise.race([
+    promise,
+    new Promise((resolve) => setTimeout(() => resolve(fallback), REDIS_SESSION_TIMEOUT_MS)),
+  ]);
+}
+
 /**
  * Cache middleware factory
  * Caches GET request responses automatically
@@ -164,8 +174,11 @@ const sessionMiddleware = async (req, res, next) => {
 
     const token = authHeader.split(' ')[1];
 
-    // Check blacklist first
-    const isBlacklisted = await sessionService.isTokenBlacklisted(token);
+    // Check blacklist first (fail open on Redis timeout — JWT auth still applies)
+    const isBlacklisted = await withRedisTimeout(
+      sessionService.isTokenBlacklisted(token),
+      false,
+    );
     if (isBlacklisted) {
       return res.status(401).json({ success: false, message: 'Token has been revoked' });
     }
@@ -174,7 +187,7 @@ const sessionMiddleware = async (req, res, next) => {
     let userId = null;
     if (req.user && req.user._id) {
       userId = req.user._id.toString();
-      const session = await sessionService.getSession(userId);
+      const session = await withRedisTimeout(sessionService.getSession(userId), null);
       if (session) {
         req.session = session;
         // Update last activity on every request (fire-and-forget)
@@ -186,7 +199,7 @@ const sessionMiddleware = async (req, res, next) => {
     }
 
     // Try quick token->user mapping stored in Redis
-    const byToken = await sessionService.getUserByToken(token);
+    const byToken = await withRedisTimeout(sessionService.getUserByToken(token), null);
     if (byToken) {
       req.session = byToken;
       userId = byToken.userId;
@@ -205,7 +218,7 @@ const sessionMiddleware = async (req, res, next) => {
       const userIdFromPayload = payload.id || payload._id || null;
       if (userIdFromPayload) {
         userId = userIdFromPayload.toString();
-        const session = await sessionService.getSession(userId);
+        const session = await withRedisTimeout(sessionService.getSession(userId), null);
         if (session) {
           req.session = session;
           // Update last activity on every request (fire-and-forget)

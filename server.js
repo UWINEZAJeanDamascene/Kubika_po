@@ -51,8 +51,9 @@ async function initializeServer() {
       'Set DATABASE_URL (e.g. postgresql://stock:stock@localhost:5432/stock_management?schema=public) in .env'
     );
   }
-  const { connectPrisma } = require('./lib/prisma');
+  const { connectPrisma, warmPrisma } = require('./lib/prisma');
   await connectPrisma();
+  await warmPrisma();
 
   // Connect to MongoDB (still used by not-yet-migrated domains).
   // When MONGODB_URI is unset, MongoDB is disabled and Mongo-backed routes
