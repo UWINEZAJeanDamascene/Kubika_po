@@ -112,6 +112,24 @@ async function sumLinesByAccountCode(companyId, options = {}) {
       `;
     }
 
+    // "Balance as of a date" (e.g. financial ratios / balance sheet): no lower
+    // bound, so this sums every posted line up to dateTo.
+    if (dateTo && !dateFrom) {
+      return prisma.$queryRaw`
+        SELECT jel.account_code AS "accountCode",
+               COALESCE(SUM(jel.debit), 0)::float AS "totalDebit",
+               COALESCE(SUM(jel.credit), 0)::float AS "totalCredit"
+        FROM journal_entry_lines jel
+        INNER JOIN journal_entries je ON je.id = jel.journal_entry_id
+        WHERE je.company_id = ${cid}
+          AND je.status = 'posted'
+          AND je.reversed = false
+          AND je.date <= ${dateTo}
+          AND jel.account_code = ANY(${codes}::text[])
+        GROUP BY jel.account_code
+      `;
+    }
+
     if (excludeSourceType) {
       return prisma.$queryRaw`
         SELECT jel.account_code AS "accountCode",
@@ -153,6 +171,22 @@ async function sumLinesByAccountCode(companyId, options = {}) {
         AND je.status = 'posted'
         AND je.reversed = false
         AND je.date >= ${dateFrom}
+        AND je.date <= ${dateTo}
+      GROUP BY jel.account_code
+    `;
+  }
+
+  // "Balance as of a date", all account codes (e.g. full balance sheet).
+  if (dateTo && !dateFrom) {
+    return prisma.$queryRaw`
+      SELECT jel.account_code AS "accountCode",
+             COALESCE(SUM(jel.debit), 0)::float AS "totalDebit",
+             COALESCE(SUM(jel.credit), 0)::float AS "totalCredit"
+      FROM journal_entry_lines jel
+      INNER JOIN journal_entries je ON je.id = jel.journal_entry_id
+      WHERE je.company_id = ${cid}
+        AND je.status = 'posted'
+        AND je.reversed = false
         AND je.date <= ${dateTo}
       GROUP BY jel.account_code
     `;

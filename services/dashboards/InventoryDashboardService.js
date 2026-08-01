@@ -1,10 +1,9 @@
-const mongoose = require("mongoose");
-const { aggregateWithTimeout } = require("../../utils/mongoAggregation");
-const Product = require("../../models/Product");
-const InventoryBatch = require("../../models/InventoryBatch");
-const StockMovement = require("../../models/StockMovement");
+const { prisma } = require("../../lib/prisma");
+const { toIdString } = require("../../utils/objectId");
+const { decimalToNumber } = require("../../utils/decimalHelpers");
 const dateHelpers = require("../../utils/dateHelpers");
 const dashboardCache = require("../DashboardCacheService");
+const journalAgg = require("../journalAggregationService");
 
 const DEAD_STOCK_LOOKBACK_DAYS = 90;
 const TOP_MOVING_WINDOW_DAYS = 30;
@@ -69,56 +68,25 @@ class InventoryDashboardService {
     return result;
   }
 
-  // ── Summary: query Product (the source of truth for currentStock) ──────────
+  // ── Summary: single SQL scan (SUM/COUNT pushed to Postgres) ────────────────
   static async _getStockSummary(companyId) {
-    const coid = new mongoose.Types.ObjectId(companyId);
-    const result = await aggregateWithTimeout(
-      Product,
-      [
-        {
-          $match: {
-            company: coid,
-            isActive: true,
-            isArchived: { $ne: true },
-            isStockable: { $ne: false },
-          },
-        },
-        {
-          $group: {
-            _id: null,
-            total_sku_count: { $sum: 1 },
-            total_units: {
-              $sum: { $toDouble: { $ifNull: ["$currentStock", 0] } },
-            },
-            total_value: {
-              $sum: {
-                $multiply: [
-                  { $toDouble: { $ifNull: ["$currentStock", 0] } },
-                  { $toDouble: { $ifNull: ["$averageCost", 0] } },
-                ],
-              },
-            },
-            total_reserved: {
-              $sum: { $toDouble: { $ifNull: ["$reservedQuantity", 0] } },
-            },
-            in_stock_count: {
-              $sum: {
-                $cond: [
-                  {
-                    $gt: [{ $toDouble: { $ifNull: ["$currentStock", 0] } }, 0],
-                  },
-                  1,
-                  0,
-                ],
-              },
-            },
-          },
-        },
-      ],
-      "dashboard",
-    );
+    const cid = toIdString(companyId);
 
-    const s = result[0] || {};
+    const rows = await prisma.$queryRaw`
+      SELECT
+        COUNT(*)::int AS total_sku_count,
+        COALESCE(SUM(current_stock), 0)::float AS total_units,
+        COALESCE(SUM(current_stock * average_cost), 0)::float AS total_value,
+        COALESCE(SUM(reserved_quantity), 0)::float AS total_reserved,
+        COUNT(*) FILTER (WHERE current_stock > 0)::int AS in_stock_count
+      FROM products
+      WHERE company_id = ${cid}
+        AND is_active = true
+        AND is_archived = false
+        AND is_stockable = true
+    `;
+
+    const s = rows[0] || {};
     const total_sku_count = s.total_sku_count || 0;
     const total_units = s.total_units || 0;
     const total_reserved = s.total_reserved || 0;
@@ -134,363 +102,169 @@ class InventoryDashboardService {
     };
   }
 
-  // ── Low-stock alerts: query Product directly ──────────────────────────────
+  // ── Low-stock alerts: reorder-point fallback logic pushed into SQL ─────────
   static async _getLowStockAlerts(companyId) {
-    const coid = new mongoose.Types.ObjectId(companyId);
-    const results = await aggregateWithTimeout(
-      Product,
-      [
-        {
-          $match: {
-            company: coid,
-            isActive: true,
-            isArchived: { $ne: true },
-            isStockable: { $ne: false },
-          },
-        },
-        {
-          $addFields: {
-            _currentStock: { $toDouble: { $ifNull: ["$currentStock", 0] } },
-            _reservedQty: { $toDouble: { $ifNull: ["$reservedQuantity", 0] } },
-            _reorderQty: { $toDouble: { $ifNull: ["$reorderQuantity", 0] } },
-            // Use reorderPoint when explicitly set > 0, otherwise fall back to
-            // lowStockThreshold — which is what the Products page "Low Stock"
-            // status uses (isLowStock virtual: currentStock <= lowStockThreshold)
-            _reorderPoint: {
-              $let: {
-                vars: {
-                  rp: { $toDouble: { $ifNull: ["$reorderPoint", 0] } },
-                  lt: { $toDouble: { $ifNull: ["$lowStockThreshold", 0] } },
-                },
-                in: {
-                  $cond: [{ $gt: ["$$rp", 0] }, "$$rp", "$$lt"],
-                },
-              },
-            },
-          },
-        },
-        {
-          $addFields: {
-            _available: { $subtract: ["$_currentStock", "$_reservedQty"] },
-          },
-        },
-        {
-          $match: {
-            _reorderPoint: { $gt: 0 },
-            // Use $lte to match the Products page isLowStock virtual which
-            // uses cs <= th (currentStock <= lowStockThreshold)
-            $expr: { $lte: ["$_available", "$_reorderPoint"] },
-          },
-        },
-        {
-          $lookup: {
-            from: "warehouses",
-            localField: "defaultWarehouse",
-            foreignField: "_id",
-            as: "_warehouseArr",
-          },
-        },
-        {
-          $project: {
-            product_id: "$_id",
-            product_code: "$sku",
-            product_name: "$name",
-            warehouse_id: { $arrayElemAt: ["$_warehouseArr._id", 0] },
-            warehouse_name: { $arrayElemAt: ["$_warehouseArr.name", 0] },
-            qty_on_hand: { $round: ["$_currentStock", 4] },
-            qty_reserved: { $round: ["$_reservedQty", 4] },
-            qty_available: { $round: ["$_available", 4] },
-            reorder_point: { $round: ["$_reorderPoint", 4] },
-            reorder_qty: "$_reorderQty",
-            shortage: {
-              $round: [{ $subtract: ["$_reorderPoint", "$_available"] }, 4],
-            },
-          },
-        },
-        { $sort: { shortage: -1 } },
-      ],
-      "dashboard",
-    );
+    const cid = toIdString(companyId);
 
-    return results;
+    const rows = await prisma.$queryRaw`
+      SELECT * FROM (
+        SELECT
+          p.id AS product_id,
+          p.sku AS product_code,
+          p.name AS product_name,
+          w.id AS warehouse_id,
+          w.name AS warehouse_name,
+          ROUND(p.current_stock::numeric, 4)::float AS qty_on_hand,
+          ROUND(p.reserved_quantity::numeric, 4)::float AS qty_reserved,
+          ROUND((p.current_stock - p.reserved_quantity)::numeric, 4)::float AS qty_available,
+          ROUND((CASE WHEN p.reorder_point > 0 THEN p.reorder_point ELSE p.low_stock_threshold END)::numeric, 4)::float AS reorder_point,
+          p.reorder_quantity::float AS reorder_qty,
+          ROUND(((CASE WHEN p.reorder_point > 0 THEN p.reorder_point ELSE p.low_stock_threshold END) - (p.current_stock - p.reserved_quantity))::numeric, 4)::float AS shortage
+        FROM products p
+        LEFT JOIN warehouses w ON w.id = p.default_warehouse_id
+        WHERE p.company_id = ${cid}
+          AND p.is_active = true
+          AND p.is_archived = false
+          AND p.is_stockable = true
+      ) sub
+      WHERE sub.reorder_point > 0 AND sub.qty_available <= sub.reorder_point
+      ORDER BY sub.shortage DESC
+    `;
+
+    return rows;
   }
 
-  // ── Dead stock: StockMovement for activity + Product for stock qty ─────────
+  // ── Dead stock: reuse journalAggregationService's outbound-activity lookup ─
   static async _getDeadStock(companyId) {
+    const cid = toIdString(companyId);
     const ninetyDaysAgo = dateHelpers.lastNDays(DEAD_STOCK_LOOKBACK_DAYS).start;
-    const coid = new mongoose.Types.ObjectId(companyId);
 
-    const moves = await StockMovement.find({
-      company: companyId,
-      movementDate: { $gte: ninetyDaysAgo },
-    }).lean();
-    const activeMoves = (moves || []).filter((m) => {
-      const reason = m.reason || m.movement_type;
-      const type = m.type || m.movement_type;
-      return ['dispatch', 'transfer_out'].includes(reason) || type === 'out';
-    });
-    const rawIds = activeMoves
-      .map((m) => m.product || m.product_id)
-      .filter(Boolean);
-    const activeProductIds = Array.from(
-      new Set(rawIds.map((id) => id.toString())),
-    ).map((id) => new mongoose.Types.ObjectId(id));
-
-    const results = await aggregateWithTimeout(
-      Product,
-      [
-        {
-          $match: {
-            company: coid,
-            isActive: true,
-            isArchived: { $ne: true },
-            isStockable: { $ne: false },
-            _id: { $nin: activeProductIds },
-          },
-        },
-        {
-          $addFields: {
-            _currentStock: { $toDouble: { $ifNull: ["$currentStock", 0] } },
-            _avgCost: { $toDouble: { $ifNull: ["$averageCost", 0] } },
-          },
-        },
-        {
-          $match: { _currentStock: { $gt: 0 } },
-        },
-        {
-          $project: {
-            product_id: "$_id",
-            product_code: "$sku",
-            product_name: "$name",
-            qty_on_hand: { $round: ["$_currentStock", 4] },
-            avg_cost: { $round: ["$_avgCost", 6] },
-            stock_value: {
-              $round: [{ $multiply: ["$_currentStock", "$_avgCost"] }, 2],
-            },
-            days_no_movement: DEAD_STOCK_LOOKBACK_DAYS,
-          },
-        },
-        { $sort: { stock_value: -1 } },
-        { $limit: 20 },
-      ],
-      "dashboard",
+    const activeProductIds = await journalAgg.getActiveOutboundProductIds(
+      cid,
+      ninetyDaysAgo,
     );
 
-    return results;
+    const rows = await prisma.$queryRaw`
+      SELECT
+        p.id AS product_id,
+        p.sku AS product_code,
+        p.name AS product_name,
+        ROUND(p.current_stock::numeric, 4)::float AS qty_on_hand,
+        ROUND(p.average_cost::numeric, 6)::float AS avg_cost,
+        ROUND((p.current_stock * p.average_cost)::numeric, 2)::float AS stock_value
+      FROM products p
+      WHERE p.company_id = ${cid}
+        AND p.is_active = true
+        AND p.is_archived = false
+        AND p.is_stockable = true
+        AND p.current_stock > 0
+        AND NOT (p.id = ANY(${activeProductIds}::text[]))
+      ORDER BY stock_value DESC
+      LIMIT 20
+    `;
+
+    return rows.map((r) => ({ ...r, days_no_movement: DEAD_STOCK_LOOKBACK_DAYS }));
   }
 
-  // ── Top moving: unchanged (already queries StockMovement correctly) ────────
+  // ── Top moving: SQL GROUP BY + JOIN instead of full-scan + in-memory group ─
   static async _getTopMovingProducts(companyId, limit) {
+    const cid = toIdString(companyId);
     const thirtyDays = dateHelpers.lastNDays(TOP_MOVING_WINDOW_DAYS);
 
-    const results = await aggregateWithTimeout(
-      StockMovement,
-      [
-        {
-          $match: {
-            $and: [
-              {
-                $or: [
-                  { company: new mongoose.Types.ObjectId(companyId) },
-                  { company_id: new mongoose.Types.ObjectId(companyId) },
-                  { company: companyId },
-                  { company_id: companyId },
-                ],
-              },
-              {
-                $or: [
-                  { reason: "dispatch" },
-                  { type: "out" },
-                  { movement_type: "dispatch" },
-                ],
-              },
-              {
-                $or: [
-                  {
-                    movementDate: {
-                      $gte: thirtyDays.start,
-                      $lte: thirtyDays.end,
-                    },
-                  },
-                  {
-                    created_at: {
-                      $gte: thirtyDays.start,
-                      $lte: thirtyDays.end,
-                    },
-                  },
-                ],
-              },
-            ],
-          },
-        },
-        {
-          $group: {
-            _id: { $ifNull: ["$product", "$product_id"] },
-            total_qty: {
-              $sum: { $ifNull: ["$quantity", { $ifNull: ["$qty", 0] }] },
-            },
-            total_value: {
-              $sum: {
-                $ifNull: ["$totalCost", { $ifNull: ["$total_cost", 0] }],
-              },
-            },
-            move_count: { $sum: 1 },
-          },
-        },
-        { $sort: { total_qty: -1 } },
-        { $limit: limit },
-        {
-          $lookup: {
-            from: "products",
-            localField: "_id",
-            foreignField: "_id",
-            as: "product",
-          },
-        },
-        { $unwind: "$product" },
-        {
-          $project: {
-            product_id: "$_id",
-            product_code: { $ifNull: ["$product.code", "$product.sku"] },
-            product_name: "$product.name",
-            total_qty: { $toDouble: { $round: ["$total_qty", 4] } },
-            total_value: { $toDouble: { $round: ["$total_value", 2] } },
-            move_count: 1,
-          },
-        },
-      ],
-      "dashboard",
-    );
+    const rows = await prisma.$queryRaw`
+      SELECT
+        sm.product_id AS product_id,
+        p.sku AS product_code,
+        p.name AS product_name,
+        ROUND(SUM(sm.quantity)::numeric, 4)::float AS total_qty,
+        ROUND(SUM(sm.total_cost)::numeric, 2)::float AS total_value,
+        COUNT(*)::int AS move_count
+      FROM stock_movements sm
+      JOIN products p ON p.id = sm.product_id
+      WHERE sm.company_id = ${cid}
+        AND (sm.reason = 'dispatch' OR sm.type = 'out')
+        AND sm.movement_date >= ${thirtyDays.start}
+        AND sm.movement_date <= ${thirtyDays.end}
+      GROUP BY sm.product_id, p.sku, p.name
+      ORDER BY total_qty DESC
+      LIMIT ${limit}
+    `;
 
-    return results;
+    return rows;
   }
 
-  // ── Warehouse breakdown: use InventoryBatch (has company+warehouse+qty+cost) ─
+  // ── Warehouse breakdown: InventoryBatch grouped by warehouse in SQL ────────
   static async _getWarehouseBreakdown(companyId) {
-    const coid = new mongoose.Types.ObjectId(companyId);
-    const results = await aggregateWithTimeout(
-      InventoryBatch,
-      [
-        {
-          $match: {
-            company: coid,
-            status: { $nin: ["exhausted"] },
-          },
-        },
-        {
-          $addFields: {
-            _availableQty: {
-              $toDouble: { $ifNull: ["$availableQuantity", 0] },
-            },
-            _unitCost: { $toDouble: { $ifNull: ["$unitCost", 0] } },
-          },
-        },
-        {
-          $match: { _availableQty: { $gt: 0 } },
-        },
-        {
-          $group: {
-            _id: "$warehouse",
-            _products: { $addToSet: "$product" },
-            total_units: { $sum: "$_availableQty" },
-            total_value: {
-              $sum: { $multiply: ["$_availableQty", "$_unitCost"] },
-            },
-          },
-        },
-        {
-          $lookup: {
-            from: "warehouses",
-            localField: "_id",
-            foreignField: "_id",
-            as: "_warehouse",
-          },
-        },
-        { $unwind: "$_warehouse" },
-        {
-          $project: {
-            warehouse_id: "$_id",
-            warehouse_name: "$_warehouse.name",
-            warehouse_code: "$_warehouse.code",
-            sku_count: { $size: "$_products" },
-            total_units: { $round: ["$total_units", 4] },
-            total_value: { $round: ["$total_value", 2] },
-          },
-        },
-        { $sort: { total_value: -1 } },
-      ],
-      "dashboard",
-    );
+    const cid = toIdString(companyId);
 
-    return results;
+    const rows = await prisma.$queryRaw`
+      SELECT
+        ib.warehouse_id AS warehouse_id,
+        w.name AS warehouse_name,
+        w.code AS warehouse_code,
+        COUNT(DISTINCT ib.product_id)::int AS sku_count,
+        ROUND(SUM(ib.available_quantity)::numeric, 4)::float AS total_units,
+        ROUND(SUM(ib.available_quantity * ib.unit_cost)::numeric, 2)::float AS total_value
+      FROM inventory_batches ib
+      JOIN warehouses w ON w.id = ib.warehouse_id
+      WHERE ib.company_id = ${cid}
+        AND ib.status <> 'exhausted'
+        AND ib.available_quantity > 0
+      GROUP BY ib.warehouse_id, w.name, w.code
+      ORDER BY total_value DESC
+    `;
+
+    return rows;
   }
 
-  // ── Recent movements: unchanged ──────────────────────────────────────────
+  // ── Recent movements: plain indexed findMany + include (no aggregation needed) ─
   static async _getRecentMovements(companyId, limit) {
-    const companyOid = new mongoose.Types.ObjectId(companyId);
+    const cid = toIdString(companyId);
 
-    return aggregateWithTimeout(
-      StockMovement,
-      [
-        {
-          $match: {
-            $or: [{ company: companyOid }, { company_id: companyOid }],
-          },
-        },
-        { $sort: { movementDate: -1, createdAt: -1 } },
-        { $limit: limit },
-        {
-          $addFields: {
-            _pid: { $ifNull: ["$product", "$product_id"] },
-            _wid: { $ifNull: ["$warehouse", "$warehouse_id"] },
-          },
-        },
-        {
-          $lookup: {
-            from: "products",
-            localField: "_pid",
-            foreignField: "_id",
-            as: "_prod",
-          },
-        },
-        { $unwind: { path: "$_prod", preserveNullAndEmptyArrays: true } },
-        {
-          $lookup: {
-            from: "warehouses",
-            localField: "_wid",
-            foreignField: "_id",
-            as: "_wh",
-          },
-        },
-        { $unwind: { path: "$_wh", preserveNullAndEmptyArrays: true } },
-        {
-          $project: {
-            type: 1,
-            reason: 1,
-            quantity: 1,
-            qty: 1,
-            unitCost: 1,
-            unit_cost: 1,
-            totalCost: 1,
-            total_cost: 1,
-            movementDate: 1,
-            createdAt: 1,
-            created_at: 1,
-            product: 1,
-            product_id: 1,
-            warehouse: 1,
-            warehouse_id: 1,
-            referenceNumber: 1,
-            referenceType: 1,
-            product_name: "$_prod.name",
-            product_code: { $ifNull: ["$_prod.code", "$_prod.sku"] },
-            warehouse_name: "$_wh.name",
-            warehouse_code: "$_wh.code",
-          },
-        },
-      ],
-      "dashboard",
-    );
+    const rows = await prisma.stockMovement.findMany({
+      where: { companyId: cid },
+      orderBy: [{ movementDate: "desc" }, { createdAt: "desc" }],
+      take: limit,
+      select: {
+        type: true,
+        reason: true,
+        quantity: true,
+        unitCost: true,
+        totalCost: true,
+        movementDate: true,
+        createdAt: true,
+        productId: true,
+        warehouseId: true,
+        referenceNumber: true,
+        referenceType: true,
+        product: { select: { name: true, sku: true } },
+        warehouse: { select: { name: true, code: true } },
+      },
+    });
+
+    return rows.map((r) => ({
+      type: r.type,
+      reason: r.reason,
+      quantity: decimalToNumber(r.quantity),
+      qty: decimalToNumber(r.quantity),
+      unitCost: decimalToNumber(r.unitCost),
+      unit_cost: decimalToNumber(r.unitCost),
+      totalCost: decimalToNumber(r.totalCost),
+      total_cost: decimalToNumber(r.totalCost),
+      movementDate: r.movementDate,
+      createdAt: r.createdAt,
+      created_at: r.createdAt,
+      product: r.productId,
+      product_id: r.productId,
+      warehouse: r.warehouseId,
+      warehouse_id: r.warehouseId,
+      referenceNumber: r.referenceNumber,
+      referenceType: r.referenceType,
+      product_name: r.product ? r.product.name : null,
+      product_code: r.product ? r.product.sku : null,
+      warehouse_name: r.warehouse ? r.warehouse.name : null,
+      warehouse_code: r.warehouse ? r.warehouse.code : null,
+    }));
   }
 }
 

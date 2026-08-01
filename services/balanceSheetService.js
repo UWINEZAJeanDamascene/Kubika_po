@@ -1,9 +1,7 @@
-const mongoose = require("mongoose");
+const { toIdString } = require("../utils/objectId");
+const journalAgg = require("./journalAggregationService");
 const ChartOfAccount = require("../models/ChartOfAccount");
-const JournalEntry = require("../models/JournalEntry");
 const Loan = require("../models/Loan");
-const { isMongoConnected } = require("../utils/mongoConnection");
-const { aggregateWithTimeout } = require("../utils/mongoAggregation");
 const Company = require("../models/Company");
 const PLStatementService = require("./plStatementService");
 
@@ -87,25 +85,15 @@ class BalanceSheetService {
       dateTo,
     );
 
-    // Get all account balances up to asOfDate
-    const accountBalances = await aggregateWithTimeout(JournalEntry, [
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          status: "posted",
-          reversed: { $ne: true },
-          date: { $lte: dateTo },
-        },
-      },
-      { $unwind: "$lines" },
-      {
-        $group: {
-          _id: "$lines.accountCode",
-          total_dr: { $sum: "$lines.debit" },
-          total_cr: { $sum: "$lines.credit" },
-        },
-      },
-    ]);
+    // Get all account balances up to asOfDate — one grouped SQL SUM instead
+    // of pulling every posted journal entry + lines and unwinding in Node.
+    const cid = toIdString(companyId);
+    const rawAccountBalances = await journalAgg.sumLinesByAccountCode(cid, { dateTo });
+    const accountBalances = rawAccountBalances.map((r) => ({
+      _id: r.accountCode,
+      total_dr: r.totalDebit,
+      total_cr: r.totalCredit,
+    }));
 
     if (accountBalances.length === 0) {
       return BalanceSheetService._emptyPeriodData();
@@ -116,7 +104,7 @@ class BalanceSheetService {
     const accountCodes = accountBalances.map((b) => b._id);
     const accounts = await ChartOfAccount.find({
       code: { $in: accountCodes },
-      company: new mongoose.Types.ObjectId(companyId),
+      company: cid,
     }).lean();
 
     const accountMap = {};
@@ -476,16 +464,14 @@ class BalanceSheetService {
 
     // Get all active loans for this company
     let loans = [];
-    if (isMongoConnected()) {
-      try {
-        loans = await Loan.find({
-          company: new mongoose.Types.ObjectId(companyId),
-          status: { $in: ['active', 'short-term', 'long-term'] },
-          outstandingBalance: { $gt: 0 }
-        }).lean();
-      } catch (_err) {
-        loans = [];
-      }
+    try {
+      loans = await Loan.find({
+        company: companyId,
+        status: { $in: ['active', 'short-term', 'long-term'] },
+        outstandingBalance: { $gt: 0 }
+      }).lean();
+    } catch (_err) {
+      loans = [];
     }
 
     const maturityMap = new Map();

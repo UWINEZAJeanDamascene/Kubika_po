@@ -1,15 +1,17 @@
-const mongoose = require('mongoose')
-const { aggregateWithTimeout } = require('../../utils/mongoAggregation')
+const { prisma } = require('../../lib/prisma')
+const { toIdString } = require('../../utils/objectId')
+const { decimalToNumber } = require('../../utils/decimalHelpers')
 const JournalEntry = require('../../models/JournalEntry')
 const BankAccount = require('../../models/BankAccount')
-const Invoice = require('../../models/Invoice')
 const Company = require('../../models/Company')
 const Loan = require('../../models/Loan')
 const { PettyCashFloat } = require('../../models/PettyCash')
 const dateHelpers = require('../../utils/dateHelpers')
 const dashboardCache = require('../DashboardCacheService')
 const journalAgg = require('../journalAggregationService')
-const { isMongoConnected } = require('../../utils/mongoConnection')
+
+/** Invoice statuses counted as outstanding accounts receivable. */
+const AR_OPEN_STATUSES = ['confirmed', 'partially_paid']
 
 class ExecutiveDashboardService {
 
@@ -250,24 +252,17 @@ class ExecutiveDashboardService {
   }
 
   static async _getOutstandingAR(companyId) {
-    const result = await aggregateWithTimeout(Invoice, [
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          status: { $in: ['confirmed', 'partially_paid'] }
-        }
+    const agg = await prisma.invoice.aggregate({
+      where: {
+        companyId: toIdString(companyId),
+        status: { in: AR_OPEN_STATUSES }
       },
-      {
-        $group: {
-          _id: null,
-          total: { $sum: { $toDouble: { $ifNull: ['$amountOutstanding', 0] } } },
-          count: { $sum: 1 }
-        }
-      }
-    ], 'dashboard')
+      _sum: { amountOutstanding: true },
+      _count: true
+    })
     return {
-      total: result[0]?.total != null ? Number(result[0].total) : 0,
-      count: result[0]?.count || 0
+      total: decimalToNumber(agg._sum.amountOutstanding),
+      count: agg._count || 0
     }
   }
 
@@ -275,25 +270,18 @@ class ExecutiveDashboardService {
     const today = new Date()
     today.setUTCHours(0, 0, 0, 0)
 
-    const result = await aggregateWithTimeout(Invoice, [
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          status: { $in: ['confirmed', 'partially_paid'] },
-          dueDate: { $lt: today }
-        }
+    const agg = await prisma.invoice.aggregate({
+      where: {
+        companyId: toIdString(companyId),
+        status: { in: AR_OPEN_STATUSES },
+        dueDate: { lt: today }
       },
-      {
-        $group: {
-          _id: null,
-          total: { $sum: { $toDouble: { $ifNull: ['$amountOutstanding', 0] } } },
-          count: { $sum: 1 }
-        }
-      }
-    ], 'dashboard')
+      _sum: { amountOutstanding: true },
+      _count: true
+    })
     return {
-      total: result[0]?.total != null ? Number(result[0].total) : 0,
-      count: result[0]?.count || 0
+      total: decimalToNumber(agg._sum.amountOutstanding),
+      count: agg._count || 0
     }
   }
 
@@ -315,7 +303,6 @@ class ExecutiveDashboardService {
       totalAmount: 0,
       payments: [],
     };
-    if (!isMongoConnected()) return empty;
 
     let activeLoans = [];
     try {

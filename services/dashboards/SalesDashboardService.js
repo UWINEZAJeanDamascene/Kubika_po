@@ -1,13 +1,10 @@
-const mongoose = require('mongoose')
-const { aggregateWithTimeout } = require('../../utils/mongoAggregation')
-const Invoice = require('../../models/Invoice')
-const CreditNote = require('../../models/CreditNote')
+const { prisma } = require('../../lib/prisma')
+const { toIdString } = require('../../utils/objectId')
+const { decimalToNumber } = require('../../utils/decimalHelpers')
 const dateHelpers = require('../../utils/dateHelpers')
 const dashboardCache = require('../DashboardCacheService')
 
 const TOP_CLIENTS_LIMIT = 5
-
-const MS_PER_DAY = 1000 * 60 * 60 * 24
 
 /** Invoice statuses for AR aging (open balances) */
 const AR_OPEN_STATUSES = ['confirmed', 'partially_paid']
@@ -22,6 +19,8 @@ const INVOICE_STATUS_ORDER = [
   'fully_paid',
   'cancelled'
 ]
+
+const MARGIN_MS = 24 * 60 * 60 * 1000
 
 class SalesDashboardService {
   static async get(companyId) {
@@ -75,208 +74,133 @@ class SalesDashboardService {
 
   /**
    * MTD invoice KPIs — excludes **draft** from counts and amounts (not yet issued).
+   * Pushed down to a single SQL aggregate (SUM/COUNT) instead of pulling every
+   * matching invoice row over the network and reducing in JS.
    */
   static async _getInvoicesSummary(companyId, period) {
-    const companyOid = new mongoose.Types.ObjectId(companyId)
-    const marginMs = 24 * 60 * 60 * 1000
-    const qStart = new Date(period.start.getTime() - marginMs)
-    const qEnd = new Date(period.end.getTime() + marginMs)
+    const cid = toIdString(companyId)
+    const qStart = new Date(period.start.getTime() - MARGIN_MS)
+    const qEnd = new Date(period.end.getTime() + MARGIN_MS)
 
-    const result = await aggregateWithTimeout(Invoice, [
-      {
-        $match: {
-          company: companyOid,
-          invoiceDate: { $gte: qStart, $lte: qEnd },
-          status: { $ne: 'draft' }
-        }
+    const agg = await prisma.invoice.aggregate({
+      where: {
+        companyId: cid,
+        invoiceDate: { gte: qStart, lte: qEnd },
+        status: { not: 'draft' }
       },
-      {
-        $group: {
-          _id: null,
-          invoices_raised: { $sum: 1 },
-          total_invoiced: { $sum: { $toDouble: { $ifNull: ['$totalAmount', 0] } } },
-          total_collected: { $sum: { $toDouble: { $ifNull: ['$amountPaid', 0] } } },
-          total_outstanding: { $sum: { $toDouble: { $ifNull: ['$amountOutstanding', 0] } } }
-        }
-      }
-    ], 'dashboard')
+      _count: true,
+      _sum: { totalAmount: true, amountPaid: true, amountOutstanding: true }
+    })
 
-    const s = result[0] || {}
     return {
-      invoices_raised: s.invoices_raised || 0,
-      total_invoiced: dateHelpers.round2(s.total_invoiced || 0),
-      total_collected: dateHelpers.round2(s.total_collected || 0),
-      total_outstanding: dateHelpers.round2(s.total_outstanding || 0)
+      invoices_raised: agg._count || 0,
+      total_invoiced: dateHelpers.round2(decimalToNumber(agg._sum.totalAmount)),
+      total_collected: dateHelpers.round2(decimalToNumber(agg._sum.amountPaid)),
+      total_outstanding: dateHelpers.round2(decimalToNumber(agg._sum.amountOutstanding))
     }
   }
 
+  /**
+   * AR aging buckets — one grouped SQL scan (CASE/SUM) instead of fetching every
+   * open invoice and bucketing in application memory.
+   */
   static async _getARAgingBuckets(companyId) {
-    const companyOid = new mongoose.Types.ObjectId(companyId)
+    const cid = toIdString(companyId)
     const today = new Date()
     today.setUTCHours(0, 0, 0, 0)
 
-    const result = await aggregateWithTimeout(Invoice, [
-      {
-        $match: {
-          company: companyOid,
-          status: { $in: AR_OPEN_STATUSES }
-        }
-      },
-      {
-        $addFields: {
-          outstanding: { $toDouble: { $ifNull: ['$amountOutstanding', 0] } },
-          days_overdue: {
-            $cond: {
-              if: { $lt: ['$dueDate', today] },
-              then: {
-                $toInt: {
-                  $divide: [{ $subtract: [today, '$dueDate'] }, MS_PER_DAY]
-                }
-              },
-              else: 0
-            }
-          }
-        }
-      },
-      {
-        $group: {
-          _id: null,
-          not_due: {
-            $sum: {
-              $cond: [{ $gte: ['$dueDate', today] }, '$outstanding', 0]
-            }
-          },
-          days_1_30: {
-            $sum: {
-              $cond: [
-                {
-                  $and: [{ $gte: ['$days_overdue', 1] }, { $lte: ['$days_overdue', 30] }]
-                },
-                '$outstanding',
-                0
-              ]
-            }
-          },
-          days_31_60: {
-            $sum: {
-              $cond: [
-                {
-                  $and: [{ $gte: ['$days_overdue', 31] }, { $lte: ['$days_overdue', 60] }]
-                },
-                '$outstanding',
-                0
-              ]
-            }
-          },
-          days_61_90: {
-            $sum: {
-              $cond: [
-                {
-                  $and: [{ $gte: ['$days_overdue', 61] }, { $lte: ['$days_overdue', 90] }]
-                },
-                '$outstanding',
-                0
-              ]
-            }
-          },
-          days_90_plus: {
-            $sum: {
-              $cond: [{ $gt: ['$days_overdue', 90] }, '$outstanding', 0]
-            }
-          },
-          total_overdue: {
-            $sum: {
-              $cond: [{ $gt: ['$days_overdue', 0] }, '$outstanding', 0]
-            }
-          },
-          total_ar_outstanding: { $sum: '$outstanding' }
-        }
-      }
-    ], 'dashboard')
+    const rows = await prisma.$queryRaw`
+      SELECT
+        COALESCE(SUM(CASE WHEN due_date >= ${today} THEN amount_outstanding ELSE 0 END), 0)::float AS "notDue",
+        COALESCE(SUM(CASE WHEN due_date < ${today}
+          AND FLOOR(EXTRACT(EPOCH FROM (${today} - due_date)) / 86400) BETWEEN 1 AND 30
+          THEN amount_outstanding ELSE 0 END), 0)::float AS "days1To30",
+        COALESCE(SUM(CASE WHEN due_date < ${today}
+          AND FLOOR(EXTRACT(EPOCH FROM (${today} - due_date)) / 86400) BETWEEN 31 AND 60
+          THEN amount_outstanding ELSE 0 END), 0)::float AS "days31To60",
+        COALESCE(SUM(CASE WHEN due_date < ${today}
+          AND FLOOR(EXTRACT(EPOCH FROM (${today} - due_date)) / 86400) BETWEEN 61 AND 90
+          THEN amount_outstanding ELSE 0 END), 0)::float AS "days61To90",
+        COALESCE(SUM(CASE WHEN due_date < ${today}
+          AND FLOOR(EXTRACT(EPOCH FROM (${today} - due_date)) / 86400) > 90
+          THEN amount_outstanding ELSE 0 END), 0)::float AS "days90Plus",
+        COALESCE(SUM(CASE WHEN due_date < ${today} THEN amount_outstanding ELSE 0 END), 0)::float AS "totalOverdue",
+        COALESCE(SUM(amount_outstanding), 0)::float AS "totalArOutstanding"
+      FROM invoices
+      WHERE company_id = ${cid}
+        AND status = ANY(${AR_OPEN_STATUSES}::text[])
+    `
 
-    const b = result[0] || {}
+    const b = rows[0] || {}
     return {
-      not_due: dateHelpers.round2(b.not_due || 0),
-      days_1_30: dateHelpers.round2(b.days_1_30 || 0),
-      days_31_60: dateHelpers.round2(b.days_31_60 || 0),
-      days_61_90: dateHelpers.round2(b.days_61_90 || 0),
-      days_90_plus: dateHelpers.round2(b.days_90_plus || 0),
-      total_overdue: dateHelpers.round2(b.total_overdue || 0),
-      total_ar_outstanding: dateHelpers.round2(b.total_ar_outstanding || 0)
+      not_due: dateHelpers.round2(b.notDue || 0),
+      days_1_30: dateHelpers.round2(b.days1To30 || 0),
+      days_31_60: dateHelpers.round2(b.days31To60 || 0),
+      days_61_90: dateHelpers.round2(b.days61To90 || 0),
+      days_90_plus: dateHelpers.round2(b.days90Plus || 0),
+      total_overdue: dateHelpers.round2(b.totalOverdue || 0),
+      total_ar_outstanding: dateHelpers.round2(b.totalArOutstanding || 0)
     }
   }
 
+  /**
+   * Top clients by revenue — SQL GROUP BY + ORDER BY + LIMIT (only `limit` rows
+   * ever leave Postgres), then one small lookup for client names/codes.
+   */
   static async _getTopClients(companyId, limit) {
-    const companyOid = new mongoose.Types.ObjectId(companyId)
+    const cid = toIdString(companyId)
 
-    return aggregateWithTimeout(Invoice, [
-      {
-        $match: {
-          company: companyOid,
-          status: { $nin: ['draft', 'cancelled'] }
-        }
+    const grouped = await prisma.invoice.groupBy({
+      by: ['clientId'],
+      where: {
+        companyId: cid,
+        status: { notIn: ['draft', 'cancelled'] }
       },
-      {
-        $group: {
-          _id: '$client',
-          total_invoiced: { $sum: { $toDouble: { $ifNull: ['$totalAmount', 0] } } },
-          total_paid: { $sum: { $toDouble: { $ifNull: ['$amountPaid', 0] } } },
-          invoice_count: { $sum: 1 }
-        }
-      },
-      { $sort: { total_invoiced: -1 } },
-      { $limit: limit },
-      {
-        $lookup: {
-          from: 'clients',
-          localField: '_id',
-          foreignField: '_id',
-          as: 'client'
-        }
-      },
-      { $unwind: '$client' },
-      {
-        $project: {
-          client_id: '$_id',
-          client_name: '$client.name',
-          client_code: { $ifNull: ['$client.code', ''] },
-          total_invoiced: { $round: ['$total_invoiced', 2] },
-          total_paid: { $round: ['$total_paid', 2] },
-          outstanding: {
-            $round: [
-              {
-                $subtract: ['$total_invoiced', '$total_paid']
-              },
-              2
-            ]
-          },
-          invoice_count: 1
-        }
+      _sum: { totalAmount: true, amountPaid: true },
+      _count: true,
+      orderBy: { _sum: { totalAmount: 'desc' } },
+      take: limit
+    })
+
+    if (grouped.length === 0) return []
+
+    const clients = await prisma.client.findMany({
+      where: { id: { in: grouped.map((g) => g.clientId) } },
+      select: { id: true, name: true, code: true }
+    })
+    const clientById = new Map(clients.map((c) => [c.id, c]))
+
+    return grouped.map((g) => {
+      const client = clientById.get(g.clientId)
+      const totalInvoiced = decimalToNumber(g._sum.totalAmount)
+      const totalPaid = decimalToNumber(g._sum.amountPaid)
+      return {
+        client_id: g.clientId,
+        client_name: client ? client.name : null,
+        client_code: (client && client.code) || '',
+        total_invoiced: dateHelpers.round2(totalInvoiced),
+        total_paid: dateHelpers.round2(totalPaid),
+        outstanding: dateHelpers.round2(totalInvoiced - totalPaid),
+        invoice_count: g._count
       }
-    ], 'dashboard')
+    })
   }
 
   static async _getInvoicesByStatus(companyId) {
-    const companyOid = new mongoose.Types.ObjectId(companyId)
+    const cid = toIdString(companyId)
 
-    const result = await aggregateWithTimeout(Invoice, [
-      {
-        $match: { company: companyOid }
-      },
-      {
-        $group: {
-          _id: '$status',
-          count: { $sum: 1 },
-          total_amount: { $sum: { $toDouble: { $ifNull: ['$totalAmount', 0] } } }
-        }
-      }
-    ], 'dashboard')
+    const grouped = await prisma.invoice.groupBy({
+      by: ['status'],
+      where: { companyId: cid },
+      _count: true,
+      _sum: { totalAmount: true }
+    })
 
     const map = {}
-    for (const row of result) {
-      map[row._id] = {
-        count: row.count,
-        total_amount: dateHelpers.round2(row.total_amount || 0)
+    for (const row of grouped) {
+      map[row.status] = {
+        count: row._count,
+        total_amount: dateHelpers.round2(decimalToNumber(row._sum.totalAmount))
       }
     }
 
@@ -290,59 +214,42 @@ class SalesDashboardService {
   }
 
   static async _getCreditNotesSummary(companyId, period) {
-    const companyOid = new mongoose.Types.ObjectId(companyId)
-    const marginMs = 24 * 60 * 60 * 1000
-    const qStart = new Date(period.start.getTime() - marginMs)
-    const qEnd = new Date(period.end.getTime() + marginMs)
+    const cid = toIdString(companyId)
+    const qStart = new Date(period.start.getTime() - MARGIN_MS)
+    const qEnd = new Date(period.end.getTime() + MARGIN_MS)
 
-    const result = await aggregateWithTimeout(CreditNote, [
-      {
-        $match: {
-          company: companyOid,
-          creditDate: { $gte: qStart, $lte: qEnd },
-          status: 'confirmed'
-        }
+    const agg = await prisma.creditNote.aggregate({
+      where: {
+        companyId: cid,
+        creditDate: { gte: qStart, lte: qEnd },
+        status: 'confirmed'
       },
-      {
-        $group: {
-          _id: null,
-          count: { $sum: 1 },
-          total_value: { $sum: { $toDouble: { $ifNull: ['$totalAmount', 0] } } }
-        }
-      }
-    ], 'dashboard')
+      _count: true,
+      _sum: { totalAmount: true }
+    })
 
     return {
-      count: result[0]?.count || 0,
-      total_value: dateHelpers.round2(result[0]?.total_value || 0)
+      count: agg._count || 0,
+      total_value: dateHelpers.round2(decimalToNumber(agg._sum.totalAmount))
     }
   }
 
   static async _getCollectionRate(companyId, period) {
-    const companyOid = new mongoose.Types.ObjectId(companyId)
-    const marginMs = 24 * 60 * 60 * 1000
-    const qStart = new Date(period.start.getTime() - marginMs)
-    const qEnd = new Date(period.end.getTime() + marginMs)
+    const cid = toIdString(companyId)
+    const qStart = new Date(period.start.getTime() - MARGIN_MS)
+    const qEnd = new Date(period.end.getTime() + MARGIN_MS)
 
-    const result = await aggregateWithTimeout(Invoice, [
-      {
-        $match: {
-          company: companyOid,
-          invoiceDate: { $gte: qStart, $lte: qEnd },
-          status: { $nin: ['draft', 'cancelled'] }
-        }
+    const agg = await prisma.invoice.aggregate({
+      where: {
+        companyId: cid,
+        invoiceDate: { gte: qStart, lte: qEnd },
+        status: { notIn: ['draft', 'cancelled'] }
       },
-      {
-        $group: {
-          _id: null,
-          total_billed: { $sum: { $toDouble: { $ifNull: ['$totalAmount', 0] } } },
-          total_paid: { $sum: { $toDouble: { $ifNull: ['$amountPaid', 0] } } }
-        }
-      }
-    ], 'dashboard')
+      _sum: { totalAmount: true, amountPaid: true }
+    })
 
-    const billed = result[0]?.total_billed || 0
-    const paid = result[0]?.total_paid || 0
+    const billed = decimalToNumber(agg._sum.totalAmount)
+    const paid = decimalToNumber(agg._sum.amountPaid)
     const rate = dateHelpers.round2(dateHelpers.safeDivide(paid, billed) * 100)
 
     return {

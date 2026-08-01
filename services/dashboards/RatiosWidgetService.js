@@ -31,16 +31,27 @@ class RatiosWidgetService {
       neutral: { color: '#888780', label: 'N/A', icon: 'neutral' }
     }
 
-    const formattedRatios = Object.entries(ratiosResult.ratios).map(([key, ratio]) => ({
-      key,
-      label: RatiosWidgetService._getLabel(key),
-      value: ratio.value,
-      formula: ratio.formula,
-      status: ratio.status,
-      status_color: statusConfig[ratio.status]?.color || statusConfig.neutral.color,
-      status_label: statusConfig[ratio.status]?.label || 'N/A',
-      inputs: ratio.inputs
-    }))
+    // ratiosResult.ratios is grouped by category (liquidity/profitability/
+    // efficiency/leverage), each holding a `ratios` map of individual ratios.
+    // Flatten to one list for the widget; each ratio already carries its own
+    // label/formula from FinancialRatiosService, so _getLabel() is only a
+    // fallback.
+    const formattedRatios = []
+    for (const [categoryKey, category] of Object.entries(ratiosResult.ratios || {})) {
+      for (const [key, ratio] of Object.entries(category?.ratios || {})) {
+        formattedRatios.push({
+          key,
+          category: categoryKey,
+          label: ratio.label || RatiosWidgetService._getLabel(key),
+          value: ratio.value,
+          formula: ratio.formula,
+          status: ratio.status,
+          status_color: statusConfig[ratio.status]?.color || statusConfig.neutral.color,
+          status_label: statusConfig[ratio.status]?.label || 'N/A',
+          inputs: ratio.inputs
+        })
+      }
+    }
 
     const result = {
       company_id: companyId,

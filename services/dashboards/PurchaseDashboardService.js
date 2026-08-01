@@ -1,8 +1,6 @@
-const mongoose = require('mongoose')
-const { aggregateWithTimeout } = require('../../utils/mongoAggregation')
-const PurchaseOrder = require('../../models/PurchaseOrder')
-const GRN = require('../../models/GoodsReceivedNote')
-const PurchaseReturn = require('../../models/PurchaseReturn')
+const { prisma } = require('../../lib/prisma')
+const { toIdString } = require('../../utils/objectId')
+const { decimalToNumber } = require('../../utils/decimalHelpers')
 const dateHelpers = require('../../utils/dateHelpers')
 const dashboardCache = require('../DashboardCacheService')
 
@@ -21,7 +19,7 @@ const PO_STATUS_ORDER = [
   'cancelled'
 ]
 
-const MS_PER_DAY = 1000 * 60 * 60 * 24
+const MARGIN_MS = 24 * 60 * 60 * 1000
 
 class PurchaseDashboardService {
   static async get(companyId) {
@@ -72,49 +70,31 @@ class PurchaseDashboardService {
 
   /**
    * Month-to-date PO stats; orderDate uses ±24h margin vs UTC month bounds (journal-style).
+   * One SQL scan with FILTER-based conditional sums instead of pulling every PO row.
    */
   static async _getPOSummary(companyId, period) {
-    const companyOid = new mongoose.Types.ObjectId(companyId)
-    const marginMs = 24 * 60 * 60 * 1000
-    const qStart = new Date(period.start.getTime() - marginMs)
-    const qEnd = new Date(period.end.getTime() + marginMs)
+    const cid = toIdString(companyId)
+    const qStart = new Date(period.start.getTime() - MARGIN_MS)
+    const qEnd = new Date(period.end.getTime() + MARGIN_MS)
 
-    const result = await aggregateWithTimeout(PurchaseOrder, [
-      {
-        $match: {
-          company: companyOid,
-          orderDate: { $gte: qStart, $lte: qEnd }
-        }
-      },
-      {
-        $group: {
-          _id: null,
-          po_count: { $sum: 1 },
-          total_value: { $sum: { $toDouble: { $ifNull: ['$totalAmount', 0] } } },
-          open_count: {
-            $sum: {
-              $cond: [{ $in: ['$status', OPEN_PO_STATUSES] }, 1, 0]
-            }
-          },
-          open_value: {
-            $sum: {
-              $cond: [
-                { $in: ['$status', OPEN_PO_STATUSES] },
-                { $toDouble: { $ifNull: ['$totalAmount', 0] } },
-                0
-              ]
-            }
-          }
-        }
-      }
-    ], 'dashboard')
+    const rows = await prisma.$queryRaw`
+      SELECT
+        COUNT(*)::int AS "poCount",
+        COALESCE(SUM(total_amount), 0)::float AS "totalValue",
+        COUNT(*) FILTER (WHERE status = ANY(${OPEN_PO_STATUSES}::text[]))::int AS "openCount",
+        COALESCE(SUM(total_amount) FILTER (WHERE status = ANY(${OPEN_PO_STATUSES}::text[])), 0)::float AS "openValue"
+      FROM purchase_orders
+      WHERE company_id = ${cid}
+        AND order_date >= ${qStart}
+        AND order_date <= ${qEnd}
+    `
 
-    const s = result[0] || {}
+    const s = rows[0] || {}
     return {
-      po_count: s.po_count || 0,
-      total_value: dateHelpers.round2(s.total_value || 0),
-      open_count: s.open_count || 0,
-      open_value: dateHelpers.round2(s.open_value || 0)
+      po_count: s.poCount || 0,
+      total_value: dateHelpers.round2(s.totalValue || 0),
+      open_count: s.openCount || 0,
+      open_value: dateHelpers.round2(s.openValue || 0)
     }
   }
 
@@ -122,267 +102,139 @@ class PurchaseDashboardService {
    * Confirmed GRNs awaiting payment — includes both invoice (total) value and remaining balance.
    */
   static async _getGRNPending(companyId) {
-    const companyOid = new mongoose.Types.ObjectId(companyId)
+    const cid = toIdString(companyId)
 
-    const result = await aggregateWithTimeout(GRN, [
-      {
-        $match: {
-          company: companyOid,
-          status: 'confirmed',
-          paymentStatus: { $in: ['pending', 'partially_paid'] }
-        }
+    const agg = await prisma.goodsReceivedNote.aggregate({
+      where: {
+        companyId: cid,
+        status: 'confirmed',
+        paymentStatus: { in: ['pending', 'partially_paid'] }
       },
-      {
-        $group: {
-          _id: null,
-          grn_count: { $sum: 1 },
-          total_value: {
-            $sum: { $toDouble: { $ifNull: ['$totalAmount', 0] } }
-          },
-          total_balance_outstanding: {
-            $sum: { $toDouble: { $ifNull: ['$balance', 0] } }
-          }
-        }
-      }
-    ], 'dashboard')
+      _count: true,
+      _sum: { totalAmount: true, balance: true }
+    })
 
-    const row = result[0] || {}
     return {
-      count: row.grn_count || 0,
-      total_value: dateHelpers.round2(row.total_value || 0),
-      total_balance_outstanding: dateHelpers.round2(row.total_balance_outstanding || 0)
+      count: agg._count || 0,
+      total_value: dateHelpers.round2(decimalToNumber(agg._sum.totalAmount)),
+      total_balance_outstanding: dateHelpers.round2(decimalToNumber(agg._sum.balance))
     }
   }
 
   /**
-   * Single scan of unpaid GRNs for AP summary + aging buckets (fewer round-trips).
+   * Single SQL scan of unpaid GRNs for AP summary + aging buckets (fewer round-trips,
+   * and the summing itself happens in Postgres instead of Node).
    */
   static async _getAPSummaryAndAging(companyId) {
-    const companyOid = new mongoose.Types.ObjectId(companyId)
+    const cid = toIdString(companyId)
     const today = new Date()
     today.setUTCHours(0, 0, 0, 0)
 
-    const [doc] = await aggregateWithTimeout(GRN, [
-      {
-        $match: {
-          company: companyOid,
-          status: 'confirmed',
-          paymentStatus: { $ne: 'paid' }
-        }
-      },
-      {
-        $facet: {
-          summary: [
-            {
-              $addFields: {
-                outstanding: { $toDouble: { $ifNull: ['$balance', 0] } }
-              }
-            },
-            {
-              $group: {
-                _id: null,
-                total_ap: { $sum: '$outstanding' },
-                count: { $sum: 1 },
-                overdue_amount: {
-                  $sum: {
-                    $cond: [
-                      {
-                        $and: [
-                          { $ne: ['$paymentDueDate', null] },
-                          { $lt: ['$paymentDueDate', today] }
-                        ]
-                      },
-                      '$outstanding',
-                      0
-                    ]
-                  }
-                },
-                overdue_count: {
-                  $sum: {
-                    $cond: [
-                      {
-                        $and: [
-                          { $ne: ['$paymentDueDate', null] },
-                          { $lt: ['$paymentDueDate', today] }
-                        ]
-                      },
-                      1,
-                      0
-                    ]
-                  }
-                }
-              }
-            }
-          ],
-          aging: [
-            {
-              $addFields: {
-                outstanding: { $toDouble: { $ifNull: ['$balance', 0] } },
-                days_overdue: {
-                  $cond: {
-                    if: {
-                      $and: [
-                        { $ne: ['$paymentDueDate', null] },
-                        { $lt: ['$paymentDueDate', today] }
-                      ]
-                    },
-                    then: {
-                      $toInt: {
-                        $divide: [{ $subtract: [today, '$paymentDueDate'] }, MS_PER_DAY]
-                      }
-                    },
-                    else: 0
-                  }
-                }
-              }
-            },
-            {
-              $group: {
-                _id: null,
-                not_due: {
-                  $sum: {
-                    $cond: [{ $eq: ['$days_overdue', 0] }, '$outstanding', 0]
-                  }
-                },
-                days_1_30: {
-                  $sum: {
-                    $cond: [
-                      {
-                        $and: [
-                          { $gte: ['$days_overdue', 1] },
-                          { $lte: ['$days_overdue', 30] }
-                        ]
-                      },
-                      '$outstanding',
-                      0
-                    ]
-                  }
-                },
-                days_31_60: {
-                  $sum: {
-                    $cond: [
-                      {
-                        $and: [
-                          { $gte: ['$days_overdue', 31] },
-                          { $lte: ['$days_overdue', 60] }
-                        ]
-                      },
-                      '$outstanding',
-                      0
-                    ]
-                  }
-                },
-                days_61_90: {
-                  $sum: {
-                    $cond: [
-                      {
-                        $and: [
-                          { $gte: ['$days_overdue', 61] },
-                          { $lte: ['$days_overdue', 90] }
-                        ]
-                      },
-                      '$outstanding',
-                      0
-                    ]
-                  }
-                },
-                days_90_plus: {
-                  $sum: {
-                    $cond: [{ $gt: ['$days_overdue', 90] }, '$outstanding', 0]
-                  }
-                },
-                total_outstanding: { $sum: '$outstanding' }
-              }
-            }
-          ]
-        }
-      }
-    ], 'dashboard')
+    const rows = await prisma.$queryRaw`
+      SELECT
+        COUNT(*)::int AS count,
+        COALESCE(SUM(balance), 0)::float AS "totalAp",
+        COALESCE(SUM(balance) FILTER (
+          WHERE payment_due_date IS NOT NULL AND payment_due_date < ${today}
+        ), 0)::float AS "overdueAmount",
+        COUNT(*) FILTER (
+          WHERE payment_due_date IS NOT NULL AND payment_due_date < ${today}
+        )::int AS "overdueCount",
+        COALESCE(SUM(balance) FILTER (
+          WHERE payment_due_date IS NULL OR payment_due_date >= ${today}
+        ), 0)::float AS "notDue",
+        COALESCE(SUM(balance) FILTER (
+          WHERE payment_due_date < ${today}
+            AND FLOOR(EXTRACT(EPOCH FROM (${today} - payment_due_date)) / 86400) BETWEEN 1 AND 30
+        ), 0)::float AS "days1To30",
+        COALESCE(SUM(balance) FILTER (
+          WHERE payment_due_date < ${today}
+            AND FLOOR(EXTRACT(EPOCH FROM (${today} - payment_due_date)) / 86400) BETWEEN 31 AND 60
+        ), 0)::float AS "days31To60",
+        COALESCE(SUM(balance) FILTER (
+          WHERE payment_due_date < ${today}
+            AND FLOOR(EXTRACT(EPOCH FROM (${today} - payment_due_date)) / 86400) BETWEEN 61 AND 90
+        ), 0)::float AS "days61To90",
+        COALESCE(SUM(balance) FILTER (
+          WHERE payment_due_date < ${today}
+            AND FLOOR(EXTRACT(EPOCH FROM (${today} - payment_due_date)) / 86400) > 90
+        ), 0)::float AS "days90Plus",
+        COALESCE(SUM(balance), 0)::float AS "totalOutstanding"
+      FROM goods_received_notes
+      WHERE company_id = ${cid}
+        AND status = 'confirmed'
+        AND payment_status <> 'paid'
+    `
 
-    const s = (doc && doc.summary && doc.summary[0]) || {}
-    const b = (doc && doc.aging && doc.aging[0]) || {}
+    const r = rows[0] || {}
 
     const apSummary = {
-      total_outstanding: dateHelpers.round2(s.total_ap || 0),
-      invoice_count: s.count || 0,
-      overdue_amount: dateHelpers.round2(s.overdue_amount || 0),
-      overdue_count: s.overdue_count || 0
+      total_outstanding: dateHelpers.round2(r.totalAp || 0),
+      invoice_count: r.count || 0,
+      overdue_amount: dateHelpers.round2(r.overdueAmount || 0),
+      overdue_count: r.overdueCount || 0
     }
 
     const apAging = {
-      not_due: dateHelpers.round2(b.not_due || 0),
-      days_1_30: dateHelpers.round2(b.days_1_30 || 0),
-      days_31_60: dateHelpers.round2(b.days_31_60 || 0),
-      days_61_90: dateHelpers.round2(b.days_61_90 || 0),
-      days_90_plus: dateHelpers.round2(b.days_90_plus || 0),
-      total_outstanding: dateHelpers.round2(b.total_outstanding || 0)
+      not_due: dateHelpers.round2(r.notDue || 0),
+      days_1_30: dateHelpers.round2(r.days1To30 || 0),
+      days_31_60: dateHelpers.round2(r.days31To60 || 0),
+      days_61_90: dateHelpers.round2(r.days61To90 || 0),
+      days_90_plus: dateHelpers.round2(r.days90Plus || 0),
+      total_outstanding: dateHelpers.round2(r.totalOutstanding || 0)
     }
 
     return { apSummary, apAging }
   }
 
   static async _getTopSuppliers(companyId, limit) {
-    const companyOid = new mongoose.Types.ObjectId(companyId)
+    const cid = toIdString(companyId)
 
-    return aggregateWithTimeout(GRN, [
-      {
-        $match: {
-          company: companyOid,
-          status: 'confirmed',
-          supplier: { $ne: null }
-        }
-      },
-      {
-        $group: {
-          _id: '$supplier',
-          total_value: { $sum: { $toDouble: { $ifNull: ['$totalAmount', 0] } } },
-          grn_count: { $sum: 1 }
-        }
-      },
-      { $sort: { total_value: -1 } },
-      { $limit: limit },
-      {
-        $lookup: {
-          from: 'suppliers',
-          localField: '_id',
-          foreignField: '_id',
-          as: 'supplier'
-        }
-      },
-      { $unwind: '$supplier' },
-      {
-        $project: {
-          supplier_id: '$_id',
-          supplier_name: '$supplier.name',
-          supplier_code: { $ifNull: ['$supplier.code', ''] },
-          total_value: { $round: ['$total_value', 2] },
-          grn_count: 1
-        }
+    // supplierId is a required column on goods_received_notes, so no null-check is needed here.
+    const grouped = await prisma.goodsReceivedNote.groupBy({
+      by: ['supplierId'],
+      where: { companyId: cid, status: 'confirmed' },
+      _sum: { totalAmount: true },
+      _count: true,
+      orderBy: { _sum: { totalAmount: 'desc' } },
+      take: limit
+    })
+
+    if (grouped.length === 0) return []
+
+    const suppliers = await prisma.supplier.findMany({
+      where: { id: { in: grouped.map((g) => g.supplierId) } },
+      select: { id: true, name: true, code: true }
+    })
+    const supplierById = new Map(suppliers.map((s) => [s.id, s]))
+
+    return grouped.map((g) => {
+      const supplier = supplierById.get(g.supplierId)
+      return {
+        supplier_id: g.supplierId,
+        supplier_name: supplier ? supplier.name : null,
+        supplier_code: (supplier && supplier.code) || '',
+        total_value: dateHelpers.round2(decimalToNumber(g._sum.totalAmount)),
+        grn_count: g._count
       }
-    ], 'dashboard')
+    })
   }
 
   static async _getPOsByStatus(companyId) {
-    const companyOid = new mongoose.Types.ObjectId(companyId)
+    const cid = toIdString(companyId)
 
-    const result = await aggregateWithTimeout(PurchaseOrder, [
-      {
-        $match: { company: companyOid }
-      },
-      {
-        $group: {
-          _id: '$status',
-          count: { $sum: 1 },
-          total_value: { $sum: { $toDouble: { $ifNull: ['$totalAmount', 0] } } }
-        }
-      }
-    ], 'dashboard')
+    const grouped = await prisma.purchaseOrder.groupBy({
+      by: ['status'],
+      where: { companyId: cid },
+      _count: true,
+      _sum: { totalAmount: true }
+    })
 
     const map = {}
-    for (const row of result) {
-      map[row._id] = {
-        count: row.count,
-        total_value: dateHelpers.round2(row.total_value || 0)
+    for (const row of grouped) {
+      map[row.status] = {
+        count: row._count,
+        total_value: dateHelpers.round2(decimalToNumber(row._sum.totalAmount))
       }
     }
 
@@ -396,29 +248,25 @@ class PurchaseDashboardService {
   }
 
   static async _getPurchaseReturnsSummary(companyId) {
-    const companyOid = new mongoose.Types.ObjectId(companyId)
+    const cid = toIdString(companyId)
 
-    const result = await aggregateWithTimeout(PurchaseReturn, [
-      { $match: { company: companyOid } },
-      {
-        $group: {
-          _id: '$status',
-          count: { $sum: 1 },
-          total_amount: { $sum: { $toDouble: { $ifNull: ['$totalAmount', 0] } } }
-        }
-      }
-    ], 'dashboard')
+    const grouped = await prisma.purchaseReturn.groupBy({
+      by: ['status'],
+      where: { companyId: cid },
+      _count: true,
+      _sum: { totalAmount: true }
+    })
 
     let totalCount = 0
     let totalAmount = 0
     let draftCount = 0
     let confirmedCount = 0
 
-    for (const row of result) {
-      totalCount += row.count
-      totalAmount += row.total_amount || 0
-      if (row._id === 'draft') draftCount = row.count
-      if (row._id === 'confirmed') confirmedCount = row.count
+    for (const row of grouped) {
+      totalCount += row._count
+      totalAmount += decimalToNumber(row._sum.totalAmount)
+      if (row.status === 'draft') draftCount = row._count
+      if (row.status === 'confirmed') confirmedCount = row._count
     }
 
     return {

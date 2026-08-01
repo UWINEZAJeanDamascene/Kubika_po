@@ -190,6 +190,17 @@ function matchValue(fieldVal, cond, doc) {
   if (cond.$gte != null) return toNumber(fieldVal) >= toNumber(cond.$gte);
   if (cond.$lt != null) return toNumber(fieldVal) < toNumber(cond.$lt);
   if (cond.$lte != null) return toNumber(fieldVal) <= toNumber(cond.$lte);
+  if (cond.$regex != null) {
+    if (fieldVal == null) return false;
+    const isRegexObj = cond.$regex instanceof RegExp;
+    const pattern = isRegexObj ? cond.$regex.source : String(cond.$regex);
+    const flags = cond.$options != null ? String(cond.$options) : (isRegexObj ? cond.$regex.flags : undefined);
+    try {
+      return new RegExp(pattern, flags).test(String(fieldVal));
+    } catch (_err) {
+      return false;
+    }
+  }
   return normalizeId(fieldVal) === normalizeId(cond);
 }
 

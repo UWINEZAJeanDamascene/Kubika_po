@@ -1,8 +1,8 @@
-const mongoose = require("mongoose");
+const { toIdString } = require("../utils/objectId");
+const { prisma } = require("../lib/prisma");
+const journalAgg = require("./journalAggregationService");
 const ChartOfAccount = require("../models/ChartOfAccount");
-const JournalEntry = require("../models/JournalEntry");
 const { CHART_OF_ACCOUNTS } = require("../constants/chartOfAccounts");
-const { aggregateWithTimeout } = require("../utils/mongoAggregation");
 
 /**
  * P&L Statement Service — IAS 1 Compliant Income Statement Format
@@ -119,31 +119,15 @@ class PLStatementService {
     const dateFromInclusive = PLStatementService._parseDateBoundary(dateFrom, "start");
     const dateToInclusive = PLStatementService._parseDateBoundary(dateTo, "end");
 
-    const rawAccountBalances = await aggregateWithTimeout(JournalEntry, [
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          status: "posted",
-          reversed: { $ne: true },
-          date: {
-            $gte: dateFromInclusive,
-            $lte: dateToInclusive,
-          },
-        },
-      },
-      { $unwind: "$lines" },
-      {
-        $group: {
-          _id: "$lines.accountCode",
-          total_dr: { $sum: "$lines.debit" },
-          total_cr: { $sum: "$lines.credit" },
-        },
-      },
-    ]);
+    const cid = toIdString(companyId);
+    const rawAccountBalances = await journalAgg.sumLinesByAccountCode(cid, {
+      dateFrom: dateFromInclusive,
+      dateTo: dateToInclusive,
+    });
 
     const accountBalanceMap = new Map();
     for (const balance of rawAccountBalances) {
-      const code = String(balance._id || "").trim();
+      const code = String(balance.accountCode || "").trim();
       if (!code) continue;
 
       const existing = accountBalanceMap.get(code) || {
@@ -152,8 +136,8 @@ class PLStatementService {
         total_cr: 0,
       };
 
-      existing.total_dr += Number(balance.total_dr?.toString() || 0);
-      existing.total_cr += Number(balance.total_cr?.toString() || 0);
+      existing.total_dr += Number(balance.totalDebit) || 0;
+      existing.total_cr += Number(balance.totalCredit) || 0;
       accountBalanceMap.set(code, existing);
     }
 
@@ -167,7 +151,7 @@ class PLStatementService {
     const accountCodes = accountBalances.map((b) => b._id);
     const accounts = await ChartOfAccount.find({
       code: { $in: accountCodes },
-      company: new mongoose.Types.ObjectId(companyId),
+      company: cid,
       type: { $in: ["revenue", "expense", "cogs"] },
     }).lean();
 
@@ -320,35 +304,25 @@ class PLStatementService {
 
     // ── Step 4: Sort each section by account code ───────────────────
     if (!cogsLines.some((line) => line.account_code === "5300")) {
-      const directLaborFallback = await aggregateWithTimeout(JournalEntry, [
-        {
-          $match: {
-            company: new mongoose.Types.ObjectId(companyId),
-            status: "posted",
-            date: {
-              $gte: dateFromInclusive,
-              $lte: dateToInclusive,
-            },
-            "lines.accountCode": "5300",
-          },
-        },
-        { $unwind: "$lines" },
-        { $match: { "lines.accountCode": "5300" } },
-        {
-          $group: {
-            _id: "$lines.accountCode",
-            total_dr: { $sum: "$lines.debit" },
-            total_cr: { $sum: "$lines.credit" },
-          },
-        },
-      ]);
+      // Note: deliberately does NOT filter out reversed entries, matching the
+      // original behavior of this fallback exactly.
+      const directLaborRows = await prisma.$queryRaw`
+        SELECT COALESCE(SUM(jel.debit), 0)::float AS "totalDebit",
+               COALESCE(SUM(jel.credit), 0)::float AS "totalCredit"
+        FROM journal_entry_lines jel
+        INNER JOIN journal_entries je ON je.id = jel.journal_entry_id
+        WHERE je.company_id = ${cid}
+          AND je.status = 'posted'
+          AND je.date >= ${dateFromInclusive}
+          AND je.date <= ${dateToInclusive}
+          AND jel.account_code = '5300'
+      `;
 
-      const directLabor = directLaborFallback[0];
-      if (directLabor) {
+      const directLabor = directLaborRows[0];
+      if (directLabor && (directLabor.totalDebit || directLabor.totalCredit)) {
         const amount =
           Math.round(
-            (Number(directLabor.total_dr?.toString() || 0) -
-              Number(directLabor.total_cr?.toString() || 0)) *
+            (Number(directLabor.totalDebit) - Number(directLabor.totalCredit)) *
               100,
           ) / 100;
 

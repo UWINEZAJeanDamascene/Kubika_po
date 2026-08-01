@@ -1,12 +1,11 @@
-const mongoose = require('mongoose');
-const { aggregateWithTimeout } = require('../utils/mongoAggregation');
+const { prisma } = require('../lib/prisma');
+const { toIdString } = require('../utils/objectId');
+const journalAgg = require('./journalAggregationService');
 const BalanceSheetService = require('./balanceSheetService');
 const PLStatementService = require('./plStatementService');
 const Company = require('../models/Company');
 const ChartOfAccount = require('../models/ChartOfAccount');
-const JournalEntry = require('../models/JournalEntry');
 const Loan = require('../models/Loan');
-const { isMongoConnected } = require('../utils/mongoConnection');
 
 /**
  * Financial Ratios Service — IAS/IFRS Compliant
@@ -171,15 +170,13 @@ class FinancialRatiosService {
 
     // ── DEBT METRICS (from loan data) ─────────────────────────────
     let activeLoans = [];
-    if (isMongoConnected()) {
-      try {
-        activeLoans = await Loan.find({
-          company: new mongoose.Types.ObjectId(companyId),
-          status: { $in: ['active', 'partially_repaid'] }
-        });
-      } catch (_err) {
-        activeLoans = [];
-      }
+    try {
+      activeLoans = await Loan.find({
+        company: companyId,
+        status: { $in: ['active', 'partially_repaid'] }
+      });
+    } catch (_err) {
+      activeLoans = [];
     }
 
     const totalBorrowings = activeLoans.reduce((sum, loan) => sum + (loan.outstandingBalance || 0), 0);
@@ -491,120 +488,66 @@ class FinancialRatiosService {
   }
 
   /**
-   * Get balance by account subtype(s) and type
-   * @private
-   */
-  static async _getAccountTypeBalance(companyId, subtypes, type, asOfDate, specificSubtype) {
-    const query = {
-      company: new mongoose.Types.ObjectId(companyId),
-      type: type,
-      isActive: true
-    };
-
-    if (specificSubtype) {
-      query.subtype = specificSubtype;
-    } else if (subtypes && subtypes.length > 0) {
-      query.subtype = { $in: subtypes };
-    }
-
-    const accounts = await ChartOfAccount.find(query).lean();
-
-    let total = 0;
-    for (const acc of accounts) {
-      const bal = await FinancialRatiosService._getAccountBalance(
-        companyId, acc.code,
-        new Date('1900-01-01'),
-        new Date(asOfDate)
-      );
-      total += bal;
-    }
-    return total;
-  }
-
-  /**
-   * Get total balance for specific account codes
+   * Get total balance for specific account codes, as of a date.
+   * One grouped SQL sum (all codes in a single query) instead of a
+   * per-code full-journal scan, plus one batched Chart of Accounts
+   * lookup to resolve each code's normal balance side (debit vs credit).
    * @private
    */
   static async _getAccountCodesBalance(companyId, accountCodes, asOfDate) {
+    const codes = [...new Set((accountCodes || []).filter(Boolean).map(String))];
+    if (codes.length === 0) return 0;
+
+    const cid = toIdString(companyId);
+    const [rows, accounts] = await Promise.all([
+      journalAgg.sumLinesByAccountCode(cid, { dateTo: new Date(asOfDate), accountCodes: codes }),
+      ChartOfAccount.find({ company: cid, code: { $in: codes } }).select('code type').lean(),
+    ]);
+
+    const typeByCode = new Map(accounts.map((a) => [String(a.code), a.type]));
+    const balanceByCode = new Map(rows.map((r) => [String(r.accountCode), r]));
+
     let total = 0;
-    for (const code of accountCodes) {
-      const bal = await FinancialRatiosService._getAccountBalance(
-        companyId, code,
-        new Date('1900-01-01'),
-        new Date(asOfDate)
-      );
-      total += bal;
+    for (const code of codes) {
+      const row = balanceByCode.get(code);
+      if (!row) continue;
+      const dr = Number(row.totalDebit) || 0;
+      const cr = Number(row.totalCredit) || 0;
+      // Same convention as before: asset/expense are debit-normal; unknown
+      // accounts (not in the Chart of Accounts) default to credit-normal.
+      const type = typeByCode.get(code);
+      total += type && ['asset', 'expense'].includes(type) ? dr - cr : cr - dr;
     }
     return total;
   }
 
   /**
-   * Get account balance from journal entries
-   * @private
-   */
-  static async _getAccountBalance(companyId, accountCode, dateFrom, dateTo) {
-    const result = await aggregateWithTimeout(JournalEntry, [
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          status: 'posted',
-          reversed: { $ne: true },
-          date: { $gte: dateFrom, $lte: new Date(dateTo) }
-        }
-      },
-      { $unwind: '$lines' },
-      { $match: { 'lines.accountCode': accountCode } },
-      {
-        $group: {
-          _id: null,
-          total_dr: { $sum: '$lines.debit' },
-          total_cr: { $sum: '$lines.credit' }
-        }
-      }
-    ]);
-
-    const dr = parseFloat(result[0]?.total_dr?.toString() || '0');
-    const cr = parseFloat(result[0]?.total_cr?.toString() || '0');
-
-    const account = await ChartOfAccount.findOne({
-      company: new mongoose.Types.ObjectId(companyId),
-      code: accountCode
-    }).lean();
-
-    if (account && ['asset', 'expense'].includes(account.type)) {
-      return dr - cr;
-    }
-    return cr - dr;
-  }
-
-  /**
-   * Get total purchases from journal entries
-   * Uses multiple sourceTypes: purchase, cogs, purchase_order
-   * Falls back to COGS + change in inventory if no purchase entries found
+   * Get total purchases from journal entries.
+   * Uses multiple sourceTypes: purchase, cogs, purchase_order.
+   * One SQL SUM instead of pulling every matching journal entry + lines
+   * and unwinding/filtering them in Node.
    * @private
    */
   static async _getTotalPurchases(companyId, dateFrom, dateTo) {
-    const result = await aggregateWithTimeout(JournalEntry, [
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          status: 'posted',
-          reversed: { $ne: true },
-          sourceType: { $in: ['purchase', 'cogs', 'purchase_order'] },
-          date: { $gte: new Date(dateFrom), $lte: new Date(dateTo) }
-        }
-      },
-      { $unwind: '$lines' },
-      { $match: { 'lines.debit': { $gt: 0 }, 'lines.accountCode': { $regex: /^(1400|2000|5000|5100|5110)$/ } } },
-      {
-        $group: {
-          _id: null,
-          total_dr: { $sum: '$lines.debit' }
-        }
-      }
-    ]);
-    const purchases = parseFloat(result[0]?.total_dr?.toString() || '0');
-    return purchases;
+    const cid = toIdString(companyId);
+    const sourceTypes = ['purchase', 'cogs', 'purchase_order'];
+    const codes = ['1400', '2000', '5000', '5100', '5110'];
+
+    const rows = await prisma.$queryRaw`
+      SELECT COALESCE(SUM(jel.debit), 0)::float AS "totalDebit"
+      FROM journal_entry_lines jel
+      INNER JOIN journal_entries je ON je.id = jel.journal_entry_id
+      WHERE je.company_id = ${cid}
+        AND je.status = 'posted'
+        AND je.reversed = false
+        AND je.source_type = ANY(${sourceTypes}::text[])
+        AND je.date >= ${new Date(dateFrom)}
+        AND je.date <= ${new Date(dateTo)}
+        AND jel.debit > 0
+        AND jel.account_code = ANY(${codes}::text[])
+    `;
+
+    return rows[0]?.totalDebit || 0;
   }
 }
 
