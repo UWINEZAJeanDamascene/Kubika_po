@@ -34,7 +34,11 @@ router.get('/executive',
   authorize('reports', 'read'),
   asyncHandler(async (req, res) => {
     res.set('Cache-Control', 'no-store')
-    res.json(await ExecutiveDashboardService.get(req.companyId))
+    const skipCache = req.query.refresh === '1' || req.query.refresh === 'true'
+    if (skipCache) {
+      await dashboardCache.invalidateDashboard(req.companyId, 'executive')
+    }
+    res.json(await ExecutiveDashboardService.get(req.companyId, { skipCache }))
   })
 )
 

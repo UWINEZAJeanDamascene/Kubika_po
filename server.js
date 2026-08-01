@@ -51,9 +51,12 @@ async function initializeServer() {
       'Set DATABASE_URL (e.g. postgresql://stock:stock@localhost:5432/stock_management?schema=public) in .env'
     );
   }
-  const { connectPrisma, warmPrisma } = require('./lib/prisma');
+  const { connectPrisma, warmPrisma, startPrismaKeepAlive } = require('./lib/prisma');
   await connectPrisma();
   await warmPrisma();
+  // Keep pinging Neon periodically so its compute doesn't autosuspend while
+  // this process is running, avoiding cold-start latency on user requests.
+  startPrismaKeepAlive();
 
   // Connect to MongoDB (still used by not-yet-migrated domains).
   // When MONGODB_URI is unset, MongoDB is disabled and Mongo-backed routes
@@ -647,7 +650,8 @@ async function initializeServer() {
 
       // Close Prisma connection
       try {
-        const { disconnectPrisma } = require('./lib/prisma');
+        const { disconnectPrisma, stopPrismaKeepAlive } = require('./lib/prisma');
+        stopPrismaKeepAlive();
         await disconnectPrisma();
       } catch (e) {
         console.warn('Error closing Prisma connection during shutdown', e && e.message ? e.message : e);

@@ -120,7 +120,14 @@ exports.getExpenses = async (req, res, next) => {
       success: true,
       count: transformedExpenses.length,
       total,
-      pages: Math.ceil(total / limit),
+      pages: Math.ceil(total / limit) || 1,
+      currentPage: parseInt(page, 10) || 1,
+      pagination: {
+        total,
+        pages: Math.ceil(total / limit) || 1,
+        currentPage: parseInt(page, 10) || 1,
+        limit: parseInt(limit, 10) || 50,
+      },
       data: transformedExpenses,
     });
   } catch (error) {

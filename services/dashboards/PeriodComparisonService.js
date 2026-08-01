@@ -1,6 +1,6 @@
 const dateHelpers = require('../../utils/dateHelpers')
 const dashboardCache = require('../DashboardCacheService')
-const ExecutiveDashboardService = require('./ExecutiveDashboardService')
+const journalAgg = require('../journalAggregationService')
 
 class PeriodComparisonService {
   static async get(companyId) {
@@ -55,11 +55,11 @@ class PeriodComparisonService {
   }
 
   static async _getPeriodMetrics(companyId, dateFrom, dateTo) {
-    const [revenue, expenses] = await Promise.all([
-      ExecutiveDashboardService._getAccountTypeTotal(companyId, 'revenue', dateFrom, dateTo),
-      ExecutiveDashboardService._getAccountTypeTotal(companyId, 'expense', dateFrom, dateTo)
-    ])
-
+    const codeToType = await journalAgg.loadChartTypeMap(companyId)
+    const range = journalAgg.withDateMargin(dateFrom, dateTo)
+    const lines = await journalAgg.sumLinesByAccountCode(companyId, range)
+    const revenue = journalAgg.totalForAccountType(lines, codeToType, 'revenue')
+    const expenses = journalAgg.totalForAccountTypes(lines, codeToType, ['expense', 'cogs'])
     const netProfit = dateHelpers.round2(revenue - expenses)
     return {
       revenue: dateHelpers.round2(revenue),

@@ -50,11 +50,11 @@ async function loadChartTypeMap(companyId) {
 function resolveAccountType(codeToType, rawCode) {
   if (rawCode == null) return null;
   const code = normalizeCode(rawCode);
-  return (
+  const type =
     codeToType.get(code)
     || codeToType.get(normalizeCodeKey(code))
-    || null
-  );
+    || null;
+  return type == null ? null : String(type).toLowerCase();
 }
 
 /**
@@ -196,16 +196,26 @@ async function sumCashLinesBySourceType(companyId, accountCodes, dateFrom, dateT
 }
 
 function totalForAccountType(rows, codeToType, accountType) {
+  const wanted = String(accountType || '').toLowerCase();
   let totalDr = 0;
   let totalCr = 0;
   for (const row of rows) {
     const type = resolveAccountType(codeToType, row.accountCode);
-    if (type !== accountType) continue;
+    if (type !== wanted) continue;
     totalDr += Number(row.totalDebit) || 0;
     totalCr += Number(row.totalCredit) || 0;
   }
-  if (accountType === 'revenue') return totalCr - totalDr;
+  if (wanted === 'revenue') return totalCr - totalDr;
   return totalDr - totalCr;
+}
+
+/** Sum one or more account types (e.g. expense + cogs). */
+function totalForAccountTypes(rows, codeToType, accountTypes) {
+  const types = Array.isArray(accountTypes) ? accountTypes : [accountTypes];
+  return types.reduce(
+    (sum, type) => sum + totalForAccountType(rows, codeToType, type),
+    0,
+  );
 }
 
 function balancesMapFromRows(rows) {
@@ -246,6 +256,7 @@ module.exports = {
   sumLinesByAccountCode,
   sumCashLinesBySourceType,
   totalForAccountType,
+  totalForAccountTypes,
   balancesMapFromRows,
   getActiveOutboundProductIds,
 };

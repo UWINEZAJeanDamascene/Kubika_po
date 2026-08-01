@@ -13,9 +13,12 @@ const { isMongoConnected } = require('../../utils/mongoConnection')
 
 class ExecutiveDashboardService {
 
-  static async get(companyId) {
-    const cached = await dashboardCache.get(companyId, 'executive')
-    if (cached) return cached
+  static async get(companyId, options = {}) {
+    const skipCache = Boolean(options.skipCache)
+    if (!skipCache) {
+      const cached = await dashboardCache.get(companyId, 'executive')
+      if (cached) return cached
+    }
 
     const company = await Company.findById(companyId).lean()
     if (!company) {
@@ -52,16 +55,57 @@ class ExecutiveDashboardService {
       ExecutiveDashboardService._getUpcomingDebtPayments(companyId)
     ])
 
+    // P&L expenses include COGS (same as statement of profit or loss).
+    const expenseTypes = ['expense', 'cogs']
     const revenueThisMonth = journalAgg.totalForAccountType(thisMonthLines, codeToType, 'revenue')
     const revenueFYTD = journalAgg.totalForAccountType(fyLines, codeToType, 'revenue')
     const revenuePrevMonth = journalAgg.totalForAccountType(lastMonthLines, codeToType, 'revenue')
-    const expensesThisMonth = journalAgg.totalForAccountType(thisMonthLines, codeToType, 'expense')
-    const expensesFYTD = journalAgg.totalForAccountType(fyLines, codeToType, 'expense')
-    const expensesPrevMonth = journalAgg.totalForAccountType(lastMonthLines, codeToType, 'expense')
+    const expensesThisMonth = journalAgg.totalForAccountTypes(thisMonthLines, codeToType, expenseTypes)
+    const expensesFYTD = journalAgg.totalForAccountTypes(fyLines, codeToType, expenseTypes)
+    const expensesPrevMonth = journalAgg.totalForAccountTypes(lastMonthLines, codeToType, expenseTypes)
 
     const netProfitThisMonth = dateHelpers.round2(revenueThisMonth - expensesThisMonth)
     const netProfitFYTD = dateHelpers.round2(revenueFYTD - expensesFYTD)
     const netProfitPrevMonth = dateHelpers.round2(revenuePrevMonth - expensesPrevMonth)
+
+    // Fall back when the calendar month has journal lines but no P&L activity
+    // (e.g. cash/bank movements only). Line-count fallback wrongly kept MTD at 0.
+    const hasPLActivity = (revenue, expenses) =>
+      Math.abs(revenue) > 0.005 || Math.abs(expenses) > 0.005
+
+    let selectedRevenue = revenueThisMonth
+    let selectedExpenses = expensesThisMonth
+    let selectedPeriod = thisMonth
+    let selectedPeriodKind = 'current_month'
+    let selectedPeriodIsFallback = false
+    let selectedVsRevenue = dateHelpers.percentageChange(revenueThisMonth, revenuePrevMonth)
+    let selectedVsExpenses = dateHelpers.percentageChange(expensesThisMonth, expensesPrevMonth)
+    let selectedVsProfit = dateHelpers.percentageChange(netProfitThisMonth, netProfitPrevMonth)
+
+    if (!hasPLActivity(revenueThisMonth, expensesThisMonth)) {
+      if (hasPLActivity(revenuePrevMonth, expensesPrevMonth)) {
+        selectedRevenue = revenuePrevMonth
+        selectedExpenses = expensesPrevMonth
+        selectedPeriod = lastMonth
+        selectedPeriodKind = 'prior_month'
+        selectedPeriodIsFallback = true
+        // No prior-prior baseline in this payload — avoid a misleading -100% delta.
+        selectedVsRevenue = null
+        selectedVsExpenses = null
+        selectedVsProfit = null
+      } else if (hasPLActivity(revenueFYTD, expensesFYTD)) {
+        selectedRevenue = revenueFYTD
+        selectedExpenses = expensesFYTD
+        selectedPeriod = currentFY
+        selectedPeriodKind = 'fiscal_ytd'
+        selectedPeriodIsFallback = true
+        selectedVsRevenue = null
+        selectedVsExpenses = null
+        selectedVsProfit = null
+      }
+    }
+
+    const selectedNetProfit = dateHelpers.round2(selectedRevenue - selectedExpenses)
 
     const arOutstandingAmt = dateHelpers.round2(outstandingAR.total)
     const arOverdueAmt = dateHelpers.round2(overdueAR.total)
@@ -77,27 +121,47 @@ class ExecutiveDashboardService {
       // -- KEY METRICS --
       key_metrics: {
         revenue: {
-          this_month: dateHelpers.round2(revenueThisMonth),
+          this_month: dateHelpers.round2(selectedRevenue),
           fiscal_year_to_date: dateHelpers.round2(revenueFYTD),
-          vs_last_month: dateHelpers.percentageChange(revenueThisMonth, revenuePrevMonth),
+          vs_last_month: selectedVsRevenue,
           label: 'Revenue'
         },
         expenses: {
-          this_month: dateHelpers.round2(expensesThisMonth),
+          this_month: dateHelpers.round2(selectedExpenses),
           fiscal_year_to_date: dateHelpers.round2(expensesFYTD),
-          vs_last_month: dateHelpers.percentageChange(expensesThisMonth, expensesPrevMonth),
+          vs_last_month: selectedVsExpenses,
           label: 'Expenses'
         },
         net_profit: {
-          this_month: netProfitThisMonth,
+          this_month: selectedNetProfit,
           fiscal_year_to_date: netProfitFYTD,
-          vs_last_month: dateHelpers.percentageChange(netProfitThisMonth, netProfitPrevMonth),
-          is_profit: netProfitFYTD >= 0,
+          vs_last_month: selectedVsProfit,
+          is_profit: selectedNetProfit >= 0,
           label: 'Net Profit'
         },
         cash_balance: {
           current: dateHelpers.round2(cashBalance),
           label: 'Cash Balance'
+        }
+      },
+
+      // Absolute period series for charts (never reverse-engineer from %).
+      period_comparison: {
+        prior_month: {
+          label: 'Prior month',
+          start: lastMonth.start,
+          end: lastMonth.end,
+          revenue: dateHelpers.round2(revenuePrevMonth),
+          expenses: dateHelpers.round2(expensesPrevMonth),
+          net_profit: netProfitPrevMonth
+        },
+        current_month: {
+          label: 'Current month',
+          start: thisMonth.start,
+          end: thisMonth.end,
+          revenue: dateHelpers.round2(revenueThisMonth),
+          expenses: dateHelpers.round2(expensesThisMonth),
+          net_profit: netProfitThisMonth
         }
       },
 
@@ -120,6 +184,10 @@ class ExecutiveDashboardService {
       date_context: {
         this_month_start: thisMonth.start,
         this_month_end: thisMonth.end,
+        selected_period_start: selectedPeriod.start,
+        selected_period_end: selectedPeriod.end,
+        selected_period_is_fallback: selectedPeriodIsFallback,
+        selected_period_kind: selectedPeriodKind,
         fiscal_year_start: currentFY.start,
         fiscal_year_end: currentFY.end
       }
