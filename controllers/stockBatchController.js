@@ -1,6 +1,12 @@
-const StockBatch = require('../models/StockBatch');
+﻿const StockBatch = require('../models/StockBatch');
 const Product = require('../models/Product');
 const Warehouse = require('../models/Warehouse');
+
+const STOCK_BATCH_LIST_SELECT = [
+  '_id', 'company', 'batchNo', 'product', 'warehouse', 'qtyReceived', 'qtyOnHand',
+  'unitCost', 'manufactureDate', 'expiryDate', 'isQuarantined', 'notes',
+  'createdAt', 'updatedAt'
+].join(' ');
 
 // @access  Private
 exports.getStockBatches = async (req, res, next) => {
@@ -22,9 +28,9 @@ exports.getStockBatches = async (req, res, next) => {
 
     const [batches, total] = await Promise.all([
       StockBatch.find(query)
+        .select(STOCK_BATCH_LIST_SELECT)
         .populate('product', 'name sku trackingType')
         .populate('warehouse', 'name code')
-        .populate('grn', 'referenceNo')
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(parseInt(limit))

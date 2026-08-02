@@ -38,6 +38,14 @@ const MODEL_RELATION_NAMES = new Map(
   ]),
 );
 
+/** Scalar/enum field names per model, used to honor legacy .select() projections. */
+const MODEL_SCALAR_FIELD_NAMES = new Map(
+  (Prisma.dmmf?.datamodel?.models || []).map((m) => [
+    m.name,
+    new Set(m.fields.filter((f) => f.kind !== 'object').map((f) => f.name)),
+  ]),
+);
+
 /** DateTime column names per model, for coercing date strings on write. */
 const MODEL_DATE_FIELDS = new Map(
   (Prisma.dmmf?.datamodel?.models || []).map((m) => [
@@ -592,6 +600,13 @@ function wrapMutableDoc(apiDoc, config) {
     return doc;
   };
 
+  doc.deleteOne = async function deleteOne() {
+    const id = doc._id || doc.id;
+    if (!id) return { acknowledged: true, deletedCount: 0 };
+    await config.delegate().delete({ where: { id: String(id) } });
+    return { acknowledged: true, deletedCount: 1 };
+  };
+
   return doc;
 }
 
@@ -633,10 +648,10 @@ function wrapResult(result, config) {
 class CompatQuery {
   constructor(executor) {
     this._executor = executor;
-    this._options = { sort: null, limit: null, skip: null, populate: [] };
+    this._options = { sort: null, limit: null, skip: null, populate: [], select: null };
   }
 
-  select() { return this; }
+  select(spec) { this._options.select = spec; return this; }
   lean() { return this; }
   session() { return this; }
   setOptions(opts = {}) {
@@ -680,8 +695,62 @@ function makeCompatModel(config) {
     return pickKnownRelations(config.include ? config.include(populate) : undefined, delegate());
   }
 
+  function targetFieldName(field) {
+    if (field === '_id') return 'id';
+    const mapped = fieldMap && fieldMap[field];
+    return (mapped && mapped.target) || field;
+  }
+
+  function parseSelectSpec(spec) {
+    if (!spec) return null;
+    const entries = [];
+    if (typeof spec === 'string') {
+      for (const token of spec.split(/\s+/).filter(Boolean)) {
+        const excluded = token.startsWith('-');
+        const clean = token.replace(/^[+-]/, '');
+        if (clean) entries.push([clean, excluded ? 0 : 1]);
+      }
+    } else if (typeof spec === 'object') {
+      for (const [key, value] of Object.entries(spec)) entries.push([key, value]);
+    }
+    if (!entries.length) return null;
+    const hasInclude = entries.some(([, value]) => value === 1 || value === true);
+    const mode = hasInclude ? 'include' : 'exclude';
+    const fields = new Set(entries
+      .filter(([, value]) => mode === 'include' ? (value === 1 || value === true) : !(value === 1 || value === true))
+      .map(([field]) => targetFieldName(field)));
+    return { mode, fields };
+  }
+
+  function queryShape(opts = {}, include) {
+    const model = modelName();
+    const scalarFields = model ? MODEL_SCALAR_FIELD_NAMES.get(model) : null;
+    const projection = parseSelectSpec(opts.select);
+    if (!projection || !scalarFields) return include ? { include } : {};
+
+    const select = {};
+    if (projection.mode === 'include') {
+      for (const field of projection.fields) {
+        if (scalarFields.has(field)) select[field] = true;
+      }
+      select.id = true;
+      if (config.tenantField && scalarFields.has(config.tenantField)) select[config.tenantField] = true;
+    } else {
+      for (const field of scalarFields) {
+        if (!projection.fields.has(field)) select[field] = true;
+      }
+      select.id = true;
+    }
+
+    for (const [key, value] of Object.entries(include || {})) {
+      select[key] = value;
+    }
+
+    return { select };
+  }
+
   /**
-   * Populate paths the include could not serve — either the model has no such
+   * Populate paths the include could not serve - either the model has no such
    * relation, or the include builder does not know the path. Resolved against
    * DOC_POPULATE_REFS with one batched query per path.
    */
@@ -695,9 +764,48 @@ function makeCompatModel(config) {
     });
   }
 
+  function projectionAliases(field) {
+    const mapped = targetFieldName(field);
+    const aliases = new Set([field, mapped]);
+    for (const [source, configEntry] of Object.entries(fieldMap || {})) {
+      if (configEntry && configEntry.target === mapped) aliases.add(source);
+    }
+    if (mapped.endsWith('Id')) aliases.add(mapped.slice(0, -2));
+    if (mapped === 'id' || field === 'id') aliases.add('_id');
+    if (field === '_id') aliases.add('id');
+    return aliases;
+  }
+
+  function applyApiProjection(doc, opts = {}) {
+    const projection = parseSelectSpec(opts.select);
+    if (!projection || !doc || typeof doc !== 'object') return doc;
+
+    const applyOne = (item) => {
+      if (!item || typeof item !== 'object') return item;
+      if (projection.mode === 'exclude') {
+        for (const field of projection.fields) {
+          for (const alias of projectionAliases(field)) delete item[alias];
+        }
+        return item;
+      }
+
+      const keep = new Set(['_id', 'id']);
+      for (const field of projection.fields) {
+        for (const alias of projectionAliases(field)) keep.add(alias);
+      }
+      for (const key of Object.keys(item)) {
+        if (!keep.has(key)) delete item[key];
+      }
+      return item;
+    };
+
+    if (Array.isArray(doc)) return doc.map(applyOne);
+    return applyOne(doc);
+  }
+
   /** Wrap rows for the legacy call surface, resolving any deferred populate paths. */
   async function finish(result, opts, include) {
-    const wrapped = wrapResult(result, config);
+    const wrapped = applyApiProjection(wrapResult(result, config), opts);
     if (!wrapped) return wrapped;
     const spec = normalizePopulateSpec(deferredPopulate(opts.populate, include));
     if (!spec.length) return wrapped;
@@ -850,7 +958,7 @@ function makeCompatModel(config) {
         const key = toId(id);
         if (!key) return null;
         const include = buildInclude(opts.populate);
-        const row = await delegate().findUnique({ where: { id: key }, include });
+        const row = await delegate().findUnique({ where: { id: key }, ...queryShape(opts, include) });
         // Legacy findById went through the tenant plugin's findOne hook:
         // a document belonging to another company was not visible.
         if (row && config.tenantField && !opts.skipTenant) {
@@ -873,7 +981,7 @@ function makeCompatModel(config) {
         const row = await delegate().findFirst({
           where,
           orderBy: translateSort(opts.sort, fieldMap),
-          include,
+          ...queryShape(opts, include),
         });
         return finish(toApi(row), opts, include);
       });
@@ -893,7 +1001,7 @@ function makeCompatModel(config) {
           orderBy: translateSort(opts.sort, fieldMap),
           take: opts.limit || undefined,
           skip: opts.skip || undefined,
-          include,
+          ...queryShape(opts, include),
         });
         return finish(rows.map((r) => toApi(r)), opts, include);
       });
@@ -931,6 +1039,14 @@ function makeCompatModel(config) {
       return createOne(data);
     },
 
+    async insertMany(docs = []) {
+      const created = [];
+      for (const doc of docs || []) {
+        created.push(await createOne(doc));
+      }
+      return created;
+    },
+
     findOneAndUpdate(filter = {}, update = {}, options = {}) {
       return tenantQuery(async (opts) => {
         const where = applyTenant(translateFilter(filter, fieldMap), opts);
@@ -959,6 +1075,21 @@ function makeCompatModel(config) {
           data: translateUpdate(update),
         }).catch(() => null);
         return wrapResult(updated ? toApi(updated) : null, config);
+      });
+    },
+
+    findOneAndDelete(filter = {}) {
+      return tenantQuery(async (opts) => {
+        const where = applyTenant(translateFilter(filter, fieldMap), opts);
+        if (where === IMPOSSIBLE) return null;
+        const row = await delegate().findFirst({
+          where,
+          orderBy: translateSort(opts.sort, fieldMap),
+          include: buildInclude([]),
+        });
+        if (!row) return null;
+        await delegate().delete({ where: { id: row.id } });
+        return wrapResult(toApi(row), config);
       });
     },
 

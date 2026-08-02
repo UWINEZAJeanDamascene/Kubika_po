@@ -1,7 +1,12 @@
-const StockSerialNumber = require('../models/StockSerialNumber');
+﻿const StockSerialNumber = require('../models/StockSerialNumber');
 const StockBatch = require('../models/StockBatch');
 const Product = require('../models/Product');
 const Warehouse = require('../models/Warehouse');
+
+const STOCK_SERIAL_LIST_SELECT = [
+  '_id', 'company', 'serialNo', 'product', 'warehouse', 'batch', 'unitCost',
+  'status', 'notes', 'createdAt', 'updatedAt'
+].join(' ');
 
 // @access  Private
 exports.getStockSerialNumbers = async (req, res, next) => {
@@ -25,12 +30,10 @@ exports.getStockSerialNumbers = async (req, res, next) => {
 
     const [serials, total] = await Promise.all([
       StockSerialNumber.find(query)
+        .select(STOCK_SERIAL_LIST_SELECT)
         .populate('product', 'name sku trackingType')
         .populate('warehouse', 'name code')
         .populate('batch', 'batchNo')
-        .populate('grn', 'referenceNo')
-        .populate('dispatchedVia', 'referenceNo')
-        .populate('returnedVia', 'referenceNo')
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(parseInt(limit))

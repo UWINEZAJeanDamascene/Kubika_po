@@ -76,9 +76,13 @@ exports.getClients = async (req, res, next) => {
       query.isActive = isActive === 'true';
     }
 
+    const CLIENT_LIST_SELECT = req.query.forPicker === '1'
+      ? '_id name code contact type isActive taxId paymentTerms'
+      : '_id name code type contact isActive outstandingBalance totalPurchases lastPurchaseDate taxId paymentTerms createdAt updatedAt';
+
     const total = await Client.countDocuments(query);
     const clients = await Client.find(query)
-      .populate('createdBy', 'name email')
+      .select(CLIENT_LIST_SELECT)
       .sort({ name: 1 })
       .limit(limit * 1)
       .skip((page - 1) * limit);
@@ -424,9 +428,13 @@ exports.getClientsWithStats = async (req, res, next) => {
       query.isActive = isActive === 'true';
     }
 
+    const CLIENT_LIST_SELECT = req.query.forPicker === '1'
+      ? '_id name code contact type isActive taxId paymentTerms'
+      : '_id name code type contact isActive outstandingBalance totalPurchases lastPurchaseDate taxId paymentTerms createdAt updatedAt';
+
     const total = await Client.countDocuments(query);
     const clients = await Client.find(query)
-      .populate('createdBy', 'name email')
+      .select(CLIENT_LIST_SELECT)
       .sort({ name: 1 })
       .limit(limit * 1)
       .skip((page - 1) * limit);
@@ -870,4 +878,3 @@ exports.getClientStatementPDF = async (req, res, next) => {
     next(error);
   }
 };
-

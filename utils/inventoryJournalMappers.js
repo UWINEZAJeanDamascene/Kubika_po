@@ -1,10 +1,10 @@
-/**
+﻿/**
  * Maps Prisma Phase 3 (inventory) + Phase 4 (journal) rows to legacy Mongoose JSON shapes.
  */
 
 const { generateObjectId, toIdString } = require('./objectId');
 const { decimalToNumber, decimalToString, idRef, mapTimestamps } = require('./decimalHelpers');
-const { mergeUpdatePayload } = require('./masterDataMappers');
+const { mergeUpdatePayload, productToApi, warehouseToApi } = require('./masterDataMappers');
 const { withReferenceNo } = require('./referenceNumbers');
 
 function qtyStr(v, dp = 4) {
@@ -593,8 +593,8 @@ function stockBatchToApi(row) {
     _id: row.id,
     company: row.companyId,
     batchNo: row.batchNo,
-    product: row.productId,
-    warehouse: row.warehouseId,
+    product: row.product ? productToApi(row.product) : row.productId,
+    warehouse: row.warehouse ? warehouseToApi(row.warehouse) : row.warehouseId,
     grn: row.grnId ?? null,
     qtyReceived: decimalToNumber(row.qtyReceived, 0),
     qtyOnHand: decimalToNumber(row.qtyOnHand, 0),
@@ -641,10 +641,10 @@ function stockSerialNumberToApi(row) {
     _id: row.id,
     company: row.companyId,
     serialNo: row.serialNo,
-    product: row.productId,
-    warehouse: row.warehouseId,
+    product: row.product ? productToApi(row.product) : row.productId,
+    warehouse: row.warehouse ? warehouseToApi(row.warehouse) : row.warehouseId,
     grn: row.grnId ?? null,
-    batch: row.batchId ?? null,
+    batch: row.batch ? stockBatchToApi(row.batch) : row.batchId ?? null,
     unitCost: decimalToNumber(row.unitCost, 0),
     status: row.status,
     dispatchedVia: row.dispatchedVia ?? null,

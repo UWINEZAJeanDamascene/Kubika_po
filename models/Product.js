@@ -84,12 +84,72 @@ function buildProductInclude(populate = []) {
   const inc = {};
   for (const p of populate) {
     const path = typeof p === 'object' ? p.path : p;
-    if (path === 'category') inc.category = true;
-    if (path === 'supplier') inc.supplier = true;
-    if (path === 'preferredSupplier') inc.preferredSupplier = true;
-    if (path === 'defaultWarehouse') inc.defaultWarehouse = true;
+    if (path === 'category') inc.category = { select: { id: true, name: true } };
+    if (path === 'supplier') inc.supplier = { select: { id: true, name: true, code: true } };
+    if (path === 'preferredSupplier') inc.preferredSupplier = { select: { id: true, name: true, code: true } };
+    if (path === 'defaultWarehouse') inc.defaultWarehouse = { select: { id: true, name: true, code: true } };
   }
   return Object.keys(inc).length ? inc : undefined;
+}
+
+const PRODUCT_SCALAR_FIELDS = [
+  'id', 'companyId', 'name', 'sku', 'barcode', 'barcodeType', 'description',
+  'categoryId', 'unit', 'supplierId', 'currentStock', 'reservedQuantity',
+  'isActive', 'isStockable', 'lowStockThreshold', 'averageCost', 'sellingPrice',
+  'costPrice', 'lastSupplyDate', 'lastSaleDate', 'costingMethod',
+  'inventoryAccount', 'cogsAccount', 'revenueAccount', 'isArchived', 'weight',
+  'brand', 'location', 'trackingType', 'trackBatch', 'trackSerialNumbers',
+  'reorderPoint', 'reorderQuantity', 'defaultWarehouseId', 'preferredSupplierId',
+  'taxCode', 'taxRate', 'ebm', 'history', 'createdById', 'customFields',
+  'createdAt', 'updatedAt',
+];
+
+function parseProductSelect(spec) {
+  if (!spec) return null;
+  const entries = [];
+  if (typeof spec === 'string') {
+    for (const token of spec.split(/\s+/).filter(Boolean)) {
+      const excluded = token.startsWith('-');
+      const clean = token.replace(/^[+-]/, '');
+      if (clean) entries.push([clean, excluded ? 0 : 1]);
+    }
+  } else if (typeof spec === 'object') {
+    for (const [key, value] of Object.entries(spec)) entries.push([key, value]);
+  }
+  if (!entries.length) return null;
+
+  const hasInclude = entries.some(([, value]) => value === 1 || value === true);
+  const mode = hasInclude ? 'include' : 'exclude';
+  const fields = new Set(entries
+    .filter(([, value]) => mode === 'include' ? (value === 1 || value === true) : !(value === 1 || value === true))
+    .map(([field]) => {
+      const mapped = FULL_FIELD_MAP[field];
+      return mapped && mapped.target ? mapped.target : field;
+    }));
+  return { mode, fields };
+}
+
+function productQueryShape(opts = {}) {
+  const include = buildProductInclude(opts.populate);
+  const projection = parseProductSelect(opts.select);
+  if (!projection) return include ? { include } : {};
+
+  const select = {};
+  if (projection.mode === 'include') {
+    for (const field of projection.fields) {
+      if (PRODUCT_SCALAR_FIELDS.includes(field)) select[field] = true;
+    }
+    select.id = true;
+    select.companyId = true;
+  } else {
+    for (const field of PRODUCT_SCALAR_FIELDS) {
+      if (!projection.fields.has(field)) select[field] = true;
+    }
+    select.id = true;
+  }
+
+  for (const [key, value] of Object.entries(include || {})) select[key] = value;
+  return { select };
 }
 
 const PRISMA_TO_DB = {
@@ -199,7 +259,7 @@ async function productCustomFind(filter, opts, { many = false } = {}) {
 
     const rows = await prisma.product.findMany({
       where: { id: { in: pageIds } },
-      include: buildProductInclude(opts.populate),
+      ...productQueryShape(opts),
     });
     const byId = new Map(rows.map((r) => [r.id, r]));
     const ordered = pageIds.map((id) => byId.get(id)).filter(Boolean);
@@ -212,7 +272,7 @@ async function productCustomFind(filter, opts, { many = false } = {}) {
     orderBy: translateSort(opts.sort, FIELD_MAP),
     take: opts.limit || undefined,
     skip: opts.skip || undefined,
-    include: buildProductInclude(opts.populate),
+    ...productQueryShape(opts),
   });
 
   return many ? rows : (rows[0] || null);

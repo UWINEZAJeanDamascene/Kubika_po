@@ -1,4 +1,4 @@
-const mongoose = require('mongoose');
+﻿const mongoose = require('mongoose');
 const StockMovement = require('../models/StockMovement');
 const Product = require('../models/Product');
 const Supplier = require('../models/Supplier');
@@ -54,11 +54,17 @@ exports.getStockMovements = async (req, res, next) => {
       if (endDate) query.movementDate.$lte = new Date(endDate);
     }
 
+    const STOCK_MOVEMENT_LIST_SELECT = [
+      '_id', 'company', 'product', 'type', 'reason', 'quantity', 'unitCost', 'totalCost',
+      'warehouse', 'referenceType', 'referenceNumber', 'notes', 'movementDate', 'ebm',
+      'createdAt', 'updatedAt'
+    ].join(' ');
+
     const total = await StockMovement.countDocuments(query);
     const movements = await StockMovement.find(query)
+      .select(STOCK_MOVEMENT_LIST_SELECT)
       .populate('product', 'name sku unit')
-      .populate('supplier', 'name code')
-      .populate('performedBy', 'name email')
+      .populate('warehouse', 'name code')
       .sort({ movementDate: -1 })
       .limit(limit * 1)
       .skip((page - 1) * limit);

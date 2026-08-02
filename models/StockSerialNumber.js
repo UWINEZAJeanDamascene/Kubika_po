@@ -1,4 +1,4 @@
-/**
+﻿/**
  * StockSerialNumber — PostgreSQL (Prisma) backed.
  */
 
@@ -9,6 +9,18 @@ const {
   stockSerialNumberTranslateUpdate,
 } = require('../utils/inventoryJournalMappers');
 
+
+function buildStockSerialNumberInclude(populate = []) {
+  if (!populate || !populate.length) return undefined;
+  const inc = {};
+  for (const p of populate) {
+    const path = typeof p === 'object' ? p.path : p;
+    if (path === 'product') inc.product = { select: { id: true, name: true, sku: true, unit: true, trackingType: true } };
+    if (path === 'warehouse') inc.warehouse = { select: { id: true, name: true, code: true } };
+    if (path === 'batch') inc.batch = { select: { id: true, batchNo: true, expiryDate: true } };
+  }
+  return Object.keys(inc).length ? inc : undefined;
+}
 const FIELD_MAP = {
   _id: { target: 'id', isId: true },
   id: { target: 'id', isId: true },
@@ -32,4 +44,5 @@ module.exports = buildTenantModel({
   translateCreate: stockSerialNumberTranslateCreate,
   translateUpdate: stockSerialNumberTranslateUpdate,
   mutable: true,
+  include: buildStockSerialNumberInclude,
 });

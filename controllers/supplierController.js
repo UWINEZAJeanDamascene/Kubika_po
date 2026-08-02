@@ -23,14 +23,20 @@ exports.getSuppliers = async (req, res, next) => {
     }
 
     const total = await Supplier.countDocuments(query);
-    const suppliers = await Supplier.find(query)
-      .populate('productsSupplied', 'name sku')
-      .populate('createdBy', 'name email')
+    const supplierQuery = Supplier.find(query)
+      .select(req.query.forPicker === '1' ? '_id name code isActive' : '-customFields')
       .sort({ name: 1 })
       .limit(limit * 1)
       .skip((page - 1) * limit);
 
-    // Transform suppliers to include products count
+    if (req.query.forPicker !== '1') {
+      supplierQuery
+        .populate('productsSupplied', 'name sku')
+        .populate('createdBy', 'name email');
+    }
+
+    const suppliers = await supplierQuery;
+
     const transformedSuppliers = suppliers.map(supplier => ({
       ...supplier.toObject(),
       productsCount: supplier.productsSupplied ? supplier.productsSupplied.length : 0

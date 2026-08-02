@@ -1,4 +1,4 @@
-const mongoose = require('mongoose');
+﻿const mongoose = require('mongoose');
 const Product = require('../models/Product');
 const User = require('../models/User');
 const StockMovement = require('../models/StockMovement');
@@ -140,17 +140,38 @@ exports.getProducts = async (req, res, next) => {
 
     const sortField = ALLOWED_PRODUCT_SORT_FIELDS.has(String(sortBy)) ? sortBy : 'createdAt';
 
-    const PRODUCT_LIST_SELECT = '-history -ebm -customFields';
+    const isPicker = req.query.forPicker === '1';
+    const isStockLevels = req.query.forStockLevels === '1';
+    const PRODUCT_LIST_SELECT = (isPicker ? [
+      '_id', 'company', 'name', 'sku', 'barcode', 'unit', 'currentStock',
+      'isActive', 'isArchived', 'trackingType', 'trackBatch',
+      'trackSerialNumbers', 'defaultWarehouse', 'sellingPrice', 'costPrice',
+      'averageCost', 'createdAt', 'updatedAt'
+    ] : isStockLevels ? [
+      '_id', 'company', 'name', 'sku', 'category', 'unit', 'currentStock',
+      'reservedQuantity', 'averageCost', 'costPrice', 'lowStockThreshold',
+      'isActive', 'isArchived', 'createdAt', 'updatedAt'
+    ] : [
+      '_id', 'company', 'name', 'sku', 'barcode', 'category', 'unit', 'supplier',
+      'currentStock', 'reservedQuantity', 'isActive', 'lowStockThreshold',
+      'averageCost', 'sellingPrice', 'costPrice', 'costingMethod', 'isArchived',
+      'trackingType', 'trackBatch', 'trackSerialNumbers', 'defaultWarehouse', 'createdAt', 'updatedAt'
+    ]).join(' ');
 
     const hasComplexFilter = !!(query.$or || query.$expr || query.$text);
     const productQuery = Product.find(query)
       .select(PRODUCT_LIST_SELECT)
-      .populate('category', 'name')
-      .populate('supplier', 'name code')
-      .populate('createdBy', 'name email')
       .sort({ [sortField]: order === 'desc' ? -1 : 1 })
       .skip(skip)
       .limit(limit);
+
+    if (isStockLevels) {
+      productQuery.populate('category', 'name');
+    } else if (!isPicker) {
+      productQuery
+        .populate('category', 'name')
+        .populate('supplier', 'name code');
+    }
 
     const [products, total] = hasComplexFilter
       ? await Promise.all([
@@ -201,8 +222,19 @@ exports.getProduct = async (req, res, next) => {
     const company = req.user && req.user.company;
     const companyId = (company && company._id) ? company._id : company;
 
+    const PRODUCT_DETAIL_SELECT = [
+      '_id', 'company', 'name', 'sku', 'barcode', 'barcodeType', 'description',
+      'category', 'unit', 'supplier', 'preferredSupplier', 'currentStock',
+      'reservedQuantity', 'isActive', 'isStockable', 'lowStockThreshold',
+      'averageCost', 'sellingPrice', 'costPrice', 'costingMethod',
+      'inventoryAccount', 'cogsAccount', 'revenueAccount', 'isArchived',
+      'brand', 'location', 'trackingType', 'trackBatch', 'trackSerialNumbers',
+      'reorderPoint', 'reorderQuantity', 'defaultWarehouse', 'taxCode', 'taxRate',
+      'ebm', 'createdBy', 'createdAt', 'updatedAt'
+    ].join(' ');
+
     const product = await Product.findOne({ _id: req.params.id, company: companyId })
-      .select('-history -ebm -customFields')
+      .select(PRODUCT_DETAIL_SELECT)
       .populate('category', 'name')
       .populate('supplier', 'name code')
       .populate('preferredSupplier', 'name code')
@@ -217,15 +249,6 @@ exports.getProduct = async (req, res, next) => {
       });
     }
 
-    const latest = await timedQuery('getProduct latestStockMovement', () =>
-      StockMovement.findOne({ company: companyId, product: product._id })
-        .select('newStock')
-        .sort({ movementDate: -1 })
-        .lean()
-        .catch(() => null),
-    );
-
-    product.currentStock = latest ? latest.newStock : (product.currentStock || 0);
 
     return res.json({ success: true, data: product });
   } catch (error) {
@@ -337,7 +360,7 @@ exports.updateProduct = async (req, res, next) => {
       });
     }
 
-    // Store old values for history (slim snapshot — never embed nested history)
+    // Store old values for history (slim snapshot - never embed nested history)
     const oldValues = slimProductForHistory(product);
     const oldSupplierId = product.supplier?.toString();
     const newSupplierId = req.body.supplier;

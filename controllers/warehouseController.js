@@ -2,6 +2,53 @@ const Warehouse = require('../models/Warehouse');
 const InventoryBatch = require('../models/InventoryBatch');
 const Product = require('../models/Product');
 const EBMBranchService = require('../services/ebmBranchService');
+const { Prisma } = require('@prisma/client');
+const { prisma } = require('../lib/prisma');
+
+function asId(value) {
+  if (!value) return null;
+  return value.toString ? value.toString() : String(value);
+}
+
+async function getWarehouseStockSummaries(companyId, warehouseIds) {
+  const ids = [...new Set(warehouseIds.map(asId).filter(Boolean))];
+  if (ids.length === 0) return new Map();
+
+  const rows = await prisma.$queryRaw`
+    SELECT
+      warehouse_id AS "warehouseId",
+      COUNT(DISTINCT product_id)::int AS "totalProducts",
+      COALESCE(SUM(available_quantity), 0) AS "totalQuantity",
+      COALESCE(SUM(available_quantity * unit_cost), 0) AS "totalValue"
+    FROM inventory_batches
+    WHERE company_id = ${asId(companyId)}
+      AND warehouse_id IN (${Prisma.join(ids)})
+      AND status <> 'exhausted'
+    GROUP BY warehouse_id
+  `;
+
+  return new Map(rows.map((row) => [
+    row.warehouseId,
+    {
+      totalProducts: Number(row.totalProducts || 0),
+      totalQuantity: Number(row.totalQuantity || 0),
+      totalValue: Number(row.totalValue || 0)
+    }
+  ]));
+}
+
+function withStockSummary(warehouse, summaries) {
+  const summary = summaries.get(asId(warehouse._id)) || {
+    totalProducts: 0,
+    totalQuantity: 0,
+    totalValue: 0
+  };
+
+  return {
+    ...warehouse.toObject(),
+    ...summary
+  };
+}
 
 // @desc    Get all warehouses
 // @route   GET /api/stock/warehouses
@@ -31,33 +78,8 @@ exports.getWarehouses = async (req, res, next) => {
       .limit(limit * 1)
       .skip((page - 1) * limit);
 
-    // Get stock summary for each warehouse (only if InventoryBatches exist)
-    const warehousesWithStock = await Promise.all(
-      warehouses.map(async (warehouse) => {
-        const batches = await InventoryBatch.find({
-          company: companyId,
-          warehouse: warehouse._id,
-          status: { $nin: ['exhausted'] }
-        }).populate('product', 'name sku');
-
-        let totalProducts = 0;
-        let totalQuantity = 0;
-        let totalValue = 0;
-
-        if (batches && batches.length > 0) {
-          totalProducts = new Set(batches.map(b => b.product?._id?.toString()).filter(Boolean)).size;
-          totalQuantity = batches.reduce((sum, b) => sum + (b.availableQuantity || 0), 0);
-          totalValue = batches.reduce((sum, b) => sum + ((b.availableQuantity || 0) * (b.unitCost || 0)), 0);
-        }
-
-        return {
-          ...warehouse.toObject(),
-          totalProducts,
-          totalQuantity,
-          totalValue
-        };
-      })
-    );
+    const stockSummaries = await getWarehouseStockSummaries(companyId, warehouses.map((warehouse) => warehouse._id));
+    const warehousesWithStock = warehouses.map((warehouse) => withStockSummary(warehouse, stockSummaries));
 
     res.json({
       success: true,
@@ -88,25 +110,11 @@ exports.getWarehouse = async (req, res, next) => {
       });
     }
 
-    // Get stock summary
-    const batches = await InventoryBatch.find({
-      company: companyId,
-      warehouse: warehouse._id,
-      status: { $nin: ['exhausted'] }
-    });
-
-    const totalProducts = new Set(batches.map(b => b.product.toString())).size;
-    const totalQuantity = batches.reduce((sum, b) => sum + b.availableQuantity, 0);
-    const totalValue = batches.reduce((sum, b) => sum + (b.availableQuantity * (b.unitCost || 0)), 0);
+    const stockSummaries = await getWarehouseStockSummaries(companyId, [warehouse._id]);
 
     res.json({
       success: true,
-      data: {
-        ...warehouse.toObject(),
-        totalProducts,
-        totalQuantity,
-        totalValue
-      }
+      data: withStockSummary(warehouse, stockSummaries)
     });
   } catch (error) {
     next(error);

@@ -14,11 +14,14 @@ exports.getCategories = async (req, res, next) => {
       query.isActive = isActive === 'true';
     }
 
-    // Return categories as a nested tree (max depth 3)
-    const categories = await Category.find(query)
-      .populate('createdBy', 'name email')
-      .sort({ name: 1 })
-      .lean();
+    // Return categories as a nested tree (max depth 3). Picker mode skips unused joins.
+    const categoryQuery = Category.find(query)
+      .select(req.query.forPicker === '1' ? '_id name parent isActive' : '-customFields')
+      .sort({ name: 1 });
+    if (req.query.forPicker !== '1') {
+      categoryQuery.populate('createdBy', 'name email');
+    }
+    const categories = await categoryQuery.lean();
 
     const map = new Map();
     categories.forEach(c => map.set(String(c._id), Object.assign(c, { children: [] })));
@@ -84,7 +87,7 @@ exports.createCategory = async (req, res, next) => {
     const companyId = req.user.company._id;
     const { name } = req.body;
     
-    // Allow duplicate category names per request — uniqueness enforced at DB only if needed
+    // Allow duplicate category names per request - uniqueness enforced at DB only if needed
     
     req.body.company = companyId;
     req.body.createdBy = req.user.id;
