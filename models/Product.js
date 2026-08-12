@@ -88,6 +88,7 @@ function buildProductInclude(populate = []) {
     if (path === 'supplier') inc.supplier = { select: { id: true, name: true, code: true } };
     if (path === 'preferredSupplier') inc.preferredSupplier = { select: { id: true, name: true, code: true } };
     if (path === 'defaultWarehouse') inc.defaultWarehouse = { select: { id: true, name: true, code: true } };
+    if (path === 'createdBy') inc.createdBy = { select: { id: true, name: true, email: true } };
   }
   return Object.keys(inc).length ? inc : undefined;
 }

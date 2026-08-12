@@ -28,6 +28,15 @@ const CACHE_CONFIGS = {
   default: { ttl: DEFAULT_TTL, prefix: 'default' },
 };
 
+const CACHE_GET_TIMEOUT_MS = Number(process.env.REDIS_CACHE_GET_TIMEOUT_MS || 500);
+
+function withCacheTimeout(promise, fallback = null) {
+  return Promise.race([
+    promise,
+    new Promise((resolve) => setTimeout(() => resolve(fallback), CACHE_GET_TIMEOUT_MS)),
+  ]);
+}
+
 class CacheService {
   // Helper to scan keys using SCAN to avoid expensive KEYS calls
   async scanKeys(pattern) {
@@ -142,7 +151,7 @@ class CacheService {
    */
   async get(key) {
     try {
-      const data = await redisClient.get(key);
+      const data = await withCacheTimeout(redisClient.get(key));
       if (!data) {
         return null;
       }

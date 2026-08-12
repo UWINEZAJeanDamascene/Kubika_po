@@ -8,7 +8,27 @@ const config = env.getConfig();
 const JWT_SECRET = config.jwt.secret;
 
 /** Cap slow Redis calls so post-login requests are not blocked for seconds each. */
-const REDIS_SESSION_TIMEOUT_MS = Number(process.env.REDIS_SESSION_TIMEOUT_MS || 2000);
+const REDIS_SESSION_TIMEOUT_MS = Number(process.env.REDIS_SESSION_TIMEOUT_MS || 500);
+
+/** GET inventory endpoints skip Redis session enrichment — JWT auth is sufficient. */
+function shouldSkipSessionEnrichment(req) {
+  if (req.method !== 'GET') return false;
+  const path = String(req.originalUrl || req.url || req.path || '').split('?')[0];
+  const skipPrefixes = [
+    '/api/auth/login',
+    '/api/auth/register',
+    '/api/auth/me',
+    '/api/auth/refresh',
+    '/api/dashboard',
+    '/api/products',
+    '/api/categories',
+    '/api/suppliers',
+    '/api/v1/products',
+    '/api/v1/categories',
+    '/api/v1/suppliers',
+  ];
+  return skipPrefixes.some((prefix) => path.startsWith(prefix));
+}
 
 function withRedisTimeout(promise, fallback) {
   return Promise.race([
@@ -158,11 +178,7 @@ const sessionMiddleware = async (req, res, next) => {
   // Authentication middleware performs the authoritative JWT/database checks.
   // Redis session enrichment is not needed for auth endpoints and can add
   // several network round trips to the login -> /me flow.
-  if (req.path.startsWith('/api/auth/login') ||
-      req.path.startsWith('/api/auth/register') ||
-      req.path.startsWith('/api/auth/me') ||
-      req.path.startsWith('/api/auth/refresh') ||
-      req.path.startsWith('/api/dashboard')) {
+  if (shouldSkipSessionEnrichment(req)) {
     return next();
   }
 

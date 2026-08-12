@@ -39,6 +39,8 @@ function paginationMeta(page, limit, total) {
     limit,
     total,
     pages,
+    currentPage: page,
+    totalPages: pages,
   };
 }
 
