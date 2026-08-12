@@ -17,7 +17,10 @@ function entityId(value) {
 }
 
 async function loadUserAndCompany(decoded) {
-  const user = await authData.findUserById(decoded.id, { populateCompany: true });
+  const user = await authData.findUserById(decoded.id, {
+    populateCompany: true,
+    populateRoles: true,
+  });
   if (!user) return { user: null, company: null };
 
   user.id = entityId(user);

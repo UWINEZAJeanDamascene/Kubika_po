@@ -68,6 +68,26 @@ const ALLOWED_PRODUCT_SORT_FIELDS = new Set([
   'createdAt', 'updatedAt', 'name', 'sku', 'currentStock', 'sellingPrice', 'costPrice',
 ]);
 
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** Prefix-first search clauses — faster on indexed name/sku than full contains scans. */
+function buildProductSearchOr(term) {
+  const trimmed = String(term).trim();
+  if (!trimmed) return null;
+  const escaped = escapeRegex(trimmed);
+  const or = [
+    { sku: { $regex: `^${escaped}`, $options: 'i' } },
+    { name: { $regex: `^${escaped}`, $options: 'i' } },
+    { barcode: trimmed },
+  ];
+  if (trimmed.length >= 4) {
+    or.push({ description: { $regex: escaped, $options: 'i' } });
+  }
+  return or;
+}
+
 function serializeProductDoc(product) {
   if (!product) return product;
   if (typeof product.toJSON === 'function') return product.toJSON();
@@ -110,12 +130,8 @@ exports.getProducts = async (req, res, next) => {
     }
 
     if (search && search.trim()) {
-      query.$or = [
-        { name: { $regex: search, $options: 'i' } },
-        { sku: { $regex: search, $options: 'i' } },
-        { description: { $regex: search, $options: 'i' } },
-        { barcode: { $regex: search, $options: 'i' } }
-      ];
+      const searchOr = buildProductSearchOr(search);
+      if (searchOr) query.$or = searchOr;
     }
 
     if (category && category.trim()) {
@@ -163,7 +179,8 @@ exports.getProducts = async (req, res, next) => {
       .select(PRODUCT_LIST_SELECT)
       .sort({ [sortField]: order === 'desc' ? -1 : 1 })
       .skip(skip)
-      .limit(limit);
+      .limit(limit)
+      .lean();
 
     if (isStockLevels) {
       productQuery.populate('category', 'name');
@@ -173,31 +190,28 @@ exports.getProducts = async (req, res, next) => {
         .populate('supplier', 'name code');
     }
 
-    const [products, total] = hasComplexFilter
-      ? await Promise.all([
-          timedQuery('getProducts complex find', () => productQuery),
-          timedQuery('getProducts complex count', () => Product.countDocuments(query)),
-        ])
-      : await Promise.all([
-          timedQuery('getProducts find', () => productQuery),
-          timedQuery('getProducts count', () => Product.countDocuments(query)),
-        ]);
+    const products = await timedQuery(
+      hasComplexFilter ? 'getProducts complex find' : 'getProducts find',
+      () => productQuery,
+    );
 
-    // Backfill: if averageCost is 0 but costPrice is set, use costPrice and persist
-    const backfillOps = [];
+    let total;
+    if (products.length < limit) {
+      total = skip + products.length;
+    } else {
+      total = await timedQuery(
+        hasComplexFilter ? 'getProducts complex count' : 'getProducts count',
+        () => Product.countDocuments(query),
+      );
+    }
+
     const data = products.map((p) => {
       const obj = serializeProductDoc(p);
       if ((!p.averageCost || Number(p.averageCost) === 0) && p.costPrice && Number(p.costPrice) > 0) {
         obj.averageCost = p.costPrice;
-        backfillOps.push({ updateOne: { filter: { _id: p._id }, update: { $set: { averageCost: p.costPrice } } } });
       }
       return obj;
     });
-    if (backfillOps.length > 0) {
-      Product.bulkWrite(backfillOps).catch((err) => {
-        slowQueryMonitor.record('getProducts backfill', 0, { error: err.message });
-      });
-    }
 
     res.json({
       success: true,

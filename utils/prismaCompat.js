@@ -973,7 +973,8 @@ function makeCompatModel(config) {
       return tenantQuery(async (opts) => {
         if (config.customFind && (filter.$expr || filter.$text || filter.$or)) {
           const row = await config.customFind(filter, opts);
-          return finish(row ? toApi(row) : null, opts, undefined);
+          const include = buildInclude(opts.populate);
+          return finish(row ? toApi(row) : null, opts, include);
         }
         const where = applyTenant(translateFilter(filter, fieldMap), opts);
         if (where === IMPOSSIBLE) return null;
@@ -991,7 +992,8 @@ function makeCompatModel(config) {
       return tenantQuery(async (opts) => {
         if (config.customFind && (filter.$expr || filter.$text || filter.$or)) {
           const rows = await config.customFind(filter, opts, { many: true });
-          return finish((rows || []).map((r) => toApi(r)), opts, undefined);
+          const include = buildInclude(opts.populate);
+          return finish((rows || []).map((r) => toApi(r)), opts, include);
         }
         const where = applyTenant(translateFilter(filter, fieldMap), opts);
         if (where === IMPOSSIBLE) return [];

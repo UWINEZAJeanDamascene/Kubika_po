@@ -19,11 +19,10 @@ const {
 const { protect } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/rbacMiddleware');
 const logAction = require('../middleware/logAction');
-const { cacheMiddleware, sessionMiddleware } = require('../middleware/cacheMiddleware');
+const { cacheMiddleware } = require('../middleware/cacheMiddleware');
 
 // All routes require authentication
 router.use(protect);
-router.use(sessionMiddleware);
 
 router.route('/')
   .get(

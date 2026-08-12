@@ -344,6 +344,13 @@ function productToApi(row) {
   const defaultWarehouse = row.defaultWarehouse && typeof row.defaultWarehouse === 'object'
     ? warehouseToApi(row.defaultWarehouse)
     : (row.defaultWarehouseId ?? null);
+  const createdBy = row.createdBy && typeof row.createdBy === 'object'
+    ? {
+        _id: row.createdBy.id,
+        name: row.createdBy.name,
+        email: row.createdBy.email,
+      }
+    : (row.createdById ?? null);
 
   const currentStock = decimalToString(row.currentStock, 4);
   const lowStockThreshold = decimalToString(row.lowStockThreshold, 4);
@@ -393,7 +400,7 @@ function productToApi(row) {
     taxRate: decimalToString(row.taxRate, 6),
     ebm,
     history: sanitizeProductHistory(Array.isArray(row.history) ? row.history : []),
-    createdBy: row.createdById ?? null,
+    createdBy,
     customFields: row.customFields ?? {},
     isLowStock: cs <= th,
     availableStock: Math.max(0, cs - parseFloat(decimalToString(row.reservedQuantity, 4))),
