@@ -2,6 +2,9 @@ const express = require('express');
 const router = express.Router();
 const { protect } = require('../middleware/auth');
 const { TOOL_DEFINITIONS, executeTool } = require('../services/aiToolService');
+const { buildStacySystemPrompt, PROMPT_TEMPLATE_VERSION } = require('../ai-engine/prompt-builder');
+const { validateFreeTextResponse, guardedFallback, GUARDRAIL_VERSION } = require('../ai-engine/guardrail');
+const { classifyQuery, actionProposalReply, clarificationReply, NLQ_VERSION } = require('../ai-engine/nlq');
 const {
   isConfigured,
   createCompletion,
@@ -10,47 +13,8 @@ const {
 } = require('../services/aiProviderService');
 
 function buildSystemPrompt(userName, companyName) {
-  return `You are Stacy, the AI operating assistant for StockManager / KUBIKA SYSTEM, a stock, sales, purchasing, accounting, payroll, reporting, and control-room SaaS for Rwanda. Address ${userName}. Company context: ${companyName}.
-
-CORE SPEC:
-- Be fast, direct, accurate, and useful. Do not pretend. If live data is needed, use tools before answering.
-- No bias, no invented facts, no fake certainty. Separate facts, calculations, forecasts, assumptions, and recommendations.
-- Currency=FRW. Tax A=0%, Tax B=18% VAT. Corporate tax=30%. FY=Jan-Dec. COGS=Opening+Purchases-Closing.
-- Understand modules one by one: Command dashboards, Inventory Core, Supply Chain, Revenue Flow, Finance Control, Intelligence, and Control Room.
-- Adapt to new modules by first calling get_module_catalog and then get_module_records when a supported module key exists. If a new module has no tool yet, explain the gap clearly and use related live tools.
-- Use tools proactively. Call multiple tools in parallel when comparing modules. Synthesize results, never dump JSON.
-- For calculations: show formula, inputs, result, and any missing-data caveat.
-- For forecasts/predictions: call forecast_business or relevant summary tools first; give confidence level and assumptions. Never guarantee the future.
-- For charts: use line/bar for trends, pie/doughnut for breakdowns, and include the chart-ready data when useful.
-- For troubleshooting: identify likely cause, verification steps, and next action.
-
-EXCEL EXPORT CAPABILITY:
-When user asks to export, download, save as Excel, CSV, PDF, or get data in file/spreadsheet format:
-1. First fetch the relevant data using appropriate tools (get_products, get_sales, get_stock_levels, etc.)
-2. Analyze the data - provide key insights, totals, trends, and notable findings in your text response
-3. Format the data into a clean array of objects where keys are column headers
-4. Call export_data with format=excel/csv/pdf, title, sheetName if Excel, data, analysis, and optional fileName. generate_excel remains available for Excel-only.
-5. The tool returns a downloadUrl field - you MUST use this EXACT URL in your response
-6. Include a clickable markdown link using the EXACT downloadUrl: [Download Report](downloadUrl)
-7. NEVER construct your own URL - always use the downloadUrl provided by the tool
-8. ALWAYS present the analysis/insights FIRST, then the download link
-
-For example, if user says "give me excel of my products":
-- Fetch products with get_products
-- Analyze: "You have X products worth Y FRW. Top categories are..." 
-- Generate Excel with columns: Name, SKU, Category, Stock, Unit Price, Total Value
-- Provide [Download Excel Report](downloadUrl)
-
-DATA ANALYSIS:
-Always analyze data before exporting. Provide:
-- Summary statistics (counts, totals, averages)
-- Key insights and trends
-- Notable items (highest, lowest, out of stock)
-- Recommendations when relevant
-
-End answers with a follow-up question.`;
+  return buildStacySystemPrompt({ userName, companyName });
 }
-
 router.post('/', protect, async (req, res) => {
   try {
     const { message, history = [] } = req.body;
@@ -58,6 +22,32 @@ router.post('/', protect, async (req, res) => {
       return res.status(400).json({ success: false, reply: 'Message is required.' });
     }
 
+    const nlq = classifyQuery(message, { history });
+    if (nlq.routesToActionEngine) {
+      return res.status(200).json({
+        success: true,
+        reply: actionProposalReply(nlq),
+        provider: 'nlq',
+        ai: {
+          nlqVersion: NLQ_VERSION,
+          intent: nlq,
+          routed: 'action_proposal_required',
+        },
+      });
+    }
+
+    if (nlq.requiresClarification) {
+      return res.status(200).json({
+        success: true,
+        reply: clarificationReply(nlq),
+        provider: 'nlq',
+        ai: {
+          nlqVersion: NLQ_VERSION,
+          intent: nlq,
+          routed: 'clarification_required',
+        },
+      });
+    }
     if (!isConfigured()) {
       const providers = getConfiguredProviders();
       return res.status(200).json({
@@ -81,6 +71,7 @@ router.post('/', protect, async (req, res) => {
     // Tool calling loop (max 5 iterations to prevent runaway)
     let finalReply = '';
     let usedProvider = 'unknown';
+    let providerMetadata = null;
     const maxIterations = 5;
 
     for (let iteration = 0; iteration < maxIterations; iteration++) {
@@ -100,6 +91,7 @@ router.post('/', protect, async (req, res) => {
 
       const assistantMessage = completionResult.result.choices[0].message;
       usedProvider = completionResult.provider || usedProvider;
+      providerMetadata = completionResult.metadata || providerMetadata;
 
       // If there are tool calls, execute them and continue the loop
       if (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0) {
@@ -146,7 +138,24 @@ router.post('/', protect, async (req, res) => {
       finalReply = 'I apologize, but I was unable to complete the analysis after several attempts. Please try rephrasing your question.';
     }
 
-    res.json({ success: true, reply: finalReply, provider: usedProvider });
+    const guardrail = validateFreeTextResponse(finalReply);
+    if (!guardrail.ok) {
+      finalReply = guardedFallback(guardrail.errors);
+    }
+
+    res.json({
+      success: true,
+      reply: finalReply,
+      provider: usedProvider,
+      ai: {
+        promptTemplateVersion: PROMPT_TEMPLATE_VERSION,
+        guardrailVersion: GUARDRAIL_VERSION,
+        guardrail,
+        providerMetadata,
+        nlqVersion: NLQ_VERSION,
+        intent: nlq,
+      },
+    });
   } catch (error) {
     console.error('AI chat error:', error.message || String(error));
 
