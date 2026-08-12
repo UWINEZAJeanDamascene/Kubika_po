@@ -40,7 +40,10 @@
     "etl:phase10:dry": "node scripts/etl/sync-phase10-mongo-to-postgres.js --dry-run",
     "test:phase10": "jest --runInBand test/phase10BudgetPayrollAssetsEbm.test.js",
     "etl:verify-parity": "node scripts/etl/verify-parity.js",
-    "test:phase0-step8": "jest --runInBand test/phase0TransactionsSequences.test.js"
+    "test:phase0-step8": "jest --runInBand test/phase0TransactionsSequences.test.js",
+    "test:ai": "npm run ai:check-boundaries && jest --runInBand ai-engine --passWithNoTests",
+    "test:ai:adversarial": "jest --runInBand ai-engine/tests/adversarial --passWithNoTests",
+    "ai:check-boundaries": "node scripts/check-ai-boundaries.js"
   },
   "keywords": [
     "stock",

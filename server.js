@@ -105,6 +105,8 @@ async function initializeServer() {
   require('./models/Backup');
   require('./models/FixedAsset');
   require('./models/AuditLog');
+  require('./models/AIFinding');
+  require('./models/AIActionProposal');
   require('./models/JournalEntryLine');
   require('./models/JournalEntry');
   require('./models/AssetCategory');
@@ -347,6 +349,7 @@ async function initializeServer() {
   apiRouter.use('/imports', require('./routes/importsRoutes'));
   apiRouter.use('/audit-trail', require('./routes/auditTrailRoutes'));
   apiRouter.use('/chat', require('./routes/aiChatRoutes'));
+  apiRouter.use('/ai', require('./routes/aiContextRoutes'));
   apiRouter.use('/journal-entries', require('./routes/journalRoutes'));
   apiRouter.use('/accounting', require('./routes/accountingRoutes'));
   apiRouter.use('/account-mappings', require('./routes/accountMappingRoutes'));
@@ -692,3 +695,4 @@ initializeServer().catch((err) => {
 });
 
 module.exports = app;
+
