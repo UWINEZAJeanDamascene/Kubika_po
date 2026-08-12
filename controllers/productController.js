@@ -190,6 +190,19 @@ exports.getProducts = async (req, res, next) => {
         .populate('supplier', 'name code');
     }
 
+    // Start the count with the page lookup. Previously a full first page
+    // always waited for these two independent database queries in sequence.
+    const totalPromise = timedQuery(
+      hasComplexFilter ? 'getProducts complex count' : 'getProducts count',
+      () => Product.countDocuments(query),
+    );
+    // If the final page is short, the exact total is derived without awaiting
+    // the count. Consume a possible background error in that case so it never
+    // becomes an unhandled rejection.
+    totalPromise.catch((error) => {
+      console.error('getProducts count error:', error);
+    });
+
     const products = await timedQuery(
       hasComplexFilter ? 'getProducts complex find' : 'getProducts find',
       () => productQuery,
@@ -199,10 +212,7 @@ exports.getProducts = async (req, res, next) => {
     if (products.length < limit) {
       total = skip + products.length;
     } else {
-      total = await timedQuery(
-        hasComplexFilter ? 'getProducts complex count' : 'getProducts count',
-        () => Product.countDocuments(query),
-      );
+      total = await totalPromise;
     }
 
     const data = products.map((p) => {

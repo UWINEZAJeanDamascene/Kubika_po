@@ -29,11 +29,12 @@ const CACHE_CONFIGS = {
 };
 
 const CACHE_GET_TIMEOUT_MS = Number(process.env.REDIS_CACHE_GET_TIMEOUT_MS || 500);
+const CACHE_WRITE_TIMEOUT_MS = Number(process.env.REDIS_CACHE_WRITE_TIMEOUT_MS || 500);
 
-function withCacheTimeout(promise, fallback = null) {
+function withCacheTimeout(promise, fallback = null, timeoutMs = CACHE_GET_TIMEOUT_MS) {
   return Promise.race([
     promise,
-    new Promise((resolve) => setTimeout(() => resolve(fallback), CACHE_GET_TIMEOUT_MS)),
+    new Promise((resolve) => setTimeout(() => resolve(fallback), timeoutMs)),
   ]);
 }
 
@@ -170,7 +171,8 @@ class CacheService {
    */
   async set(key, data, ttl = DEFAULT_TTL) {
     try {
-      await redisClient.setex(key, ttl, JSON.stringify(data));
+      // Bound direct callers too; cache failure must not become API latency.
+      await withCacheTimeout(redisClient.setex(key, ttl, JSON.stringify(data)), null, CACHE_WRITE_TIMEOUT_MS);
       return true;
     } catch (error) {
       console.error('Cache set error:', error);

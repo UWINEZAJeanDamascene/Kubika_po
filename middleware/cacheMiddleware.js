@@ -100,10 +100,14 @@ const cacheMiddleware = (options = {}) => {
       const originalJson = res.json.bind(res);
 
       // Override json method to cache response
-      res.json = async (data) => {
+      res.json = (data) => {
         // Only cache successful responses
         if (res.statusCode === 200 && data) {
-          await cacheService.set(cacheKey, data, ttl);
+          // Cache writes must not delay the response when Redis is reconnecting
+          // or unavailable. The cache is an optimization, not a dependency.
+          cacheService.set(cacheKey, data, ttl).catch((error) => {
+            console.error('Cache set error:', error);
+          });
         }
         return originalJson(data);
       };
