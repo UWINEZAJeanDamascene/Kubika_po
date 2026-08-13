@@ -54,6 +54,10 @@ async function initializeServer() {
   const { connectPrisma, warmPrisma, startPrismaKeepAlive } = require('./lib/prisma');
   await connectPrisma();
   await warmPrisma();
+  // Required reference data is synchronized at every boot. This replaces
+  // manual role and chart-of-account seed commands and is safe to repeat.
+  const { initializeRequiredData } = require('./services/systemBootstrapService');
+  await initializeRequiredData();
   // Keep pinging Neon periodically so its compute doesn't autosuspend while
   // this process is running, avoiding cold-start latency on user requests.
   startPrismaKeepAlive();

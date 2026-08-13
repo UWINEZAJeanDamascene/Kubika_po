@@ -127,11 +127,8 @@ const systemRoles = [
   }
 ];
 
-async function run() {
-  await connectPrisma();
-
-  console.log('Seeding system roles...\n');
-
+async function syncSystemRoles() {
+  const results = { created: 0, updated: 0 };
   for (const roleData of systemRoles) {
     const existing = await prisma.role.findFirst({
       where: { name: roleData.name, isSystemRole: true },
@@ -145,7 +142,7 @@ async function run() {
           permissions: roleData.permissions,
         },
       });
-      console.log(`Updated role: ${roleData.name}`);
+      results.updated += 1;
       continue;
     }
 
@@ -158,15 +155,28 @@ async function run() {
         permissions: roleData.permissions,
       },
     });
-    console.log(`Created role: ${roleData.name}`);
+    results.created += 1;
   }
 
-  console.log('\nSystem roles seeded successfully!');
+  return results;
+}
+
+async function run() {
+  await connectPrisma();
+
+  console.log('Seeding system roles...\n');
+  const results = await syncSystemRoles();
+
+  console.log(`\nSystem roles synced successfully (${results.created} created, ${results.updated} updated).`);
   await disconnectPrisma();
   process.exit(0);
 }
 
-run().catch(err => {
-  console.error('Error seeding roles:', err);
-  process.exit(1);
-});
+if (require.main === module) {
+  run().catch(err => {
+    console.error('Error seeding roles:', err);
+    process.exit(1);
+  });
+}
+
+module.exports = { systemRoles, syncSystemRoles };

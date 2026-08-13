@@ -4,9 +4,8 @@ const { generateObjectId, toIdString } = require('../utils/objectId');
 const { companyToApi, companyInputToPrisma, userToApi } = require('../utils/authMappers');
 const passwordUtils = require('../utils/passwordUtils');
 const AuditLogService = require('./AuditLogService');
-const ChartOfAccount = require('../models/ChartOfAccount');
 const SubscriptionPlanService = require('./SubscriptionPlanService');
-const { CHART_OF_ACCOUNTS } = require('../constants/chartOfAccounts');
+const { syncCompanyChartOfAccounts } = require('./systemBootstrapService');
 
 let PLAN_FEATURES = {
   starter: ['inventory', 'sales', 'purchases', 'reports'],
@@ -225,24 +224,12 @@ function serializeCompany(row) {
 }
 
 async function seedChartOfAccounts(companyId, createdByUserId) {
-  // Chart of accounts is still Mongo-backed until the finance migration phase.
   try {
-    const accounts = Object.entries(CHART_OF_ACCOUNTS).map(([code, account]) => ({
-      company: companyId,
-      code,
-      name: account.name,
-      type: account.type,
-      subtype: account.subtype,
-      normal_balance: account.normalBalance,
-      allow_direct_posting: account.allowDirectPosting,
-      isActive: true,
-      createdBy: createdByUserId || null,
-    }));
-    await ChartOfAccount.insertMany(accounts);
-    console.log(`Seeded ${accounts.length} chart of accounts for company ${companyId}`);
+    const result = await syncCompanyChartOfAccounts(companyId, createdByUserId);
+    console.log(`Synced chart of accounts for company ${companyId} (${result.created} created, ${result.updated} updated)`);
   } catch (seedError) {
-    console.error('Error seeding chart of accounts:', seedError);
-    // Don't fail company creation if seeding fails
+    console.error('Error syncing chart of accounts:', seedError);
+    throw seedError;
   }
 }
 
