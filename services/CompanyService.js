@@ -306,7 +306,20 @@ class CompanyService {
       throw err;
     }
 
-    const selectedPlan = (c.subscription_plan || 'starter').toString().trim();
+    const selectedPlan = (c.subscription_plan || '').toString().trim().toLowerCase();
+    // Do not silently place applicants on Starter. The public form must send
+    // an active package selected by the company, and that requested package
+    // is retained for the platform administrator's approval decision.
+    await SubscriptionPlanService.seedDefaultPlans();
+    const plan = selectedPlan
+      ? await SubscriptionPlanService.getPlanByKey(selectedPlan)
+      : null;
+    if (!plan || !plan.is_active) {
+      const err = new Error('INVALID_SUBSCRIPTION_PLAN');
+      err.code = 'INVALID_SUBSCRIPTION_PLAN';
+      throw err;
+    }
+    await loadPlanFeatures();
     const company = await prisma.company.create({
       data: {
         id: generateObjectId(),

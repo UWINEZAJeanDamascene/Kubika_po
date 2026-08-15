@@ -713,58 +713,79 @@ const isQuotationExpired = (quotation) => {
 exports.getQuotations = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { 
-      page = 1, 
-      limit = 20, 
-      status, 
-      clientId, 
+    const {
+      page = 1,
+      limit = 20,
+      status,
+      clientId,
       client_id,
-      date_from, 
-      date_to, 
-      expiry_before 
+      date_from,
+      date_to,
+      startDate,
+      endDate,
+      search,
+      expiry_before,
     } = req.query;
     const query = { company: companyId };
 
-    // Filter by status
     if (status) {
       query.status = status;
     }
 
-    // Filter by client (support both clientId and client_id)
     const clientFilter = clientId || client_id;
     if (clientFilter) {
       query.client = clientFilter;
     }
 
-    // Filter by quotation date range
-    if (date_from || date_to) {
+    const from = date_from || startDate;
+    const to = date_to || endDate;
+    if (from || to) {
       query.quotationDate = {};
-      if (date_from) query.quotationDate.$gte = new Date(date_from);
-      if (date_to) query.quotationDate.$lte = new Date(date_to);
+      if (from) query.quotationDate.$gte = new Date(from);
+      if (to) query.quotationDate.$lte = new Date(to);
     }
 
-    // Filter by expiry before date (for expired quotations)
     if (expiry_before) {
       query.expiryDate = { $lte: new Date(expiry_before) };
     }
 
-    const total = await Quotation.countDocuments(query);
-    const quotations = await Quotation.find(query)
-      .populate('client', 'name code contact taxId')
-      .populate('lines.product', 'name sku unit')
-      .populate('createdBy', 'name email')
-      .populate('approvedBy', 'name email')
-      .sort({ createdAt: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit);
+    if (search) {
+      query.$or = [
+        { referenceNo: { $regex: search, $options: 'i' } },
+        { notes: { $regex: search, $options: 'i' } },
+      ];
+    }
+
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+    const skip = (pageNum - 1) * limitNum;
+
+    // List path: headers + client only (no line/product payload).
+    const [total, quotations] = await Promise.all([
+      Quotation.countDocuments(query),
+      Quotation.find(query)
+        .populate('-lines')
+        .populate('client', 'name code contact taxId')
+        .populate('createdBy', 'name email')
+        .sort({ createdAt: -1 })
+        .limit(limitNum)
+        .skip(skip),
+    ]);
 
     res.json({
       success: true,
       count: quotations.length,
       total,
-      pages: Math.ceil(total / limit),
-      currentPage: page,
-      data: quotations
+      page: pageNum,
+      pages: Math.ceil(total / limitNum),
+      currentPage: pageNum,
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total,
+        pages: Math.ceil(total / limitNum),
+      },
+      data: quotations,
     });
   } catch (error) {
     next(error);
@@ -781,8 +802,7 @@ exports.getQuotation = async (req, res, next) => {
       .populate('client', 'name code contact type taxId')
       .populate('lines.product', 'name sku unit')
       .populate('createdBy', 'name email')
-      .populate('approvedBy', 'name email')
-      .populate('convertedToInvoice');
+      .populate('approvedBy', 'name email');
 
     if (!quotation) {
       return res.status(404).json({

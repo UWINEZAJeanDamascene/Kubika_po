@@ -38,6 +38,31 @@ enum BillingCycle {
   annual
 }
 
+/// Platform-wide subscription package catalog (pricing tiers shown on signup/pricing pages).
+model SubscriptionPlanCatalog {
+  id                   String       @id @db.Char(24)
+  key                  String       @unique
+  name                 String
+  description          String       @default("")
+  features             String[]     @default([])
+  modules              String[]     @default([])
+  outcomes             String[]     @default([])
+  badge                String       @default("")
+  icon                 String       @default("")
+  featured             Boolean      @default(false)
+  buttonLabel          String       @default("") @map("button_label")
+  defaultBillingAmount Decimal      @default(0) @map("default_billing_amount") @db.Decimal(19, 4)
+  defaultBillingCycle  BillingCycle @default(monthly) @map("default_billing_cycle")
+  isActive             Boolean      @default(true) @map("is_active")
+  sortOrder            Int          @default(0) @map("sort_order")
+  createdAt            DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt            DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@index([isActive])
+  @@index([sortOrder])
+  @@map("subscription_plan_catalog")
+}
+
 enum CompanyUserStatus {
   active
   inactive
@@ -1646,6 +1671,8 @@ model Quotation {
   @@unique([companyId, referenceNo])
   @@index([companyId, status])
   @@index([companyId, expiryDate])
+  @@index([companyId, createdAt(sort: Desc)])
+  @@index([companyId, quotationDate(sort: Desc)])
   @@index([clientId])
   @@map("quotations")
 }
@@ -1715,6 +1742,7 @@ model SalesOrder {
   @@unique([companyId, referenceNo])
   @@index([companyId, status])
   @@index([companyId, orderDate(sort: Desc)])
+  @@index([companyId, createdAt(sort: Desc)])
   @@index([companyId, clientId])
   @@index([quotationId])
   @@map("sales_orders")

@@ -61,6 +61,9 @@ function quotationLineToApi(row) {
 function quotationToApi(row) {
   if (!row) return null;
   const lines = mapLines(row, quotationLineToApi);
+  const lineCount = row._count?.lines != null
+    ? Number(row._count.lines)
+    : (Array.isArray(lines) ? lines.length : 0);
   return {
     _id: row.id,
     company: row.companyId,
@@ -93,7 +96,8 @@ function quotationToApi(row) {
     publicAcceptToken: row.customerAction?.publicAcceptToken ?? null,
     publicRejectToken: row.customerAction?.publicRejectToken ?? null,
     publicTokenExpiresAt: row.customerAction?.publicTokenExpiresAt ?? null,
-    lines,
+    lineCount,
+    lines: lines.length ? lines : Array.from({ length: lineCount }),
     ...mapTimestamps(row),
   };
 }
@@ -339,7 +343,16 @@ function salesOrderLineToApi(row) {
     invoiceLines: trace.invoiceLines ?? [],
   });
   if (row.product && typeof row.product === 'object') {
-    base.product = relationRef(row.product, row.productId);
+    base.product = {
+      _id: row.product.id,
+      name: row.product.name,
+      sku: row.product.sku,
+      unit: row.product.unit,
+      ...(row.product.taxRate != null ? { taxRate: qtyNum(row.product.taxRate) } : {}),
+      ...(row.product.taxCode != null ? { taxCode: row.product.taxCode } : {}),
+      ...(row.product.trackingType != null ? { trackingType: row.product.trackingType } : {}),
+      ...(row.product.isStockable != null ? { isStockable: row.product.isStockable } : {}),
+    };
   }
   return base;
 }
@@ -347,6 +360,9 @@ function salesOrderLineToApi(row) {
 function salesOrderToApi(row) {
   if (!row) return null;
   const lines = mapLines(row, salesOrderLineToApi);
+  const lineCount = row._count?.lines != null
+    ? Number(row._count.lines)
+    : (row.lineCount != null ? Number(row.lineCount) : (Array.isArray(lines) ? lines.length : 0));
   return {
     _id: row.id,
     company: row.companyId,
@@ -371,7 +387,9 @@ function salesOrderToApi(row) {
     pickPackId: row.pickPackId ?? null,
     notes: row.notes ?? null,
     createdBy: row.createdById ?? null,
-    lines,
+    lineCount,
+    // Preserve .length for list UIs that only need a count (no product payload).
+    lines: lines.length ? lines : Array.from({ length: lineCount }),
     ...mapTimestamps(row),
   };
 }

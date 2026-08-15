@@ -69,12 +69,23 @@ exports.getSalesOrders = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     
-    const { status, client, startDate, endDate, fulfillmentStatus, search, page = 1, limit = 25 } = req.query;
+    const {
+      status,
+      client,
+      clientId,
+      startDate,
+      endDate,
+      fulfillmentStatus,
+      search,
+      page = 1,
+      limit = 25,
+    } = req.query;
     
     const filter = { company: companyId };
     
     if (status) filter.status = status;
-    if (client) filter.client = client;
+    const clientFilter = client || clientId;
+    if (clientFilter) filter.client = clientFilter;
     if (fulfillmentStatus) filter.fulfillmentStatus = fulfillmentStatus;
     
     if (startDate || endDate) {
@@ -89,17 +100,20 @@ exports.getSalesOrders = async (req, res, next) => {
         { notes: { $regex: search, $options: 'i' } }
       ];
     }
+
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 25));
+    const skip = (pageNum - 1) * limitNum;
     
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-    
+    // List path: headers + client + line count only (no product rows).
     const [salesOrders, totalCount] = await Promise.all([
       SalesOrder.find(filter)
+        .populate('-lines')
         .populate('client', 'name code tin')
-        .populate('lines.product', 'name sku')
         .populate('createdBy', 'name email')
         .sort({ createdAt: -1 })
         .skip(skip)
-        .limit(parseInt(limit))
+        .limit(limitNum)
         .lean(),
       SalesOrder.countDocuments(filter)
     ]);
@@ -108,8 +122,14 @@ exports.getSalesOrders = async (req, res, next) => {
       success: true,
       count: salesOrders.length,
       total: totalCount,
-      page: parseInt(page),
-      pages: Math.ceil(totalCount / parseInt(limit)),
+      page: pageNum,
+      pages: Math.ceil(totalCount / limitNum),
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total: totalCount,
+        pages: Math.ceil(totalCount / limitNum),
+      },
       data: salesOrders
     });
   } catch (error) {
@@ -127,16 +147,8 @@ exports.getSalesOrder = async (req, res, next) => {
     const salesOrder = await SalesOrder.findOne({ _id: req.params.id, company: companyId })
       .populate('client', 'name code tin address phone email')
       .populate('lines.product', 'name sku unit taxRate taxCode trackingType isStockable')
-      .populate('lines.warehouse', 'name code')
       .populate('createdBy', 'name email')
-      .populate('confirmedBy', 'name email')
-      .populate('packedBy', 'name email')
-      .populate('deliveredBy', 'name email')
-      .populate('invoicedBy', 'name email')
-      .populate('quotation', 'referenceNo')
-      .populate('deliveryNotes', 'referenceNo status deliveryDate')
-      .populate('invoices', 'referenceNo status totalAmount')
-      .populate('pickPackId');
+      .populate('quotation', 'referenceNo');
     
     if (!salesOrder) {
       return res.status(404).json({
@@ -678,7 +690,9 @@ exports.getWorkflowStatus = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     
-    const salesOrder = await SalesOrder.findOne({ _id: req.params.id, company: companyId });
+    const salesOrder = await SalesOrder.findOne({ _id: req.params.id, company: companyId })
+      .populate('-lines')
+      .select('status');
     
     if (!salesOrder) {
       return res.status(404).json({
@@ -706,7 +720,9 @@ exports.getWorkflowStatus = async (req, res, next) => {
     const transitions = availableTransitions.map(status => ({
       status,
       label: status.charAt(0).toUpperCase() + status.slice(1).replace(/_/g, ' '),
-      possible: salesOrder.canTransitionTo(status)
+      possible: typeof salesOrder.canTransitionTo === 'function'
+        ? salesOrder.canTransitionTo(status)
+        : (validTransitions[currentStatus] || []).includes(status)
     }));
     
     res.status(200).json({
@@ -716,7 +732,9 @@ exports.getWorkflowStatus = async (req, res, next) => {
         currentStatusLabel: currentStatus.charAt(0).toUpperCase() + currentStatus.slice(1).replace(/_/g, ' '),
         transitions,
         canEdit: ['draft', 'confirmed'].includes(currentStatus),
-        canCancel: salesOrder.canTransitionTo('cancelled'),
+        canCancel: typeof salesOrder.canTransitionTo === 'function'
+          ? salesOrder.canTransitionTo('cancelled')
+          : (validTransitions[currentStatus] || []).includes('cancelled'),
         isComplete: ['closed', 'cancelled'].includes(currentStatus)
       }
     });

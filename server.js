@@ -67,6 +67,14 @@ async function initializeServer() {
   // fail fast; only the PostgreSQL-backed domains are served.
   await connectDB();
 
+  // Pricing packages are customer-facing reference data. Initialize the
+  // default catalog automatically on PostgreSQL, without replacing administrator edits.
+  if (process.env.DATABASE_URL) {
+    const SubscriptionPlanService = require('./services/SubscriptionPlanService');
+    await SubscriptionPlanService.seedDefaultPlans();
+    console.log('[Bootstrap] Subscription plan catalog is ready.');
+  }
+
   // With MongoDB disabled, background schedulers touching Mongo models reject
   // asynchronously. Log instead of letting Node kill the process.
   if (!config.db.uri) {

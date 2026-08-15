@@ -305,6 +305,12 @@ exports.registerPublic = async (req, res) => {
         code
       });
     }
+    if (code === 'INVALID_SUBSCRIPTION_PLAN') {
+      return res.status(400).json({
+        success: false,
+        message: 'Please select an active subscription plan.'
+      });
+    }
     if (code === 'EMAIL_NOT_AVAILABLE') {
       return res.status(409).json({
         success: false,
@@ -662,6 +668,9 @@ exports.forcePasswordReset = async (req, res) => {
 /** GET /api/companies/subscription-plans — platform_admin */
 exports.getSubscriptionPlans = async (req, res) => {
   try {
+    // The registration page is public, so it may be the first endpoint hit
+    // after deployment. Ensure the standard package catalog exists first.
+    await SubscriptionPlanService.seedDefaultPlans();
     const activeOnly = req.query.active === 'true';
     const plans = await SubscriptionPlanService.getAllPlans(activeOnly);
     res.json({ success: true, data: plans });

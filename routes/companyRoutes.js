@@ -17,7 +17,8 @@ const registerValidation = [
   body('company.subscription_plan')
     .optional({ nullable: true, checkFalsy: true })
     .trim()
-    .isIn(['trial', 'starter', 'professional', 'enterprise'])
+    .isLength({ min: 1, max: 64 })
+    .matches(/^[a-z0-9_-]+$/i)
     .withMessage('Invalid subscription plan'),
   body('admin').isObject().withMessage('admin object required'),
   body('admin.name').trim().notEmpty().withMessage('Admin name required'),

@@ -177,7 +177,8 @@ function pickKnownRelations(include, delegate) {
 
   let out = null;
   for (const key of Object.keys(include)) {
-    if (known.has(key)) continue;
+    // Prisma `_count` is a valid include key, not a named relation.
+    if (key === '_count' || known.has(key)) continue;
     if (!out) out = { ...include };
     delete out[key];
     warnOnce(
