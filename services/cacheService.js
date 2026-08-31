@@ -18,6 +18,22 @@ const CACHE_CONFIGS = {
   dashboard: { ttl: 60, prefix: 'dashboard' },
   // Stock levels - 1 minute
   stock: { ttl: 60, prefix: 'stock' },
+  // Reference data — read on nearly every screen, changed rarely. Each type
+  // gets its own prefix so invalidating one does not clear the others (an
+  // unknown type falls back to `default`, where they would all collide).
+  warehouse: { ttl: 600, prefix: 'warehouse' },
+  department: { ttl: 600, prefix: 'department' },
+  asset_category: { ttl: 600, prefix: 'asset_category' },
+  chart_of_accounts: { ttl: 600, prefix: 'chart_of_accounts' },
+  account_mapping: { ttl: 600, prefix: 'account_mapping' },
+  period: { ttl: 600, prefix: 'period' },
+  // Currencies and rates change at most daily but are read constantly by every
+  // multi-currency screen.
+  currency: { ttl: 3600, prefix: 'currency' },
+  exchange_rate: { ttl: 3600, prefix: 'exchange_rate' },
+  // Budgets: heavily read (74 endpoints) and edited in bursts during planning.
+  // Short TTL because budget-vs-actual moves whenever a transaction posts.
+  budget: { ttl: 300, prefix: 'budget' },
   // Reports - 15 minutes (expensive queries); override with FINANCIAL_REPORT_CACHE_TTL_SECONDS
   report: { ttl: 900, prefix: 'report' },
   // Financial ratios API — 5 minutes (dashboard widget uses in-memory cache separately)
@@ -27,6 +43,61 @@ const CACHE_CONFIGS = {
   // Default
   default: { ttl: DEFAULT_TTL, prefix: 'default' },
 };
+
+// ── Hit-ratio instrumentation ───────────────────────────────────────────
+//
+// A hit ratio sliding from 90% to 40% is the most common cause of a gradual,
+// unexplained slowdown, and today it is invisible. Counters are per cache type
+// so a single misbehaving type is distinguishable from a Redis-wide problem.
+const cacheStats = new Map(); // type -> { hits, misses, errors }
+
+/** Type is the segment after the `cache:` prefix, e.g. cache:product:CID:hash. */
+function cacheTypeOf(key) {
+  const parts = String(key || '').split(':');
+  return parts.length > 1 ? parts[1] : 'unknown';
+}
+
+function recordCacheEvent(key, outcome) {
+  const type = cacheTypeOf(key);
+  let s = cacheStats.get(type);
+  if (!s) {
+    s = { hits: 0, misses: 0, errors: 0 };
+    cacheStats.set(type, s);
+  }
+  if (outcome === 'hit') s.hits++;
+  else if (outcome === 'miss') s.misses++;
+  else s.errors++;
+}
+
+/** Hit ratio overall and per type, worst ratio first. */
+function getCacheMetrics() {
+  let hits = 0;
+  let misses = 0;
+  let errors = 0;
+  const byType = [];
+  for (const [type, s] of cacheStats) {
+    hits += s.hits;
+    misses += s.misses;
+    errors += s.errors;
+    const lookups = s.hits + s.misses;
+    byType.push({
+      type,
+      hits: s.hits,
+      misses: s.misses,
+      errors: s.errors,
+      hit_ratio: lookups ? Math.round((s.hits / lookups) * 1000) / 10 : null,
+    });
+  }
+  byType.sort((a, b) => (a.hit_ratio ?? 101) - (b.hit_ratio ?? 101));
+  const lookups = hits + misses;
+  return {
+    hits,
+    misses,
+    errors,
+    hit_ratio: lookups ? Math.round((hits / lookups) * 1000) / 10 : null,
+    by_type: byType,
+  };
+}
 
 const CACHE_GET_TIMEOUT_MS = Number(process.env.REDIS_CACHE_GET_TIMEOUT_MS || 500);
 const CACHE_WRITE_TIMEOUT_MS = Number(process.env.REDIS_CACHE_WRITE_TIMEOUT_MS || 500);
@@ -150,14 +221,25 @@ class CacheService {
    * Get cached data
    * @param {string} key - Cache key
    */
+  /** Hit/miss/error counters since process start, overall and per cache type. */
+  getMetrics() {
+    return getCacheMetrics();
+  }
+
   async get(key) {
     try {
       const data = await withCacheTimeout(redisClient.get(key));
       if (!data) {
+        recordCacheEvent(key, 'miss');
         return null;
       }
+      recordCacheEvent(key, 'hit');
       return JSON.parse(data);
     } catch (error) {
+      // Counted separately: an error is not a miss. A hit ratio quietly
+      // collapsing because Redis is timing out looks identical to a cold cache
+      // unless the two are distinguished.
+      recordCacheEvent(key, 'error');
       console.error('Cache get error:', error);
       return null;
     }
@@ -300,7 +382,11 @@ class CacheService {
   /** Trial balance, P&L, GL, ratios, etc. — Redis keys invalidated after journal post */
   async invalidateFinancialReportCaches(companyId) {
     let total = 0;
-    for (const t of ['report', 'financial_ratios', 'general_ledger', 'general_ledger_summary']) {
+    // 'budget' belongs here because budget-vs-actual consumption is derived
+    // from posted transactions: a journal entry changes the answer even though
+    // nothing under /api/budgets was written, so route-level invalidation alone
+    // would leave those figures stale.
+    for (const t of ['report', 'financial_ratios', 'general_ledger', 'general_ledger_summary', 'budget']) {
       total += await this.invalidateByCompany(companyId, t);
     }
     return total;

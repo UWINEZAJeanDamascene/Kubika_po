@@ -8,6 +8,14 @@ const mongoose = require('mongoose');
 const os = require('os');
 
 // ── Request Timing Tracker ──────────────────────────────────────────────
+//
+// Averages hide the users you care about: an endpoint averaging 400ms with a
+// p99 of 12s is broken for 1 request in 100, and the mean will never show it.
+// So durations are kept as samples per route and reported as percentiles.
+//
+// Routes are keyed by their matched Express pattern (`GET /api/products/:id`),
+// never the raw URL — otherwise every id would create its own bucket and the
+// map would grow without bound.
 const requestStats = {
   count: 0,
   errors: 0,
@@ -17,7 +25,38 @@ const requestStats = {
 };
 const MAX_SAMPLES = 200;
 
-function recordRequest(durationMs, statusCode) {
+/** Apdex satisfaction threshold in ms. Satisfied <= T, tolerating <= 4T. */
+const APDEX_T_MS = Number(process.env.APDEX_T_MS) || 1000;
+
+/** Per-route rolling stats. Bounded so a surprise route explosion cannot leak. */
+const routeStats = new Map();
+const MAX_ROUTES = Number(process.env.METRICS_MAX_ROUTES) || 200;
+const MAX_ROUTE_SAMPLES = 100;
+
+function percentile(sortedAsc, p) {
+  if (!sortedAsc.length) return 0;
+  // Nearest-rank: the smallest value at or above the p-th percentile position.
+  const rank = Math.ceil((p / 100) * sortedAsc.length);
+  return sortedAsc[Math.min(Math.max(rank, 1), sortedAsc.length) - 1];
+}
+
+function summarize(durations) {
+  const sorted = [...durations].sort((a, b) => a - b);
+  return {
+    count: sorted.length,
+    p50_ms: percentile(sorted, 50),
+    p95_ms: percentile(sorted, 95),
+    p99_ms: percentile(sorted, 99),
+    max_ms: sorted[sorted.length - 1] || 0,
+  };
+}
+
+/**
+ * @param {number} durationMs
+ * @param {number} statusCode
+ * @param {string} [route] Matched route pattern, e.g. "GET /api/products/:id".
+ */
+function recordRequest(durationMs, statusCode, route) {
   requestStats.count++;
   requestStats.totalMs += durationMs;
   if (durationMs > 500) requestStats.slowCount++;
@@ -31,6 +70,36 @@ function recordRequest(durationMs, statusCode) {
   if (requestStats.samples.length > MAX_SAMPLES) {
     requestStats.samples.shift();
   }
+
+  if (!route) return;
+  let entry = routeStats.get(route);
+  if (!entry) {
+    // Stop adding new routes rather than evicting: a full map still describes
+    // the busiest routes accurately, and eviction would bias the percentiles.
+    if (routeStats.size >= MAX_ROUTES) return;
+    entry = { count: 0, errors: 0, totalMs: 0, durations: [] };
+    routeStats.set(route, entry);
+  }
+  entry.count++;
+  entry.totalMs += durationMs;
+  if (statusCode >= 400) entry.errors++;
+  entry.durations.push(Math.round(durationMs));
+  if (entry.durations.length > MAX_ROUTE_SAMPLES) entry.durations.shift();
+}
+
+/**
+ * Apdex over the recent global sample window: (satisfied + tolerating/2) / total.
+ * One 0-1 number for "is the system fast enough", comparable week over week.
+ */
+function getApdex(samples) {
+  if (!samples.length) return null;
+  let satisfied = 0;
+  let tolerating = 0;
+  for (const s of samples) {
+    if (s.durationMs <= APDEX_T_MS) satisfied++;
+    else if (s.durationMs <= APDEX_T_MS * 4) tolerating++;
+  }
+  return Math.round(((satisfied + tolerating / 2) / samples.length) * 1000) / 1000;
 }
 
 function getRequestMetrics() {
@@ -41,36 +110,95 @@ function getRequestMetrics() {
       error_rate: 0,
       slow_rate: 0,
       requests_per_min: 0,
+      apdex: null,
+      apdex_t_ms: APDEX_T_MS,
     };
   }
   const recent = requestStats.samples.filter(
     (s) => Date.now() - s.timestamp < 60 * 1000
   );
   const recentMs = recent.reduce((s, r) => s + r.durationMs, 0);
+  const overall = summarize(requestStats.samples.map((s) => s.durationMs));
+
   return {
     total_requests: requestStats.count,
+    // Kept for backwards compatibility with existing health dashboards, but
+    // read the percentiles below instead — this number cannot show the tail.
     avg_response_ms: Math.round((requestStats.totalMs / requestStats.count) * 100) / 100,
     error_rate: Math.round((requestStats.errors / requestStats.count) * 10000) / 100,
     slow_rate: Math.round((requestStats.slowCount / requestStats.count) * 10000) / 100,
     requests_per_min: recent.length,
     recent_avg_ms: recent.length > 0 ? Math.round((recentMs / recent.length) * 100) / 100 : 0,
+    p50_ms: overall.p50_ms,
+    p95_ms: overall.p95_ms,
+    p99_ms: overall.p99_ms,
+    max_ms: overall.max_ms,
+    apdex: getApdex(requestStats.samples),
+    apdex_t_ms: APDEX_T_MS,
+  };
+}
+
+/**
+ * Per-route breakdown, slowest p95 first — the ranking you actually optimise
+ * from. `limit` caps how many rows are returned, not how many are tracked.
+ */
+function getRouteMetrics(limit = 20) {
+  const rows = [];
+  for (const [route, e] of routeStats) {
+    const s = summarize(e.durations);
+    rows.push({
+      route,
+      count: e.count,
+      avg_ms: Math.round((e.totalMs / e.count) * 100) / 100,
+      p50_ms: s.p50_ms,
+      p95_ms: s.p95_ms,
+      p99_ms: s.p99_ms,
+      max_ms: s.max_ms,
+      error_rate: Math.round((e.errors / e.count) * 10000) / 100,
+    });
+  }
+  rows.sort((a, b) => b.p95_ms - a.p95_ms);
+  return {
+    tracked_routes: routeStats.size,
+    truncated: routeStats.size >= MAX_ROUTES,
+    routes: rows.slice(0, limit),
   };
 }
 
 // ── Event Loop Lag Monitor ──────────────────────────────────────────────
 let lastEventLoopLag = 0;
+const eventLoopSamples = [];
+const MAX_LOOP_SAMPLES = 240; // 5s cadence -> ~20 minutes of history
 
 function measureEventLoopLag() {
   const start = process.hrtime.bigint();
   setImmediate(() => {
     const end = process.hrtime.bigint();
     lastEventLoopLag = Number(end - start) / 1_000_000; // ns -> ms
+    eventLoopSamples.push(lastEventLoopLag);
+    if (eventLoopSamples.length > MAX_LOOP_SAMPLES) eventLoopSamples.shift();
   });
 }
 
 // Sample every 5 seconds
 const eventLoopTimer = setInterval(measureEventLoopLag, 5000);
 if (eventLoopTimer.unref) eventLoopTimer.unref();
+
+/**
+ * Rolling event-loop lag. When this rises, every endpoint slows at once and no
+ * single query looks guilty — which is exactly the case that per-route
+ * percentiles alone cannot explain.
+ */
+function getEventLoopMetrics() {
+  const s = summarize(eventLoopSamples);
+  return {
+    current_ms: Math.round(lastEventLoopLag * 100) / 100,
+    p50_ms: Math.round(s.p50_ms * 100) / 100,
+    p95_ms: Math.round(s.p95_ms * 100) / 100,
+    max_ms: Math.round(s.max_ms * 100) / 100,
+    samples: s.count,
+  };
+}
 
 // ── Database Stats ──────────────────────────────────────────────────────
 async function getDatabaseStats() {
@@ -270,13 +398,28 @@ async function buildAdvancedMetrics(memorySnapshot) {
   });
   const system = getSystemLoad();
 
+  // Cache stats are read defensively: metrics must never be the thing that
+  // breaks a health endpoint.
+  let cache = null;
+  try {
+    cache = require('./cacheService').getMetrics();
+  } catch (e) {
+    cache = { error: e.message };
+  }
+
   return {
     requests,
+    routes: getRouteMetrics(),
+    cache,
     database_stats: dbStats,
     company_stats: companyStats,
     capacity,
     system,
     event_loop_lag_ms: Math.round(lastEventLoopLag * 100) / 100,
+    // A single instantaneous sample can miss a spike entirely; the window shows
+    // whether the loop is intermittently blocked, which is what actually
+    // degrades every endpoint at once.
+    event_loop_lag: getEventLoopMetrics(),
     active_connections: mongoose.connection.readyState === 1
       ? (mongoose.connection.db?.serverConfig?.connections?.length || 1)
       : 0,
@@ -286,6 +429,8 @@ async function buildAdvancedMetrics(memorySnapshot) {
 module.exports = {
   recordRequest,
   getRequestMetrics,
+  getRouteMetrics,
+  getEventLoopMetrics,
   getDatabaseStats,
   getCompanyDatasetStats,
   getCapacityEstimate,

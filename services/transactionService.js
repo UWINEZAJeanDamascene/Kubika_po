@@ -22,8 +22,19 @@ function isMongoEnabled() {
  */
 async function runInPrismaTransaction(operation, options = {}) {
   const { prisma } = require('../lib/prisma');
+  const { getActiveTx, runWithTx } = require('../lib/txContext');
+
+  // Prisma cannot nest interactive transactions — opening a second one inside
+  // the first deadlocks against the pool. Join the existing transaction so an
+  // inner runInTransaction() is a no-op wrapper rather than an error.
+  const existing = getActiveTx();
+  if (existing) return operation(existing);
+
   return prisma.$transaction(
-    async (tx) => operation(tx),
+    // The tx client is published on the async context so every compat-model
+    // read/write in this scope resolves to it automatically. Without this the
+    // transaction would be opened and then bypassed by its own body.
+    async (tx) => runWithTx(tx, () => operation(tx)),
     {
       maxWait: options.maxWait ?? TX_DEFAULTS.maxWait,
       timeout: options.timeout ?? TX_DEFAULTS.timeout,
@@ -70,8 +81,13 @@ async function runInMongoTransaction(operation) {
  * Run an operation in a database transaction.
  *
  * - `{ backend: 'prisma' }` — always use PostgreSQL (Step 8 path).
- * - `{ backend: 'mongo' }`   — always use MongoDB session.
- * - default                  — Mongo when connected, else non-transactional.
+ * - `{ backend: 'mongo' }`   — always use MongoDB session (legacy, opt-in).
+ * - default                  — PostgreSQL, the system of record.
+ *
+ * The handle passed to `operation` is the Prisma transaction client. Call sites
+ * do not need to use it directly: compat models resolve the active transaction
+ * from the async context, so any Model.find/create/update inside the callback
+ * joins it automatically. Nested calls reuse the outer transaction.
  *
  * @template T
  * @param {(handle: import('@prisma/client').Prisma.TransactionClient | import('mongoose').ClientSession | null) => Promise<T>} operation
@@ -85,10 +101,11 @@ async function runInTransaction(operation, options = {}) {
   if (options.backend === 'mongo') {
     return runInMongoTransaction(operation);
   }
-  if (isMongoEnabled()) {
-    return runInMongoTransaction(operation);
-  }
-  return operation(null);
+  // PostgreSQL is the system of record, so it is the default. This previously
+  // fell through to `operation(null)` whenever Mongo was disabled, which meant
+  // every multi-step write — stock receipt, invoice + journal posting, GRN,
+  // transfers — ran with no transaction at all and could half-commit.
+  return runInPrismaTransaction(operation, options);
 }
 
 module.exports = {

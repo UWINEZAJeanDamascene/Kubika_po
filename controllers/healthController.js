@@ -30,6 +30,41 @@ exports.systemHealth = async (req, res) => {
   }
 };
 
+/**
+ * GET /api/performance
+ *
+ * The performance block on its own — per-route p50/p95/p99, Apdex, cache hit
+ * ratio and event-loop lag — without the database/collection statistics the
+ * full health payload gathers. Cheap enough to poll, and it is what a baseline
+ * capture reads.
+ *
+ * Counters are per-process and reset on restart: a number here describes this
+ * instance since it booted, not the fleet.
+ */
+exports.performanceMetrics = async (req, res) => {
+  try {
+    const {
+      getRequestMetrics,
+      getRouteMetrics,
+      getEventLoopMetrics,
+    } = require('../services/systemMetricsService');
+    const cacheService = require('../services/cacheService');
+
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
+
+    res.json({
+      timestamp: new Date().toISOString(),
+      uptime_seconds: Math.floor(process.uptime()),
+      requests: getRequestMetrics(),
+      routes: getRouteMetrics(limit),
+      cache: cacheService.getMetrics(),
+      event_loop_lag: getEventLoopMetrics(),
+    });
+  } catch (e) {
+    res.status(503).json({ error: e.message });
+  }
+};
+
 // GET /api/health/accounting
 exports.accountingHealth = async (req, res, next) => {
   try {

@@ -771,6 +771,9 @@ model Client {
   @@index([companyId])
   @@index([companyId, isActive])
   @@index([companyId, name])
+  // Trigram indexes backing ILIKE '%term%' client search (pickers on most forms).
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([code(ops: raw("gin_trgm_ops"))], type: Gin)
   @@map("clients")
 }
 
@@ -814,6 +817,9 @@ model Supplier {
   @@index([companyId])
   @@index([companyId, isActive])
   @@index([companyId, name])
+  // Trigram indexes backing ILIKE '%term%' supplier search.
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([code(ops: raw("gin_trgm_ops"))], type: Gin)
   @@map("suppliers")
 }
 
@@ -899,6 +905,11 @@ model Product {
   @@index([companyId, isArchived, isActive])
   @@index([companyId, isActive, isArchived])
   @@index([companyId, categoryId, isActive])
+  // Trigram indexes backing ILIKE '%term%' product search. Declared here so
+  // schema and database agree; created in 20260831000001_search_trigram_indexes.
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([sku(ops: raw("gin_trgm_ops"))], type: Gin)
+  @@index([barcode(ops: raw("gin_trgm_ops"))], type: Gin)
   @@map("products")
 }
 

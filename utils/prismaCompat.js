@@ -22,8 +22,67 @@ const { prisma } = require('../lib/prisma');
 const { getCompanyId } = require('./prismaTenant');
 const { createAggregateMethod } = require('./prismaAggregate');
 const { generateObjectId } = require('./objectId');
+const { getActiveTx } = require('../lib/txContext');
+
+/**
+ * Prisma delegate for `config`, bound to the ambient transaction client when
+ * one is active. Shared by makeCompatModel and the document helpers below so a
+ * doc.save() inside a transaction joins it like any other write.
+ */
+function txDelegate(config) {
+  const base = config.delegate();
+  const tx = getActiveTx();
+  if (!tx || !base) return base;
+  const name = typeof base.name === 'string' ? base.name : null;
+  if (!name) return base;
+  const key = name.charAt(0).toLowerCase() + name.slice(1);
+  return tx[key] || base;
+}
 
 const IMPOSSIBLE = Symbol('impossible-filter');
+
+/**
+ * Unbounded-read guard.
+ *
+ * `find()` without `.limit()` used to issue `take: undefined`, i.e. "return every
+ * matching row". That is invisible on small tenants and pathological on large
+ * ones: the whole table is serialized through Node, blocking the event loop for
+ * every other in-flight request.
+ *
+ * Two modes, because silently truncating a financial read would be a worse bug
+ * than a slow one:
+ *   - warn (default): the over-limit query is re-run unbounded, so results are
+ *     byte-for-byte what they were before, and the call site is logged.
+ *   - enforce (QUERY_ENFORCE_MAX_ROWS=true): the result is capped.
+ *
+ * Run in warn mode until the logs are quiet, then enforce.
+ */
+const QUERY_MAX_ROWS = Math.max(1, Number(process.env.QUERY_MAX_ROWS) || 5000);
+const QUERY_ENFORCE_MAX_ROWS = String(process.env.QUERY_ENFORCE_MAX_ROWS || '').toLowerCase() === 'true';
+
+/** Call sites already reported, so a hot endpoint logs once rather than per request. */
+const reportedUnbounded = new Set();
+
+/**
+ * Identify the caller of an unbounded read. The Prisma/compat frames are dropped
+ * so the first line points at the controller or service that needs paginating.
+ */
+function unboundedCallSite() {
+  const stack = (new Error().stack || '').split('\n').slice(2);
+  const frame = stack.find((l) => !l.includes('prismaCompat.js') && !l.includes('node:internal'));
+  return (frame || 'unknown').trim();
+}
+
+function reportUnboundedRead(rowCount) {
+  const site = unboundedCallSite();
+  if (reportedUnbounded.has(site)) return;
+  reportedUnbounded.add(site);
+  const action = QUERY_ENFORCE_MAX_ROWS ? `capped at ${QUERY_MAX_ROWS}` : 're-read unbounded (warn mode)';
+  console.warn(
+    `[unbounded-read] find() returned more than ${QUERY_MAX_ROWS} rows (${rowCount}+) with no .limit() — ${action}. ` +
+    `Add pagination at: ${site}`,
+  );
+}
 
 /** Column and relation names per Prisma model, keyed by the delegate's model name. */
 const MODEL_FIELD_NAMES = new Map(
@@ -190,6 +249,56 @@ function pickKnownRelations(include, delegate) {
   return Object.keys(out).length ? out : undefined;
 }
 
+/** Regex metacharacters that make a pattern more than a literal string. */
+const REGEX_META = '.*+?^${}()|[]\\';
+
+/**
+ * Translate a Mongo `$regex` operand into the most selective Prisma string
+ * filter it can safely become.
+ *
+ *   ^ABC$  -> { equals: 'ABC' }      exact
+ *   ^ABC   -> { startsWith: 'ABC' }  index-usable prefix
+ *   ABC$   -> { endsWith: 'ABC' }
+ *   ABC    -> { contains: 'ABC' }
+ *
+ * Only patterns that are literal text (optionally with backslash-escaped
+ * metacharacters, which is what escapeRegex produces) are mapped precisely.
+ * Anything with real regex syntax falls back to `contains` on the
+ * anchor-stripped pattern — the historical behaviour — because Prisma has no
+ * way to express it and a wrong-but-narrower filter would silently drop rows.
+ */
+function translateRegexOperand(pattern) {
+  const raw = String(pattern);
+
+  const anchoredStart = raw.startsWith('^');
+  const anchoredEnd = /(?:^|[^\\])\$$/.test(raw) || raw === '$';
+  const body = raw.slice(anchoredStart ? 1 : 0, anchoredEnd ? -1 : undefined);
+
+  // Literal text, allowing `\x` escapes. Anything else is real regex syntax.
+  let literal = '';
+  let isLiteral = true;
+  for (let i = 0; i < body.length; i += 1) {
+    const ch = body[i];
+    if (ch === '\\') {
+      const next = body[i + 1];
+      if (next === undefined) { isLiteral = false; break; }
+      literal += next;
+      i += 1;
+      continue;
+    }
+    if (REGEX_META.includes(ch)) { isLiteral = false; break; }
+    literal += ch;
+  }
+
+  if (!isLiteral) {
+    return { contains: raw.replace(/^\^|\$$/g, '') };
+  }
+  if (anchoredStart && anchoredEnd) return { equals: literal };
+  if (anchoredStart) return { startsWith: literal };
+  if (anchoredEnd) return { endsWith: literal };
+  return { contains: literal };
+}
+
 function toId(value) {
   if (value == null) return value;
   if (typeof value === 'object' && value._id) return String(value._id);
@@ -219,10 +328,18 @@ function translateOperatorObject(value, isIdField) {
         if (v) return IMPOSSIBLE;
         out.equals = null;
         break;
-      case '$regex':
-        out.contains = String(v).replace(/^\^|\$$/g, '');
+      case '$regex': {
+        // Anchors carry the caller's intent and must survive translation.
+        // This previously stripped `^` and `$` and always emitted `contains`,
+        // turning an anchored prefix query into `ILIKE '%term%'` — a leading
+        // wildcard, which no B-tree index can serve. buildProductSearchOr()
+        // in productController builds `^sku` precisely to avoid that, and the
+        // optimisation was being discarded here.
+        const translated = translateRegexOperand(String(v));
+        Object.assign(out, translated);
         if (value.$options && String(value.$options).includes('i')) out.mode = 'insensitive';
         break;
+      }
       case '$options':
         break;
       default:
@@ -576,14 +693,14 @@ function wrapMutableDoc(apiDoc, config) {
     const id = doc._id;
     const plain = typeof doc.toObject === 'function' ? doc.toObject() : doc;
     const raw = config.docToUpdate ? config.docToUpdate(doc) : config.translateUpdate({ $set: plain });
-    const delegate = config.delegate();
+    const delegate = txDelegate(config);
     const stripped = stripUnknownColumns(raw, delegate, 'save');
     const lines = await rewrittenLines(doc, config);
     const payload = coerceDateInputs(
       lines ? { ...stripped, lines: { deleteMany: {}, create: lines } } : stripped,
       typeof delegate.name === 'string' ? delegate.name : null,
     );
-    const row = await config.delegate().update({
+    const row = await delegate.update({
       where: { id: String(id) },
       data: payload,
       // Without the include, saving a document would strip its lines/relations.
@@ -604,7 +721,7 @@ function wrapMutableDoc(apiDoc, config) {
   doc.deleteOne = async function deleteOne() {
     const id = doc._id || doc.id;
     if (!id) return { acknowledged: true, deletedCount: 0 };
-    await config.delegate().delete({ where: { id: String(id) } });
+    await txDelegate(config).delete({ where: { id: String(id) } });
     return { acknowledged: true, deletedCount: 1 };
   };
 
@@ -688,7 +805,21 @@ class CompatQuery {
  * }
  */
 function makeCompatModel(config) {
-  const delegate = config.delegate;
+  const baseDelegate = config.delegate;
+
+  /**
+   * Resolve the Prisma delegate for this model, preferring the ambient
+   * interactive-transaction client when one is active.
+   *
+   * Outside a transaction this returns exactly what `config.delegate()` always
+   * returned, so behaviour is unchanged. Inside `runInPrismaTransaction` every
+   * read and write routes through the transaction client instead, which is what
+   * makes multi-step writes actually atomic — see lib/txContext.js.
+   */
+  function delegate() {
+    return txDelegate(config);
+  }
+
   const fieldMap = config.fieldMap;
   const toApi = config.toApi;
 
@@ -999,13 +1130,29 @@ function makeCompatModel(config) {
         const where = applyTenant(translateFilter(filter, fieldMap), opts);
         if (where === IMPOSSIBLE) return [];
         const include = buildInclude(opts.populate);
-        const rows = await delegate().findMany({
+        const baseQuery = {
           where,
           orderBy: translateSort(opts.sort, fieldMap),
-          take: opts.limit || undefined,
           skip: opts.skip || undefined,
           ...queryShape(opts, include),
-        });
+        };
+
+        // An explicit .limit(n) is the caller being deliberate — honour it as-is.
+        const explicitLimit = Number(opts.limit) > 0 ? Number(opts.limit) : null;
+        if (explicitLimit) {
+          const rows = await delegate().findMany({ ...baseQuery, take: explicitLimit });
+          return finish(rows.map((r) => toApi(r)), opts, include);
+        }
+
+        // No limit: probe one row past the cap so we can tell "exactly at the cap"
+        // from "more than the cap".
+        let rows = await delegate().findMany({ ...baseQuery, take: QUERY_MAX_ROWS + 1 });
+        if (rows.length > QUERY_MAX_ROWS) {
+          reportUnboundedRead(rows.length);
+          rows = QUERY_ENFORCE_MAX_ROWS
+            ? rows.slice(0, QUERY_MAX_ROWS)
+            : await delegate().findMany(baseQuery);
+        }
         return finish(rows.map((r) => toApi(r)), opts, include);
       });
     },

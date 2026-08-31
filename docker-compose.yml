@@ -21,6 +21,11 @@ services:
       # Override the .env value here so the API can reach the container.
       - DATABASE_URL=postgresql://stock:stock@postgres:5432/stock_management?schema=public
       - DIRECT_URL=postgresql://stock:stock@postgres:5432/stock_management?schema=public
+      # Same reason as Postgres above: inside compose the Redis host is the
+      # service name. Without this the app falls back to whatever .env says
+      # (usually localhost), silently starts in non-cached mode, and every
+      # cache added in Phase 3 does nothing.
+      - REDIS_URL=redis://redis:6379
     env_file:
       - .env.development
     volumes:

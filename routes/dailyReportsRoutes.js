@@ -10,6 +10,7 @@ const router = express.Router();
 const DailyReportsService = require('../services/dailyReportsService');
 const { protect } = require('../middleware/auth');
 const { attachCompanyId } = require('../middleware/companyContext');
+const { cacheMiddleware } = require('../middleware/cacheMiddleware');
 const { authorize } = require('../middleware/authorize');
 
 // PDF and Excel generation utilities
@@ -34,6 +35,20 @@ const getCompanyTin = (company) =>
 // Apply authentication and company context to all routes
 router.use(protect);
 router.use(attachCompanyId);
+
+// Report responses are expensive to compute and change only when something is
+// posted. Every write path that can move these figures already calls
+// cacheService.bumpCompanyFinancialCaches(), which clears the 'report' type for
+// the company, and period close/reopen/lock clears it too — so this TTL is an
+// upper bound on staleness, not the actual refresh interval.
+//
+// PDF and Excel variants are skipped: they stream binary rather than calling
+// res.json, so there is nothing for this middleware to store.
+router.use(cacheMiddleware({
+  type: 'report',
+  ttl: 900,
+  skipCache: (req) => /\/(pdf|excel)$/.test(req.path),
+}));
 
 // ============================================
 // 1. DAILY SALES SUMMARY

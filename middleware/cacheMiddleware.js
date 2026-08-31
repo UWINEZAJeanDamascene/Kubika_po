@@ -47,12 +47,30 @@ function withRedisTimeout(promise, fallback) {
  * @param {number} options.ttl - Custom TTL in seconds
  * @param {boolean} options.skipCache - Function to determine if should skip cache
  */
+/**
+ * Tenant that a cached response belongs to, or null when it cannot be
+ * determined (most importantly a platform admin, for whom `protect` sets
+ * `req.company = null` and lets the request through).
+ */
+const resolveCompanyId = (req) =>
+  req.company?._id?.toString()
+  || req.user?.company?._id?.toString()
+  || (typeof req.user?.company === 'string' ? req.user.company : undefined)
+  // Report routes run behind attachCompanyId, which puts the tenant here.
+  || (req.companyId ? String(req.companyId) : undefined)
+  || req.query.companyId
+  || null;
+
 const cacheMiddleware = (options = {}) => {
   const {
     type = 'default',
     keyGenerator = null,
     ttl = null,
     skipCache = null,
+    // Set for genuinely tenant-independent data (public/platform-wide). Without
+    // it, a request with no resolvable tenant is served uncached rather than
+    // risking a shared cache entry.
+    global: isGlobal = false,
   } = options;
 
   return async (req, res, next) => {
@@ -66,6 +84,14 @@ const cacheMiddleware = (options = {}) => {
       return next();
     }
 
+    // Never cache tenant-scoped data under a key that has no tenant in it: two
+    // different callers would otherwise share one entry. Platform admins reach
+    // here with req.company === null, so this is a live path, not a theoretical
+    // one. Serving uncached is always safe; serving another tenant's rows is not.
+    if (!isGlobal && !keyGenerator && !resolveCompanyId(req)) {
+      return next();
+    }
+
     try {
       // Generate cache key
       let cacheKey;
@@ -76,11 +102,7 @@ const cacheMiddleware = (options = {}) => {
         const params = {
           path: req.path,
           query: req.query,
-          companyId:
-            req.company?._id?.toString()
-            || req.user?.company?._id?.toString()
-            || (typeof req.user?.company === 'string' ? req.user.company : undefined)
-            || req.query.companyId,
+          companyId: resolveCompanyId(req),
         };
         cacheKey = cacheService.generateKey(type, params);
       }
@@ -156,11 +178,14 @@ const cacheInvalidationMiddleware = (options = {}) => {
           } else if (keyGenerator) {
             const key = keyGenerator(req, data);
             await cacheService.delete(key);
-          } else if (invalidateByCompany && req.company?._id) {
-            await cacheService.invalidateByCompany(
-              req.company._id.toString(),
-              type
-            );
+          } else if (invalidateByCompany) {
+            // Must use the same tenant resolution as key generation. Reading
+            // only req.company here meant a write whose cache key came from
+            // req.user.company invalidated nothing, leaving stale reads behind.
+            const companyId = resolveCompanyId(req);
+            if (companyId) {
+              await cacheService.invalidateByCompany(companyId, type);
+            }
           }
         } catch (error) {
           console.error('Cache invalidation error:', error);

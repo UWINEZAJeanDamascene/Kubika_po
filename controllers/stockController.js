@@ -570,7 +570,12 @@ exports.getStockLevels = async (req, res, next) => {
     // If no inventory batches found but we have products with default warehouse, also show those
     // This handles the case where products have currentStock but no InventoryBatch records
     if (total === 0) {
-      const productQuery = { 
+      // NOTE: filter semantics are deliberately unchanged from the original —
+      // the top-level `$or` is what routes this through productCustomFind(),
+      // which resolves Product's full field map. Restructuring it would silently
+      // switch code paths. (Pre-existing quirk kept as-is: when `search` is
+      // supplied it replaces the stock condition rather than narrowing it.)
+      const productQuery = {
         company: companyId,
         $or: [
           { currentStock: { $gt: 0 } },
@@ -586,8 +591,33 @@ exports.getStockLevels = async (req, res, next) => {
           { sku: { $regex: search, $options: 'i' } }
         ];
       }
-      const productsWithStock = await Product.find(productQuery).lean();
+
+      // Page in the database. Fetching every product to slice 10 rows off the
+      // end made this — the most-visited screen in the app — scale with catalog
+      // size instead of page size.
+      const pageNum = Math.max(1, parseInt(page, 10) || 1);
+      const limitNum = Math.max(1, parseInt(limit, 10) || 50);
+      const PRODUCT_SORT_FIELDS = {
+        productName: 'name',
+        productSku: 'sku',
+        quantity: 'currentStock',
+        availableQuantity: 'currentStock',
+        unitCost: 'costPrice'
+      };
+      const productSortField = PRODUCT_SORT_FIELDS[sortBy] || 'name';
+
+      const productsWithStock = await Product.find(productQuery)
+        .sort({ [productSortField]: order === 'asc' ? 1 : -1 })
+        .skip((pageNum - 1) * limitNum)
+        .limit(limitNum)
+        .lean();
+      // Guard stays keyed on the fetched rows, exactly as before, so a count
+      // that resolves differently can never blank out a page that has data.
       if (productsWithStock.length > 0) {
+        const countedProducts = await Product.countDocuments(productQuery);
+        const productTotal = countedProducts > 0
+          ? countedProducts
+          : (pageNum - 1) * limitNum + productsWithStock.length;
         // Get all warehouses to show product stock (default warehouse or all)
         const warehouses = await Warehouse.find({ company: companyId, isActive: true }).lean();
         
@@ -611,21 +641,18 @@ exports.getStockLevels = async (req, res, next) => {
           source: 'product' // Mark as from product currentStock
         }));
 
-        // Apply pagination
-        const pageNum = parseInt(page);
-        const limitNum = parseInt(limit);
-        const startIndex = (pageNum - 1) * limitNum;
-        const paginatedData = stockFromProducts.slice(startIndex, startIndex + limitNum);
-
+        // `stockFromProducts` is already exactly one page — the database applied
+        // the skip/limit — so it is returned as-is. `productTotal` is the full
+        // match count used for the page arithmetic.
         return res.json({
           success: true,
-          data: paginatedData,
+          data: stockFromProducts,
           warehouses: warehouses,
           pagination: {
-            total: stockFromProducts.length,
+            total: productTotal,
             page: pageNum,
             limit: limitNum,
-            pages: Math.ceil(stockFromProducts.length / limitNum)
+            pages: Math.ceil(productTotal / limitNum)
           }
         });
       }

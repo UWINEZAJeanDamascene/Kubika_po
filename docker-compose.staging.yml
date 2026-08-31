@@ -16,6 +16,10 @@ services:
       - "3000:3000"
     environment:
       - NODE_ENV=staging
+      # Inside compose the Redis host is the service name, not localhost. Set
+      # here rather than left to .env.staging so staging cannot silently boot in
+      # non-cached mode — the failure is a log line that is easy to miss.
+      - REDIS_URL=redis://redis:6379
     env_file:
       - .env.staging
     volumes:

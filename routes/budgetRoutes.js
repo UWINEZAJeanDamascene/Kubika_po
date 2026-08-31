@@ -4,10 +4,24 @@ const budgetController = require("../controllers/budgetController");
 const { protect } = require("../middleware/auth");
 const { authorize } = require("../middleware/authorize");
 const { attachCompanyId } = require("../middleware/companyContext");
+const { cacheMiddleware, cacheInvalidationMiddleware } = require("../middleware/cacheMiddleware");
 
 // All routes require authentication + company context
 router.use(protect);
 router.use(attachCompanyId);
+
+// One pair of middlewares covers all 74 endpoints: cacheMiddleware only acts on
+// GET, cacheInvalidationMiddleware only on POST/PUT/PATCH/DELETE.
+//
+// Invalidation is per-company rather than type-wide: this is a write-heavy
+// module, and wiping every tenant's budget cache on each edit would throw away
+// far more than it protects.
+//
+// Note the TTL is short because budget-vs-actual is derived from posted
+// transactions, which do not go through these routes. Journal posting clears
+// the 'budget' type via cacheService.invalidateFinancialReportCaches().
+router.use(cacheMiddleware({ type: "budget", ttl: 300 }));
+router.use(cacheInvalidationMiddleware({ type: "budget" }));
 
 // ── Forecasts (must be before /:id routes to avoid conflicts) ──────────
 router.get(

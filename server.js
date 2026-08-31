@@ -11,6 +11,10 @@ const fs = require('fs');
 // Load environment variables FIRST, before any other imports
 dotenv.config();
 
+// Sentry as early as possible so its instrumentation wraps the app. Inert
+// unless SENTRY_DSN is set, so this costs nothing in environments without it.
+require('./lib/sentry').initSentry();
+
 // Prefer IPv4 DNS lookups to avoid IPv6 ENETUNREACH timeouts on some hosts
 try {
   const dns = require('dns');
@@ -211,6 +215,8 @@ async function initializeServer() {
   app.get('/health', cors(), healthController.systemHealth);
   app.get('/api/health/accounting', protect, requireCompanyHeader, healthController.accountingHealth);
   app.post('/api/health/gc', cors(), healthController.gcHint);
+  // Performance metrics only — see healthController.performanceMetrics.
+  app.get('/api/performance', cors(), healthController.performanceMetrics);
 
   // CORS - must run BEFORE rate limiters so that rate-limited responses
   // (429) include proper CORS headers instead of failing the browser fetch.
@@ -489,6 +495,11 @@ async function initializeServer() {
       message: 'Route not found' 
     });
   });
+
+  // Sentry's error handler must come before ours: ours ends the request with a
+  // JSON response, so anything registered after it never sees the error.
+  // No-op unless SENTRY_DSN is configured.
+  require('./lib/sentry').setupExpressErrorHandler(app);
 
   // Error handler
   app.use(errorHandler);

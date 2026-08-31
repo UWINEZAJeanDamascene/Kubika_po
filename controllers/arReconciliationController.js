@@ -303,7 +303,11 @@ exports.getCurrentReceivables = async (req, res, next) => {
     // Note: amountOutstanding is Decimal128, so we need special handling
     const query = {
       company: companyId,
-      status: { $in: ['confirmed', 'partially_paid'] }
+      status: { $in: ['confirmed', 'partially_paid'] },
+      // Filter in SQL rather than pulling every confirmed invoice into Node.
+      // `amountOutstanding` is a non-nullable Decimal defaulting to 0, so this
+      // is exactly equivalent to the in-memory `parseFloat(...) > 0` below.
+      amountOutstanding: { $gt: 0 }
     };
 
     if (clientId) query.client = clientId;

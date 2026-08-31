@@ -448,6 +448,14 @@ exports.syncAccounts = async (req, res, next) => {
       await cacheService.invalidateFinancialReportCaches(companyId);
     }
 
+    // The account list itself is cached at the route layer. Invalidate here
+    // rather than via route middleware because /sync is reachable by GET, which
+    // the invalidation middleware ignores — and inserts change the list just as
+    // much as updates do.
+    if (!dryRun && (results.updated.length > 0 || results.inserted.length > 0)) {
+      await cacheService.invalidateType('chart_of_accounts');
+    }
+
     res.json({
       success: true,
       dry_run: dryRun,

@@ -103,19 +103,32 @@ function buildMemorySnapshot(usage = process.memoryUsage(), heapStats = v8.getHe
  */
 async function checkDatabase() {
   const start = Date.now();
+
+  // PostgreSQL is the system of record: it is what "the database is up" means.
+  // This previously pinged MongoDB only, so with MONGODB_URI unset — the
+  // intended end state of the migration — a fully healthy server reported
+  // status "down" and every uptime probe would have paged on it.
   try {
-    if (mongoose.connection.readyState !== 1) {
-      return { status: 'error', ping_ms: 0 };
-    }
-    const db = mongoose.connection.db;
-    if (!db || typeof db.admin !== 'function') {
-      return { status: 'error', ping_ms: Date.now() - start };
-    }
-    await db.admin().command({ ping: 1 });
+    const { prisma } = require('../lib/prisma');
+    await prisma.$queryRaw`SELECT 1`;
     const ping_ms = Date.now() - start;
-    return { status: 'ok', ping_ms };
+    const result = { status: 'ok', ping_ms, engine: 'postgresql' };
+
+    // Mongo is reported alongside only while it is still configured, and never
+    // decides overall health.
+    if (mongoose.connection.readyState === 1) {
+      result.mongo = { status: 'ok' };
+    } else if (process.env.MONGODB_URI) {
+      result.mongo = { status: 'error' };
+    }
+    return result;
   } catch (e) {
-    return { status: 'error', ping_ms: Math.max(0, Date.now() - start) };
+    return {
+      status: 'error',
+      ping_ms: Math.max(0, Date.now() - start),
+      engine: 'postgresql',
+      error: e.message,
+    };
   }
 }
 
