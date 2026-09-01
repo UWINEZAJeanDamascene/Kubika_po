@@ -1,6 +1,7 @@
 const CreditNote = require("../models/CreditNote");
 const Invoice = require("../models/Invoice");
 const Product = require("../models/Product");
+const { loadLineProducts, getLineProduct } = require("../utils/lineProducts");
 const StockMovement = require("../models/StockMovement");
 const Client = require("../models/Client");
 const Company = require("../models/Company");
@@ -641,11 +642,9 @@ exports.approveCreditNote = async (req, res, next) => {
       if (note.stockReversed) {
         // already reversed
       } else {
+        const cnLineProducts = await loadLineProducts(Product, note.items, companyId);
         for (const item of note.items) {
-          const product = await Product.findOne({
-            _id: item.product,
-            company: companyId,
-          });
+          const product = getLineProduct(cnLineProducts, item);
           if (product) {
             const previousStock = product.currentStock || 0;
             // If serial numbers provided, update each serial record
@@ -723,11 +722,9 @@ exports.approveCreditNote = async (req, res, next) => {
     // Calculate inventory cost for stock reversal (cost of goods sold)
     let inventoryCost = 0;
     if (reverseStock && note.items && note.items.length > 0) {
+      const cnCostProducts = await loadLineProducts(Product, note.items, companyId);
       for (const item of note.items) {
-        const product = await Product.findOne({
-          _id: item.product,
-          company: companyId,
-        });
+        const product = getLineProduct(cnCostProducts, item);
         if (product && product.averageCost) {
           const qty = item.quantity || 0;
           inventoryCost += product.averageCost * qty;

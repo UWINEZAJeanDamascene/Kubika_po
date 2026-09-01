@@ -1,4 +1,3 @@
-const mongoose = require('mongoose');
 const Company = require('../models/Company');
 const ReportSnapshot = require('../models/ReportSnapshot');
 const {
@@ -262,6 +261,11 @@ const initializeScheduler = (app) => {
   console.log('Report scheduler initialized');
 };
 
+function stopScheduler() {
+  clearSchedulerTimers();
+  schedulerStarted = false;
+}
+
 // Get available periods for a company
 const getAvailablePeriods = async (companyId, periodType, limit = 24) => {
   return ReportSnapshot.getAvailablePeriods(companyId, periodType, limit);
@@ -274,6 +278,7 @@ const manuallyGenerateSnapshot = async (companyId, periodType, year, periodNumbe
 
 module.exports = {
   initializeScheduler,
+  stopScheduler,
   runScheduledTasks,
   generateWeeklySnapshot,
   generateMonthlySnapshot,

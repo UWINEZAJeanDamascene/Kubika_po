@@ -115,6 +115,7 @@ function translateUpdate(update = {}) {
 
 const User = makeCompatModel({
   delegate: () => prisma.user,
+  delegateName: 'user',
   fieldMap: FIELD_MAP,
   toApi: userToApi,
   translateCreate,

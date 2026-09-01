@@ -7,6 +7,8 @@ const {
   runInPrismaTransaction,
   isMongoEnabled,
 } = require('../services/transactionService');
+const { runWithTx } = require('../lib/txContext');
+const { makeCompatModel } = require('../utils/prismaCompat');
 
 describe('Step 8 — sequence helpers', () => {
   test('padSeq zero-pads to requested width', () => {
@@ -22,6 +24,31 @@ describe('Step 8 — transactionService', () => {
     // Re-require env cache bust — isMongoEnabled checks mongoose readyState too
     expect(typeof isMongoEnabled()).toBe('boolean');
     if (prev) process.env.MONGODB_URI = prev;
+  });
+
+  test('compat model operations use the ambient transaction delegate', async () => {
+    // This is deliberately database-free: it proves the routing invariant that
+    // makes rollback possible. A regression here would send compat writes to
+    // the global Prisma client even though runInPrismaTransaction created `tx`.
+    const globalCalls = [];
+    const txCalls = [];
+    const globalDelegate = { create: async () => { globalCalls.push('create'); return { id: 'global' }; } };
+    const txDelegate = { create: async () => { txCalls.push('create'); return { id: 'tx' }; } };
+    const Model = makeCompatModel({
+      delegate: () => globalDelegate,
+      delegateName: 'taxTransaction',
+      fieldMap: {},
+      toApi: (row) => row,
+      translateCreate: async (data) => data,
+    });
+
+    const result = await runWithTx({ taxTransaction: txDelegate }, () =>
+      Model.create({ id: 'a' }),
+    );
+
+    expect(result._id).toBe('tx');
+    expect(txCalls).toEqual(['create']);
+    expect(globalCalls).toEqual([]);
   });
 
   test('runInPrismaTransaction passes tx client to operation', async () => {

@@ -3,7 +3,7 @@
  * These are NOT product/inventory categories.
  */
 
-const { prisma } = require('../lib/prisma');
+const { dbClient } = require('../lib/prisma');
 const { generateObjectId, toIdString } = require('./objectId');
 const {
   assetCategoryToApi,
@@ -123,7 +123,7 @@ async function seedAssetCategoryDefaults(companyId, createdById = null) {
   const company = toIdString(companyId);
   if (!company) return [];
 
-  const existing = await prisma.assetCategory.count({
+  const existing = await dbClient().assetCategory.count({
     where: { companyId: company, isDeleted: false },
   });
   if (existing > 0) return [];
@@ -137,7 +137,7 @@ async function seedAssetCategoryDefaults(companyId, createdById = null) {
       createdBy: createdById,
       isDeleted: false,
     });
-    const row = await prisma.assetCategory.create({
+    const row = await dbClient().assetCategory.create({
       data: {
         id: generateObjectId(),
         ...payload,
@@ -155,7 +155,7 @@ async function syncDefaultAssetCategoryAccounts(companyId) {
 
   for (const def of DEFAULT_ASSET_CATEGORIES) {
     if (!def.categoryCode) continue;
-    await prisma.assetCategory.updateMany({
+    await dbClient().assetCategory.updateMany({
       where: { companyId: company, categoryCode: def.categoryCode, isSystem: true },
       data: {
         defaultAssetAccountCode: def.defaultAssetAccountCode,

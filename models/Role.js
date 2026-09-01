@@ -58,6 +58,7 @@ function translateUpdate(update = {}) {
 
 const Role = makeCompatModel({
   delegate: () => prisma.role,
+  delegateName: 'role',
   fieldMap: FIELD_MAP,
   toApi: roleToApi,
   translateCreate,

@@ -4,6 +4,7 @@ require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 const {
   stockLevelToApi,
   stockMovementToApi,
+  stockMovementTranslateCreate,
   journalEntryToApi,
   journalLineToApi,
   accountBalanceToApi,
@@ -53,6 +54,20 @@ describe('Phase 3+4 inventory/journal mappers', () => {
     expect(api.company_id).toBe('c1');
     expect(api.quantity).toBe('10.0000');
     expect(api.unitCost).toBe('5.50');
+  });
+
+  test('stock movement stores legacy createdBy as performedBy, never an unknown createdById', async () => {
+    const row = await stockMovementTranslateCreate({
+      _id: '507f1f77bcf86cd799439011',
+      company: '507f1f77bcf86cd799439012',
+      product: '507f1f77bcf86cd799439013',
+      type: 'adjustment',
+      reason: 'correction',
+      createdBy: '507f1f77bcf86cd799439014',
+    });
+
+    expect(row.performedById).toBe('507f1f77bcf86cd799439014');
+    expect(row).not.toHaveProperty('createdById');
   });
 
   test('journalEntryToApi embeds lines from child rows', () => {

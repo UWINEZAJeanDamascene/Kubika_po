@@ -1,6 +1,7 @@
 const Quotation = require('../models/Quotation');
 const Invoice = require('../models/Invoice');
 const Product = require('../models/Product');
+const { loadLineProducts, getLineProduct } = require('../utils/lineProducts');
 const Client = require('../models/Client');
 const Company = require('../models/Company');
 const CurrencyService = require('../services/CurrencyService');
@@ -588,8 +589,10 @@ exports.publicRejectQuotation = async (req, res, next) => {
 const validateQuotationProducts = async (lines, companyId) => {
   const inactiveProducts = [];
   
+  // Products loaded together; the loop still reports every offender in line order.
+  const validationProducts = await loadLineProducts(Product, lines, companyId);
   for (const line of lines) {
-    const product = await Product.findOne({ _id: line.product, company: companyId });
+    const product = getLineProduct(validationProducts, line);
     if (!product) {
       inactiveProducts.push({ product: line.product, reason: 'Product not found' });
     } else if (!product.isActive) {
@@ -839,11 +842,8 @@ exports.createQuotation = async (req, res, next) => {
       });
     }
 
-    const productCache = new Map();
-    for (const line of lines) {
-      const product = await Product.findOne({ _id: line.product, company: companyId });
-      if (product) productCache.set(String(line.product), product);
-    }
+    // loadLineProducts returns precisely this map, in one query.
+    const productCache = await loadLineProducts(Product, lines, companyId);
 
     const computed = await computeQuotationTotals({
       lines: lines.map((line) => {
@@ -937,11 +937,7 @@ exports.updateQuotation = async (req, res, next) => {
     let updatedPayload = { ...req.body };
 
     if (req.body.lines) {
-      const productCache = new Map();
-      for (const line of req.body.lines) {
-        const product = await Product.findOne({ _id: line.product, company: companyId });
-        if (product) productCache.set(String(line.product), product);
-      }
+      const productCache = await loadLineProducts(Product, req.body.lines, companyId);
 
       const computed = await computeQuotationTotals({
         lines: req.body.lines.map((line) => {

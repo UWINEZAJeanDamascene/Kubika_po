@@ -510,22 +510,34 @@ class BudgetService {
     const projectById = new Map();
 
     // Validate every account and project belongs to this company
+    // Accounts for every line in one query; validation still walks lines in
+    // order so the first offending line still raises ACCOUNT_NOT_FOUND.
+    const budgetAccountRows = await ChartOfAccount.find({
+      _id: { $in: lines.map((l) => l.account_id).filter(Boolean) },
+      company: companyId,
+    });
+    const budgetAccountsById = new Map(
+      (budgetAccountRows || []).map((a) => [String(a._id), a]),
+    );
+
+    // Projects referenced by the lines, in one query. Read-only validation:
+    // the loop creates no projects, so an up-front fetch is equivalent.
+    const budgetProjectIds = [...new Set(lines.map((l) => l.project_id).filter(Boolean).map(String))];
+    const budgetProjectRows = budgetProjectIds.length
+      ? await Project.find({ _id: { $in: budgetProjectIds }, company_id: companyId, is_active: true }).select('_id wbs_code')
+      : [];
+    const budgetProjectsById = new Map((budgetProjectRows || []).map((pr) => [String(pr._id), pr]));
     for (const line of lines) {
-      const account = await ChartOfAccount.findOne({
-        _id: line.account_id,
-        company: companyId
-      });
+      const account = line.account_id
+        ? budgetAccountsById.get(String(line.account_id))
+        : null;
 
       if (!account) {
         throw new Error('ACCOUNT_NOT_FOUND');
       }
 
       if (line.project_id) {
-        const project = await Project.findOne({
-          _id: line.project_id,
-          company_id: companyId,
-          is_active: true
-        }).select('_id wbs_code');
+        const project = budgetProjectsById.get(String(line.project_id)) || null;
 
         if (!project) {
           throw new Error('PROJECT_NOT_FOUND');

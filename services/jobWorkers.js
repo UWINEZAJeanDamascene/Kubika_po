@@ -6,7 +6,11 @@
  */
 
 const { Worker } = require('bullmq');
-const { redisClient, isRedisConfigured } = require('../config/redis');
+const { redisClient, isRedisConfigured , createQueueConnection } = require('../config/redis');
+
+// BullMQ needs its own connection: it rejects a client with maxRetriesPerRequest
+// set, and its blocking reads would otherwise stall shared cache traffic.
+const queueConnection = createQueueConnection();
 const Invoice = require('../models/Invoice');
 const Product = require('../models/Product');
 const Company = require('../models/Company');
@@ -33,7 +37,7 @@ const isRedisAvailable = () => {
  */
 function createWorker(queueName, processorFn) {
   const worker = new Worker(queueName, processorFn, {
-    connection: redisClient,
+    connection: queueConnection,
     concurrency: 5, // Process 5 jobs concurrently
     limiter: {
       max: 10,

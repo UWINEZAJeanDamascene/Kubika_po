@@ -18,6 +18,9 @@ const CACHE_CONFIGS = {
   dashboard: { ttl: 60, prefix: 'dashboard' },
   // Stock levels - 1 minute
   stock: { ttl: 60, prefix: 'stock' },
+  // Supplier/client master data feeds the high-frequency form pickers.
+  supplier: { ttl: 300, prefix: 'supplier' },
+  client: { ttl: 300, prefix: 'client' },
   // Reference data — read on nearly every screen, changed rarely. Each type
   // gets its own prefix so invalidating one does not clear the others (an
   // unknown type falls back to `default`, where they would all collide).

@@ -146,16 +146,32 @@ class CurrencyService {
     const currencies = await Currency.find({ is_active: true }).sort({ code: 1 }).lean();
 
     const out = [];
+
+    // All rates in one query rather than one per currency. Sorted newest-first,
+    // so the first row seen for a currency is its latest effective rate —
+    // exactly what the per-currency findOne().sort({effective_date:-1}) returned.
+    const activeCodes = currencies
+      .map((c) => String(c.code).toUpperCase())
+      .filter((code) => code !== base);
+    const rateRows = activeCodes.length
+      ? await ExchangeRate.find({
+          company_id: companyId,
+          from_currency: { $in: activeCodes },
+          to_currency: base,
+        })
+          .sort({ effective_date: -1 })
+          .lean()
+      : [];
+    const latestRateByCode = new Map();
+    for (const r of rateRows) {
+      const key = String(r.from_currency).toUpperCase();
+      if (!latestRateByCode.has(key)) latestRateByCode.set(key, r);
+    }
+
     for (const c of currencies) {
       const code = String(c.code).toUpperCase();
       if (code === base) continue;
-      const row = await ExchangeRate.findOne({
-        company_id: companyId,
-        from_currency: code,
-        to_currency: base
-      })
-        .sort({ effective_date: -1 })
-        .lean();
+      const row = latestRateByCode.get(code) || null;
 
       out.push({
         currency: code,

@@ -23,6 +23,8 @@
  */
 
 const mongoose = require('mongoose');
+const { dbClient } = require('../lib/prisma');
+const { toIdString } = require('../utils/objectId');
 const Invoice = require('../models/Invoice');
 const Purchase = require('../models/Purchase');
 const Expense = require('../models/Expense');
@@ -43,6 +45,23 @@ const { PettyCashFloat } = require('../models/PettyCash');
 const Payslip = Payroll;
 
 const toObjectId = (value) => new mongoose.Types.ObjectId(String(value));
+
+const REVENUE_STATUSES = ['fully_paid', 'partially_paid', 'confirmed', 'sent'];
+
+// Keep report payloads numeric while doing the scan/sum in PostgreSQL. This
+// replaces the former Invoice.aggregate() compatibility pipelines used by the
+// P&L report; the database only returns one decimal aggregate per period.
+async function invoiceRevenue(companyId, start, end) {
+  const result = await dbClient().invoice.aggregate({
+    where: {
+      companyId: String(companyId),
+      invoiceDate: { gte: start, lte: end },
+      status: { in: REVENUE_STATUSES },
+    },
+    _sum: { subtotal: true },
+  });
+  return toNumber(result._sum.subtotal);
+}
 
 const toNumber = (value) => {
   if (value === null || value === undefined || value === '') return 0;
@@ -155,40 +174,10 @@ class MonthlyReportsService {
     const prior = getPriorMonth(year, month);
     const priorRange = getMonthRange(prior.year, prior.month);
     const ytdRange = getYearToDateRange(year, month);
-    // Revenue - current month
-    const revenueCurrent = await Invoice.aggregate([
-      {
-        $match: {
-          company: toObjectId(companyId),
-          invoiceDate: { $gte: start, $lte: end },
-          status: { $in: ['fully_paid', 'partially_paid', 'confirmed', 'sent'] }
-        }
-      },
-      { $group: { _id: null, total: { $sum: { $toDouble: { $ifNull: ['$subtotal', '$total'] } } } } }
-    ]);
-
-    // Revenue - prior month
-    const revenuePrior = await Invoice.aggregate([
-      {
-        $match: {
-          company: toObjectId(companyId),
-          invoiceDate: { $gte: priorRange.start, $lte: priorRange.end },
-          status: { $in: ['fully_paid', 'partially_paid', 'confirmed', 'sent'] }
-        }
-      },
-      { $group: { _id: null, total: { $sum: { $toDouble: { $ifNull: ['$subtotal', '$total'] } } } } }
-    ]);
-
-    // Revenue - YTD
-    const revenueYTD = await Invoice.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          invoiceDate: { $gte: ytdRange.start, $lte: ytdRange.end },
-          status: { $in: ['fully_paid', 'partially_paid', 'confirmed', 'sent'] }
-        }
-      },
-      { $group: { _id: null, total: { $sum: { $toDouble: { $ifNull: ['$subtotal', '$total'] } } } } }
+    const [revenueCurrent, revenuePrior, revenueYTD] = await Promise.all([
+      invoiceRevenue(companyId, start, end),
+      invoiceRevenue(companyId, priorRange.start, priorRange.end),
+      invoiceRevenue(companyId, ytdRange.start, ytdRange.end),
     ]);
 
     // COGS - current month (from purchase costs and inventory movements)
@@ -211,9 +200,9 @@ class MonthlyReportsService {
     const interestPrior = await this._getAccountTotal(companyId, priorRange.start, priorRange.end, ['interest', 'interest_expense']);
     const interestYTD = await this._getAccountTotal(companyId, ytdRange.start, ytdRange.end, ['interest', 'interest_expense']);
 
-    const revCurrent = revenueCurrent[0]?.total || 0;
-    const revPrior = revenuePrior[0]?.total || 0;
-    const revYTD = revenueYTD[0]?.total || 0;
+    const revCurrent = revenueCurrent;
+    const revPrior = revenuePrior;
+    const revYTD = revenueYTD;
 
     const cogsCur = cogsCurrent;
     const cogsPr = cogsPrior;
@@ -341,21 +330,16 @@ class MonthlyReportsService {
 
   // Helper: Calculate COGS
   static async _calculateCOGS(companyId, start, end) {
-    const Purchase = Purchase;
-
-    const stockOut = await StockMovement.aggregate([
-      {
-        $match: {
-          company: toObjectId(companyId),
-          movementDate: { $gte: start, $lte: end },
-          type: 'out',
-          reason: { $in: ['sale', 'dispatch'] }
-        }
-      },
-      { $group: { _id: null, total: { $sum: { $multiply: [{ $toDouble: '$quantity' }, { $toDouble: { $ifNull: ['$unitCost', 0] } }] } } } }
-    ]);
-
-    return stockOut[0]?.total || 0;
+    const rows = await dbClient().$queryRaw`
+      SELECT COALESCE(SUM(quantity * unit_cost), 0)::float AS total
+      FROM stock_movements
+      WHERE company_id = ${String(companyId)}
+        AND movement_date >= ${start}
+        AND movement_date <= ${end}
+        AND type = 'out'
+        AND reason IN ('sale', 'dispatch')
+    `;
+    return toNumber(rows[0]?.total);
   }
 
   // Helper: Get expenses by category
@@ -860,15 +844,16 @@ class MonthlyReportsService {
 
   // Helper: Get receivables change
   static async _getReceivablesChange(companyId, start, end) {
-    const beginning = await Invoice.aggregate([
-      { $match: { company: new mongoose.Types.ObjectId(companyId), invoiceDate: { $lt: start }, status: { $in: ['sent', 'partially_paid'] } } },
-      { $group: { _id: null, total: { $sum: { $toDouble: '$balanceDue' } } } }
+    const where = (date) => ({
+      companyId: String(companyId),
+      invoiceDate: { lte: date },
+      status: { in: ['sent', 'partially_paid'] },
+    });
+    const [beginning, ending] = await Promise.all([
+      dbClient().invoice.aggregate({ where: where(start), _sum: { amountOutstanding: true } }),
+      dbClient().invoice.aggregate({ where: where(end), _sum: { amountOutstanding: true } }),
     ]);
-    const ending = await Invoice.aggregate([
-      { $match: { company: new mongoose.Types.ObjectId(companyId), invoiceDate: { $lte: end }, status: { $in: ['sent', 'partially_paid'] } } },
-      { $group: { _id: null, total: { $sum: { $toDouble: '$balanceDue' } } } }
-    ]);
-    return (ending[0]?.total || 0) - (beginning[0]?.total || 0);
+    return toNumber(ending._sum.amountOutstanding) - toNumber(beginning._sum.amountOutstanding);
   }
 
   // Helper: Get payables change
@@ -886,40 +871,40 @@ class MonthlyReportsService {
 
   // Helper: Get inventory change
   static async _getInventoryChange(companyId, start, end) {
-    const movements = await StockMovement.aggregate([
-      { $match: { company: new mongoose.Types.ObjectId(companyId), movementDate: { $gte: start, $lte: end } } },
-      {
-        $group: {
-          _id: '$type',
-          value: { $sum: { $multiply: [{ $toDouble: '$quantity' }, { $toDouble: { $ifNull: ['$unitCost', 0] } }] } }
-        }
-      }
-    ]);
-    const stockIn = movements.find(m => m._id === 'in')?.value || 0;
-    const stockOut = movements.find(m => m._id === 'out')?.value || 0;
-    return stockIn - stockOut;
+    const movements = await dbClient().$queryRaw`
+      SELECT type, COALESCE(SUM(quantity * unit_cost), 0)::float AS value
+      FROM stock_movements
+      WHERE company_id = ${String(companyId)}
+        AND movement_date >= ${start} AND movement_date <= ${end}
+      GROUP BY type
+    `;
+    const stockIn = movements.find((m) => m.type === 'in')?.value || 0;
+    const stockOut = movements.find((m) => m.type === 'out')?.value || 0;
+    return Number(stockIn) - Number(stockOut);
   }
 
   // Helper: Get investing cash flow
   static async _getInvestingCashFlow(companyId, start, end) {
-    const result = await JournalEntry.aggregate([
-      { $match: { company: new mongoose.Types.ObjectId(companyId), date: { $gte: start, $lte: end } } },
-      { $unwind: '$lines' },
-      { $match: { 'lines.accountName': { $regex: 'asset', $options: 'i' } } },
-      { $group: { _id: null, total: { $sum: { $toDouble: '$lines.debit' } } } }
-    ]);
-    return -(result[0]?.total || 0);
+    const result = await dbClient().$queryRaw`
+      SELECT COALESCE(SUM(jel.debit), 0)::float AS total
+      FROM journal_entry_lines jel
+      JOIN journal_entries je ON je.id = jel.journal_entry_id
+      WHERE je.company_id = ${String(companyId)} AND je.date >= ${start} AND je.date <= ${end}
+        AND je.status = 'posted' AND jel.account_name ILIKE '%asset%'
+    `;
+    return -Number(result[0]?.total || 0);
   }
 
   // Helper: Get financing cash flow
   static async _getFinancingCashFlow(companyId, start, end) {
-    const result = await JournalEntry.aggregate([
-      { $match: { company: new mongoose.Types.ObjectId(companyId), date: { $gte: start, $lte: end } } },
-      { $unwind: '$lines' },
-      { $match: { 'lines.accountName': { $regex: 'equity|loan|capital', $options: 'i' } } },
-      { $group: { _id: null, total: { $sum: { $toDouble: '$lines.credit' } } } }
-    ]);
-    return result[0]?.total || 0;
+    const result = await dbClient().$queryRaw`
+      SELECT COALESCE(SUM(jel.credit), 0)::float AS total
+      FROM journal_entry_lines jel
+      JOIN journal_entries je ON je.id = jel.journal_entry_id
+      WHERE je.company_id = ${String(companyId)} AND je.date >= ${start} AND je.date <= ${end}
+        AND je.status = 'posted' AND jel.account_name ~* '(equity|loan|capital)'
+    `;
+    return Number(result[0]?.total || 0);
   }
 
   // Helper: Get cash balance at date
@@ -1031,41 +1016,31 @@ class MonthlyReportsService {
    */
   static async getSalesByCustomer(companyId, year, month) {
     const { start, end } = getMonthRange(year, month);
-    const customerSales = await Invoice.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          invoiceDate: { $gte: start, $lte: end },
-          status: { $in: ['fully_paid', 'partially_paid', 'confirmed', 'sent'] }
-        }
+    const customerSales = await dbClient().invoice.groupBy({
+      by: ['clientId'],
+      where: {
+        companyId: String(companyId),
+        invoiceDate: { gte: start, lte: end },
+        status: { in: REVENUE_STATUSES },
       },
-      {
-        $group: {
-          _id: '$client',
-          totalRevenue: { $sum: { $toDouble: { $ifNull: ['$totalAmount', '$total', 0] } } },
-          invoiceCount: { $sum: 1 },
-          outstandingBalance: { $sum: { $toDouble: { $ifNull: ['$amountOutstanding', '$balanceDue', 0] } } }
-        }
-      },
-      { $sort: { totalRevenue: -1 } },
-      {
-        $lookup: {
-          from: 'clients',
-          localField: '_id',
-          foreignField: '_id',
-          as: 'client'
-        }
-      },
-      { $unwind: { path: '$client', preserveNullAndEmptyArrays: true } }
-    ]);
+      _sum: { totalAmount: true, amountOutstanding: true },
+      _count: true,
+      orderBy: { _sum: { totalAmount: 'desc' } },
+    });
+
+    const clients = await dbClient().client.findMany({
+      where: { id: { in: customerSales.map((row) => row.clientId) } },
+      select: { id: true, name: true },
+    });
+    const clientNames = new Map(clients.map((client) => [client.id, client.name]));
 
     const customers = customerSales.map(c => ({
-      customerId: c._id,
-      customerName: c.client?.name || 'Unknown',
-      totalRevenue: c.totalRevenue,
-      invoiceCount: c.invoiceCount,
-      averageOrderValue: c.totalRevenue / c.invoiceCount,
-      outstandingBalance: c.outstandingBalance
+      customerId: c.clientId,
+      customerName: clientNames.get(c.clientId) || 'Unknown',
+      totalRevenue: toNumber(c._sum.totalAmount),
+      invoiceCount: c._count,
+      averageOrderValue: toNumber(c._sum.totalAmount) / c._count,
+      outstandingBalance: toNumber(c._sum.amountOutstanding)
     }));
 
     return {
@@ -1484,65 +1459,47 @@ static async getPayrollSummary(companyId, year, month) {
   static async getVATReturn(companyId, year, month) {
     const { start, end } = getMonthRange(year, month);
     // Output VAT from sales
-    const outputVAT = await Invoice.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          invoiceDate: { $gte: start, $lte: end },
-          status: { $in: ['fully_paid', 'partially_paid', 'confirmed', 'sent'] }
-        }
+    const outputVATRows = await dbClient().invoiceLine.groupBy({
+      by: ['taxCode', 'taxRate'],
+      where: {
+        companyId: String(companyId),
+        invoice: {
+          invoiceDate: { gte: start, lte: end },
+          status: { in: ['fully_paid', 'partially_paid', 'confirmed', 'sent'] },
+        },
       },
-      { $unwind: { path: '$lines', preserveNullAndEmptyArrays: true } },
-      {
-        $group: {
-          _id: '$lines.taxCode',
-          taxCode: { $first: '$lines.taxCode' },
-          taxRate: { $first: '$lines.taxRate' },
-          taxableAmount: { $sum: { $toDouble: { $ifNull: ['$lines.lineSubtotal', 0] } } },
-          taxAmount: { $sum: { $toDouble: { $ifNull: ['$lines.lineTax', 0] } } }
-        }
-      }
-    ]);
+      _sum: { lineSubtotal: true, lineTax: true },
+    });
+    const outputVAT = outputVATRows.map((row) => ({
+      taxCode: row.taxCode,
+      taxRate: toNumber(row.taxRate),
+      taxableAmount: toNumber(row._sum.lineSubtotal),
+      taxAmount: toNumber(row._sum.lineTax),
+    }));
 
     // Input VAT from direct purchases
-    const inputVAT = await Purchase.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          purchaseDate: { $gte: start, $lte: end },
-          status: { $in: ['received', 'partial', 'completed', 'paid'] }
-        }
+    const inputVAT = await dbClient().purchase.aggregate({
+      where: {
+        companyId: String(companyId),
+        purchaseDate: { gte: start, lte: end },
+        status: { in: ['received', 'partial', 'completed', 'paid'] },
       },
-      {
-        $group: {
-          _id: null,
-          totalInputVAT: { $sum: { $toDouble: { $ifNull: ['$totalTax', 0] } } },
-          totalPurchases: { $sum: { $toDouble: { $ifNull: ['$subtotal', '$grandTotal'] } } }
-        }
-      }
-    ]);
+      _sum: { taxAmount: true, subtotal: true },
+    });
 
     // Input VAT from purchase orders
-    const poInputVAT = await PurchaseOrder.aggregate([
-      {
-        $match: {
-          company: toObjectId(companyId),
-          orderDate: { $gte: start, $lte: end },
-          status: { $in: ['approved', 'partially_received', 'fully_received'] }
-        }
+    const poInputVAT = await dbClient().purchaseOrder.aggregate({
+      where: {
+        companyId: toIdString(companyId),
+        orderDate: { gte: start, lte: end },
+        status: { in: ['approved', 'partially_received', 'fully_received'] },
       },
-      {
-        $group: {
-          _id: null,
-          totalInputVAT: { $sum: { $toDouble: { $ifNull: ['$taxAmount', 0] } } },
-          totalPurchases: { $sum: { $toDouble: { $ifNull: ['$subtotal', '$totalAmount', 0] } } }
-        }
-      }
-    ]);
+      _sum: { taxAmount: true, subtotal: true },
+    });
 
     const totalOutputVAT = outputVAT.reduce((s, v) => s + (v.taxAmount || 0), 0);
-    const totalInputVAT = (inputVAT[0]?.totalInputVAT || 0) + (poInputVAT[0]?.totalInputVAT || 0);
-    const totalPurchases = (inputVAT[0]?.totalPurchases || 0) + (poInputVAT[0]?.totalPurchases || 0);
+    const totalInputVAT = toNumber(inputVAT._sum.taxAmount) + toNumber(poInputVAT._sum.taxAmount);
+    const totalPurchases = toNumber(inputVAT._sum.subtotal) + toNumber(poInputVAT._sum.subtotal);
     const netVAT = totalOutputVAT - totalInputVAT;
 
     return {
@@ -1730,36 +1687,36 @@ static async getPayrollSummary(companyId, year, month) {
     });
 
     // Get actual revenue
-    const actualRevenue = await Invoice.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          invoiceDate: { $gte: start, $lte: end },
-          status: { $in: ['fully_paid', 'partially_paid', 'confirmed', 'sent'] }
-        }
+    const actualRevenue = await dbClient().invoice.aggregate({
+      where: {
+        companyId: String(companyId),
+        invoiceDate: { gte: start, lte: end },
+        status: { in: ['fully_paid', 'partially_paid', 'confirmed', 'sent'] },
       },
-      { $group: { _id: null, total: { $sum: { $toDouble: { $ifNull: ['$totalAmount', '$total', 0] } } } } }
-    ]);
+      _sum: { totalAmount: true },
+    });
 
     // Get actual expenses from multiple sources: Expense, Purchase (paid), Payroll
-    const [expenseAgg, purchaseAgg] = await Promise.all([
+    const [expenseAgg, purchaseAggResult] = await Promise.all([
       // Direct expenses
       Expense.aggregate([
         { $match: { company: new mongoose.Types.ObjectId(companyId), expense_date: { $gte: start, $lte: end } } },
         { $group: { _id: { $ifNull: ['$category', 'Operations'] }, actual: { $sum: { $toDouble: { $ifNull: ['$amountInRWF', '$amount', 0] } } } } }
       ]),
       // Purchase orders that are paid/received
-      Purchase.aggregate([
-        { 
-          $match: { 
-            company: new mongoose.Types.ObjectId(companyId), 
-            purchaseDate: { $gte: start, $lte: end },
-            status: { $in: ['paid', 'received', 'partial'] }
-          } 
+      dbClient().purchase.aggregate({
+        where: {
+          companyId: String(companyId),
+          purchaseDate: { gte: start, lte: end },
+          status: { in: ['paid', 'received', 'partial'] },
         },
-        { $group: { _id: 'Purchases', actual: { $sum: { $toDouble: { $ifNull: ['$grandTotal', '$total', 0] } } } } }
-      ]),
+        _sum: { totalAmount: true },
+      }),
     ]);
+    const purchaseAgg = [{
+      _id: 'Purchases',
+      actual: toNumber(purchaseAggResult._sum.totalAmount),
+    }];
 
     // Payroll expenses — Prisma-backed, cannot use aggregate
     const payrollRecords = await Payroll.find({
@@ -1798,9 +1755,9 @@ static async getPayrollSummary(companyId, year, month) {
     const revenueLine = {
       category: 'Revenue',
       budget: revenueBudgetAmount,
-      actual: actualRevenue[0]?.total || 0,
-      variance: (actualRevenue[0]?.total || 0) - revenueBudgetAmount,
-      variancePercent: revenueBudgetAmount ? ((actualRevenue[0]?.total || 0) - revenueBudgetAmount) / revenueBudgetAmount * 100 : 0
+      actual: toNumber(actualRevenue._sum.totalAmount),
+      variance: toNumber(actualRevenue._sum.totalAmount) - revenueBudgetAmount,
+      variancePercent: revenueBudgetAmount ? (toNumber(actualRevenue._sum.totalAmount) - revenueBudgetAmount) / revenueBudgetAmount * 100 : 0
     };
 
     const expenseLines = expenseBudgets.map(b => {

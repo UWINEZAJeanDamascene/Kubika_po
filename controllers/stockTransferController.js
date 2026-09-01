@@ -161,6 +161,7 @@ const InventoryBatch = require("../models/InventoryBatch");
 const SerialNumber = require("../models/SerialNumber");
 const StockMovement = require("../models/StockMovement");
 const Product = require("../models/Product");
+const { loadLineProducts, getLineProduct } = require("../utils/lineProducts");
 const Warehouse = require("../models/Warehouse");
 const JournalService = require("../services/journalService");
 const journalController = require("./journalController");
@@ -278,12 +279,12 @@ exports.createStockTransfer = async (req, res, next) => {
       });
     }
 
-    // Validate items and check stock availability
+    // Validate items and check stock availability.
+    // Products for every line are loaded together; the loop still validates in
+    // order so the first failure and its message are unchanged.
+    const transferLineProducts = await loadLineProducts(Product, items, companyId);
     for (const item of items) {
-      const product = await Product.findOne({
-        _id: item.product,
-        company: companyId,
-      });
+      const product = getLineProduct(transferLineProducts, item);
       if (!product) {
         return res.status(404).json({
           success: false,
@@ -430,12 +431,15 @@ exports.approveStockTransfer = async (req, res, next) => {
         });
     }
 
-    // Before approving re-validate available stock (on-hand minus reserved)
+    // Before approving re-validate available stock (on-hand minus reserved).
+    // Unpopulated items are resolved in one query up front rather than one per
+    // item; already-populated items still short-circuit to what they carry.
+    const approveLineProducts = await loadLineProducts(Product, transfer.items, companyId);
     for (const item of transfer.items) {
       const product =
         item.product && item.product._id
           ? item.product
-          : await Product.findOne({ _id: item.product, company: companyId });
+          : getLineProduct(approveLineProducts, item);
       if (!product) continue;
 
       // compute reserved in source warehouse
@@ -478,14 +482,12 @@ exports.approveStockTransfer = async (req, res, next) => {
     await runInTransaction(async (trx) => {
       let totalTransferValue = 0;
 
+      const confirmLineProducts = await loadLineProducts(Product, transfer.items, companyId);
       for (const item of transfer.items) {
         const product =
           item.product && item.product._id
             ? item.product
-            : await Product.findOne({
-                _id: item.product,
-                company: companyId,
-              }).session(trx || undefined);
+            : getLineProduct(confirmLineProducts, item);
         const qty =
           item.quantity || (item.qty ? Number(item.qty.toString()) : 0);
         let unitCost = product?.averageCost || 0;
@@ -969,8 +971,15 @@ exports.cancelStockTransfer = async (req, res, next) => {
         referenceDocument: transfer._id,
         referenceModel: "StockTransfer",
       });
+      // Products for every movement in one query; the reversal writes below
+      // stay sequential because each depends on the running stock position.
+      const reversalProducts = await loadLineProducts(
+        Product,
+        movements.map((m) => ({ product: m.product })),
+        companyId,
+      );
       for (const m of movements) {
-        const product = await Product.findById(m.product);
+        const product = getLineProduct(reversalProducts, { product: m.product });
         // create opposite movement
         await StockMovement.create({
           company: companyId,

@@ -4,6 +4,7 @@ const DeliveryNote = require("../models/DeliveryNote");
 const Quotation = require("../models/Quotation");
 const Invoice = require("../models/Invoice");
 const Product = require("../models/Product");
+const { loadLineProducts, getLineProduct } = require("../utils/lineProducts");
 const StockMovement = require("../models/StockMovement");
 const InventoryBatch = require("../models/InventoryBatch");
 const StockBatch = require("../models/StockBatch");
@@ -825,12 +826,18 @@ exports.confirmDelivery = async (req, res, next) => {
           });
         }
 
+        // All serials for the line in one query. Validation below is unchanged:
+        // the loop still walks them in order and the first bad serial still
+        // decides the response.
+        const serialRows = await StockSerialNumber.find({
+          _id: { $in: line.serialNumbers },
+          company: companyId,
+          product: product._id,
+        });
+        const serialsById = new Map((serialRows || []).map((r) => [String(r._id), r]));
+
         for (const serialId of line.serialNumbers) {
-          const serial = await StockSerialNumber.findOne({
-            _id: serialId,
-            company: companyId,
-            product: product._id,
-          });
+          const serial = serialsById.get(String(serialId)) || null;
 
           if (!serial) {
             return res.status(404).json({
@@ -865,13 +872,13 @@ exports.confirmDelivery = async (req, res, next) => {
 
     await runInTransaction(async (session) => {
       // Process each line
+      // Products for every line in one query; lines that are skipped below
+      // (nothing to deliver / reverse) simply never look theirs up.
+      const dnLineProducts = await loadLineProducts(Product, deliveryNote.lines, companyId);
       for (const line of deliveryNote.lines) {
         if (line.qtyToDeliver <= 0) continue;
 
-        const product = await Product.findOne({
-          _id: line.product._id,
-          company: companyId,
-        }).session(session);
+        const product = getLineProduct(dnLineProducts, line);
         if (!product) continue;
 
         const trackingType = product.trackingType || "none";
@@ -1408,13 +1415,13 @@ exports.cancelDeliveryNote = async (req, res, next) => {
     // Execute reversal in transaction
     await runInTransaction(async (session) => {
       // Reverse each line
+      // Products for every line in one query; lines that are skipped below
+      // (nothing to deliver / reverse) simply never look theirs up.
+      const dnLineProducts = await loadLineProducts(Product, deliveryNote.lines, companyId);
       for (const line of deliveryNote.lines) {
         if (line.deliveredQty <= 0) continue;
 
-        const product = await Product.findOne({
-          _id: line.product._id,
-          company: companyId,
-        }).session(session);
+        const product = getLineProduct(dnLineProducts, line);
         if (!product) continue;
 
         const trackingType = product.trackingType || "none";

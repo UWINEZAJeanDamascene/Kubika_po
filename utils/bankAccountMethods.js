@@ -2,7 +2,7 @@
  * BankAccount static/instance methods ported from the legacy Mongoose model.
  */
 
-const { prisma } = require('../lib/prisma');
+const { dbClient } = require('../lib/prisma');
 const { decimalToNumber } = require('./decimalHelpers');
 const { queryWithTimeout } = require('./sqlQuery');
 const {
@@ -62,7 +62,7 @@ BankAccountDocProto.addTransaction = async function addTransaction(transactionDa
     balance: newBal,
   });
 
-  await prisma.bankAccount.update({
+  await dbClient().bankAccount.update({
     where: { id: String(this._id) },
     data: {
       cachedBalance: String(newBal),
@@ -120,7 +120,7 @@ BankAccountDocProto.getBalance = async function getBalance(_JournalEntry, asOfDa
   const computedBalance = totalDebits - totalCredits;
   const now = new Date();
 
-  await prisma.bankAccount.update({
+  await dbClient().bankAccount.update({
     where: { id: String(this._id) },
     data: {
       cachedBalance: String(computedBalance),
@@ -150,12 +150,12 @@ BankAccountDocProto.save = async function save() {
   if (this.isNew || !this._id) {
     const createData = await bankAccountTranslateCreate(this);
     if (createData.isDefault) {
-      await prisma.bankAccount.updateMany({
+      await dbClient().bankAccount.updateMany({
         where: { companyId: createData.companyId, id: { not: createData.id } },
         data: { isDefault: false },
       });
     }
-    const row = await prisma.bankAccount.create({ data: createData });
+    const row = await dbClient().bankAccount.create({ data: createData });
     Object.assign(this, bankAccountToApi(row));
     this.isNew = false;
     this.__mutable = true;
@@ -163,7 +163,7 @@ BankAccountDocProto.save = async function save() {
   }
 
   if (this.isDefault) {
-    await prisma.bankAccount.updateMany({
+    await dbClient().bankAccount.updateMany({
       where: {
         companyId: String(this.company || this.companyId),
         id: { not: String(this._id) },
@@ -172,7 +172,7 @@ BankAccountDocProto.save = async function save() {
     });
   }
 
-  const row = await prisma.bankAccount.update({
+  const row = await dbClient().bankAccount.update({
     where: { id: String(this._id) },
     data: bankAccountTranslateUpdate({ $set: this }),
   });
@@ -258,7 +258,7 @@ function attachBankAccountStatics(BankAccount) {
     openingBalance,
   ) {
     const bankAccountId = String(accountId);
-    const latest = await prisma.bankTransaction.findFirst({
+    const latest = await dbClient().bankTransaction.findFirst({
       where: { bankAccountId },
       orderBy: [{ date: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
       select: { balanceAfter: true, balance: true },
@@ -268,7 +268,7 @@ function attachBankAccountStatics(BankAccount) {
       return decimalToNumber(latest.balanceAfter ?? latest.balance, 0);
     }
 
-    const rows = await prisma.bankTransaction.groupBy({
+    const rows = await dbClient().bankTransaction.groupBy({
       by: ['type'],
       where: { bankAccountId },
       _sum: { amount: true },
@@ -353,12 +353,12 @@ function buildBankTransactionModel(base) {
   Doc.prototype.save = async function save() {
     if (this.isNew || !this._id) {
       const createData = await bankTransactionTranslateCreate(this);
-      const row = await prisma.bankTransaction.create({ data: createData });
+      const row = await dbClient().bankTransaction.create({ data: createData });
       Object.assign(this, bankTransactionToApi(row));
       this.isNew = false;
       return this;
     }
-    const row = await prisma.bankTransaction.update({
+    const row = await dbClient().bankTransaction.update({
       where: { id: String(this._id) },
       data: bankTransactionTranslateUpdate({ $set: this }),
     });

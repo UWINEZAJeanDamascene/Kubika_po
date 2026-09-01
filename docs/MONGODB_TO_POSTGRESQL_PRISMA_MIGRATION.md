@@ -1029,6 +1029,248 @@ Reference: existing `docs/module1_journal_engine_spec.md`.
 
 **Rollout:** run `npm run etl:phase10` once with Mongo reachable (after Phases 2–9 ETL), then restart API.
 
+### Phase 10b — Notifications (2026-09-01) — models DONE, schedulers PARTIAL
+
+Migrated `Notification` and `NotificationSettings` to Prisma. An audit of the
+first version of this entry found several claims wrong; they are corrected here
+rather than edited away.
+
+**The models are done and verified.** 20 checks against the live database:
+create, filtered find, `updateMany`, both preserved statics
+(`createNotification`, `getUnreadCount`), nested-shape reassembly,
+Decimal→number conversion for thresholds, array persistence, partial-group
+updates leaving other defaults intact, idempotent upsert. Test rows deleted after.
+
+| Model | Notes |
+|---|---|
+| `Notification` | `type`/`severity` are `String`, not enums — the Mongo schema listed 24 types and the set grows; an enum forces a migration per new alert. |
+| `NotificationSettings` | Nested groups flattened to columns so defaults live in the database; API shape rebuilt in `utils/notificationMappers.js`. Phone lists are native `text[]`. |
+
+**Correction — the migration creates four indexes, not three:** the two
+notification indexes, the unique `notification_settings_company_id_key`, and
+`products_company_id_is_archived_is_active_idx` (from a pre-existing schema
+declaration Prisma had not yet materialised).
+
+**A destructive migration was caught before applying.** `prisma migrate dev`
+generated `DROP INDEX` for both product-list indexes — created by raw SQL in
+`20260812000001` and never declared in `schema.prisma`, so the diff read them as
+drift. They are now declared with explicit `map:` names, as are the seven trigram
+indexes. The applied migration has zero `DROP` statements.
+
+**Correction — my scheduler audit was wrong, and the method was the reason.**
+It only checked `require('../models/X')` and whether those models were
+Prisma-backed. That misses every other way a service reaches Mongo. Three real
+dependencies got through:
+
+| Service | Missed dependency | Resolution |
+|---|---|---|
+| `ebmRetryJob` | `mongoose.models` lookup | **Real hazard.** The registry returns the bare `strict:false` stubs from `registerBareSchema()`, not the Prisma compat models, so writes targeted a dead connection — a queue row could be marked submitted while its source document was never updated. Now resolves the seven source models by direct require. |
+| `backupScheduler` | shells out to `mongodump --uri=config.db.uri` | **Not fixable here.** With `MONGODB_URI` unset that is `undefined.split('/')`, a TypeError; and it would archive a database that no longer holds the data. **Removed from the worker.** It needs a PostgreSQL implementation (`pg_dump`, or Neon's own backups) before any process starts it. It stayed quiet in the first test only because `AUTO_BACKUP_ENABLED` is unset — a false clean. |
+| `notificationScheduler` | `utils/mongoAggregation` | **Naming only.** `aggregateWithTimeout` takes an early Prisma path when `model.aggregate()` is thenable, which the compat models' is. Verified live: the Product aggregation returned real data rather than the silent `[]` fallback. The file deserves renaming. |
+
+Stale unused `mongoose` imports removed from `reportSchedulerService` and
+`backupScheduler` (confirmed zero `mongoose.*` usages first).
+
+**Worker status.** Starts exchange rates, notifications, EBM retry and report
+snapshots — **four schedulers, not all nineteen**. Backups are deliberately
+excluded. Shutdown now attempts notifications too, but
+`notificationScheduler` exports no `stopScheduler()`: its cron handles are not
+returned by `startScheduler()`, so they cannot be cancelled and are torn down by
+process exit. Adding that export is outstanding work.
+
+The API server's own scheduler block remains disabled behind `if (false && ...)`
+in three places in `server.js`. That is not a migration artefact to celebrate —
+it means those schedulers run nowhere until each is audited the same way.
+
+**Remaining Mongo surface — 23 true Mongoose-only models.** The number depends
+entirely on the criterion, and two obvious criteria each undercounted, so the
+method matters more than the figure:
+
+| Criterion | Count | Why it is wrong |
+|---|---|---|
+| Mentions `mongoose` anywhere under `models/` | 33 | Includes `models/schemas/` and `models/plugins/`, and Prisma-backed models that import mongoose only for `registerBareSchema()` or ObjectId helpers |
+| `require('mongoose')` | 30 | Same over-count, minus subdirectories |
+| Has `new mongoose.Schema({` and no Prisma marker | 21 | **False negatives.** The regex is whitespace-sensitive; `FixedDeposit` and `InterestAccrual` declare their schema differently and were missed |
+| `module.exports = mongoose.model(...)` | 22 | **False negative.** `PrecomputedAggregation` assigns the model to a variable first |
+
+The defensible test is all three conditions together — defines a schema, exports
+a mongoose model, and has no Prisma backing (checked for indirect routes via
+`masterDataCommon` / `salesApCommon` / `prismaCompat`, not just the builder
+names). That gives **23**:
+
+`AIActionProposal`, `AIFinding`, `APTransactionLedger`, `ARBadDebtWriteoff`,
+`ARTransactionLedger`, `Backup`, `CashDrawer`, `EBMSequence`, `FixedDeposit`,
+`ImportJob`, `ImportLog`, `ImportTemplate`, `InterestAccrual`, `Liability`,
+`PaymentSchedule`, `PrecomputedAggregation`, `Sequence`, `Subscription`,
+`SubscriptionPlan`, `SystemSettings`, `TaxTransaction`, `Testimonial`,
+`WarehouseInventoryCost`.
+
+All are unusable while `MONGODB_URI` is unset. None blocks the four schedulers
+now running, but `Backup` blocks the backup scheduler and `Sequence` /
+`EBMSequence` underpin reference-number generation, so they are the natural next
+targets.
+
+### Phase 6 follow-up (2026-09-01) — outstanding items worked through
+
+**1. `notificationScheduler.stopScheduler()` — done.** Cron handles are now kept
+in `scheduledTasks` and cancelled on shutdown. Previously `startScheduler()`
+discarded them, so the tasks could only be stopped by killing the process — and
+node-cron timers keep the event loop alive, so the worker could not drain. Also
+guards against a double start.
+
+**2. Backup — two real bugs fixed; `mongodump` still unresolved.**
+`backupController` resolved every collection through `mongoose.model(name)`,
+which returns the bare `strict:false` compatibility stubs rather than the
+Prisma-backed models. Consequences:
+
+- `performBackup` would have written a backup reporting success while
+  containing **nothing** — worse than failing loudly.
+- `restoreBackup` silently no-opped for the same reason.
+
+Both now resolve by `require('../models/<name>')`, skipping (and logging) any
+name with no usable model instead of writing an empty array. **Note that this
+makes restore genuinely destructive again** — it really does `deleteMany` before
+reinserting, which is what a restore should do, but it was inert before.
+
+`backupScheduler` itself still shells out to `mongodump` and is still not started
+by any process. Replacing it needs a decision — `pg_dump`, Neon's own backups, or
+promoting the per-company JSON export — not just a code change.
+
+**Follow-up: partial success was being reported as success.** An audit of the
+above fix found the deeper problem was not model resolution but reporting:
+
+- `performBackup` caught per-collection failures, recorded them in the manifest,
+  then set `status = 'completed'` and `integrityStatus = 'valid'` regardless. A
+  backup missing 20 of 30 collections presented as a complete, valid one.
+- `restoreBackup` was worse. It deletes the company's rows per collection, then
+  reinserts. Per-collection failures were caught with a `console.warn`, after
+  which it set `status = 'verified'` and logged "completed successfully" — a
+  destructive half-restore reported as a clean one.
+
+Now:
+
+- A new `completed_with_errors` status distinguishes a partial archive from a
+  full one. `integrityStatus: 'valid'` is kept but commented — it attests the
+  file matches its checksum, not that the contents are complete.
+- Collections with no usable model are recorded as errors in the manifest rather
+  than skipped silently, so a restore cannot quietly leave data behind.
+- Restore **refuses** an archive marked `completed_with_errors`: restoring one
+  deletes current rows the archive cannot put back.
+- Any per-collection restore failure now marks the whole restore `failed` with
+  the collection names, instead of `verified`.
+
+**Follow-up 2: the refusal had a bypass.** Gating on `backup.status` was the
+wrong design — the field is mutable. `markAsVerified()` set `status = 'verified'`
+unconditionally, so verifying a `completed_with_errors` backup laundered it into
+a status the restore guard accepts. Checksum verification proves the *file* is
+intact; it says nothing about whether every collection reached that file.
+
+Three changes:
+
+1. **The authoritative gate now reads the archive's own manifest.** After
+   decompressing, `performRestore` refuses if any entry in
+   `backupData.collections` carries an `error`. That is a property of the file
+   and cannot be altered by editing a record. Verified to run before the first
+   `deleteMany` (line ordering checked, not assumed).
+2. `markAsVerified()` no longer promotes `completed_with_errors`. A complete
+   backup still becomes `verified` as before.
+3. `performBackup` no longer logs "completed successfully" for a partial run; it
+   names the number of missing collections.
+
+The status check is kept as a cheap early-out, but it is no longer the thing
+being relied on. Five logic tests cover the bypass path directly: a forged
+`verified` status still hits the manifest refusal.
+
+**Follow-up 3: the restore is now all-or-nothing.**
+
+The stated blocker — "cannot be atomic while the archive spans Mongo-only
+models" — was true but smaller than it sounded. Of the 30 backupable
+collections, **28 are Prisma-backed; only `CashDrawer` and `Subscription` are
+not.**
+
+Those two also created a trap. With `MONGODB_URI` unset their reads throw, so
+including them would mark *every* archive `completed_with_errors` — and the
+manifest gate would then refuse *every* restore. A safety gate that blocks
+everything is an outage, not a safeguard. `BACKUP_COLLECTIONS` now carries an
+explicit `restorable` flag per collection; the two Mongo-only ones are excluded
+from new archives, and the flag flips as each model migrates.
+
+With the archive limited to PostgreSQL-backed collections, the whole restore runs
+in **one transaction**:
+
+- Per-collection `try/catch` removed. The first failure aborts the transaction,
+  so Postgres rolls back every delete and insert already issued. There is no
+  longer a "partially restored" outcome to report, because there is no longer a
+  partially restored state.
+- The compat models join the transaction automatically — `runInTransaction`
+  publishes the client on the async context and `prismaCompat` resolves its
+  delegate from there. That ambient design (added in the Phase 1 performance
+  work) is what makes wrapping a loop over 28 models practical; threading a
+  client through by hand would have touched every call site.
+- Transaction timeout raised to 120s (`RESTORE_TRANSACTION_TIMEOUT_MS`): a
+  full-company restore writes far more than a request, and the default 30s would
+  abort mid-restore. Safe now, but it fails work that would have succeeded.
+
+**Verified against the live database.** A restore was simulated that deletes
+rows and then fails partway through: the deletes are visible inside the
+transaction, the error propagates, and every row is present again afterwards. A
+successful transaction commits normally. One earlier test iteration reported a
+false failure because it counted through the base Prisma client, which cannot
+see uncommitted work — the check had to go through the transaction-aware model.
+
+**Mongoose in `backupController` is reduced, not eliminated.** `mongoose.version`
+was recording the wrong thing entirely — the data comes from PostgreSQL — and is
+replaced by the actual `server_version`. `mongoose.Types.ObjectId` remains for
+one `Backup.aggregate()` call, because `Backup` is itself one of the 23
+Mongoose-only models. The import is annotated with the condition for removing it.
+
+**5. The Mongoose-only models — 23 down to 17.**
+
+*Three were dead code, not migration work.* `Sequence`, `SubscriptionPlan` and
+`EBMSequence` had zero references anywhere. Reference numbers already run
+through `services/postgresSequenceStore`; the sequence ETL script defines its own
+bare models rather than importing these. Deleted (git-tracked, recoverable);
+server boots unaffected.
+
+*One was migrated by someone else mid-session.* `TaxTransaction` moved to Prisma
+independently — the `dbClient()` helper in `lib/prisma.js` appeared at the same
+time. Noted so the count reconciles: 23 − 3 deleted − 1 external = 19, then − 2
+below = **17**.
+
+*Two migrated here: the AR and AP transaction ledgers* (migration
+`20260901011723_add_ar_ap_transaction_ledgers`, strictly additive, zero drops or
+renames — the index declarations added last round held).
+
+These are the reconciliation audit trails, so the statics matter more than the
+schema. Notes on the parts that needed judgement:
+
+- **`findDiscrepancies` was reimplemented, not translated.** Its Mongo pipeline
+  used `$lookup` + `$addFields` + `$cond`, which the aggregate compatibility
+  layer does not cover — relying on it would have failed quietly or returned
+  wrong rows. It now joins through Prisma and compares in JS, where the logic is
+  visible. It also compares on a rounded difference rather than `$ne`, which
+  previously flagged representational differences as real discrepancies.
+- **`verifyIntegrity` kept its balance-chain walk** and moved only the grouping
+  out of the pipeline. Row order is `(supplier, transactionDate, createdAt)`,
+  matching the pipeline's `$sort` — a running total is meaningless if the order
+  changes.
+- **Decimals are converted to numbers on read.** `getSupplierBalanceAtDate`
+  previously returned a raw Decimal128 that callers did arithmetic on; that
+  coerces in Mongo but misbehaves silently against a Prisma Decimal object.
+- **`signedAmount`** was a Mongoose virtual; it is computed in the mapper.
+
+Verified against the live database with 17 checks, including a deliberately
+planted balance error that `verifyIntegrity` caught with the correct expected
+value (150.00). Test rows deleted after.
+
+**17 remaining:** `AIActionProposal`, `AIFinding`, `ARBadDebtWriteoff`, `Backup`,
+`CashDrawer`, `FixedDeposit`, `ImportJob`, `ImportLog`, `ImportTemplate`,
+`InterestAccrual`, `Liability`, `PaymentSchedule`, `PrecomputedAggregation`,
+`Subscription`, `SystemSettings`, `Testimonial`, `WarehouseInventoryCost`.
+Blocked files: **31 → 25**.
+
+**Phase 6 is NOT Mongo-free and NOT scheduler-complete.**
+
 ### Phase 11 — Decommission MongoDB (Week 36+)
 
 See [Step 14 — Final cutover checklist](#19-step-14--final-cutover-checklist).

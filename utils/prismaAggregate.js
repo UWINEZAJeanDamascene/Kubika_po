@@ -10,6 +10,40 @@ const LOOKUP_MODELS = {
   warehouses: () => require('../models/Warehouse'),
 };
 
+// This legacy compatibility shim is for low-volume pipelines only. Never let
+// an unbounded tenant read become an invisible Node.js heap/event-loop outage.
+const AGG_MAX_ROWS = Math.max(1, Number(process.env.AGG_MAX_ROWS || 50000));
+const AGG_TELEMETRY = process.env.AGG_TELEMETRY === 'true';
+
+function modelLabel(config) {
+  if (config.modelName) return config.modelName;
+  const source = typeof config.delegate === 'function' ? Function.prototype.toString.call(config.delegate) : '';
+  const match = source.match(/prisma\.([A-Za-z_$][\w$]*)/);
+  return match ? match[1] : 'unknown';
+}
+
+function aggregateLimitError(config, matchStage) {
+  const error = new Error(`Aggregate on ${modelLabel(config)} exceeds the ${AGG_MAX_ROWS.toLocaleString()} row safety limit. Use a SQL/Prisma aggregate or add a narrower filter.`);
+  error.name = 'AggregateRowLimitError';
+  error.code = 'AGGREGATE_ROW_LIMIT';
+  error.status = 413;
+  error.aggregate = { model: modelLabel(config), match: matchStage, maxRows: AGG_MAX_ROWS };
+  return error;
+}
+
+function emitTelemetry(config, metrics, error) {
+  if (!AGG_TELEMETRY && !error) return;
+  const payload = {
+    event: 'prisma_compat_aggregate',
+    model: modelLabel(config),
+    rowsFetched: metrics.rowsFetched,
+    durationMs: Date.now() - metrics.startedAt,
+    capped: Boolean(error && error.code === 'AGGREGATE_ROW_LIMIT'),
+  };
+  if (error) payload.error = error.code || error.message;
+  console.warn(`[aggregate] ${JSON.stringify(payload)}`);
+}
+
 function normalizeId(v) {
   if (v == null) return v;
   if (typeof v === 'object' && v._id != null) return String(v._id);
@@ -23,6 +57,33 @@ function toNumber(v) {
   if (typeof v === 'string') return parseFloat(v) || 0;
   if (typeof v === 'object' && typeof v.toString === 'function') return parseFloat(v.toString()) || 0;
   return Number(v) || 0;
+}
+
+/**
+ * Order-comparable value for $gt/$gte/$lt/$lte.
+ *
+ * toNumber() cannot rank dates: a Date falls through to
+ * `parseFloat(v.toString())` — parseFloat('Fri Jan 15 2091 …') is NaN, so it
+ * returns 0 — and an ISO string parses as its year. Both operands collapsing to
+ * 0 made `$lt`/`$gt` reject every row (0 < 0) while `$gte`/`$lte` accepted every
+ * row (0 <= 0). The latter was invisible because the leading $match had already
+ * filtered correctly in Postgres; the former silently emptied any aggregate
+ * with a strict date bound.
+ */
+function toComparable(v) {
+  if (v instanceof Date) return v.getTime();
+  if (typeof v === 'string') {
+    // Only ISO-like strings — a plain numeric string must stay numeric.
+    if (/^\d{4}-\d{2}-\d{2}([T ]|$)/.test(v)) {
+      const t = Date.parse(v);
+      if (!Number.isNaN(t)) return t;
+    }
+  }
+  if (v && typeof v === 'object' && typeof v.getTime === 'function') {
+    const t = v.getTime();
+    if (!Number.isNaN(t)) return t;
+  }
+  return toNumber(v);
 }
 
 function getPath(obj, path) {
@@ -49,6 +110,10 @@ function evalExpr(expr, root, vars = {}) {
     return getPath(root, expr.slice(1));
   }
   if (typeof expr !== 'object') return expr;
+  // A Date is an object with no own enumerable keys, so the generic
+  // "walk the object" fallback at the bottom turned it into `{}` — every
+  // comparison against a date literal in $expr/$cond then compared against 0.
+  if (expr instanceof Date) return expr;
   if (Array.isArray(expr)) return expr.map((e) => evalExpr(e, root, vars));
 
   if (expr.$toDouble) return toNumber(evalExpr(expr.$toDouble, root, vars));
@@ -140,19 +205,19 @@ function evalExpr(expr, root, vars = {}) {
   }
   if (expr.$gt) {
     const [a, b] = expr.$gt;
-    return toNumber(evalExpr(a, root, vars)) > toNumber(evalExpr(b, root, vars));
+    return toComparable(evalExpr(a, root, vars)) > toComparable(evalExpr(b, root, vars));
   }
   if (expr.$gte) {
     const [a, b] = expr.$gte;
-    return toNumber(evalExpr(a, root, vars)) >= toNumber(evalExpr(b, root, vars));
+    return toComparable(evalExpr(a, root, vars)) >= toComparable(evalExpr(b, root, vars));
   }
   if (expr.$lt) {
     const [a, b] = expr.$lt;
-    return toNumber(evalExpr(a, root, vars)) < toNumber(evalExpr(b, root, vars));
+    return toComparable(evalExpr(a, root, vars)) < toComparable(evalExpr(b, root, vars));
   }
   if (expr.$lte) {
     const [a, b] = expr.$lte;
-    return toNumber(evalExpr(a, root, vars)) <= toNumber(evalExpr(b, root, vars));
+    return toComparable(evalExpr(a, root, vars)) <= toComparable(evalExpr(b, root, vars));
   }
   if (expr.$and) return expr.$and.every((e) => evalExpr(e, root, vars));
   if (expr.$or) return expr.$or.some((e) => evalExpr(e, root, vars));
@@ -170,37 +235,62 @@ function evalExpr(expr, root, vars = {}) {
   return out;
 }
 
-function matchValue(fieldVal, cond, doc) {
-  if (cond == null || typeof cond !== 'object' || Array.isArray(cond)) {
+/** Evaluate one operator of a field condition. */
+function matchOperator(fieldVal, op, operand, cond) {
+  switch (op) {
+    case '$in': return operand.map(normalizeId).includes(normalizeId(fieldVal));
+    case '$nin': return !operand.map(normalizeId).includes(normalizeId(fieldVal));
+    case '$ne':
+      return operand == null
+        ? fieldVal != null && fieldVal !== undefined
+        : normalizeId(fieldVal) !== normalizeId(operand);
+    case '$exists':
+      return operand
+        ? fieldVal != null && fieldVal !== undefined
+        : fieldVal == null || fieldVal === undefined;
+    case '$gt': return toComparable(fieldVal) > toComparable(operand);
+    case '$gte': return toComparable(fieldVal) >= toComparable(operand);
+    case '$lt': return toComparable(fieldVal) < toComparable(operand);
+    case '$lte': return toComparable(fieldVal) <= toComparable(operand);
+    case '$regex': {
+      if (fieldVal == null) return false;
+      const isRegexObj = operand instanceof RegExp;
+      const pattern = isRegexObj ? operand.source : String(operand);
+      const flags = cond.$options != null
+        ? String(cond.$options)
+        : (isRegexObj ? operand.flags : undefined);
+      try {
+        return new RegExp(pattern, flags).test(String(fieldVal));
+      } catch (_err) {
+        return false;
+      }
+    }
+    default: return null; // not a recognised operator
+  }
+}
+
+/** Operators that only modify another operator rather than constraining a value. */
+const MATCH_MODIFIERS = new Set(['$options']);
+
+function matchValue(fieldVal, cond) {
+  if (cond == null || typeof cond !== 'object' || Array.isArray(cond) || cond instanceof Date) {
     return normalizeId(fieldVal) === normalizeId(cond);
   }
-  if (cond.$in) return cond.$in.map(normalizeId).includes(normalizeId(fieldVal));
-  if (cond.$nin) return !cond.$nin.map(normalizeId).includes(normalizeId(fieldVal));
-  if ('$ne' in cond) {
-    return cond.$ne == null
-      ? fieldVal != null && fieldVal !== undefined
-      : normalizeId(fieldVal) !== normalizeId(cond.$ne);
+
+  // Every operator present must hold. This used to `return` on the first one it
+  // recognised, so a range like `{ $gte: start, $lte: end }` applied only the
+  // lower bound — invisible while Postgres had already applied both, and wrong
+  // as soon as the filter fell back to matching in memory.
+  let sawOperator = false;
+  for (const [op, operand] of Object.entries(cond)) {
+    if (!op.startsWith('$') || MATCH_MODIFIERS.has(op)) continue;
+    const result = matchOperator(fieldVal, op, operand, cond);
+    if (result === null) continue; // unknown operator: leave unconstrained
+    sawOperator = true;
+    if (!result) return false;
   }
-  if ('$exists' in cond) {
-    return cond.$exists
-      ? fieldVal != null && fieldVal !== undefined
-      : fieldVal == null || fieldVal === undefined;
-  }
-  if (cond.$gt != null) return toNumber(fieldVal) > toNumber(cond.$gt);
-  if (cond.$gte != null) return toNumber(fieldVal) >= toNumber(cond.$gte);
-  if (cond.$lt != null) return toNumber(fieldVal) < toNumber(cond.$lt);
-  if (cond.$lte != null) return toNumber(fieldVal) <= toNumber(cond.$lte);
-  if (cond.$regex != null) {
-    if (fieldVal == null) return false;
-    const isRegexObj = cond.$regex instanceof RegExp;
-    const pattern = isRegexObj ? cond.$regex.source : String(cond.$regex);
-    const flags = cond.$options != null ? String(cond.$options) : (isRegexObj ? cond.$regex.flags : undefined);
-    try {
-      return new RegExp(pattern, flags).test(String(fieldVal));
-    } catch (_err) {
-      return false;
-    }
-  }
+
+  if (sawOperator) return true;
   return normalizeId(fieldVal) === normalizeId(cond);
 }
 
@@ -407,8 +497,13 @@ function detectInclude(pipeline, defaultInclude) {
   return undefined;
 }
 
-async function fetchMatchDocs(matchStage, config, fullPipeline = []) {
+async function fetchMatchDocs(matchStage, config, fullPipeline = [], metrics = null) {
   const { translateFilter, IMPOSSIBLE, containsInvalidNullFilter } = require('./prismaCompat');
+  // `config.delegate` is makeCompatModel's tx-aware delegate (see its only
+  // caller, prismaCompat's createAggregateMethod({ delegate, ... })), so these
+  // reads already join the ambient interactive transaction. Keep it that way:
+  // binding this to the plain client would make an aggregate that recomputes a
+  // total inside runInTransaction silently read the pre-transaction snapshot.
   // Inspect the full pipeline so $unwind: '$lines' pulls related line rows.
   const include = detectInclude([{ $match: matchStage }, ...fullPipeline], config.include);
   const companyOnly = translateFilter(
@@ -432,17 +527,27 @@ async function fetchMatchDocs(matchStage, config, fullPipeline = []) {
   const where = translateFilter(knownMatch, config.fieldMap);
   const needsInMemory = where === IMPOSSIBLE || containsInvalidNullFilter(where);
 
+  const fetch = async (where) => {
+    // Read one extra row so a group after a truncated read never returns an
+    // inaccurate result. The caller receives a clear, retryable 413 instead.
+    const rows = await config.delegate().findMany({ where, include, take: AGG_MAX_ROWS + 1 });
+    if (metrics) metrics.rowsFetched = rows.length;
+    if (rows.length > AGG_MAX_ROWS) throw aggregateLimitError(config, matchStage);
+    return rows;
+  };
+
   if (needsInMemory) {
-    const rows = await config.delegate().findMany({ where: companyOnly, include });
+    const rows = await fetch(companyOnly);
     return rows.map((r) => config.toApi(r)).filter((d) => matchDoc(d, matchStage));
   }
 
   try {
-    const rows = await config.delegate().findMany({ where, include });
+    const rows = await fetch(where);
     // Still apply original match in memory for fields Prisma couldn't express.
     return rows.map((r) => config.toApi(r)).filter((d) => matchDoc(d, matchStage));
-  } catch (_err) {
-    const rows = await config.delegate().findMany({ where: companyOnly, include });
+  } catch (error) {
+    if (error && error.code === 'AGGREGATE_ROW_LIMIT') throw error;
+    const rows = await fetch(companyOnly);
     return rows.map((r) => config.toApi(r)).filter((d) => matchDoc(d, matchStage));
   }
 }
@@ -451,7 +556,7 @@ async function runPipeline(pipeline, seedDocs, config, opts = {}) {
   let docs = seedDocs || [];
 
   if (!opts.inMemory && pipeline[0]?.$match) {
-    docs = await fetchMatchDocs(pipeline[0].$match, config, pipeline.slice(1));
+    docs = await fetchMatchDocs(pipeline[0].$match, config, pipeline.slice(1), opts.metrics);
     pipeline = pipeline.slice(1);
   }
 
@@ -459,7 +564,7 @@ async function runPipeline(pipeline, seedDocs, config, opts = {}) {
     if (stage.$facet) {
       const out = {};
       for (const [name, sub] of Object.entries(stage.$facet)) {
-        out[name] = await runPipeline(sub, docs, config, { inMemory: true });
+        out[name] = await runPipeline(sub, docs, config, { inMemory: true, metrics: opts.metrics });
       }
       docs = [out];
     } else if (stage.$lookup) {
@@ -475,7 +580,15 @@ function createAggregateMethod(config) {
   return function aggregate(pipeline, _options = {}) {
     const run = async () => {
       if (!Array.isArray(pipeline)) return [];
-      return runPipeline(pipeline, null, config);
+      const metrics = { startedAt: Date.now(), rowsFetched: 0 };
+      try {
+        const result = await runPipeline(pipeline, null, config, { metrics });
+        emitTelemetry(config, metrics);
+        return result;
+      } catch (error) {
+        emitTelemetry(config, metrics, error);
+        throw error;
+      }
     };
 
     // Mongoose Aggregate is thenable and also exposes .exec() / .session().

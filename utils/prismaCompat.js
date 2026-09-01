@@ -33,10 +33,22 @@ function txDelegate(config) {
   const base = config.delegate();
   const tx = getActiveTx();
   if (!tx || !base) return base;
-  const name = typeof base.name === 'string' ? base.name : null;
-  if (!name) return base;
-  const key = name.charAt(0).toLowerCase() + name.slice(1);
-  return tx[key] || base;
+
+  // Prisma delegates do not expose a stable `.name` property.  Relying on it
+  // meant the earlier transaction-context change quietly returned `base` (the
+  // global client) for every compat model, so writes escaped the transaction.
+  // Builders provide delegateName explicitly; infer it for the small number of
+  // older hand-written shims until they are converted.
+  let key = config.delegateName;
+  if (!key && typeof config.delegate === 'function') {
+    const match = Function.prototype.toString.call(config.delegate)
+      .match(/prisma\.([A-Za-z_$][\w$]*)/);
+    key = match && match[1];
+  }
+  if (!key && typeof base.name === 'string') {
+    key = base.name.charAt(0).toLowerCase() + base.name.slice(1);
+  }
+  return (key && tx[key]) || base;
 }
 
 const IMPOSSIBLE = Symbol('impossible-filter');
@@ -1360,6 +1372,7 @@ function makeCompatModel(config) {
 
     aggregate: createAggregateMethod({
       delegate,
+      modelName: config.delegateName,
       fieldMap,
       toApi,
       include: config.include,
@@ -1430,6 +1443,7 @@ module.exports = {
   makeCompatModel,
   translateFilter,
   translateSort,
+  txDelegate,
   IMPOSSIBLE,
   toId,
   containsInvalidNullFilter,

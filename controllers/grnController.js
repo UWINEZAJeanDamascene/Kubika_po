@@ -6,6 +6,7 @@ const StockBatch = require("../models/StockBatch");
 const StockSerialNumber = require("../models/StockSerialNumber");
 const StockMovement = require("../models/StockMovement");
 const Product = require("../models/Product");
+const { loadLineProducts, getLineProduct } = require("../utils/lineProducts");
 const Supplier = require("../models/Supplier");
 const Company = require("../models/Company");
 const { generateUniqueNumber } = require('../models/utils/autoIncrement');
@@ -401,13 +402,14 @@ exports.confirmGRN = async (req, res, next) => {
     const updatedProducts = new Map(); // productId -> { previousStock, previousAvg }
     const updatedPOLines = [];
 
+    // Both passes below walk the same lines, so the products are loaded once
+    // here instead of once per line per pass — previously 2N round-trips for an
+    // N-line receipt, all of them sequential.
+    const grnLineProducts = await loadLineProducts(Product, grn.lines, companyId);
+
     // First pass: Validate tracking types and prepare batch/serial data
     for (const line of grn.lines) {
-      const product = await Product.findOne(
-        { _id: line.product, company: companyId },
-        null,
-        useSession ? { session: sess } : {},
-      );
+      const product = getLineProduct(grnLineProducts, line);
 
       if (!product) {
         throw Object.assign(new Error(`Product not found: ${resolveLineProductId(line)}`), {
@@ -485,11 +487,7 @@ exports.confirmGRN = async (req, res, next) => {
 
     // Second pass: Process stock
     for (const line of grn.lines) {
-      const product = await Product.findOne(
-        { _id: line.product, company: companyId },
-        null,
-        useSession ? { session: sess } : {},
-      );
+      const product = getLineProduct(grnLineProducts, line);
       const trackingType = product.trackingType || "none";
 
       // Helper to parse date safely
@@ -558,17 +556,22 @@ exports.confirmGRN = async (req, res, next) => {
         line.serialNumbers &&
         line.serialNumbers.length > 0
       ) {
+        // One query for every serial on the line instead of one per serial.
+        // A 100-unit serialised receipt was 100 sequential existence checks
+        // before any stock moved. The loop below still reports the first
+        // duplicate in the original order, so the error message is unchanged.
+        const upperSerials = line.serialNumbers.map((sn) => String(sn).toUpperCase());
+        const existingSerialRows = await StockSerialNumber.find({
+          company: companyId,
+          product: line.product,
+          serialNo: { $in: upperSerials },
+        });
+        const existingSerialSet = new Set(
+          (existingSerialRows || []).map((r) => String(r.serialNo).toUpperCase()),
+        );
+
         for (const serialNo of line.serialNumbers) {
-          // Check if serial already exists for this product
-          const existingSerial = await StockSerialNumber.findOne(
-            {
-              company: companyId,
-              product: line.product,
-              serialNo: serialNo.toUpperCase(),
-            },
-            null,
-            useSession ? { session: sess } : {},
-          );
+          const existingSerial = existingSerialSet.has(String(serialNo).toUpperCase());
 
           if (existingSerial) {
             throw Object.assign(
@@ -772,8 +775,15 @@ exports.confirmGRN = async (req, res, next) => {
 
     // Build journal lines from TaxAutomationService output
     // Inventory lines (per product)
+    // Products for every total in one query. This runs while building journal
+    // lines, so it was one lookup per distinct product on the GRN.
+    const journalProducts = await loadLineProducts(
+      Product,
+      [...productTotals.keys()].map((id) => ({ product: id })),
+      companyId,
+    );
     for (const [prodId, amt] of productTotals.entries()) {
-      const product = await Product.findById(prodId).lean();
+      const product = getLineProduct(journalProducts, { product: prodId });
       let invAcct = DEFAULT_ACCOUNTS.inventory;
       if (product.inventoryAccount) {
         if (

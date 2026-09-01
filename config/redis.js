@@ -209,9 +209,39 @@ process.on('SIGINT', gracefulShutdown);
 process.on('SIGTERM', gracefulShutdown);
 
 // Export the client and a function to get a new client if needed
+/**
+ * Dedicated connection for BullMQ.
+ *
+ * BullMQ refuses a client with `maxRetriesPerRequest` set — its workers use
+ * blocking commands (BRPOPLPUSH) that must wait indefinitely rather than time
+ * out and retry. The shared cache client sets it to 5, so passing that client
+ * to a Worker throws "Your redis options maxRetriesPerRequest must be null".
+ *
+ * A separate connection is right regardless of that error: a blocking read on
+ * the shared client would stall ordinary cache traffic behind it.
+ *
+ * Returns null when Redis is not configured, so callers can skip the queue.
+ */
+const createQueueConnection = () => {
+  if (!isRedisConfigured()) return null;
+  const options = {
+    maxRetriesPerRequest: null,   // required by BullMQ
+    enableReadyCheck: false,      // recommended for BullMQ connections
+  };
+  if (cacheConfig.redisUrl) return new Redis(cacheConfig.redisUrl, options);
+  return new Redis({
+    host: cacheConfig.redisHost,
+    port: cacheConfig.redisPort,
+    password: cacheConfig.redisPassword,
+    db: cacheConfig.redisDb,
+    ...options,
+  });
+};
+
 module.exports = {
   redisClient,
   createRedisClient,
+  createQueueConnection,
   isRedisConfigured,
   // Helper to get a client for specific operations (e.g., different DB)
   getClient: (db = 0) => {

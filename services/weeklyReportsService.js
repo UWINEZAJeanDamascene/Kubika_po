@@ -19,6 +19,8 @@ const Payroll = require('../models/Payroll');
 const PayrollRun = require('../models/PayrollRun');
 const Employee = require('../models/Employee');
 const { BankAccount, BankTransaction } = require('../models/BankAccount');
+const { dbClient } = require('../lib/prisma');
+const { toIdString } = require('../utils/objectId');
 
 const toObjectId = (value) => new mongoose.Types.ObjectId(String(value));
 
@@ -59,6 +61,80 @@ const salesOrderMatchStage = (companyId, start, end) => ({
   orderDate: { $gte: start, $lte: end },
   status: { $in: ACTIVE_SALES_ORDER_STATUSES },
 });
+
+async function invoiceMetrics(companyId, start, end) {
+  const result = await dbClient().invoice.aggregate({
+    where: {
+      companyId: toIdString(companyId),
+      invoiceDate: { gte: start, lte: end },
+      status: { in: CONFIRMED_INVOICE_STATUSES },
+    },
+    _sum: { totalAmount: true },
+    _count: { _all: true },
+  });
+  return [{
+    totalSales: toNumber(result._sum.totalAmount),
+    invoiceCount: result._count._all,
+  }];
+}
+
+async function invoiceItemMetrics(companyId, start, end) {
+  const result = await dbClient().invoiceLine.aggregate({
+    where: {
+      companyId: toIdString(companyId),
+      invoice: {
+        invoiceDate: { gte: start, lte: end },
+        status: { in: CONFIRMED_INVOICE_STATUSES },
+      },
+    },
+    _sum: { qty: true },
+  });
+  return [{ totalItems: toNumber(result._sum.qty) }];
+}
+
+async function salesOrderMetrics(companyId, start, end) {
+  const where = {
+    companyId: toIdString(companyId),
+    orderDate: { gte: start, lte: end },
+    status: { in: ACTIVE_SALES_ORDER_STATUSES },
+  };
+  const [orders, lines] = await Promise.all([
+    dbClient().salesOrder.count({ where }),
+    dbClient().salesOrderLine.aggregate({
+      where: { companyId: toIdString(companyId), salesOrder: { orderDate: { gte: start, lte: end }, status: { in: ACTIVE_SALES_ORDER_STATUSES } } },
+      _sum: { qty: true },
+    }),
+  ]);
+  return [{ totalOrders: orders, totalItems: toNumber(lines._sum.qty) }];
+}
+
+async function purchaseOrderSupplierMetrics(companyId, where) {
+  const rows = await dbClient().purchaseOrder.groupBy({
+    by: ['supplierId'],
+    where: { companyId: toIdString(companyId), ...where },
+    _count: { _all: true },
+    _sum: { totalAmount: true },
+  });
+  return rows.map((row) => ({
+    _id: row.supplierId,
+    count: row._count._all,
+    totalValue: toNumber(row._sum.totalAmount),
+  }));
+}
+
+async function grnSupplierMetrics(companyId, start, end) {
+  const rows = await dbClient().goodsReceivedNote.groupBy({
+    by: ['supplierId'],
+    where: { companyId: toIdString(companyId), receivedDate: { gte: start, lte: end }, status: 'confirmed' },
+    _count: { _all: true },
+    _sum: { totalAmount: true },
+  });
+  return rows.map((row) => ({
+    _id: row.supplierId,
+    count: row._count._all,
+    totalValue: toNumber(row._sum.totalAmount),
+  }));
+}
 
 class WeeklyReportsService {
   /**
@@ -107,99 +183,17 @@ class WeeklyReportsService {
       thisWeekOrders, lastWeekOrders
     ] = await Promise.all([
       // This week invoices
-      Invoice.aggregate([
-        { $match: invoiceMatchStage(companyId, start, end) },
-        {
-          $group: {
-            _id: null,
-            totalSales: { $sum: { $toDouble: { $ifNull: ['$totalAmount', '$total'] } } },
-            invoiceCount: { $sum: 1 }
-          }
-        }
-      ]),
+      invoiceMetrics(companyId, start, end),
       // Last week invoices
-      Invoice.aggregate([
-        { $match: invoiceMatchStage(companyId, prevStart, prevEnd) },
-        {
-          $group: {
-            _id: null,
-            totalSales: { $sum: { $toDouble: { $ifNull: ['$totalAmount', '$total'] } } },
-            invoiceCount: { $sum: 1 }
-          }
-        }
-      ]),
+      invoiceMetrics(companyId, prevStart, prevEnd),
       // Items sold this week (from invoice lines)
-      Invoice.aggregate([
-        { $match: invoiceMatchStage(companyId, start, end) },
-        { $unwind: { path: '$lines', preserveNullAndEmptyArrays: false } },
-        {
-          $group: {
-            _id: null,
-            totalItems: { $sum: { $toDouble: { $ifNull: ['$lines.qty', 0] } } }
-          }
-        }
-      ]),
+      invoiceItemMetrics(companyId, start, end),
       // Items sold last week
-      Invoice.aggregate([
-        { $match: invoiceMatchStage(companyId, prevStart, prevEnd) },
-        { $unwind: { path: '$lines', preserveNullAndEmptyArrays: false } },
-        {
-          $group: {
-            _id: null,
-            totalItems: { $sum: { $toDouble: { $ifNull: ['$lines.qty', 0] } } }
-          }
-        }
-      ]),
+      invoiceItemMetrics(companyId, prevStart, prevEnd),
       // This week sales orders
-      SalesOrder.aggregate([
-        { $match: salesOrderMatchStage(companyId, start, end) },
-        {
-          $project: {
-            _id: 1,
-            totalQty: {
-              $sum: {
-                $map: {
-                  input: { $ifNull: ['$lines', []] },
-                  as: 'line',
-                  in: { $toDouble: { $ifNull: ['$$line.qty', 0] } }
-                }
-              }
-            }
-          }
-        },
-        {
-          $group: {
-            _id: null,
-            totalOrders: { $sum: 1 },
-            totalItems: { $sum: '$totalQty' }
-          }
-        }
-      ]),
+      salesOrderMetrics(companyId, start, end),
       // Last week sales orders
-      SalesOrder.aggregate([
-        { $match: salesOrderMatchStage(companyId, prevStart, prevEnd) },
-        {
-          $project: {
-            _id: 1,
-            totalQty: {
-              $sum: {
-                $map: {
-                  input: { $ifNull: ['$lines', []] },
-                  as: 'line',
-                  in: { $toDouble: { $ifNull: ['$$line.qty', 0] } }
-                }
-              }
-            }
-          }
-        },
-        {
-          $group: {
-            _id: null,
-            totalOrders: { $sum: 1 },
-            totalItems: { $sum: '$totalQty' }
-          }
-        }
-      ])
+      salesOrderMetrics(companyId, prevStart, prevEnd)
     ]);
     
     const thisWeek = {
@@ -315,75 +309,20 @@ class WeeklyReportsService {
     }, { name: 1 }).lean();
     
     // Get POs raised this week
-    const posRaised = await PurchaseOrder.aggregate([
-      {
-        $match: {
-          company: toObjectId(companyId),
-          orderDate: { $gte: start, $lte: end }
-        }
-      },
-      {
-        $group: {
-          _id: '$supplier',
-          count: { $sum: 1 },
-          totalValue: { $sum: { $toDouble: { $ifNull: ['$totalAmount', '$total'] } } }
-        }
-      }
-    ]);
+    const posRaised = await purchaseOrderSupplierMetrics(companyId, { orderDate: { gte: start, lte: end } });
     
     // Get GRNs received this week
-    const grnsReceived = await GoodsReceivedNote.aggregate([
-      {
-        $match: {
-          company: toObjectId(companyId),
-          receivedDate: { $gte: start, $lte: end },
-          status: 'confirmed'
-        }
-      },
-      {
-        $group: {
-          _id: '$supplier',
-          count: { $sum: 1 },
-          totalValue: { $sum: { $toDouble: '$totalAmount' } }
-        }
-      }
-    ]);
+    const grnsReceived = await grnSupplierMetrics(companyId, start, end);
     
     // Get pending orders (not yet fully received)
-    const pendingOrders = await PurchaseOrder.aggregate([
-      {
-        $match: {
-          company: toObjectId(companyId),
-          status: { $in: ['approved', 'partially_received'] }
-        }
-      },
-      {
-        $group: {
-          _id: '$supplier',
-          count: { $sum: 1 },
-          totalValue: { $sum: { $toDouble: { $ifNull: ['$totalAmount', '$total'] } } }
-        }
-      }
-    ]);
+    const pendingOrders = await purchaseOrderSupplierMetrics(companyId, { status: { in: ['approved', 'partially_received'] } });
     
     // Get overdue deliveries (expected delivery date passed)
     const today = new Date();
-    const overdueOrders = await PurchaseOrder.aggregate([
-      {
-        $match: {
-          company: toObjectId(companyId),
-          expectedDeliveryDate: { $lt: today },
-          status: { $in: ['approved', 'partially_received'] }
-        }
-      },
-      {
-        $group: {
-          _id: '$supplier',
-          count: { $sum: 1 },
-          totalValue: { $sum: { $toDouble: { $ifNull: ['$totalAmount', '$total'] } } }
-        }
-      }
-    ]);
+    const overdueOrders = await purchaseOrderSupplierMetrics(companyId, {
+      expectedDeliveryDate: { lt: today },
+      status: { in: ['approved', 'partially_received'] },
+    });
     
     // Combine into supplier performance data
     const performanceMap = new Map();
@@ -555,23 +494,22 @@ class WeeklyReportsService {
       })
         .populate('supplier', 'name')
         .lean(),
-      PurchaseOrder.aggregate([
-        {
-          $match: {
-            company: toObjectId(companyId),
-            status: { $in: ['approved', 'partially_received', 'received'] },
-            balance: { $gt: 0 }
-          }
+      dbClient().purchaseOrder.findMany({
+        where: {
+          companyId: toIdString(companyId),
+          status: { in: ['approved', 'partially_received', 'received'] },
+          balance: { gt: 0 },
         },
-        {
-          $lookup: {
-            from: 'suppliers',
-            localField: 'supplier',
-            foreignField: '_id',
-            as: 'supplierDoc'
-          }
-        }
-      ])
+        select: {
+          id: true,
+          referenceNo: true,
+          orderDate: true,
+          expectedDeliveryDate: true,
+          totalAmount: true,
+          balance: true,
+          supplier: { select: { id: true, name: true } },
+        },
+      })
     ]);
 
     const payableItems = [
@@ -585,12 +523,12 @@ class WeeklyReportsService {
         balance: toNumber(grn.balance)
       })),
       ...unpaidOrders.map((po) => ({
-        purchaseId: po._id,
+        purchaseId: po.id,
         purchaseNumber: po.referenceNo || po.purchaseOrderNumber || 'PO',
-        supplierName: po.supplierDoc?.[0]?.name || 'Unknown',
+        supplierName: po.supplier?.name || 'Unknown',
         purchaseDate: po.orderDate,
         dueDate: new Date(po.expectedDeliveryDate || po.orderDate),
-        totalAmount: toNumber(po.totalAmount) || toNumber(po.total),
+        totalAmount: toNumber(po.totalAmount),
         balance: toNumber(po.balance)
       }))
     ];
@@ -670,23 +608,20 @@ class WeeklyReportsService {
       weekDates.push(d);
     }
     
-    const bankTransactions = await BankTransaction.aggregate([
-      {
-        $match: {
-          company: toObjectId(companyId),
-          date: { $gte: start, $lte: end }
-        }
-      },
-      {
-        $group: {
-          _id: {
-            date: { $dateToString: { format: '%Y-%m-%d', date: '$date' } },
-            type: '$type'
-          },
-          amount: { $sum: { $toDouble: { $ifNull: ['$amount', 0] } } }
-        }
-      }
-    ]);
+    const bankRows = await dbClient().$queryRaw`
+      SELECT TO_CHAR(DATE_TRUNC('day', date), 'YYYY-MM-DD') AS date,
+             type,
+             COALESCE(SUM(amount), 0)::float AS amount
+      FROM bank_transactions
+      WHERE company_id = ${toIdString(companyId)}
+        AND date >= ${start} AND date <= ${end}
+      GROUP BY DATE_TRUNC('day', date), type
+      ORDER BY DATE_TRUNC('day', date)
+    `;
+    const bankTransactions = bankRows.map((row) => ({
+      _id: { date: row.date, type: row.type },
+      amount: row.amount,
+    }));
     
     // Get Cash/Bank account codes
     const cashBankAccounts = await ChartOfAccount.find({
@@ -700,51 +635,32 @@ class WeeklyReportsService {
     const cashBankCodes = cashBankAccounts.map(a => a.code);
     
     // Fallback source: posted journal entries for cash/bank accounts if no bank transactions exist.
-    const cashInJournals = cashBankCodes.length > 0 ? await JournalEntry.aggregate([
-      {
-        $match: {
-          company: toObjectId(companyId),
-          date: { $gte: start, $lte: end },
-          status: 'posted'
-        }
-      },
-      { $unwind: '$lines' },
-      {
-        $match: {
-          'lines.accountCode': { $in: cashBankCodes },
-          'lines.debit': { $gt: 0 }
-        }
-      },
-      {
-        $group: {
-          _id: { $dateToString: { format: '%Y-%m-%d', date: '$date' } },
-          amount: { $sum: { $toDouble: '$lines.debit' } }
-        }
-      }
-    ]) : [];
-    
-    const cashOutJournals = cashBankCodes.length > 0 ? await JournalEntry.aggregate([
-      {
-        $match: {
-          company: toObjectId(companyId),
-          date: { $gte: start, $lte: end },
-          status: 'posted'
-        }
-      },
-      { $unwind: '$lines' },
-      {
-        $match: {
-          'lines.accountCode': { $in: cashBankCodes },
-          'lines.credit': { $gt: 0 }
-        }
-      },
-      {
-        $group: {
-          _id: { $dateToString: { format: '%Y-%m-%d', date: '$date' } },
-          amount: { $sum: { $toDouble: '$lines.credit' } }
-        }
-      }
-    ]) : [];
+    const [cashInRows, cashOutRows] = cashBankCodes.length > 0
+      ? await Promise.all([
+        dbClient().$queryRaw`
+          SELECT TO_CHAR(DATE_TRUNC('day', je.date), 'YYYY-MM-DD') AS date,
+                 COALESCE(SUM(jel.debit), 0)::float AS amount
+          FROM journal_entry_lines jel
+          JOIN journal_entries je ON je.id = jel.journal_entry_id
+          WHERE je.company_id = ${toIdString(companyId)} AND je.status = 'posted'
+            AND je.date >= ${start} AND je.date <= ${end}
+            AND jel.account_code = ANY(${cashBankCodes}::text[]) AND jel.debit > 0
+          GROUP BY DATE_TRUNC('day', je.date)
+        `,
+        dbClient().$queryRaw`
+          SELECT TO_CHAR(DATE_TRUNC('day', je.date), 'YYYY-MM-DD') AS date,
+                 COALESCE(SUM(jel.credit), 0)::float AS amount
+          FROM journal_entry_lines jel
+          JOIN journal_entries je ON je.id = jel.journal_entry_id
+          WHERE je.company_id = ${toIdString(companyId)} AND je.status = 'posted'
+            AND je.date >= ${start} AND je.date <= ${end}
+            AND jel.account_code = ANY(${cashBankCodes}::text[]) AND jel.credit > 0
+          GROUP BY DATE_TRUNC('day', je.date)
+        `,
+      ])
+      : [[], []];
+    const cashInJournals = cashInRows.map((row) => ({ _id: row.date, amount: row.amount }));
+    const cashOutJournals = cashOutRows.map((row) => ({ _id: row.date, amount: row.amount }));
     
     const hasBankTransactions = bankTransactions.length > 0;
     

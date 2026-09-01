@@ -12,8 +12,10 @@ const FinanceDashboardService = require('../services/dashboards/FinanceDashboard
 const PurchaseDashboardService = require('../services/dashboards/PurchaseDashboardService');
 const SalesDashboardService = require('../services/dashboards/SalesDashboardService');
 const ExecutiveDashboardService = require('../services/dashboards/ExecutiveDashboardService');
-const mongoose = require('mongoose');
 const { parsePagination, paginationMeta, MAX_LIMIT } = require('../utils/pagination');
+const { dbClient } = require('../lib/prisma');
+const { toIdString } = require('../utils/objectId');
+const { decimalToNumber } = require('../utils/decimalHelpers');
 
 // @desc    Get dashboard statistics
 // @route   GET /api/dashboard/stats
@@ -29,100 +31,83 @@ exports.getDashboardStats = async (req, res, next) => {
     }
 
     const companyId = req.user.company._id;
-    const companyOid = mongoose.Types.ObjectId.isValid(companyId)
-      ? new mongoose.Types.ObjectId(companyId)
-      : companyId;
+    const companyKey = toIdString(companyId);
     const today = new Date();
     const startOfMonth = new Date(today.getFullYear(), today.getMonth(), 1);
     const startOfYear = new Date(today.getFullYear(), 0, 1);
 
     // Product stats
-    const totalProducts = await Product.countDocuments({ company: companyId, isArchived: false });
+    const totalProducts = await dbClient().product.count({ where: { companyId: companyKey, isArchived: false } });
 
     const [lowStockProducts, outOfStockProducts, stockValAgg] = await Promise.all([
-      Product.countDocuments({
-        company: companyId,
-        isArchived: false,
-        currentStock: { $gt: 0 },
-        $expr: { $lte: ['$currentStock', '$lowStockThreshold'] },
-      }),
-      Product.countDocuments({ company: companyId, isArchived: false, currentStock: 0 }),
-      Product.aggregate([
-        { $match: { company: companyOid, isArchived: false } },
-        {
-          $group: {
-            _id: null,
-            totalValue: { $sum: { $multiply: [{ $ifNull: ['$currentStock', 0] }, { $ifNull: ['$averageCost', 0] }] } },
-          },
-        },
-      ]),
+      dbClient().$queryRaw`
+        SELECT COUNT(*)::int AS count
+        FROM products
+        WHERE company_id = ${companyKey}
+          AND is_archived = false
+          AND current_stock > 0
+          AND current_stock <= low_stock_threshold
+      `,
+      dbClient().product.count({ where: { companyId: companyKey, isArchived: false, currentStock: 0 } }),
+      dbClient().$queryRaw`
+        SELECT COALESCE(SUM(current_stock * average_cost), 0)::float AS "totalValue"
+        FROM products
+        WHERE company_id = ${companyKey} AND is_archived = false
+      `,
     ]);
 
-    const totalStockValue = stockValAgg[0]?.totalValue || 0;
+    const totalStockValue = Number(stockValAgg[0]?.totalValue || 0);
+    const lowStockCount = Number(lowStockProducts[0]?.count || 0);
 
     // Previous month product stats for comparison
     const startOfLastMonth = new Date(today.getFullYear(), today.getMonth() - 1, 1);
     const endOfLastMonth = new Date(today.getFullYear(), today.getMonth(), 0);
-    const totalProductsLastMonth = await Product.countDocuments({
-      company: companyId,
-      isArchived: false,
-      createdAt: { $lte: endOfLastMonth }
+    const totalProductsLastMonth = await dbClient().product.count({
+      where: { companyId: companyKey, isArchived: false, createdAt: { lte: endOfLastMonth } },
     });
 
     // Previous month client stats
-    const totalClientsLastMonth = await Client.countDocuments({ 
-      company: companyId,
-      isActive: true,
-      createdAt: { $lte: endOfLastMonth }
+    const totalClientsLastMonth = await dbClient().client.count({
+      where: { companyId: companyKey, isActive: true, createdAt: { lte: endOfLastMonth } },
     });
 
     // Invoice stats
-    const totalInvoices = await Invoice.countDocuments({ company: companyId });
-    const pendingInvoices = await Invoice.countDocuments({ 
-      company: companyId,
-      status: { $in: ['pending', 'partial', 'overdue'] } 
+    const totalInvoices = await dbClient().invoice.count({ where: { companyId: companyKey } });
+    const pendingInvoices = await dbClient().invoice.count({
+      where: { companyId: companyKey, status: { in: ['pending', 'partial', 'overdue'] } },
     });
     
-    const monthlyInvoices = await Invoice.aggregate([
-      { $match: { company: companyId, invoiceDate: { $gte: startOfMonth } } },
-      { $group: { 
-        _id: null, 
-        total: { $sum: '$grandTotal' },
-        paid: { $sum: '$amountPaid' },
-        count: { $sum: 1 }
-      }}
-    ]);
+    const monthlyInvoices = await dbClient().invoice.aggregate({
+      where: { companyId: companyKey, invoiceDate: { gte: startOfMonth } },
+      _sum: { totalAmount: true, amountPaid: true },
+      _count: { _all: true },
+    });
 
     // Subtract credit notes issued this month from sales totals to reflect net sales
-    const monthlyCreditNotes = await CreditNote.aggregate([
-      { $match: { company: companyId, issueDate: { $gte: startOfMonth }, status: { $ne: 'draft' } } },
-      { $group: { _id: null, totalCredits: { $sum: '$grandTotal' } } }
-    ]);
+    const monthlyCreditNotes = await dbClient().creditNote.aggregate({
+      where: { companyId: companyKey, creditDate: { gte: startOfMonth }, status: { not: 'draft' } },
+      _sum: { totalAmount: true },
+    });
 
-    const yearlyInvoices = await Invoice.aggregate([
-      { $match: { company: companyId, invoiceDate: { $gte: startOfYear } } },
-      { $group: { 
-        _id: null, 
-        total: { $sum: '$grandTotal' },
-        paid: { $sum: '$amountPaid' },
-        count: { $sum: 1 }
-      }}
-    ]);
+    const yearlyInvoices = await dbClient().invoice.aggregate({
+      where: { companyId: companyKey, invoiceDate: { gte: startOfYear } },
+      _sum: { totalAmount: true, amountPaid: true },
+      _count: { _all: true },
+    });
 
     // Subtract credit notes for the year
-    const yearlyCreditNotes = await CreditNote.aggregate([
-      { $match: { company: companyId, issueDate: { $gte: startOfYear }, status: { $ne: 'draft' } } },
-      { $group: { _id: null, totalCredits: { $sum: '$grandTotal' } } }
-    ]);
+    const yearlyCreditNotes = await dbClient().creditNote.aggregate({
+      where: { companyId: companyKey, creditDate: { gte: startOfYear }, status: { not: 'draft' } },
+      _sum: { totalAmount: true },
+    });
 
     // Quotation stats
-    const activeQuotations = await Quotation.countDocuments({ 
-      company: companyId,
-      status: { $in: ['draft', 'sent', 'approved'] } 
+    const activeQuotations = await dbClient().quotation.count({
+      where: { companyId: companyKey, status: { in: ['draft', 'sent', 'approved'] } },
     });
 
     // Client stats
-    const totalClients = await Client.countDocuments({ company: companyId, isActive: true });
+    const totalClients = await dbClient().client.count({ where: { companyId: companyKey, isActive: true } });
 
     res.json({
       success: true,
@@ -130,7 +115,7 @@ exports.getDashboardStats = async (req, res, next) => {
         products: {
           total: totalProducts,
           totalLastMonth: totalProductsLastMonth,
-          lowStock: lowStockProducts,
+          lowStock: lowStockCount,
           outOfStock: outOfStockProducts,
           totalValue: totalStockValue
         },
@@ -138,15 +123,15 @@ exports.getDashboardStats = async (req, res, next) => {
           total: totalInvoices,
           pending: pendingInvoices,
           monthly: {
-            count: monthlyInvoices[0]?.count || 0,
+            count: monthlyInvoices._count._all || 0,
             // subtract credit notes to show net sales
-            total: (monthlyInvoices[0]?.total || 0) - (monthlyCreditNotes[0]?.totalCredits || 0),
-            paid: monthlyInvoices[0]?.paid || 0
+            total: decimalToNumber(monthlyInvoices._sum.totalAmount) - decimalToNumber(monthlyCreditNotes._sum.totalAmount),
+            paid: decimalToNumber(monthlyInvoices._sum.amountPaid)
           },
           yearly: {
-            count: yearlyInvoices[0]?.count || 0,
-            total: (yearlyInvoices[0]?.total || 0) - (yearlyCreditNotes[0]?.totalCredits || 0),
-            paid: yearlyInvoices[0]?.paid || 0
+            count: yearlyInvoices._count._all || 0,
+            total: decimalToNumber(yearlyInvoices._sum.totalAmount) - decimalToNumber(yearlyCreditNotes._sum.totalAmount),
+            paid: decimalToNumber(yearlyInvoices._sum.amountPaid)
           }
         },
         quotations: {
@@ -257,30 +242,37 @@ exports.getTopSellingProducts = async (req, res, next) => {
       if (endDate) matchStage.movementDate.$lte = new Date(endDate);
     }
 
-    const topProducts = await StockMovement.aggregate([
-      { $match: matchStage },
-      { $group: {
-        _id: '$product',
-        totalQuantity: { $sum: '$quantity' },
-        totalRevenue: { $sum: '$totalCost' },
-        salesCount: { $sum: 1 }
-      }},
-      { $sort: { totalQuantity: -1 } },
-      { $limit: limit }
-    ]);
-
-    // Populate product details
-    await Product.populate(topProducts, { 
-      path: '_id', 
-      select: 'name sku unit category',
-      match: { company: companyId },
-      populate: { path: 'category', select: 'name' }
+    const topProducts = await dbClient().stockMovement.groupBy({
+      by: ['productId'],
+      where: {
+        companyId: toIdString(companyId), type: 'out', reason: 'sale',
+        ...(startDate || endDate ? { movementDate: {
+          ...(startDate ? { gte: new Date(startDate) } : {}),
+          ...(endDate ? { lte: new Date(endDate) } : {}),
+        } } : {}),
+      },
+      _sum: { quantity: true, totalCost: true },
+      _count: { _all: true },
+      orderBy: { _sum: { quantity: 'desc' } },
+      take: limit,
     });
+    const productIds = topProducts.map((row) => row.productId).filter(Boolean);
+    const products = await dbClient().product.findMany({
+      where: { companyId: toIdString(companyId), id: { in: productIds } },
+      select: { id: true, name: true, sku: true, unit: true, category: { select: { name: true } } },
+    });
+    const productById = new Map(products.map((product) => [product.id, product]));
+    const topProductRows = topProducts.map((row) => ({
+      _id: productById.get(row.productId) || row.productId,
+      totalQuantity: decimalToNumber(row._sum.quantity),
+      totalRevenue: decimalToNumber(row._sum.totalCost),
+      salesCount: row._count._all,
+    }));
 
     res.json({
       success: true,
-      count: topProducts.length,
-      data: topProducts
+      count: topProductRows.length,
+      data: topProductRows
     });
   } catch (error) {
     next(error);
@@ -315,29 +307,37 @@ exports.getTopClients = async (req, res, next) => {
       if (endDate) matchStage.invoiceDate.$lte = new Date(endDate);
     }
 
-    const topClients = await Invoice.aggregate([
-      { $match: matchStage },
-      { $group: {
-        _id: '$client',
-        totalAmount: { $sum: '$grandTotal' },
-        totalPaid: { $sum: '$amountPaid' },
-        invoiceCount: { $sum: 1 }
-      }},
-      { $sort: { totalAmount: -1 } },
-      { $limit: limit }
-    ]);
-
-    // Populate client details
-    await Client.populate(topClients, { 
-      path: '_id', 
-      match: { company: companyId },
-      select: 'name code contact type'
+    const topClients = await dbClient().invoice.groupBy({
+      by: ['clientId'],
+      where: {
+        companyId: toIdString(companyId), status: { in: ['paid', 'partial'] },
+        ...(startDate || endDate ? { invoiceDate: {
+          ...(startDate ? { gte: new Date(startDate) } : {}),
+          ...(endDate ? { lte: new Date(endDate) } : {}),
+        } } : {}),
+      },
+      _sum: { totalAmount: true, amountPaid: true },
+      _count: { _all: true },
+      orderBy: { _sum: { totalAmount: 'desc' } },
+      take: limit,
     });
+    const clientIds = topClients.map((row) => row.clientId);
+    const clients = await dbClient().client.findMany({
+      where: { companyId: toIdString(companyId), id: { in: clientIds } },
+      select: { id: true, name: true, code: true, contact: true, type: true },
+    });
+    const clientById = new Map(clients.map((client) => [client.id, client]));
+    const topClientRows = topClients.map((row) => ({
+      _id: clientById.get(row.clientId) || row.clientId,
+      totalAmount: decimalToNumber(row._sum.totalAmount),
+      totalPaid: decimalToNumber(row._sum.amountPaid),
+      invoiceCount: row._count._all,
+    }));
 
     res.json({
       success: true,
-      count: topClients.length,
-      data: topClients
+      count: topClientRows.length,
+      data: topClientRows
     });
   } catch (error) {
     next(error);
@@ -360,44 +360,31 @@ exports.getSalesChart = async (req, res, next) => {
     const companyId = req.user.company._id;
     const { period = 'month' } = req.query; // 'week', 'month', 'year'
     
-    let groupBy;
     let startDate = new Date();
 
     if (period === 'week') {
       startDate.setDate(startDate.getDate() - 7);
-      groupBy = { 
-        $dateToString: { format: '%Y-%m-%d', date: '$invoiceDate' }
-      };
     } else if (period === 'month') {
       startDate.setMonth(startDate.getMonth() - 1);
-      groupBy = { 
-        $dateToString: { format: '%Y-%m-%d', date: '$invoiceDate' }
-      };
     } else {
       startDate.setFullYear(startDate.getFullYear() - 1);
-      groupBy = { 
-        $dateToString: { format: '%Y-%m', date: '$invoiceDate' }
-      };
     }
 
-    const salesData = await Invoice.aggregate([
-      { $match: { 
-        company: companyId,
-        invoiceDate: { $gte: startDate },
-        status: { $ne: 'cancelled' }
-      }},
-      { $group: {
-        _id: groupBy,
-        sales: { $sum: '$grandTotal' },
-        totalPaid: { $sum: '$amountPaid' },
-        invoiceCount: { $sum: 1 }
-      }},
-      { $sort: { _id: 1 } }
-    ]);
+    const bucket = period === 'year' ? 'month' : 'day';
+    const salesData = await dbClient().$queryRaw`
+      SELECT TO_CHAR(DATE_TRUNC(${bucket}, invoice_date), ${period === 'year' ? 'YYYY-MM' : 'YYYY-MM-DD'}) AS month,
+             COALESCE(SUM(total_amount), 0)::float AS sales
+      FROM invoices
+      WHERE company_id = ${toIdString(companyId)}
+        AND invoice_date >= ${startDate}
+        AND status <> 'cancelled'
+      GROUP BY DATE_TRUNC(${bucket}, invoice_date)
+      ORDER BY DATE_TRUNC(${bucket}, invoice_date)
+    `;
 
     // Transform data for frontend chart
     const formattedSalesData = salesData.map(item => ({
-      month: item._id,
+      month: item.month,
       sales: item.sales
     }));
 
@@ -436,18 +423,16 @@ exports.getStockMovementChart = async (req, res, next) => {
       startDate.setFullYear(startDate.getFullYear() - 1);
     }
 
-    const movementData = await StockMovement.aggregate([
-      { $match: { company: companyId, movementDate: { $gte: startDate } } },
-      { $group: {
-        _id: '$type',
-        quantity: { $sum: '$quantity' }
-      }}
-    ]);
+    const movementData = await dbClient().stockMovement.groupBy({
+      by: ['type'],
+      where: { companyId: toIdString(companyId), movementDate: { gte: startDate } },
+      _sum: { quantity: true },
+    });
 
     // Transform data for frontend chart
     const formattedStockData = movementData.map(item => ({
-      type: item._id || 'unknown',
-      quantity: item.quantity
+      type: item.type || 'unknown',
+      quantity: decimalToNumber(item._sum.quantity)
     }));
 
     res.json({

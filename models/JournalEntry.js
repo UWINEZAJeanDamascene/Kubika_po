@@ -4,7 +4,7 @@
  */
 
 const mongoose = require('mongoose');
-const { prisma } = require('../lib/prisma');
+const { prisma, dbClient } = require('../lib/prisma');
 const { makeCompatModel, toId } = require('../utils/prismaCompat');
 const { decimalToNumber } = require('../utils/decimalHelpers');
 const { runInPrismaTransaction } = require('../services/transactionService');
@@ -59,7 +59,7 @@ JournalEntryDoc.prototype.save = async function save() {
 
   if (this.isNew || !this._id) {
     const createData = await journalEntryTranslateCreate(this);
-    const row = await prisma.journalEntry.create({ data: createData, include: LINE_INCLUDE });
+    const row = await dbClient().journalEntry.create({ data: createData, include: LINE_INCLUDE });
     Object.assign(this, journalEntryToApi(row));
     this.isNew = false;
 
@@ -75,7 +75,7 @@ JournalEntryDoc.prototype.save = async function save() {
     return this;
   }
 
-  const existing = await prisma.journalEntry.findUnique({
+  const existing = await dbClient().journalEntry.findUnique({
     where: { id: String(this._id) },
     select: { status: true, isLocked: true },
   });
@@ -133,6 +133,7 @@ JournalEntryDoc.prototype.isBalanced = function isBalanced() {
 
 const base = makeCompatModel({
   delegate: () => prisma.journalEntry,
+  delegateName: 'journalEntry',
   fieldMap: FIELD_MAP,
   toApi: journalEntryToApi,
   translateCreate: journalEntryTranslateCreate,
@@ -199,7 +200,7 @@ JournalEntry.generateEntryNumber = async function generateEntryNumber(companyId)
 };
 
 JournalEntry.getTrialBalance = async function getTrialBalance(companyId, startDate, endDate) {
-  const entries = await prisma.journalEntry.findMany({
+  const entries = await dbClient().journalEntry.findMany({
     where: {
       companyId: String(companyId),
       status: 'posted',

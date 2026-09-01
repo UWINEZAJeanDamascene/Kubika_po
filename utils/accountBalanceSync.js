@@ -2,7 +2,7 @@
  * Keep AccountBalance in sync with posted journal entries.
  */
 
-const { prisma } = require('../lib/prisma');
+const { prisma, dbClient } = require('../lib/prisma');
 const AccountBalance = require('../models/AccountBalance');
 const { decimalToNumber } = require('./decimalHelpers');
 const { toIdString } = require('./objectId');
@@ -35,9 +35,9 @@ async function rebuildAccountBalancesFromJournal(companyId) {
   const cid = toIdString(companyId);
   if (!cid) throw new Error('companyId is required');
 
-  await prisma.accountBalance.deleteMany({ where: { companyId: cid } });
+  await dbClient().accountBalance.deleteMany({ where: { companyId: cid } });
 
-  const entries = await prisma.journalEntry.findMany({
+  const entries = await dbClient().journalEntry.findMany({
     where: {
       companyId: cid,
       status: 'posted',
@@ -51,7 +51,7 @@ async function rebuildAccountBalancesFromJournal(companyId) {
     await applyJournalLinesToAccountBalances(cid, entry.lines || [], 1);
   }
 
-  const count = await prisma.accountBalance.count({ where: { companyId: cid } });
+  const count = await dbClient().accountBalance.count({ where: { companyId: cid } });
   return { companyId: cid, journalEntries: entries.length, accountBalanceRows: count };
 }
 

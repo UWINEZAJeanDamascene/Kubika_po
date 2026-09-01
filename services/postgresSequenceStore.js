@@ -7,6 +7,22 @@ const { prisma } = require('../lib/prisma');
 
 const MAX_VSDC_NUMBER = 9999999999;
 
+/**
+ * Sequence counters deliberately do NOT join the caller's ambient transaction
+ * (see lib/txContext.js), unlike every other write in this codebase.
+ *
+ * `INSERT … ON CONFLICT DO UPDATE … RETURNING` holds a row lock until its
+ * transaction ends. Enlisting it in a document-posting transaction would hold
+ * that lock for the whole posting — every concurrent invoice for the same
+ * company would serialize behind it, up to the 30s transaction timeout. Running
+ * on the plain client commits the increment immediately, so concurrent postings
+ * never block each other.
+ *
+ * The trade-off is that a rolled-back posting burns its number, leaving a gap
+ * in the series. That is the normal, auditable behaviour for document numbering
+ * and is far preferable to duplicate numbers or serialized POS throughput. Pass
+ * an explicit `tx` at a call site that genuinely needs gapless allocation.
+ */
 function client(tx) {
   return tx || prisma;
 }

@@ -3,7 +3,7 @@
  */
 
 const { buildTenantModel } = require('../utils/masterDataCommon');
-const { prisma } = require('../lib/prisma');
+const { prisma, dbClient } = require('../lib/prisma');
 const {
   salaryHistoryToApi,
   salaryHistoryTranslateCreate,
@@ -29,7 +29,7 @@ const SalaryHistory = buildTenantModel({
 });
 
 SalaryHistory.getEffectiveSalary = async function(employeeId, asOfDate, companyId) {
-  const rows = await prisma.salaryHistory.findMany({
+  const rows = await dbClient().salaryHistory.findMany({
     where: {
       companyId,
       employeeId,

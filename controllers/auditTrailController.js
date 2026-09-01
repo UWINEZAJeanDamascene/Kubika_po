@@ -1,4 +1,5 @@
 const ActionLog = require('../models/ActionLog');
+const { wantsCursor, cursorFilter, cursorSort, cursorPage } = require('../utils/cursorPagination');
 const { redactSensitive } = require('../utils/redactSensitive');
 
 const sanitizeLog = (log) => {
@@ -50,6 +51,24 @@ exports.getAuditTrail = async (req, res, next) => {
 
     const sort = {};
     sort[sortBy] = sortOrder === 'asc' ? 1 : -1;
+
+    // Cursor mode is opt-in. The audit trail is append-only and the largest
+    // table in a mature install, so deep offsets here are exactly what keyset
+    // pagination is for. page/limit is untouched for existing callers.
+    if (wantsCursor(req.query)) {
+      const pageSize = Math.min(Math.max(Number(limit) || 50, 1), 100);
+      const direction = sortOrder === 'asc' ? 'asc' : 'desc';
+      const cursorQuery = { ...query, ...cursorFilter(req.query.cursor, direction) };
+
+      const rows = await ActionLog.find(cursorQuery)
+        .populate('user', 'name email')
+        .sort(cursorSort(sortBy, direction))
+        .limit(pageSize + 1)
+        .lean();
+
+      const { data, pagination } = cursorPage(rows, pageSize, sortBy);
+      return res.json({ success: true, count: data.length, data, pagination });
+    }
 
     const total = await ActionLog.countDocuments(query);
     const logs = await ActionLog.find(query)

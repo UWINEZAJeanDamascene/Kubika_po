@@ -1,43 +1,49 @@
-const mongoose = require('mongoose');
+/**
+ * NotificationSettings — PostgreSQL (Prisma) backed.
+ *
+ * One row per company (enforced by a unique index on company_id, where Mongo
+ * used `unique: true` on the field).
+ *
+ * The document shape callers see is unchanged — `emailNotifications`,
+ * `smsNotifications` and `preferences` are still nested objects — but they are
+ * stored as flat columns so the defaults live in the database rather than in a
+ * Mongoose schema. See utils/notificationMappers.js.
+ */
 
-const notificationSettingsSchema = new mongoose.Schema({
-  company: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Company',
-    required: true,
-    unique: true
-  },
-  // Email notifications
-  emailNotifications: {
-    enabled: { type: Boolean, default: true },
-    invoiceDelivery: { type: Boolean, default: false },
-    paymentReminders: { type: Boolean, default: true },
-    lowStockAlerts: { type: Boolean, default: true },
-    dailySummary: { type: Boolean, default: false },
-    weeklySummary: { type: Boolean, default: true }
-  },
-  // SMS notifications
-  smsNotifications: {
-    enabled: { type: Boolean, default: false },
-    criticalOnly: { type: Boolean, default: true },
-    adminPhones: [{ type: String }] // Array of phone numbers
-  },
-  // Notification preferences
-  preferences: {
-    lowStockThreshold: { type: Number, default: 10 },
-    paymentReminderDays: { type: Number, default: 3 },
-    summarySendTime: { type: String, default: '09:00' }, // HH:MM format
-    largeOrderThreshold: { type: Number, default: 10000 }
-  },
-  // Admin phone numbers for critical alerts
-  criticalAlertPhones: [{ type: String }],
-  createdAt: { type: Date, default: Date.now },
-  updatedAt: { type: Date, default: Date.now }
+const { buildTenantModel } = require('../utils/masterDataCommon');
+const {
+  notificationSettingsToApi,
+  notificationSettingsTranslateCreate,
+  notificationSettingsTranslateUpdate,
+} = require('../utils/notificationMappers');
+
+const FIELD_MAP = {
+  // Nested groups are not queryable as such; callers filter by company only.
+  emailNotifications: { target: 'emailEnabled' },
+  smsNotifications: { target: 'smsEnabled' },
+};
+
+const NotificationSettings = buildTenantModel({
+  name: 'NotificationSettings',
+  collection: 'notificationsettings',
+  delegateName: 'notificationSettings',
+  fieldMap: FIELD_MAP,
+  toApi: notificationSettingsToApi,
+  translateCreate: notificationSettingsTranslateCreate,
+  translateUpdate: notificationSettingsTranslateUpdate,
 });
 
-notificationSettingsSchema.pre('save', function(next) {
-  this.updatedAt = new Date();
-  next();
-});
+/**
+ * Settings for a company, creating the row from database defaults when absent.
+ *
+ * The scheduler previously relied on Mongoose defaults materialising on a fresh
+ * document; with the defaults now on the columns, an explicit upsert gives the
+ * same result and avoids every caller having to handle null.
+ */
+NotificationSettings.getOrCreateForCompany = async function getOrCreateForCompany(companyId) {
+  const existing = await NotificationSettings.findOne({ company: companyId });
+  if (existing) return existing;
+  return NotificationSettings.create({ company: companyId });
+};
 
-module.exports = mongoose.model('NotificationSettings', notificationSettingsSchema);
+module.exports = NotificationSettings;

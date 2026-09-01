@@ -2,7 +2,7 @@
  * PettyCash models — PostgreSQL (Prisma) backed.
  */
 
-const { prisma } = require('../lib/prisma');
+const { prisma, dbClient } = require('../lib/prisma');
 const { buildTenantModel } = require('../utils/masterDataCommon');
 const { buildConstructorModel } = require('../utils/bankAccountMethods');
 const {
@@ -112,7 +112,7 @@ PettyCashFloat.invalidateCacheForLedgerAccount = async function invalidateCacheF
 };
 
 PettyCashFloat.getCurrentBalance = async function getCurrentBalance(floatId) {
-  const rows = await prisma.pettyCashTransaction.findMany({
+  const rows = await dbClient().pettyCashTransaction.findMany({
     where: { floatId: String(floatId) },
     select: { amount: true },
   });

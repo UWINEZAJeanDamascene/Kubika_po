@@ -1,4 +1,5 @@
 ﻿const mongoose = require('mongoose');
+const { wantsCursor, cursorFilter, cursorSort, cursorPage } = require('../utils/cursorPagination');
 const StockMovement = require('../models/StockMovement');
 const Product = require('../models/Product');
 const Supplier = require('../models/Supplier');
@@ -59,6 +60,27 @@ exports.getStockMovements = async (req, res, next) => {
       'warehouse', 'referenceType', 'referenceNumber', 'notes', 'movementDate', 'ebm',
       'createdAt', 'updatedAt'
     ].join(' ');
+
+    // Cursor mode is opt-in (send `cursor` or `mode=cursor`). Stock movements
+    // are append-only and grow without bound, so deep offsets here are the
+    // classic case for keyset pagination — but page/limit keeps working
+    // unchanged for every existing caller.
+    if (wantsCursor(req.query)) {
+      const pageSize = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 100);
+      const cursorQuery = { ...query, ...cursorFilter(req.query.cursor, 'desc') };
+
+      // limit + 1 probes for a further page without counting the whole table —
+      // skipping the count is much of the benefit at scale.
+      const rows = await StockMovement.find(cursorQuery)
+        .select(STOCK_MOVEMENT_LIST_SELECT)
+        .populate('product', 'name sku unit')
+        .populate('warehouse', 'name code')
+        .sort(cursorSort('movementDate', 'desc'))
+        .limit(pageSize + 1);
+
+      const { data, pagination } = cursorPage(rows, pageSize, 'movementDate');
+      return res.json({ success: true, count: data.length, data, pagination });
+    }
 
     const total = await StockMovement.countDocuments(query);
     const movements = await StockMovement.find(query)

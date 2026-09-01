@@ -24,12 +24,16 @@ const { requirePermission } = require('../middleware/rbacMiddleware');
 const logAction = require('../middleware/logAction');
 const validateRequest = require('../middleware/validateRequest');
 const stripUnvalidatedBody = require('../middleware/stripUnvalidatedBody');
+const { cacheMiddleware, cacheInvalidationMiddleware } = require('../middleware/cacheMiddleware');
+
+const cacheClients = cacheMiddleware({ type: 'client', ttl: 300 });
+const invalidateClients = cacheInvalidationMiddleware({ type: 'client' });
 
 router.use(protect);
 
 router.route('/')
-  .get(requirePermission('clients', 'read'), getClients)
-  .post(requirePermission('clients', 'create'), logAction('client'), createClient);
+  .get(requirePermission('clients', 'read'), cacheClients, getClients)
+  .post(requirePermission('clients', 'create'), invalidateClients, logAction('client'), createClient);
 
 // New route for clients with stats (for list view with outstanding invoice counts)
 router.get('/with-stats', requirePermission('clients', 'read'), getClientsWithStats);
@@ -38,12 +42,12 @@ router.get('/with-stats', requirePermission('clients', 'read'), getClientsWithSt
 router.get('/export/pdf', requirePermission('clients', 'read'), exportClientsToPDF);
 
 router.route('/:id')
-  .get(requirePermission('clients', 'read'), getClient)
-  .put(requirePermission('clients', 'update'), logAction('client'), updateClient)
-  .delete(requirePermission('clients', 'delete'), logAction('client'), deleteClient);
+  .get(requirePermission('clients', 'read'), cacheClients, getClient)
+  .put(requirePermission('clients', 'update'), invalidateClients, logAction('client'), updateClient)
+  .delete(requirePermission('clients', 'delete'), invalidateClients, logAction('client'), deleteClient);
 
 // Toggle status
-router.put('/:id/toggle-status', requirePermission('clients', 'update'), toggleClientStatus);
+router.put('/:id/toggle-status', requirePermission('clients', 'update'), invalidateClients, toggleClientStatus);
 router.post(
   '/:id/ebm/verify-tin',
   requirePermission('clients', 'update'),
@@ -51,6 +55,7 @@ router.post(
   body('bhfId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
   validateRequest,
   stripUnvalidatedBody,
+  invalidateClients,
   verifyClientTin,
 );
 router.post(
@@ -60,6 +65,7 @@ router.post(
   body('bhfId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
   validateRequest,
   stripUnvalidatedBody,
+  invalidateClients,
   saveClientBranchCustomer,
 );
 

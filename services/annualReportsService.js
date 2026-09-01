@@ -19,6 +19,8 @@
  */
 
 const mongoose = require('mongoose');
+const { dbClient } = require('../lib/prisma');
+const { toIdString } = require('../utils/objectId');
 
 // Format currency in Rwandan Francs
 const formatRWF = (amount) => {
@@ -96,28 +98,16 @@ class AnnualReportsService {
 
     // ========== INCOME STATEMENT ==========
     // Revenue - current year
-    const revenueCurrent = await Invoice.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          invoiceDate: { $gte: start, $lte: end },
-          status: { $in: ['fully_paid', 'partially_paid', 'confirmed', 'sent'] }
-        }
-      },
-      { $group: { _id: null, total: { $sum: { $toDouble: { $ifNull: ['$subtotal', '$total'] } } } } }
-    ]);
+    const revenueCurrent = await dbClient().invoice.aggregate({
+      where: { companyId: toIdString(companyId), invoiceDate: { gte: start, lte: end }, status: { in: ['fully_paid', 'partially_paid', 'confirmed', 'sent'] } },
+      _sum: { subtotal: true },
+    });
 
     // Revenue - prior year
-    const revenuePrior = await Invoice.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          invoiceDate: { $gte: prior.start, $lte: prior.end },
-          status: { $in: ['fully_paid', 'partially_paid', 'confirmed', 'sent'] }
-        }
-      },
-      { $group: { _id: null, total: { $sum: { $toDouble: { $ifNull: ['$subtotal', '$total'] } } } } }
-    ]);
+    const revenuePrior = await dbClient().invoice.aggregate({
+      where: { companyId: toIdString(companyId), invoiceDate: { gte: prior.start, lte: prior.end }, status: { in: ['fully_paid', 'partially_paid', 'confirmed', 'sent'] } },
+      _sum: { subtotal: true },
+    });
 
     // COGS calculation
     const cogsCurrent = await this._calculateAnnualCOGS(companyId, start, end);
@@ -139,8 +129,8 @@ class AnnualReportsService {
     const taxCurrent = await this._getAnnualAccountTotal(companyId, start, end, ['tax', 'income_tax', 'tax_expense']);
     const taxPrior = await this._getAnnualAccountTotal(companyId, prior.start, prior.end, ['tax', 'income_tax', 'tax_expense']);
 
-    const revCurrent = revenueCurrent[0]?.total || 0;
-    const revPrior = revenuePrior[0]?.total || 0;
+    const revCurrent = Number(revenueCurrent._sum.subtotal || 0);
+    const revPrior = Number(revenuePrior._sum.subtotal || 0);
 
     const grossProfitCurrent = revCurrent - cogsCurrent;
     const grossProfitPrior = revPrior - cogsPrior;
@@ -159,21 +149,10 @@ class AnnualReportsService {
 
     // ========== BALANCE SHEET ==========
     // Assets
-    const fixedAssetsCurrent = await FixedAsset.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          status: { $in: ['active', 'in_use'] }
-        }
-      },
-      {
-        $group: {
-          _id: null,
-          totalCost: { $sum: { $toDouble: '$purchaseCost' } },
-          totalDepreciation: { $sum: { $toDouble: { $ifNull: ['$accumulatedDepreciation', 0] } } }
-        }
-      }
-    ]);
+    const fixedAssetsCurrent = await dbClient().fixedAsset.aggregate({
+      where: { companyId: toIdString(companyId), status: { in: ['active', 'in_use'] } },
+      _sum: { purchaseCost: true, accumulatedDepreciation: true },
+    });
 
     const inventoryValue = await this._getInventoryValue(companyId, end);
     const arValue = await this._getAccountsReceivable(companyId, end);
@@ -184,7 +163,9 @@ class AnnualReportsService {
     const loansPayable = await this._getLoansPayable(companyId, end);
 
     // Calculate equity
-    const totalAssets = (fixedAssetsCurrent[0]?.totalCost || 0) - (fixedAssetsCurrent[0]?.totalDepreciation || 0) + inventoryValue + arValue + bankBalance;
+    const fixedAssetCost = Number(fixedAssetsCurrent._sum.purchaseCost || 0);
+    const fixedAssetDepreciation = Number(fixedAssetsCurrent._sum.accumulatedDepreciation || 0);
+    const totalAssets = fixedAssetCost - fixedAssetDepreciation + inventoryValue + arValue + bankBalance;
     const totalLiabilities = apValue + loansPayable;
     const equity = totalAssets - totalLiabilities;
 
@@ -243,8 +224,8 @@ class AnnualReportsService {
       balanceSheet: {
         assets: {
           nonCurrent: {
-            propertyPlantEquipment: (fixedAssetsCurrent[0]?.totalCost || 0) - (fixedAssetsCurrent[0]?.totalDepreciation || 0),
-            totalNonCurrent: (fixedAssetsCurrent[0]?.totalCost || 0) - (fixedAssetsCurrent[0]?.totalDepreciation || 0)
+            propertyPlantEquipment: fixedAssetCost - fixedAssetDepreciation,
+            totalNonCurrent: fixedAssetCost - fixedAssetDepreciation
           },
           current: {
             inventory: inventoryValue,
@@ -558,54 +539,33 @@ class AnnualReportsService {
     const openingStock = await this._calculateInventoryValueAtDate(companyId, priorYearEnd, products);
 
     // Total purchases during the year
-    const purchases = await Purchase.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          purchaseDate: { $gte: start, $lte: end },
-          status: { $in: ['received', 'partially_received', 'confirmed'] }
-        }
+    const purchases = await dbClient().purchase.aggregate({
+      where: {
+        companyId: toIdString(companyId),
+        purchaseDate: { gte: start, lte: end },
+        status: { in: ['received', 'partially_received', 'confirmed'] },
       },
-      { $group: { _id: null, total: { $sum: { $toDouble: { $ifNull: ['$subtotal', '$grandTotal'] } } } } }
-    ]);
-    const totalPurchases = purchases[0]?.total || 0;
+      _sum: { subtotal: true },
+    });
+    const totalPurchases = Number(purchases._sum.subtotal || 0);
 
     // Cost of goods sold (stock movements out)
-    const stockOutMovements = await StockMovement.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          movementDate: { $gte: start, $lte: end },
-          type: 'out',
-          reason: { $in: ['sale', 'dispatch', 'adjustment'] }
-        }
-      },
-      {
-        $group: {
-          _id: null,
-          total: { $sum: { $multiply: [{ $toDouble: '$quantity' }, { $toDouble: { $ifNull: ['$unitCost', 0] } }] } }
-        }
-      }
-    ]);
-    const cogs = stockOutMovements[0]?.total || 0;
+    const stockOutMovements = await dbClient().$queryRaw`
+      SELECT COALESCE(SUM(quantity * unit_cost), 0)::float AS total
+      FROM stock_movements
+      WHERE company_id = ${toIdString(companyId)} AND movement_date >= ${start} AND movement_date <= ${end}
+        AND type = 'out' AND reason IN ('sale', 'dispatch')
+    `;
+    const cogs = Number(stockOutMovements[0]?.total || 0);
 
     // Stock adjustments
-    const adjustments = await StockMovement.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          movementDate: { $gte: start, $lte: end },
-          reason: { $in: ['adjustment', 'damaged', 'expired'] }
-        }
-      },
-      {
-        $group: {
-          _id: null,
-          total: { $sum: { $multiply: [{ $toDouble: '$quantity' }, { $toDouble: { $ifNull: ['$unitCost', 0] } }] } }
-        }
-      }
-    ]);
-    const totalAdjustments = adjustments[0]?.total || 0;
+    const adjustments = await dbClient().$queryRaw`
+      SELECT COALESCE(SUM(quantity * unit_cost), 0)::float AS total
+      FROM stock_movements
+      WHERE company_id = ${toIdString(companyId)} AND movement_date >= ${start} AND movement_date <= ${end}
+        AND (type = 'adjustment' OR reason IN ('damage', 'expired'))
+    `;
+    const totalAdjustments = Number(adjustments[0]?.total || 0);
 
     // Closing stock (at end of year)
     const closingStock = await this._calculateInventoryValueAtDate(companyId, end, products);
@@ -1089,43 +1049,19 @@ class AnnualReportsService {
 
     // ========== VAT RECONCILIATION ==========
     // Output VAT (from sales)
-    const outputVAT = await Invoice.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          invoiceDate: { $gte: start, $lte: end },
-          status: { $in: ['fully_paid', 'partially_paid', 'confirmed', 'sent'] }
-        }
-      },
-      {
-        $group: {
-          _id: null,
-          totalVAT: { $sum: { $toDouble: { $ifNull: ['$taxAmount', 0] } } },
-          totalSales: { $sum: { $toDouble: { $ifNull: ['$subtotal', '$total'] } } }
-        }
-      }
-    ]);
+    const outputVAT = await dbClient().invoice.aggregate({
+      where: { companyId: toIdString(companyId), invoiceDate: { gte: start, lte: end }, status: { in: ['fully_paid', 'partially_paid', 'confirmed', 'sent'] } },
+      _sum: { taxAmount: true, subtotal: true },
+    });
 
     // Input VAT (from purchases)
-    const inputVAT = await Purchase.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          purchaseDate: { $gte: start, $lte: end },
-          status: { $in: ['received', 'partially_received', 'confirmed'] }
-        }
-      },
-      {
-        $group: {
-          _id: null,
-          totalVAT: { $sum: { $toDouble: { $ifNull: ['$taxAmount', 0] } } },
-          totalPurchases: { $sum: { $toDouble: { $ifNull: ['$subtotal', '$grandTotal'] } } }
-        }
-      }
-    ]);
+    const inputVAT = await dbClient().purchase.aggregate({
+      where: { companyId: toIdString(companyId), purchaseDate: { gte: start, lte: end }, status: { in: ['received', 'partially_received', 'confirmed'] } },
+      _sum: { taxAmount: true, subtotal: true },
+    });
 
-    const totalOutputVAT = outputVAT[0]?.totalVAT || 0;
-    const totalInputVAT = inputVAT[0]?.totalVAT || 0;
+    const totalOutputVAT = Number(outputVAT._sum.taxAmount || 0);
+    const totalInputVAT = Number(inputVAT._sum.taxAmount || 0);
     const netVATPayable = totalOutputVAT - totalInputVAT;
 
     // ========== PAYE ==========
@@ -1231,8 +1167,8 @@ class AnnualReportsService {
         outputVAT: totalOutputVAT,
         inputVAT: totalInputVAT,
         netVATPayable,
-        totalSales: outputVAT[0]?.totalSales || 0,
-        totalPurchases: inputVAT[0]?.totalPurchases || 0
+        totalSales: Number(outputVAT._sum.subtotal || 0),
+        totalPurchases: Number(inputVAT._sum.subtotal || 0)
       },
       paye: {
         totalPaye,
@@ -1668,47 +1604,27 @@ class AnnualReportsService {
   }
 
   static async _getAccountsReceivable(companyId, date) {
-    const Invoice = mongoose.model('Invoice');
-
-    const result = await Invoice.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          invoiceDate: { $lte: date },
-          status: { $in: ['confirmed', 'sent', 'partially_paid', 'overdue'] }
-        }
+    const result = await dbClient().invoice.aggregate({
+      where: {
+        companyId: toIdString(companyId),
+        invoiceDate: { lte: date },
+        status: { in: ['confirmed', 'sent', 'partially_paid', 'overdue'] },
       },
-      {
-        $group: {
-          _id: null,
-          total: { $sum: { $subtract: [{ $toDouble: { $ifNull: ['$total', 0] } }, { $toDouble: { $ifNull: ['$amountPaid', 0] } }] } }
-        }
-      }
-    ]);
-
-    return result[0]?.total || 0;
+      _sum: { amountOutstanding: true },
+    });
+    return Number(result._sum.amountOutstanding || 0);
   }
 
   static async _getAccountsPayable(companyId, date) {
-    const Purchase = mongoose.model('Purchase');
-
-    const result = await Purchase.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          purchaseDate: { $lte: date },
-          status: { $in: ['ordered', 'confirmed', 'partially_received', 'received'] }
-        }
+    const result = await dbClient().goodsReceivedNote.aggregate({
+      where: {
+        companyId: toIdString(companyId),
+        receivedDate: { lte: date },
+        status: 'confirmed',
       },
-      {
-        $group: {
-          _id: null,
-          total: { $sum: { $subtract: [{ $toDouble: { $ifNull: ['$grandTotal', '$total'] } }, { $toDouble: { $ifNull: ['$amountPaid', 0] } }] } }
-        }
-      }
-    ]);
-
-    return result[0]?.total || 0;
+      _sum: { balance: true },
+    });
+    return Number(result._sum.balance || 0);
   }
 
   static async _getBankBalance(companyId, date) {
@@ -1819,35 +1735,10 @@ class AnnualReportsService {
   }
 
   static async _calculateInventoryValueAtDate(companyId, date, products) {
-    const StockMovement = mongoose.model('StockMovement');
-
     let totalValue = 0;
 
     for (const product of products) {
-      const movements = await StockMovement.aggregate([
-        {
-          $match: {
-            product: new mongoose.Types.ObjectId(product._id),
-            movementDate: { $lte: date }
-          }
-        },
-        {
-          $group: {
-            _id: null,
-            netQty: {
-              $sum: {
-                $cond: [
-                  { $eq: ['$type', 'in'] },
-                  { $toDouble: '$quantity' },
-                  { $multiply: [{ $toDouble: '$quantity' }, -1] }
-                ]
-              }
-            }
-          }
-        }
-      ]);
-
-      const quantity = movements[0]?.netQty || 0;
+      const quantity = await this._getProductQuantityAtDate(product._id, date);
       const unitCost = product.averageCost || product.unitCost || 0;
       totalValue += quantity * unitCost;
     }
@@ -1856,32 +1747,12 @@ class AnnualReportsService {
   }
 
   static async _getProductQuantityAtDate(productId, date) {
-    const StockMovement = mongoose.model('StockMovement');
-
-    const result = await StockMovement.aggregate([
-      {
-        $match: {
-          product: new mongoose.Types.ObjectId(productId),
-          movementDate: { $lte: date }
-        }
-      },
-      {
-        $group: {
-          _id: null,
-          netQty: {
-            $sum: {
-              $cond: [
-                { $eq: ['$type', 'in'] },
-                { $toDouble: '$quantity' },
-                { $multiply: [{ $toDouble: '$quantity' }, -1] }
-              ]
-            }
-          }
-        }
-      }
-    ]);
-
-    return result[0]?.netQty || 0;
+    const result = await dbClient().$queryRaw`
+      SELECT COALESCE(SUM(CASE WHEN type = 'in' THEN quantity ELSE -quantity END), 0)::float AS "netQty"
+      FROM stock_movements
+      WHERE product_id = ${toIdString(productId)} AND movement_date <= ${date}
+    `;
+    return Number(result[0]?.netQty || 0);
   }
 }
 

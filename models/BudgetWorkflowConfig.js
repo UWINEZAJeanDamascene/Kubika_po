@@ -8,7 +8,7 @@ const {
   budgetWorkflowConfigTranslateCreate,
   budgetWorkflowConfigTranslateUpdate,
 } = require('../utils/phase10Mappers');
-const { prisma } = require('../lib/prisma');
+const { prisma, dbClient } = require('../lib/prisma');
 const { decimalToNumber } = require('../utils/decimalHelpers');
 
 const FIELD_MAP = {
@@ -43,7 +43,7 @@ BudgetWorkflowConfig.findMatchingWorkflow = async function(
     isActive: true,
   };
 
-  const workflows = await prisma.budgetWorkflowConfig.findMany({
+  const workflows = await dbClient().budgetWorkflowConfig.findMany({
     where,
     orderBy: { priority: 'desc' },
   });
@@ -65,7 +65,7 @@ BudgetWorkflowConfig.findMatchingWorkflow = async function(
     return budgetWorkflowConfigToApi(workflow);
   }
 
-  const defaultWorkflow = await prisma.budgetWorkflowConfig.findFirst({
+  const defaultWorkflow = await dbClient().budgetWorkflowConfig.findFirst({
     where: {
       companyId: String(companyId),
       workflowType,

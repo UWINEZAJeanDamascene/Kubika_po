@@ -4,7 +4,7 @@
  */
 
 const mongoose = require('mongoose');
-const { prisma } = require('../lib/prisma');
+const { prisma, dbClient } = require('../lib/prisma');
 const { makeCompatModel, translateFilter, IMPOSSIBLE, toId } = require('../utils/prismaCompat');
 const { generateObjectId } = require('../utils/objectId');
 const { accountBalanceToApi } = require('../utils/inventoryJournalMappers');
@@ -23,6 +23,7 @@ if (!mongoose.models.AccountBalance) {
 
 const base = makeCompatModel({
   delegate: () => prisma.accountBalance,
+  delegateName: 'accountBalance',
   fieldMap: FIELD_MAP,
   toApi: accountBalanceToApi,
   translateCreate: async (data) => ({
@@ -46,11 +47,11 @@ const base = makeCompatModel({
 base.adjust = async function adjust(companyId, accountCode, deltaDebit = 0, deltaCredit = 0) {
   const cid = toId(companyId);
   const code = String(accountCode);
-  const existing = await prisma.accountBalance.findUnique({
+  const existing = await dbClient().accountBalance.findUnique({
     where: { companyId_accountCode: { companyId: cid, accountCode: code } },
   });
   if (existing) {
-    const row = await prisma.accountBalance.update({
+    const row = await dbClient().accountBalance.update({
       where: { id: existing.id },
       data: {
         debit: { increment: deltaDebit },
@@ -60,7 +61,7 @@ base.adjust = async function adjust(companyId, accountCode, deltaDebit = 0, delt
     });
     return accountBalanceToApi(row);
   }
-  const row = await prisma.accountBalance.create({
+  const row = await dbClient().accountBalance.create({
     data: {
       id: generateObjectId(),
       companyId: cid,

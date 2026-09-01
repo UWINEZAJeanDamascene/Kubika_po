@@ -4,7 +4,7 @@
  */
 
 const mongoose = require('mongoose');
-const { prisma } = require('../lib/prisma');
+const { prisma, dbClient } = require('../lib/prisma');
 const { makeCompatModel, translateFilter, translateSort, IMPOSSIBLE, toId } = require('../utils/prismaCompat');
 const { getCompanyId } = require('../utils/prismaTenant');
 const { decimalToNumber } = require('../utils/decimalHelpers');
@@ -61,7 +61,7 @@ function wrapStockLevelDoc(apiDoc) {
 
   doc.save = async function save() {
     const payload = stockLevelTranslateUpdate({ $set: doc });
-    const row = await prisma.stockLevel.update({
+    const row = await dbClient().stockLevel.update({
       where: { id: String(doc._id) },
       data: payload,
     });
@@ -122,6 +122,7 @@ function wrapStockLevelDoc(apiDoc) {
 
 const model = makeCompatModel({
   delegate: () => prisma.stockLevel,
+  delegateName: 'stockLevel',
   fieldMap: FIELD_MAP,
   toApi: (row) => wrapStockLevelDoc(stockLevelToApi(row)),
   translateCreate: stockLevelTranslateCreate,
@@ -134,11 +135,11 @@ model.getOrCreate = async function getOrCreate(companyId, productId, warehouseId
   const cid = toId(companyId);
   const pid = toId(productId);
   const wid = toId(warehouseId);
-  let row = await prisma.stockLevel.findUnique({
+  let row = await dbClient().stockLevel.findUnique({
     where: { companyId_productId_warehouseId: { companyId: cid, productId: pid, warehouseId: wid } },
   });
   if (row) return wrapStockLevelDoc(stockLevelToApi(row));
-  row = await prisma.stockLevel.create({
+  row = await dbClient().stockLevel.create({
     data: {
       ...(await stockLevelTranslateCreate({
         company_id: cid,
@@ -171,7 +172,7 @@ model.recalculateWAC = async function recalculateWAC(companyId, productId, wareh
 
 model.validateAvailable = async function validateAvailable(companyId, productId, warehouseId, requiredQty) {
   const cid = toId(companyId);
-  const row = await prisma.stockLevel.findUnique({
+  const row = await dbClient().stockLevel.findUnique({
     where: {
       companyId_productId_warehouseId: {
         companyId: cid,

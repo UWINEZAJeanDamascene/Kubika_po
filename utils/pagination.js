@@ -44,8 +44,38 @@ function paginationMeta(page, limit, total) {
   };
 }
 
+
+/**
+ * Opt-in pagination for list endpoints that historically returned every row.
+ *
+ * Forcing a default limit on these would silently truncate existing screens —
+ * the backups list, for instance, calls `/backups` with no params and renders
+ * whatever comes back. So the contract here is:
+ *
+ *   - client sends `page` or `limit`  -> paginate, and report totals
+ *   - client sends neither            -> return everything, exactly as before
+ *
+ * Either way the response carries a `pagination` block, so a client can
+ * discover there is more data and start paging without a server change. The
+ * unbounded default is still protected by the row guard in prismaCompat, which
+ * caps and logs runaway reads.
+ *
+ * @param {Record<string, any>} query - req.query
+ * @param {{ defaultLimit?: number, maxLimit?: number }} [opts]
+ * @returns {{ paginated: boolean, page: number, limit: number|null, skip: number }}
+ */
+function parseOptionalPagination(query = {}, opts = {}) {
+  const asked = query.page !== undefined || query.limit !== undefined;
+  if (!asked) {
+    return { paginated: false, page: 1, limit: null, skip: 0 };
+  }
+  const { page, limit, skip } = parsePagination(query, opts);
+  return { paginated: true, page, limit, skip };
+}
+
 module.exports = {
   parsePagination,
+  parseOptionalPagination,
   paginationMeta,
   DEFAULT_LIMIT,
   MAX_LIMIT,

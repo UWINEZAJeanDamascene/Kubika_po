@@ -11,7 +11,11 @@
  */
 
 const { Queue, Worker, Scheduler } = require('bullmq');
-const { redisClient, isRedisConfigured } = require('../config/redis');
+const { redisClient, isRedisConfigured , createQueueConnection } = require('../config/redis');
+
+// BullMQ needs its own connection: it rejects a client with maxRetriesPerRequest
+// set, and its blocking reads would otherwise stall shared cache traffic.
+const queueConnection = createQueueConnection();
 
 // Check if Redis is available
 const isRedisAvailable = () => {
@@ -49,16 +53,16 @@ if (isRedisAvailable()) {
   try {
     queues = {
       // High priority queue for urgent jobs
-      highPriority: new Queue('high-priority', { connection: redisClient }),
+      highPriority: new Queue('high-priority', { connection: queueConnection }),
       
       // Default queue for regular jobs
-      default: new Queue('default', { connection: redisClient }),
+      default: new Queue('default', { connection: queueConnection }),
       
       // Low priority queue for background jobs (nightly jobs)
-      background: new Queue('background', { connection: redisClient }),
+      background: new Queue('background', { connection: queueConnection }),
       
       // Reports queue
-      reports: new Queue('reports', { connection: redisClient })
+      reports: new Queue('reports', { connection: queueConnection })
     };
     console.log('✅ BullMQ job queues initialized');
   } catch (error) {

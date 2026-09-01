@@ -3,7 +3,6 @@
  * Automates database backups on a schedule
  */
 
-const mongoose = require('mongoose');
 const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');

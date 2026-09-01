@@ -22,7 +22,11 @@ const backupSchema = new mongoose.Schema({
   // Backup status
   status: {
     type: String,
-    enum: ['pending', 'in_progress', 'completed', 'failed', 'verified', 'restoring'],
+    // 'completed_with_errors': the archive was written, but at least one
+    // collection could not be read (or had no usable model). Distinguishing it
+    // from 'completed' matters — a partial archive must not be mistaken for a
+    // full one at restore time.
+    enum: ['pending', 'in_progress', 'completed', 'completed_with_errors', 'failed', 'verified', 'restoring'],
     default: 'pending'
   },
   // Storage location (local, cloud, etc.)
@@ -200,8 +204,15 @@ backupSchema.methods.markAsVerified = function(verifiedBy, checksum) {
   this.verification.verifiedAt = new Date();
   this.verification.verifiedBy = verifiedBy;
   this.verification.checksum = checksum;
+  // The checksum proves the FILE is intact. It says nothing about whether every
+  // collection made it into that file.
   this.verification.integrityStatus = 'valid';
-  this.status = 'verified';
+  // Preserve a partial result. Promoting 'completed_with_errors' to 'verified'
+  // would launder an incomplete archive past the restore guard — the archive is
+  // still missing collections however well its bytes check out.
+  if (this.status !== 'completed_with_errors') {
+    this.status = 'verified';
+  }
   return this.save();
 };
 

@@ -1,4 +1,5 @@
 const JournalEntry = require('../models/JournalEntry');
+const { wantsCursor, cursorFilter, cursorSort, cursorPage } = require('../utils/cursorPagination');
 const FixedAsset = require('../models/FixedAsset');
 const { CHART_OF_ACCOUNTS, getAccount, getAccountsByType, DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
 const ChartOfAccount = require('../models/ChartOfAccount');
@@ -35,6 +36,18 @@ exports.getJournalEntries = async (req, res, next) => {
       ];
     }
     
+    // Cursor mode is opt-in. Journal lines are append-only and the highest-volume
+    // financial table, so deep offsets get expensive first here.
+    if (wantsCursor(req.query)) {
+      const pageSize = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 100);
+      const cursorQuery = { ...query, ...cursorFilter(req.query.cursor, 'desc') };
+      const rows = await JournalEntry.find(cursorQuery)
+        .sort(cursorSort('date', 'desc'))
+        .limit(pageSize + 1);
+      const { data, pagination } = cursorPage(rows, pageSize, 'date');
+      return res.json({ success: true, count: data.length, data, pagination });
+    }
+
     const entries = await JournalEntry.find(query)
       .populate('createdBy', 'name email')
       .populate('postedBy', 'name email')

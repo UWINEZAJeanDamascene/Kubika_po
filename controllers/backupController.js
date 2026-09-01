@@ -1,4 +1,11 @@
+// Retained ONLY for the Backup.aggregate() call in getBackupStats: `Backup` is
+// itself still a Mongoose-only model, so its aggregate needs a real ObjectId.
+// Everything else in this file is PostgreSQL-backed. Remove this import when
+// Backup migrates to Prisma.
 const mongoose = require('mongoose');
+const { runInTransaction } = require('../services/transactionService');
+const { generateObjectId } = require('../utils/objectId');
+const { parseOptionalPagination, paginationMeta } = require('../utils/pagination');
 const Backup = require('../models/Backup');
 const Company = require('../models/Company');
 const Currency = require('../models/Currency');
@@ -12,16 +19,98 @@ const { google } = require('googleapis');
 const { notifyBackupSuccess, notifyBackupFailed } = require('../services/notificationHelper');
 
 // Get list of all models that can be backed up
-const getBackupableCollections = () => {
-  return [
-    'ActionLog', 'Budget', 'CashDrawer', 'Category', 'Client', 
-    'Company', 'CreditNote', 'Currency', 'Department', 'ExchangeRate', 
-    'InventoryBatch', 'Invoice', 'InvoiceReceiptMetadata', 'IPWhitelist',
-    'Notification', 'NotificationSettings', 'Product', 'Purchase', 
-    'Quotation', 'RecurringInvoice', 'ReorderPoint', 'Role',
-    'SerialNumber', 'StockAudit', 'StockMovement', 'StockTransfer',
-    'Subscription', 'Supplier', 'User', 'Warehouse'
-  ];
+/**
+ * Every collection the backup feature knows about.
+ *
+ * `restorable: false` marks one that is still MongoDB-only. Those are excluded
+ * from new backups rather than attempted-and-failed, for two reasons:
+ *
+ *  - With MONGODB_URI unset their reads throw, so including them would make
+ *    EVERY archive `completed_with_errors` — and the restore guard would then
+ *    refuse every backup ever taken. A safety gate that blocks everything is
+ *    just an outage.
+ *  - The restore runs in a single PostgreSQL transaction (see performRestore).
+ *    A Mongo write cannot join that transaction, so including one would break
+ *    the all-or-nothing guarantee.
+ *
+ * Flip a collection to `restorable: true` when its model moves to Prisma.
+ */
+const BACKUP_COLLECTIONS = [
+  { name: 'ActionLog', restorable: true },
+  { name: 'Budget', restorable: true },
+  { name: 'CashDrawer', restorable: false },        // Mongoose-only
+  { name: 'Category', restorable: true },
+  { name: 'Client', restorable: true },
+  { name: 'Company', restorable: true },
+  { name: 'CreditNote', restorable: true },
+  { name: 'Currency', restorable: true },
+  { name: 'Department', restorable: true },
+  { name: 'ExchangeRate', restorable: true },
+  { name: 'InventoryBatch', restorable: true },
+  { name: 'Invoice', restorable: true },
+  { name: 'InvoiceReceiptMetadata', restorable: true },
+  { name: 'IPWhitelist', restorable: true },
+  { name: 'Notification', restorable: true },
+  { name: 'NotificationSettings', restorable: true },
+  { name: 'Product', restorable: true },
+  { name: 'Purchase', restorable: true },
+  { name: 'Quotation', restorable: true },
+  { name: 'RecurringInvoice', restorable: true },
+  { name: 'ReorderPoint', restorable: true },
+  { name: 'Role', restorable: true },
+  { name: 'SerialNumber', restorable: true },
+  { name: 'StockAudit', restorable: true },
+  { name: 'StockMovement', restorable: true },
+  { name: 'StockTransfer', restorable: true },
+  { name: 'Subscription', restorable: false },      // Mongoose-only
+  { name: 'Supplier', restorable: true },
+  { name: 'User', restorable: true },
+  { name: 'Warehouse', restorable: true },
+];
+
+/** Collections included in a new backup: the PostgreSQL-backed ones. */
+const getBackupableCollections = () =>
+  BACKUP_COLLECTIONS.filter((c) => c.restorable).map((c) => c.name);
+
+/** Collections deliberately left out, surfaced in the archive manifest. */
+const getExcludedCollections = () =>
+  BACKUP_COLLECTIONS.filter((c) => !c.restorable).map((c) => c.name);
+
+
+/**
+ * Resolve a backupable collection to its model.
+ *
+ * Must NOT use mongoose.model(name): most models are Prisma-backed compat
+ * objects, and the mongoose registry holds only the bare `strict: false` stubs
+ * registered for compatibility. Reading through those hits a MongoDB connection
+ * that no longer exists, so every collection would come back empty and the
+ * backup would report success while containing nothing.
+ *
+ * Returns null when a name has no model file, so the caller can record it as
+ * skipped rather than silently writing an empty array.
+ */
+const resolveBackupModel = (collectionName) => {
+  try {
+    return require(`../models/${collectionName}`);
+  } catch (error) {
+    if (error && error.code === 'MODULE_NOT_FOUND') return null;
+    throw error;
+  }
+};
+
+/**
+ * Source database version, recorded in the archive so a restore can tell what
+ * produced it. Failure here must not fail the backup — it is metadata.
+ */
+const getSourceEngineVersion = async () => {
+  try {
+    const { prisma } = require('../lib/prisma');
+    const rows = await prisma.$queryRawUnsafe('SHOW server_version');
+    const version = rows && rows[0] && rows[0].server_version;
+    return version ? `postgresql ${version}` : 'postgresql';
+  } catch (error) {
+    return 'postgresql (version unavailable)';
+  }
 };
 
 // Get backup directory
@@ -45,16 +134,27 @@ exports.getBackups = async (req, res) => {
   try {
     const companyId = req.company._id || req.company;
     
-    const backups = await Backup.find({ company: companyId })
+    // Opt-in pagination: callers that send page/limit get a page and totals;
+    // callers that send neither keep the previous all-rows behaviour, so the
+    // existing backups screen is unaffected.
+    const { paginated, page, limit, skip } = parseOptionalPagination(req.query, { defaultLimit: 50 });
+    const filter = { company: companyId };
+
+    let query = Backup.find(filter)
       .populate('createdBy', 'name email')
       .populate('verification.verifiedBy', 'name email')
       .populate('restore.restoredBy', 'name email')
       .sort({ createdAt: -1 });
+    if (paginated) query = query.skip(skip).limit(limit);
+
+    const backups = await query;
+    const total = paginated ? await Backup.countDocuments(filter) : backups.length;
 
     res.json({
       success: true,
       count: backups.length,
-      data: backups
+      data: backups,
+      pagination: paginationMeta(page, limit || backups.length || 1, total)
     });
   } catch (error) {
     console.error('Error getting backups:', error);
@@ -172,7 +272,20 @@ const performBackup = async (backupId, companyId, collections) => {
     // Backup each collection
     for (const collectionName of collections) {
       try {
-        const Model = mongoose.model(collectionName);
+        const Model = resolveBackupModel(collectionName);
+        if (!Model || typeof Model.find !== 'function') {
+          // Recorded as an error, not skipped silently: a collection missing
+          // from the archive must be visible in the manifest, or a restore
+          // from this file would quietly leave that data behind.
+          console.warn(`[backup] No usable model for ${collectionName}`);
+          backupData.collections.push({
+            name: collectionName,
+            documentCount: 0,
+            data: [],
+            error: 'No usable model — collection not backed up',
+          });
+          continue;
+        }
         let query = { company: companyId };
         
         // If point-in-time recovery, filter by date
@@ -206,12 +319,25 @@ const performBackup = async (backupId, companyId, collections) => {
     
     const checksum = generateChecksum(compressedData);
 
-    // Update backup record
-    backup.status = 'completed';
+    // A backup that could not read every collection is NOT 'completed'.
+    // Marking it so would let a partial archive be restored later as though it
+    // were whole — the failure would only surface as missing data.
+    const failedCollections = backupData.collections.filter((c) => c.error);
+    backup.status = failedCollections.length ? 'completed_with_errors' : 'completed';
+    if (failedCollections.length) {
+      console.warn(
+        `[backup] ${failedCollections.length}/${backupData.collections.length} collections failed: ` +
+        failedCollections.map((c) => c.name).join(', '),
+      );
+    }
     backup.filePath = filePath;
     backup.fileSize = compressedData.length;
-    backup.mongoVersion = mongoose.version;
+    // Field name is legacy. The data now comes from PostgreSQL, so recording a
+    // Mongoose version would misidentify the source of the archive.
+    backup.mongoVersion = await getSourceEngineVersion();
     backup.verification.checksum = checksum;
+    // 'valid' here means the archive file matches its checksum — it does not
+    // mean the archive contains every collection. See status above.
     backup.verification.integrityStatus = 'valid';
     
     // Update collections info
@@ -227,7 +353,11 @@ const performBackup = async (backupId, companyId, collections) => {
       await uploadToCloud(backup);
     }
 
-    console.log(`Backup ${backupId} completed successfully`);
+    console.log(
+      failedCollections.length
+        ? `Backup ${backupId} completed WITH ERRORS — ${failedCollections.length} collection(s) missing`
+        : `Backup ${backupId} completed successfully`,
+    );
   } catch (error) {
     console.error('Backup failed:', error);
     backup.status = 'failed';
@@ -480,6 +610,17 @@ const performRestore = async (backupId, companyId, userId) => {
   if (!backup) return;
 
   try {
+    // Refuse a knowingly-partial archive. Restoring one deletes the company's
+    // current rows for every collection it does contain, so restoring from an
+    // archive that is already missing collections destroys data that the backup
+    // cannot put back.
+    if (backup.status === 'completed_with_errors') {
+      throw new Error(
+        'Refusing to restore: this backup completed with errors and is missing at least one '
+        + 'collection. Restoring would delete current data that the archive cannot replace.',
+      );
+    }
+
     backup.status = 'restoring';
     backup.restore.restoredAt = new Date();
     backup.restore.restoredBy = userId;
@@ -497,40 +638,86 @@ const performRestore = async (backupId, companyId, userId) => {
     const decompressedData = zlib.gunzipSync(compressedData);
     const backupData = JSON.parse(decompressedData.toString());
 
+    // THE authoritative completeness check: the archive's own manifest.
+    //
+    // The status-based refusal above is only an early-out — `status` is mutable
+    // and markAsVerified() used to overwrite 'completed_with_errors' with
+    // 'verified', laundering a partial archive past that gate. The manifest is a
+    // property of the file itself and cannot be edited by changing a record.
+    const archiveErrors = (backupData.collections || []).filter((c) => c.error);
+    if (archiveErrors.length) {
+      throw new Error(
+        `Refusing to restore: archive is missing ${archiveErrors.length} collection(s) `
+        + `(${archiveErrors.map((c) => c.name).join(', ')}). Restoring would delete current `
+        + 'data that this archive cannot replace.',
+      );
+    }
+
     // Verify checksum
     const currentChecksum = generateChecksum(compressedData);
     if (currentChecksum !== backup.verification.checksum) {
       throw new Error('Backup file integrity check failed');
     }
 
-    // Restore each collection
-    for (const collection of backupData.collections) {
-      if (collection.error) continue;
-      
-      try {
-        const Model = mongoose.model(collection.name);
-        
-        // Delete existing data for this company
+    // ALL-OR-NOTHING RESTORE.
+    //
+    // Every collection is deleted and reinserted inside ONE PostgreSQL
+    // transaction. Previously each collection was handled independently with
+    // its own try/catch, so a failure partway through left the company with
+    // some collections restored, some emptied by the delete, and some
+    // untouched — an unrecoverable mixture, because the delete had already run.
+    //
+    // The compat models join this transaction automatically: runInTransaction
+    // publishes the Prisma transaction client on the async context and
+    // prismaCompat resolves its delegate from there (see lib/txContext.js).
+    // Nothing has to be threaded through by hand, which is what makes wrapping
+    // a loop over 28 models feasible at all.
+    //
+    // Errors are deliberately NOT caught per collection: the first failure must
+    // abort the transaction so Postgres rolls the whole thing back.
+    const restoredCounts = [];
+    await runInTransaction(async () => {
+      for (const collection of backupData.collections) {
+        const Model = resolveBackupModel(collection.name);
+        if (!Model || typeof Model.deleteMany !== 'function') {
+          // Throwing rolls back everything done so far, which is correct: a
+          // restore missing a collection is not a restore.
+          throw new Error(`No usable model for collection "${collection.name}"`);
+        }
+
         await Model.deleteMany({ company: companyId });
-        
-        // Insert backup data with new IDs
+
         if (collection.data && collection.data.length > 0) {
-          const newData = collection.data.map(doc => {
+          const newData = collection.data.map((doc) => {
             const newDoc = { ...doc };
-            newDoc._id = new mongoose.Types.ObjectId();
+            // New ids: the archive's ids may collide with rows created since.
+            newDoc._id = generateObjectId();
             newDoc.company = companyId;
             newDoc.createdAt = doc.createdAt ? new Date(doc.createdAt) : new Date();
             newDoc.updatedAt = doc.updatedAt ? new Date(doc.updatedAt) : new Date();
             return newDoc;
           });
-          
-          await Model.insertMany(newData);
-        }
-      } catch (err) {
-        console.warn(`Could not restore collection ${collection.name}:`, err.message);
-      }
-    }
 
+          await Model.insertMany(newData);
+          restoredCounts.push(`${collection.name}: ${newData.length}`);
+        } else {
+          restoredCounts.push(`${collection.name}: 0`);
+        }
+      }
+    }, {
+      // A full-company restore writes far more than an ordinary request. Without
+      // a raised timeout Prisma aborts mid-restore — which now rolls back
+      // safely, but fails work that would otherwise have succeeded.
+      timeout: Number(process.env.RESTORE_TRANSACTION_TIMEOUT_MS) || 120000,
+      maxWait: Number(process.env.RESTORE_TRANSACTION_MAX_WAIT_MS) || 10000,
+    });
+
+    console.log(`[restore] Restored ${restoredCounts.length} collections: ${restoredCounts.join(', ')}`);
+
+    // Reaching here means the transaction committed, so every collection was
+    // restored. There is no longer a "partially restored" outcome to report:
+    // any failure above throws, the transaction rolls back, and the outer catch
+    // records the backup as failed with the database untouched.
     backup.status = 'verified';
     await backup.save();
 

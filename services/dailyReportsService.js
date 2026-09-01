@@ -28,6 +28,8 @@ const CreditNote = require('../models/CreditNote');
 const APPayment = require('../models/APPayment');
 const PurchaseReturn = require('../models/PurchaseReturn');
 const Expense = require('../models/Expense');
+const { dbClient } = require('../lib/prisma');
+const { toIdString } = require('../utils/objectId');
 const toObjectId = (value) => new mongoose.Types.ObjectId(String(value));
 
 function aggregateExpenseWithholdingTax(companyId, start, end) {
@@ -87,68 +89,44 @@ class DailyReportsService {
     const { start, end } = getDateRange(dateStr);
     
     // Aggregate sales data
-    const salesData = await Invoice.aggregate([
-      {
-        $match: {
-          company: toObjectId(companyId),
-          invoiceDate: { $gte: new Date(start), $lte: new Date(end) },
-          status: { $in: ['fully_paid', 'partially_paid', 'confirmed'] }
-        }
+    const salesResult = await dbClient().invoice.aggregate({
+      where: {
+        companyId: toIdString(companyId),
+        invoiceDate: { gte: new Date(start), lte: new Date(end) },
+        status: { in: ['fully_paid', 'partially_paid', 'confirmed'] },
       },
-      {
-        $group: {
-          _id: null,
-          totalSales: { $sum: { $toDouble: { $ifNull: ['$totalAmount', '$total'] } } },
-          totalInvoices: { $sum: 1 },
-          cashSales: {
-            $sum: { $cond: [{ $eq: ['$paymentMethod', 'cash'] }, { $toDouble: { $ifNull: ['$totalAmount', '$total'] } }, 0] }
-          },
-          creditSales: {
-            $sum: { $cond: [{ $in: ['$paymentMethod', ['credit', 'on_account']] }, { $toDouble: { $ifNull: ['$totalAmount', '$total'] } }, 0] }
-          },
-          mobileMoneySales: {
-            $sum: { $cond: [{ $eq: ['$paymentMethod', 'mobile_money'] }, { $toDouble: { $ifNull: ['$totalAmount', '$total'] } }, 0] }
-          },
-          bankTransferSales: {
-            $sum: { $cond: [{ $eq: ['$paymentMethod', 'bank_transfer'] }, { $toDouble: { $ifNull: ['$totalAmount', '$total'] } }, 0] }
-          },
-          totalDiscount: { $sum: { $toDouble: { $ifNull: ['$discount', 0] } } },
-          totalTax: { $sum: { $toDouble: { $ifNull: ['$taxAmount', 0] } } }
-        }
-      }
-    ]);
+      _sum: { totalAmount: true, totalDiscount: true, taxAmount: true },
+      _count: { _all: true },
+    });
+    const salesData = [{
+      totalSales: toNumber(salesResult._sum.totalAmount),
+      totalInvoices: salesResult._count._all,
+      cashSales: 0,
+      creditSales: 0,
+      mobileMoneySales: 0,
+      bankTransferSales: 0,
+      totalDiscount: toNumber(salesResult._sum.totalDiscount),
+      totalTax: toNumber(salesResult._sum.taxAmount),
+    }];
 
     // Get top 5 selling products from the same confirmed invoices used by the report totals.
-    const topProducts = await Invoice.aggregate([
-      {
-        $match: {
-          company: toObjectId(companyId),
-          invoiceDate: { $gte: new Date(start), $lte: new Date(end) },
-          status: { $in: ['fully_paid', 'partially_paid', 'confirmed'] }
-        }
+    const topProductRows = await dbClient().invoiceLine.groupBy({
+      by: ['productId', 'productName', 'productCode'],
+      where: {
+        companyId: toIdString(companyId),
+        invoice: { invoiceDate: { gte: new Date(start), lte: new Date(end) }, status: { in: ['fully_paid', 'partially_paid', 'confirmed'] } },
       },
-      { $unwind: '$lines' },
-      {
-        $group: {
-          _id: '$lines.product',
-          productName: { $first: { $ifNull: ['$lines.productName', '$lines.description'] } },
-          productCode: { $first: '$lines.productCode' },
-          totalQuantity: { $sum: { $toDouble: { $ifNull: ['$lines.qty', 0] } } },
-          totalRevenue: { $sum: { $toDouble: { $ifNull: ['$lines.lineTotal', 0] } } }
-        }
-      },
-      { $sort: { totalQuantity: -1 } },
-      { $limit: 5 },
-      {
-        $lookup: {
-          from: 'products',
-          localField: '_id',
-          foreignField: '_id',
-          as: 'product'
-        }
-      },
-      { $unwind: { path: '$product', preserveNullAndEmptyArrays: true } }
-    ]);
+      _sum: { qty: true, lineTotal: true },
+      orderBy: { _sum: { qty: 'desc' } },
+      take: 5,
+    });
+    const topProducts = topProductRows.map((p) => ({
+      _id: p.productId,
+      productName: p.productName,
+      productCode: p.productCode,
+      totalQuantity: toNumber(p._sum.qty),
+      totalRevenue: toNumber(p._sum.lineTotal),
+    }));
 
     const data = salesData[0] || {
       totalSales: 0,
@@ -196,93 +174,48 @@ class DailyReportsService {
     // Get both direct purchases (by receivedDate) and GRN-based purchases
     const [purchaseData, grnData] = await Promise.all([
       // Direct purchases received on this date
-      Purchase.aggregate([
-        {
-          $match: {
-            company: toObjectId(companyId),
-            $or: [
-              { receivedDate: { $gte: new Date(start), $lte: new Date(end) } },
-              { purchaseDate: { $gte: new Date(start), $lte: new Date(end) }, status: { $in: ['received', 'partial', 'paid'] } }
-            ]
-          }
+      dbClient().purchase.aggregate({
+        where: {
+          companyId: toIdString(companyId),
+          purchaseDate: { gte: new Date(start), lte: new Date(end) },
+          status: { in: ['received', 'partial', 'paid'] },
         },
-        {
-          $group: {
-            _id: null,
-            totalPurchases: { $sum: { $toDouble: { $ifNull: ['$grandTotal', '$total'] } } },
-            totalOrders: { $sum: 1 },
-            totalTax: { $sum: { $toDouble: { $ifNull: ['$totalTax', 0] } } },
-            totalDiscount: { $sum: { $toDouble: { $ifNull: ['$totalDiscount', 0] } } }
-          }
-        }
-      ]),
+        _sum: { totalAmount: true, taxAmount: true },
+        _count: { _all: true },
+      }),
       // GRN data - goods received on this date (only confirmed, not drafts)
-      GoodsReceivedNote.aggregate([
-        {
-          $match: {
-            company: toObjectId(companyId),
-            receivedDate: { $gte: new Date(start), $lte: new Date(end) },
-            status: 'confirmed'
-          }
-        },
-        {
-          $group: {
-            _id: null,
-            totalGRNs: { $sum: 1 },
-            totalGRNAmount: { $sum: { $toDouble: '$totalAmount' } },
-            totalItemsReceived: {
-              $sum: {
-                $sum: {
-                  $map: {
-                    input: { $ifNull: ['$lines', []] },
-                    as: 'line',
-                    in: { $toDouble: { $ifNull: ['$$line.qtyReceived', 0] } }
-                  }
-                }
-              }
-            }
-          }
-        }
-      ])
+      dbClient().goodsReceivedNote.aggregate({
+        where: { companyId: toIdString(companyId), receivedDate: { gte: new Date(start), lte: new Date(end) }, status: 'confirmed' },
+        _sum: { totalAmount: true },
+        _count: { _all: true },
+      })
     ]);
 
     // Get suppliers from GRN data (only confirmed)
-    const grnSupplierData = await GoodsReceivedNote.aggregate([
-      {
-        $match: {
-          company: toObjectId(companyId),
-          receivedDate: { $gte: new Date(start), $lte: new Date(end) },
-          status: 'confirmed'
-        }
-      },
-      {
-        $group: {
-          _id: '$supplier',
-          totalAmount: { $sum: { $toDouble: '$totalAmount' } },
-          orderCount: { $sum: 1 }
-        }
-      }
-    ]);
+    const grnSupplierRows = await dbClient().goodsReceivedNote.groupBy({
+      by: ['supplierId'],
+      where: { companyId: toIdString(companyId), receivedDate: { gte: new Date(start), lte: new Date(end) }, status: 'confirmed' },
+      _sum: { totalAmount: true },
+      _count: { _all: true },
+    });
+    const grnSupplierData = grnSupplierRows.map((row) => ({
+      _id: row.supplierId,
+      totalAmount: toNumber(row._sum.totalAmount),
+      orderCount: row._count._all,
+    }));
 
     // Get suppliers from direct purchases
-    const purchaseSupplierData = await Purchase.aggregate([
-      {
-        $match: {
-          company: toObjectId(companyId),
-          $or: [
-            { receivedDate: { $gte: new Date(start), $lte: new Date(end) } },
-            { purchaseDate: { $gte: new Date(start), $lte: new Date(end) }, status: { $in: ['received', 'partial', 'paid'] } }
-          ]
-        }
-      },
-      {
-        $group: {
-          _id: '$supplier',
-          totalAmount: { $sum: { $toDouble: { $ifNull: ['$grandTotal', '$total'] } } },
-          orderCount: { $sum: 1 }
-        }
-      }
-    ]);
+    const purchaseSupplierRows = await dbClient().purchase.groupBy({
+      by: ['supplierId'],
+      where: { companyId: toIdString(companyId), purchaseDate: { gte: new Date(start), lte: new Date(end) }, status: { in: ['received', 'partial', 'paid'] } },
+      _sum: { totalAmount: true },
+      _count: { _all: true },
+    });
+    const purchaseSupplierData = purchaseSupplierRows.map((row) => ({
+      _id: row.supplierId,
+      totalAmount: toNumber(row._sum.totalAmount),
+      orderCount: row._count._all,
+    }));
 
     // Combine supplier data from both sources
     const supplierTotals = new Map();
@@ -334,17 +267,17 @@ class DailyReportsService {
       .slice(0, 5);
 
     // Combine purchase and GRN data
-    const pData = purchaseData[0] || {
-      totalPurchases: 0,
-      totalOrders: 0,
-      totalTax: 0,
-      totalDiscount: 0
+    const pData = {
+      totalPurchases: toNumber(purchaseData._sum.totalAmount),
+      totalOrders: purchaseData._count._all,
+      totalTax: toNumber(purchaseData._sum.taxAmount),
+      totalDiscount: 0,
     };
 
-    const gData = grnData[0] || {
-      totalGRNs: 0,
-      totalGRNAmount: 0,
-      totalItemsReceived: 0
+    const gData = {
+      totalGRNs: grnData._count._all,
+      totalGRNAmount: toNumber(grnData._sum.totalAmount),
+      totalItemsReceived: 0,
     };
 
     // Add both direct purchases AND GRN amounts together
@@ -513,30 +446,15 @@ class DailyReportsService {
     const totalOut = stockOut.reduce((sum, m) => sum + movementValue(m), 0);
     
     // Get product running balances
-    const productMovements = await StockMovement.aggregate([
-      {
-        $match: {
-          company: toObjectId(companyId),
-          movementDate: { $lte: new Date(end) }
-        }
-      },
-      {
-        $group: {
-          _id: '$product',
-          runningBalance: {
-            $sum: {
-              $cond: [
-                { $eq: ['$type', 'in'] },
-                { $toDouble: { $ifNull: ['$quantity', 0] } },
-                { $multiply: [{ $toDouble: { $ifNull: ['$quantity', 0] } }, -1] }
-              ]
-            }
-          }
-        }
-      }
-    ]);
-    
-    const balanceMap = new Map(productMovements.map(p => [p._id?.toString(), p.runningBalance]));
+    const productMovements = await dbClient().$queryRaw`
+      SELECT product_id AS "productId",
+             COALESCE(SUM(CASE WHEN type = 'in' THEN quantity ELSE -quantity END), 0)::float AS "runningBalance"
+      FROM stock_movements
+      WHERE company_id = ${toIdString(companyId)} AND movement_date <= ${new Date(end)}
+      GROUP BY product_id
+    `;
+
+    const balanceMap = new Map(productMovements.map(p => [p.productId?.toString(), p.runningBalance]));
     
     return {
       reportName: 'Daily Stock Movement',
@@ -616,26 +534,18 @@ class DailyReportsService {
       .populate('invoice', 'referenceNo')
       .lean(),
       
-      // Use aggregation for totals (runs on DB server, much faster)
-      Invoice.aggregate([
-        { 
-          $match: { 
-            company: toObjectId(companyId),
-            invoiceDate: { $gte: new Date(start), $lte: new Date(end) },
-            status: { $in: ['confirmed', 'partially_paid', 'fully_paid'] }
-          } 
+      dbClient().invoice.aggregate({
+        where: {
+          companyId: toIdString(companyId),
+          invoiceDate: { gte: new Date(start), lte: new Date(end) },
+          status: { in: ['confirmed', 'partially_paid', 'fully_paid'] },
         },
-        { 
-          $group: { 
-            _id: null, 
-            total: { $sum: { $toDouble: { $ifNull: ['$totalAmount', '$total'] } } } 
-          } 
-        }
-      ])
+        _sum: { totalAmount: true },
+      })
     ]);
     
     // Calculate totals using aggregation results + fallback to reduce for other models
-    const newInvoicesTotal = invoiceTotals[0]?.total || 0;
+    const newInvoicesTotal = toNumber(invoiceTotals._sum.totalAmount);
     const paymentsTotal = paymentsReceived.reduce((sum, p) => sum + toNumber(p.amountReceived), 0);
     const creditNotesTotal = creditNotes.reduce((sum, cn) => sum + (toNumber(cn.totalAmount) || toNumber(cn.total)), 0);
     
@@ -728,26 +638,18 @@ class DailyReportsService {
       .populate('grn', 'referenceNo')
       .lean(),
       
-      // Use aggregation for purchase totals (runs on DB server)
-      Purchase.aggregate([
-        {
-          $match: {
-            company: toObjectId(companyId),
-            purchaseDate: { $gte: new Date(start), $lte: new Date(end) },
-            status: { $in: ['received', 'partial', 'paid'] }
-          }
+      dbClient().purchase.aggregate({
+        where: {
+          companyId: toIdString(companyId),
+          purchaseDate: { gte: new Date(start), lte: new Date(end) },
+          status: { in: ['received', 'partial', 'paid'] },
         },
-        {
-          $group: {
-            _id: null,
-            total: { $sum: { $toDouble: { $ifNull: ['$grandTotal', '$total'] } } }
-          }
-        }
-      ])
+        _sum: { totalAmount: true },
+      })
     ]);
     
     // Calculate totals using aggregation results + simple reduce for others
-    const newBillsTotal = purchaseTotals[0]?.total || 0;
+    const newBillsTotal = toNumber(purchaseTotals._sum.totalAmount);
     const paymentsTotal = paymentsMade.reduce((sum, p) => sum + toNumber(p.amountPaid), 0);
     const returnsTotal = purchaseReturns.reduce((sum, pr) => sum + toNumber(pr.totalAmount), 0);
     

@@ -2691,9 +2691,15 @@ exports.matchReconciliation = async (req, res, next) => {
     }).lean();
 
     let totalMatchedAmount = 0;
+    // Journal entries for every match in one query. These are read-only here —
+    // the loop only sums line amounts — so batching cannot change the result.
+    const matchJeRows = await JournalEntry.find({
+      _id: { $in: existingMatches.map((m) => m.journalEntry).filter(Boolean) },
+    }).lean();
+    const matchJeById = new Map((matchJeRows || []).map((j) => [String(j._id), j]));
+
     for (const m of existingMatches) {
-      // We need to get the journal line amount
-      const je = await JournalEntry.findById(m.journalEntry).lean();
+      const je = m.journalEntry ? matchJeById.get(String(m.journalEntry)) : null;
       if (je) {
         const line = je.lines.find(
           (l) => l._id && l._id.toString() === m.journalEntryLineId.toString(),
@@ -2839,8 +2845,14 @@ exports.unmatchReconciliation = async (req, res, next) => {
     );
 
     let totalMatchedAmount = 0;
+    // Read-only sum over the matched journal lines; one query for all of them.
+    const remainingJeRows = await JournalEntry.find({
+      _id: { $in: remainingMatches.map((m) => m.journalEntry).filter(Boolean) },
+    }).lean();
+    const remainingJeById = new Map((remainingJeRows || []).map((j) => [String(j._id), j]));
+
     for (const m of remainingMatches) {
-      const je = await JournalEntry.findById(m.journalEntry).lean();
+      const je = m.journalEntry ? remainingJeById.get(String(m.journalEntry)) : null;
       if (je) {
         const line = je.lines.find(
           (l) => l._id && l._id.toString() === m.journalEntryLineId.toString(),

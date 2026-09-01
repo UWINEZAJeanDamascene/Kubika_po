@@ -12,20 +12,24 @@ const {
 const { protect } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/rbacMiddleware');
 const logAction = require('../middleware/logAction');
+const { cacheMiddleware, cacheInvalidationMiddleware } = require('../middleware/cacheMiddleware');
+
+const cacheSuppliers = cacheMiddleware({ type: 'supplier', ttl: 300 });
+const invalidateSuppliers = cacheInvalidationMiddleware({ type: 'supplier' });
 
 router.use(protect);
 
 router.route('/')
-  .get(requirePermission('suppliers', 'read'), getSuppliers)
-  .post(requirePermission('suppliers', 'create'), logAction('supplier'), createSupplier);
+  .get(requirePermission('suppliers', 'read'), cacheSuppliers, getSuppliers)
+  .post(requirePermission('suppliers', 'create'), invalidateSuppliers, logAction('supplier'), createSupplier);
 
 router.route('/:id')
-  .get(requirePermission('suppliers', 'read'), getSupplier)
-  .put(requirePermission('suppliers', 'update'), logAction('supplier'), updateSupplier)
-  .delete(requirePermission('suppliers', 'delete'), logAction('supplier'), deleteSupplier);
+  .get(requirePermission('suppliers', 'read'), cacheSuppliers, getSupplier)
+  .put(requirePermission('suppliers', 'update'), invalidateSuppliers, logAction('supplier'), updateSupplier)
+  .delete(requirePermission('suppliers', 'delete'), invalidateSuppliers, logAction('supplier'), deleteSupplier);
 
 router.get('/:id/purchase-history', requirePermission('suppliers', 'read'), getSupplierPurchaseHistory);
 
-router.put('/:id/toggle-status', requirePermission('suppliers', 'update'), logAction('supplier'), toggleSupplierStatus);
+router.put('/:id/toggle-status', requirePermission('suppliers', 'update'), invalidateSuppliers, logAction('supplier'), toggleSupplierStatus);
 
 module.exports = router;

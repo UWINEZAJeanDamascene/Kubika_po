@@ -50,11 +50,16 @@ class OpeningBalanceService {
     }
 
     // Validate all accounts belong to this company
+    // Accounts in one query; the loop still validates in order so the first
+    // offending balance still raises ACCOUNT_NOT_FOUND with its own id.
+    const obAccountIds = [...new Set(balances.map((b) => b.account_id).filter(Boolean).map(String))];
+    const obAccountRows = obAccountIds.length
+      ? await ChartOfAccount.find({ _id: { $in: obAccountIds }, company: companyId })
+      : [];
+    const obAccountsById = new Map((obAccountRows || []).map((a) => [String(a._id), a]));
+
     for (const bal of balances) {
-      const account = await ChartOfAccount.findOne({
-        _id: bal.account_id,
-        company: companyId
-      });
+      const account = bal.account_id ? obAccountsById.get(String(bal.account_id)) : null;
 
       if (!account) {
         const error = new Error(`ACCOUNT_NOT_FOUND: Account ${bal.account_id} not found or does not belong to company`);

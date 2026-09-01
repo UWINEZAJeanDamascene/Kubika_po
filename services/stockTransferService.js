@@ -5,6 +5,7 @@ const StockTransferLine = require('../models/StockTransferLine');
 const InventoryBatch = require('../models/InventoryBatch');
 const InventoryLayer = require('../models/InventoryLayer');
 const Product = require('../models/Product');
+const { loadLineProducts, getLineProduct } = require('../utils/lineProducts');
 const StockMovement = require('../models/StockMovement');
 const { runInTransaction } = require('./transactionService');
 const WarehouseInventoryCost = require('../models/WarehouseInventoryCost');
@@ -19,9 +20,12 @@ async function _ensureActiveAndStockable(productIds) {
 }
 
 async function _checkAvailability(companyId, fromWarehouse, lines) {
-  // For each line check qty_available at source (onHand - reserved)
+  // For each line check qty_available at source (onHand - reserved).
+  // Products are resolved in one query; the per-line aggregate below still runs
+  // in order so the first insufficient line still decides the thrown error.
+  const availabilityProducts = await loadLineProducts(Product, lines, companyId);
   for (const line of lines) {
-    const prod = await Product.findById(line.product);
+    const prod = getLineProduct(availabilityProducts, line);
     if (!prod) throw { code: 'PRODUCT_NOT_FOUND', product: line.product };
     const agg = await aggregateWithTimeout(InventoryBatch, [
       { $match: { company: companyId, product: prod._id, warehouse: fromWarehouse } },
@@ -40,8 +44,9 @@ async function _checkAvailability(companyId, fromWarehouse, lines) {
 async function _resolveCostsAndConsumeLots(session, companyId, fromWarehouse, lines) {
   // For each line determine unitCost and, for FIFO, consume lots and produce consumedLots array
   const results = [];
+  const costingProducts = await loadLineProducts(Product, lines, companyId);
   for (const line of lines) {
-    const product = await Product.findById(line.product).session(session);
+    const product = getLineProduct(costingProducts, line);
     const qty = Number(line.qty.toString());
     if (product.costingMethod === 'wac' || product.costingMethod === 'avg' || !product.costingMethod) {
       // Prefer per-warehouse ledger for accurate WAC; fall back to product averageCost

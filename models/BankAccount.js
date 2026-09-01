@@ -5,7 +5,7 @@
  */
 
 const mongoose = require('mongoose');
-const { prisma } = require('../lib/prisma');
+const { prisma, dbClient } = require('../lib/prisma');
 const { makeCompatModel } = require('../utils/prismaCompat');
 const { STANDARD_TENANT_FIELD_MAP, registerBareSchema } = require('../utils/masterDataCommon');
 const {
@@ -121,12 +121,12 @@ function wrapStatementLineDoc(apiDoc) {
   doc.save = async function save() {
     if (doc.isNew || !doc._id) {
       const createData = await bankStatementLineTranslateCreate(doc);
-      const row = await prisma.bankStatementLine.create({ data: createData });
+      const row = await dbClient().bankStatementLine.create({ data: createData });
       Object.assign(doc, bankStatementLineToApi(row), { __mutable: true });
       doc.isNew = false;
       return doc;
     }
-    const row = await prisma.bankStatementLine.update({
+    const row = await dbClient().bankStatementLine.update({
       where: { id: String(doc._id) },
       data: bankStatementLineTranslateUpdate({ $set: doc }),
     });
@@ -142,12 +142,12 @@ function wrapReconMatchDoc(apiDoc) {
   doc.save = async function save() {
     if (doc.isNew || !doc._id) {
       const createData = await bankReconciliationMatchTranslateCreate(doc);
-      const row = await prisma.bankReconciliationMatch.create({ data: createData });
+      const row = await dbClient().bankReconciliationMatch.create({ data: createData });
       Object.assign(doc, bankReconciliationMatchToApi(row), { __mutable: true });
       doc.isNew = false;
       return doc;
     }
-    const row = await prisma.bankReconciliationMatch.update({
+    const row = await dbClient().bankReconciliationMatch.update({
       where: { id: String(doc._id) },
       data: bankReconciliationMatchTranslateUpdate({ $set: doc }),
     });
@@ -159,6 +159,7 @@ function wrapReconMatchDoc(apiDoc) {
 
 const bankTransactionBase = makeCompatModel({
   delegate: () => prisma.bankTransaction,
+  delegateName: 'bankTransaction',
   fieldMap: { ...STANDARD_TENANT_FIELD_MAP, ...BANK_TRANSACTION_FIELD_MAP },
   toApi: bankTransactionToApi,
   translateCreate: bankTransactionTranslateCreate,
@@ -172,6 +173,7 @@ setBankTransactionRef(BankTransaction);
 
 const bankAccountBase = makeCompatModel({
   delegate: () => prisma.bankAccount,
+  delegateName: 'bankAccount',
   fieldMap: { ...STANDARD_TENANT_FIELD_MAP, ...BANK_ACCOUNT_FIELD_MAP },
   toApi: (row) => wrapBankAccountDoc(bankAccountToApi(row)),
   translateCreate: bankAccountTranslateCreate,
@@ -202,6 +204,7 @@ BankAccount.create = async function create(data) {
 
 const BankStatementLineBase = makeCompatModel({
   delegate: () => prisma.bankStatementLine,
+  delegateName: 'bankStatementLine',
   fieldMap: { ...STANDARD_TENANT_FIELD_MAP, ...BANK_STATEMENT_LINE_FIELD_MAP },
   toApi: (row) => wrapStatementLineDoc(bankStatementLineToApi(row)),
   translateCreate: bankStatementLineTranslateCreate,
@@ -222,6 +225,7 @@ const BankStatementLine = buildConstructorModel({
 
 const BankReconciliationMatchBase = makeCompatModel({
   delegate: () => prisma.bankReconciliationMatch,
+  delegateName: 'bankReconciliationMatch',
   fieldMap: { ...STANDARD_TENANT_FIELD_MAP, ...BANK_RECON_MATCH_FIELD_MAP },
   toApi: (row) => wrapReconMatchDoc(bankReconciliationMatchToApi(row)),
   translateCreate: bankReconciliationMatchTranslateCreate,
@@ -242,6 +246,7 @@ const BankReconciliationMatch = buildConstructorModel({
 
 const BankReconciliation = makeCompatModel({
   delegate: () => prisma.bankReconciliation,
+  delegateName: 'bankReconciliation',
   fieldMap: { ...STANDARD_TENANT_FIELD_MAP, ...BANK_RECONCILIATION_FIELD_MAP },
   toApi: bankReconciliationToApi,
   translateCreate: bankReconciliationTranslateCreate,

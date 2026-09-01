@@ -426,31 +426,58 @@ async function runAutomaticDepreciation() {
 // SCHEDULER START
 // ============================================
 
+// Cron handles are kept so the process can shut down cleanly. Without this the
+// tasks could only be stopped by killing the process, which left the worker
+// unable to drain: node-cron timers keep the event loop alive.
+let scheduledTasks = [];
+
 function startScheduler() {
   console.log('📅 Starting notification scheduler...');
-  
-  // Payment reminders - every hour
-  cron.schedule('0 * * * *', sendPaymentReminders);
-  
-  // Low stock check - every 2 hours
-  cron.schedule('0 */2 * * *', checkLowStock);
-  
-  // Daily summary - every day at 9 AM
-  cron.schedule('0 9 * * *', sendDailySummaryReports);
-  
-  // Weekly summary - every Monday at 9 AM
-  cron.schedule('0 9 * * 1', sendWeeklySummaryReports);
-  
-  // Automatic depreciation - every day at 1 AM
-  cron.schedule('0 1 * * *', runAutomaticDepreciation);
-  
+
+  if (scheduledTasks.length) {
+    console.warn('⚠️  Notification scheduler already running; ignoring duplicate start.');
+    return;
+  }
+
+  scheduledTasks = [
+    // Payment reminders - every hour
+    cron.schedule('0 * * * *', sendPaymentReminders),
+    // Low stock check - every 2 hours
+    cron.schedule('0 */2 * * *', checkLowStock),
+    // Daily summary - every day at 9 AM
+    cron.schedule('0 9 * * *', sendDailySummaryReports),
+    // Weekly summary - every Monday at 9 AM
+    cron.schedule('0 9 * * 1', sendWeeklySummaryReports),
+    // Automatic depreciation - every day at 1 AM
+    cron.schedule('0 1 * * *', runAutomaticDepreciation),
+  ];
+
   // Run initial checks
   sendPaymentReminders();
   checkLowStock();
   sendDailySummaryReports();
   // Don't run depreciation on startup to avoid issues
-  
+
   console.log('✅ Notification scheduler started with cron jobs');
 }
 
-module.exports = { startScheduler };
+/**
+ * Cancel every scheduled task. Safe to call when the scheduler was never
+ * started, and safe to call twice.
+ */
+function stopScheduler() {
+  if (!scheduledTasks.length) return;
+  for (const task of scheduledTasks) {
+    try {
+      // node-cron exposes stop(); newer versions also expose destroy().
+      if (task && typeof task.stop === 'function') task.stop();
+      if (task && typeof task.destroy === 'function') task.destroy();
+    } catch (error) {
+      console.warn('Error stopping a notification cron task:', error.message || error);
+    }
+  }
+  scheduledTasks = [];
+  console.log('🛑 Notification scheduler stopped.');
+}
+
+module.exports = { startScheduler, stopScheduler };

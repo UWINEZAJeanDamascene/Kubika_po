@@ -157,6 +157,7 @@ function serialNumberTranslateUpdate(update = {}) {
 
 const SerialNumber = makeCompatModel({
   delegate: () => prisma.stockSerialNumber,
+  delegateName: 'stockSerialNumber',
   fieldMap: FIELD_MAP,
   toApi: serialNumberToApi,
   translateCreate: serialNumberTranslateCreate,

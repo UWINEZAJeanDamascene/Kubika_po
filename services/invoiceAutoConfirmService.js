@@ -4,6 +4,7 @@
 
 const Invoice = require('../models/Invoice');
 const Product = require('../models/Product');
+const { loadLineProducts, getLineProduct } = require('../utils/lineProducts');
 const Client = require('../models/Client');
 const StockMovement = require('../models/StockMovement');
 const JournalService = require('./journalService');
@@ -51,8 +52,10 @@ async function confirmDraftInvoice(companyId, invoiceId, userId, { submitEbm = t
   let totalInvoiceCOGS = 0;
   let hasStockableLines = false;
 
+  // One query for every line's product instead of one per line.
+  const autoConfirmProducts0 = await loadLineProducts(Product, invoice.lines, companyId);
   for (const line of invoice.lines) {
-    const product = await Product.findOne({ _id: line.product._id, company: companyId });
+    const product = getLineProduct(autoConfirmProducts0, line);
     if (!product) confirmError('ERR_PRODUCT_NOT_FOUND', `Product not found: ${line.product.name}`, 400);
     if (product.isActive === false) {
       confirmError('ERR_INACTIVE_PRODUCT', `Product ${product.name} is inactive`, 400);
@@ -181,8 +184,10 @@ async function confirmDraftInvoice(companyId, invoiceId, userId, { submitEbm = t
     }
   }
 
+  // One query for every line's product instead of one per line.
+  const autoConfirmProducts1 = await loadLineProducts(Product, invoice.lines, companyId);
   for (const line of invoice.lines) {
-    const product = await Product.findOne({ _id: line.product._id, company: companyId });
+    const product = getLineProduct(autoConfirmProducts1, line);
     if (product && product.isStockable) {
       const qty = line.qty || line.quantity || 0;
       if (qty > 0) {

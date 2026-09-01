@@ -3,7 +3,7 @@
  * Supports mutable docs (.save()) and customFind for $expr low-stock queries.
  */
 
-const { prisma } = require('../lib/prisma');
+const { dbClient } = require('../lib/prisma');
 const { Prisma } = require('@prisma/client');
 const { translateFilter, translateSort, IMPOSSIBLE } = require('../utils/prismaCompat');
 const { getCompanyId } = require('../utils/prismaTenant');
@@ -187,6 +187,10 @@ function buildExprWhere(expr) {
   }
 }
 
+// Bypasses the compat layer's tx-bound delegate (it needs raw SQL for the
+// $expr low-stock comparison), so it resolves the ambient transaction itself
+// via dbClient() — otherwise a read inside runInTransaction would miss rows the
+// same transaction just wrote.
 async function productCustomFind(filter, opts, { many = false } = {}) {
   const { $expr, $or, $text, ...rest } = filter;
   const where = applyTenant(translateFilter(rest, FULL_FIELD_MAP), opts);
@@ -249,7 +253,7 @@ async function productCustomFind(filter, opts, { many = false } = {}) {
     if (where.supplierId !== undefined) conditions.push(Prisma.sql`p.supplier_id = ${where.supplierId}`);
     const whereSql = Prisma.join(conditions, ' AND ');
 
-    const idRows = await prisma.$queryRaw`
+    const idRows = await dbClient().$queryRaw`
       SELECT p.id FROM products p
       WHERE ${whereSql}
       ORDER BY p.${Prisma.raw(`"${safeOrderColumn}"`)} ${Prisma.raw(safeSortOrder)}
@@ -258,7 +262,7 @@ async function productCustomFind(filter, opts, { many = false } = {}) {
     const pageIds = idRows.map((r) => r.id);
     if (pageIds.length === 0) return many ? [] : null;
 
-    const rows = await prisma.product.findMany({
+    const rows = await dbClient().product.findMany({
       where: { id: { in: pageIds } },
       ...productQueryShape(opts),
     });
@@ -268,7 +272,7 @@ async function productCustomFind(filter, opts, { many = false } = {}) {
     return many ? ordered : (ordered[0] || null);
   }
 
-  let rows = await prisma.product.findMany({
+  let rows = await dbClient().product.findMany({
     where,
     orderBy: translateSort(opts.sort, FIELD_MAP),
     take: opts.limit || undefined,

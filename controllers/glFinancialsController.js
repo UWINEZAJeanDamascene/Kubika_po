@@ -113,9 +113,16 @@ exports.getBalanceSheet = async (req, res, next) => {
 
     const assets = {};
     let totalAssets = 0;
-    for (const k of assetKeys) {
+    // Each key resolves independently, so they are fetched concurrently rather
+    // than one after another. This loop previously issued two sequential
+    // queries per key — 54 round-trips for a single balance sheet. The
+    // accumulation below still runs in key order, so the arithmetic and
+    // rounding are bit-for-bit what they were.
+    const assetNets = await Promise.all(assetKeys.map(async (k) => {
       const codes = await resolveAccountCodes(companyId, 'report', k, DEFAULT_ACCOUNTS[k]);
-      const net = await sumAccountNets(companyId, codes);
+      return [k, await sumAccountNets(companyId, codes)];
+    }));
+    for (const [k, net] of assetNets) {
       const value = net > 0 ? net : 0;
       assets[k] = Math.round(value * 100) / 100;
       totalAssets += value;
@@ -123,9 +130,16 @@ exports.getBalanceSheet = async (req, res, next) => {
 
     const liabilities = {};
     let totalLiabilities = 0;
-    for (const k of liabilityKeys) {
+    // Each key resolves independently, so they are fetched concurrently rather
+    // than one after another. This loop previously issued two sequential
+    // queries per key — 54 round-trips for a single balance sheet. The
+    // accumulation below still runs in key order, so the arithmetic and
+    // rounding are bit-for-bit what they were.
+    const liabilityNets = await Promise.all(liabilityKeys.map(async (k) => {
       const codes = await resolveAccountCodes(companyId, 'report', k, DEFAULT_ACCOUNTS[k]);
-      const net = await sumAccountNets(companyId, codes);
+      return [k, await sumAccountNets(companyId, codes)];
+    }));
+    for (const [k, net] of liabilityNets) {
       const value = net < 0 ? -net : 0;
       liabilities[k] = Math.round(value * 100) / 100;
       totalLiabilities += value;
@@ -133,9 +147,16 @@ exports.getBalanceSheet = async (req, res, next) => {
 
     const equity = {};
     let totalEquity = 0;
-    for (const k of equityKeys) {
+    // Each key resolves independently, so they are fetched concurrently rather
+    // than one after another. This loop previously issued two sequential
+    // queries per key — 54 round-trips for a single balance sheet. The
+    // accumulation below still runs in key order, so the arithmetic and
+    // rounding are bit-for-bit what they were.
+    const equityNets = await Promise.all(equityKeys.map(async (k) => {
       const codes = await resolveAccountCodes(companyId, 'report', k, DEFAULT_ACCOUNTS[k]);
-      const net = await sumAccountNets(companyId, codes);
+      return [k, await sumAccountNets(companyId, codes)];
+    }));
+    for (const [k, net] of equityNets) {
       const value = net < 0 ? -net : net;
       equity[k] = Math.round(value * 100) / 100;
       totalEquity += value;

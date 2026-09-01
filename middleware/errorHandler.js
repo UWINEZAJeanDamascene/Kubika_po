@@ -43,6 +43,13 @@ const errorHandler = (err, req, res, next) => {
     statusCode = 404;
     code = 'NOT_FOUND';
     message = err.message || 'Resource not found';
+  } else if (err.code === 'AGGREGATE_ROW_LIMIT') {
+    // The compatibility pipeline refuses to return a silently truncated
+    // aggregate. Existing frontend dashboard/report error states surface this
+    // response and offer retry rather than rendering wrong financial totals.
+    statusCode = 413;
+    code = 'AGGREGATE_ROW_LIMIT';
+    message = err.message || 'This report is too large to calculate in the API process.';
   } else if (err.code === 50 || err.codeName === 'MaxTimeMSExpired') {
     statusCode = 503;
     code = 'QUERY_TIMEOUT';

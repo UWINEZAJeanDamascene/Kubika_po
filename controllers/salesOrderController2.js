@@ -1,6 +1,7 @@
 const SalesOrder = require('../models/SalesOrder');
 const Client = require('../models/Client');
 const Product = require('../models/Product');
+const { loadLineProducts, getLineProduct } = require('../utils/lineProducts');
 const Warehouse = require('../models/Warehouse');
 
 // Error codes
@@ -118,8 +119,18 @@ exports.createSalesOrder = async (req, res, next) => {
     
     // Validate and process lines
     const processedLines = [];
+    // Products for every line in one query instead of one per line.
+    const lineProducts0 = await loadLineProducts(Product, lines || [], companyId);
+    // Warehouses referenced by the lines, in one query. Pure reference read:
+    // nothing in this loop writes a warehouse, so a single up-front fetch is
+    // equivalent to fetching per line.
+    const lineWarehouseIds = [...new Set((lines || []).map((l) => l.warehouse).filter(Boolean).map(String))];
+    const lineWarehouseRows = lineWarehouseIds.length
+      ? await Warehouse.find({ _id: { $in: lineWarehouseIds }, company: companyId })
+      : [];
+    const lineWarehouses = new Map((lineWarehouseRows || []).map((w) => [String(w._id), w]));
     for (const line of lines || []) {
-      const product = await Product.findOne({ _id: line.product, company: companyId });
+      const product = getLineProduct(lineProducts0, line);
       if (!product) {
         return res.status(404).json({
           success: false,
@@ -129,7 +140,7 @@ exports.createSalesOrder = async (req, res, next) => {
       
       // Validate warehouse if provided
       if (line.warehouse) {
-        const warehouse = await Warehouse.findOne({ _id: line.warehouse, company: companyId });
+        const warehouse = lineWarehouses.get(String(line.warehouse)) || null;
         if (!warehouse) {
           return res.status(404).json({
             success: false,
@@ -209,8 +220,10 @@ exports.updateSalesOrder = async (req, res, next) => {
     // Process lines if provided
     if (lines) {
       const processedLines = [];
+      // Products for every line in one query instead of one per line.
+      const lineProducts1 = await loadLineProducts(Product, lines, companyId);
       for (const line of lines) {
-        const product = await Product.findOne({ _id: line.product, company: companyId });
+        const product = getLineProduct(lineProducts1, line);
         if (!product) {
           return res.status(404).json({
             success: false,

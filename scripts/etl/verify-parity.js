@@ -18,6 +18,9 @@ const { prisma, connectPrisma, disconnectPrisma } = require('../../lib/prisma');
 const SKIP_LOG = path.join(__dirname, 'etl_skipped.log');
 
 const PHASE_ENTITIES = {
+  12: [
+    { label: 'TaxTransaction', mongo: 'taxtransactions', prisma: 'taxTransaction' },
+  ],
   10: [
     { label: 'AssetCategory', mongo: 'assetcategories', prisma: 'assetCategory' },
     { label: 'FixedAsset', mongo: 'fixedassets', prisma: 'fixedAsset' },

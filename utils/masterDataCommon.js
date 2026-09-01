@@ -44,6 +44,9 @@ function buildTenantModel({
   registerBareSchema(name, collection);
   return makeCompatModel({
     delegate: () => prisma[delegateName],
+    // Required by prismaCompat to select the same delegate on an ambient
+    // interactive transaction client. Prisma delegates have no reliable name.
+    delegateName,
     fieldMap: { ...STANDARD_TENANT_FIELD_MAP, ...fieldMap },
     toApi,
     translateCreate,
@@ -75,6 +78,7 @@ function buildGlobalModel({
   registerBareSchema(name, collection);
   return makeCompatModel({
     delegate: () => prisma[delegateName],
+    delegateName,
     fieldMap: {
       _id: { target: 'id', isId: true },
       id: { target: 'id', isId: true },

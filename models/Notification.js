@@ -1,81 +1,43 @@
-const mongoose = require('mongoose');
+/**
+ * Notification — PostgreSQL (Prisma) backed.
+ *
+ * Was a Mongoose model, which is why the notification scheduler and the EBM
+ * retry job could not run in a Mongo-free worker. The call surface is unchanged:
+ * find / findById / countDocuments / create / updateMany, plus the two statics
+ * below that callers rely on.
+ */
 
-const notificationSchema = new mongoose.Schema({
-  company: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Company',
-    required: true,
-    index: true
-  },
-  user: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
-    required: true,
-    index: true
-  },
-  type: {
-    type: String,
-    enum: [
-      'low_stock', 'out_of_stock', 'stock_received', 'auto_po_created', 'auto_direct_purchase_created',
-      'invoice_created', 'payment_received', 'payment_overdue', 'invoice_sent',
-      'quotation_created', 'quotation_approved', 'quotation_expired',
-      'user_created', 'company_approved', 'password_changed', 'failed_login',
-      'backup_success', 'backup_failed',
-      'invoice_generated', 'recurring_paused', 'recurring_failed',
-      'account_locked',
-      'system', 'alert'
-    ],
-    required: true
-  },
-  title: {
-    type: String,
-    required: true
-  },
-  message: {
-    type: String,
-    required: true
-  },
-  severity: {
-    type: String,
-    enum: ['info', 'warning', 'critical'],
-    default: 'info'
-  },
-  isRead: {
-    type: Boolean,
-    default: false
-  },
-  readAt: {
-    type: Date,
-    default: null
-  },
-  link: {
-    type: String,
-    default: null
-  },
-  metadata: {
-    type: mongoose.Schema.Types.Mixed,
-    default: {}
-  }
-}, {
-  timestamps: true
+const { buildTenantModel } = require('../utils/masterDataCommon');
+const {
+  NOTIFICATION_FIELD_MAP,
+  notificationToApi,
+  notificationTranslateCreate,
+  notificationTranslateUpdate,
+} = require('../utils/notificationMappers');
+
+const Notification = buildTenantModel({
+  name: 'Notification',
+  collection: 'notifications',
+  delegateName: 'notification',
+  fieldMap: NOTIFICATION_FIELD_MAP,
+  toApi: notificationToApi,
+  translateCreate: notificationTranslateCreate,
+  translateUpdate: notificationTranslateUpdate,
 });
 
-// Index for efficient queries
-notificationSchema.index({ company: 1, user: 1, isRead: 1, createdAt: -1 });
-
-// Static method to create notification
-notificationSchema.statics.createNotification = async function(data) {
-  const notification = await this.create(data);
-  return notification;
+/**
+ * Preserved from the Mongoose schema statics — callers use these directly.
+ */
+Notification.createNotification = async function createNotification(data) {
+  return Notification.create(data);
 };
 
-// Static method to get unread count
-notificationSchema.statics.getUnreadCount = async function(companyId, userId) {
-  return this.countDocuments({
+Notification.getUnreadCount = async function getUnreadCount(companyId, userId) {
+  return Notification.countDocuments({
     company: companyId,
     user: userId,
-    isRead: false
+    isRead: false,
   });
 };
 
-module.exports = mongoose.model('Notification', notificationSchema);
+module.exports = Notification;

@@ -156,8 +156,18 @@ class ARTrackingService {
 
       // Create allocation transactions for each invoice
       if (allocations && allocations.length > 0) {
+        // Invoices for every allocation in one query; the ledger writes below
+        // stay per-allocation because each records its own transaction.
+        const allocInvoiceRows = await Invoice.find({
+          _id: { $in: allocations.map((a) => a.invoice).filter(Boolean) },
+        });
+        const allocInvoicesById = new Map(
+          (allocInvoiceRows || []).map((i) => [String(i._id), i]),
+        );
         for (const allocation of allocations) {
-          const invoice = await Invoice.findById(allocation.invoice).session(session || null);
+          const invoice = allocation.invoice
+            ? allocInvoicesById.get(String(allocation.invoice))
+            : null;
           if (invoice) {
             const allocAmount = parseFloat(allocation.amountAllocated) || 0;
             const currentInvoiceBalance = parseFloat(invoice.amountOutstanding) || parseFloat(invoice.balance) || 0;
@@ -240,8 +250,18 @@ class ARTrackingService {
 
       // Record allocation removals
       if (allocations && allocations.length > 0) {
+        // Invoices for every allocation in one query; the ledger writes below
+        // stay per-allocation because each records its own transaction.
+        const allocInvoiceRows = await Invoice.find({
+          _id: { $in: allocations.map((a) => a.invoice).filter(Boolean) },
+        });
+        const allocInvoicesById = new Map(
+          (allocInvoiceRows || []).map((i) => [String(i._id), i]),
+        );
         for (const allocation of allocations) {
-          const invoice = await Invoice.findById(allocation.invoice).session(session || null);
+          const invoice = allocation.invoice
+            ? allocInvoicesById.get(String(allocation.invoice))
+            : null;
           if (invoice) {
             const allocAmount = parseFloat(allocation.amountAllocated) || 0;
             const currentInvoiceBalance = parseFloat(invoice.amountOutstanding) || parseFloat(invoice.balance) || 0;
@@ -576,11 +596,20 @@ class ARTrackingService {
       // Get all unique invoices from transactions
       const invoiceIds = await ARTransactionLedger.distinct('invoice', query);
       
+      // One query for the invoices; getCurrentInvoiceBalance stays per-invoice
+      // because it aggregates that invoice's own ledger rows.
+      const reconInvoiceRows = await Invoice.find({
+        _id: { $in: invoiceIds.filter(Boolean) },
+      });
+      const reconInvoicesById = new Map(
+        (reconInvoiceRows || []).map((i) => [String(i._id), i]),
+      );
+
       for (const invId of invoiceIds) {
         if (!invId) continue;
 
         const ledgerBalance = await this.getCurrentInvoiceBalance(companyId, invId);
-        const invoice = await Invoice.findById(invId);
+        const invoice = reconInvoicesById.get(String(invId)) || null;
         
         if (invoice) {
           const actualBalance = parseFloat(invoice.amountOutstanding) || parseFloat(invoice.balance) || 0;
@@ -601,9 +630,14 @@ class ARTrackingService {
       // Get all unique clients from transactions
       const clientIds = await ARTransactionLedger.distinct('client', query);
       
+      // Clients fetched together; the per-client ledger aggregate below still
+      // runs individually because it sums that client's own rows.
+      const reconClientRows = await Client.find({ _id: { $in: clientIds.filter(Boolean) } });
+      const reconClientsById = new Map((reconClientRows || []).map((c) => [String(c._id), c]));
+
       for (const clId of clientIds) {
         const ledgerBalance = await this.getCurrentClientBalance(companyId, clId);
-        const client = await Client.findById(clId);
+        const client = reconClientsById.get(String(clId)) || null;
         
         if (client) {
           const actualBalance = parseFloat(client.outstandingBalance) || 0;

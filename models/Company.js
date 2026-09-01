@@ -67,6 +67,7 @@ function translateUpdate(update = {}) {
 
 const Company = makeCompatModel({
   delegate: () => prisma.company,
+  delegateName: 'company',
   fieldMap: FIELD_MAP,
   toApi: companyToApi,
   translateCreate,

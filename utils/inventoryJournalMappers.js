@@ -192,7 +192,16 @@ async function stockMovementTranslateCreate(data) {
     idFields: ['productId', 'supplierId', 'warehouseId', 'performedById', 'referenceDocumentId'],
   });
   if (mapped.reason !== undefined) mapped.reason = normalizeMovementReason(data, mapped.reason);
-  return { ...tenantCreateBase(data), ...mapped };
+
+  // Stock movements have `performedById`, not `createdById`.  Do not spread
+  // tenantCreateBase blindly here: its generic creator field was being dropped
+  // by Prisma on every movement write. Treat the legacy `createdBy` input as
+  // the actor when callers have not already provided `performedBy`.
+  const { createdById: legacyCreatedById, ...tenantBase } = tenantCreateBase(data);
+  if (mapped.performedById == null && legacyCreatedById) {
+    mapped.performedById = legacyCreatedById;
+  }
+  return { ...tenantBase, ...mapped };
 }
 
 function stockMovementTranslateUpdate(update = {}) {

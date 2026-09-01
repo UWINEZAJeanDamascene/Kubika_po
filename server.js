@@ -504,113 +504,16 @@ async function initializeServer() {
   // Error handler
   app.use(errorHandler);
 
-  // Start background schedulers and workers (skip during tests and in Jest workers)
-  // Jest sets NODE_ENV='test' and also sets JEST_WORKER_ID; guard both to be safe.
-  // These schedulers all read/write Mongo-backed domains (invoices, products,
-  // EBM, report snapshots) — skip them entirely while MongoDB is disabled.
-  if (!(NODE_ENV === 'test' || process.env.JEST_WORKER_ID) && !config.db.uri) {
-    console.log('⏭️  MongoDB disabled — skipping Mongo-backed schedulers (recurring invoices, notifications, EBM sync, report snapshots)');
-  }
-  // Prisma-backed currency infrastructure (independent of MongoDB)
-  if (!(NODE_ENV === 'test' || process.env.JEST_WORKER_ID)) {
-    // Seed the standard currency list (idempotent, non-blocking)
-    try {
-      const CurrencyService = require('./services/CurrencyService');
-      CurrencyService.seedCurrencies().catch((err) =>
-        console.warn('Could not seed currencies:', err.message || err)
-      );
-    } catch (err) {
-      console.warn('Could not seed currencies:', err.message || err);
-    }
-
-    // Daily exchange-rate sync (external market rates -> exchange_rates table)
-    try {
-      const { startExchangeRateScheduler } = require('./services/exchangeRateScheduler');
-      startExchangeRateScheduler();
-    } catch (err) {
-      console.warn('Could not start exchange rate scheduler', err);
-    }
-  }
-  if (!(NODE_ENV === 'test' || process.env.JEST_WORKER_ID) && config.db.uri) {
-    // Start recurring scheduler (non-blocking)
-    try {
-      const { startScheduler } = require('./services/recurringService');
-      startScheduler();
-    } catch (err) {
-      console.warn('Could not start recurring invoice scheduler', err);
-    }
-
-    // Start notification scheduler (payment reminders, low-stock, summaries)
-    try {
-      const notify = require('./services/notificationScheduler');
-      notify.startScheduler();
-    } catch (err) {
-      console.warn('Could not start recurring invoice scheduler', err);
-    }
-
-    // Start backup scheduler (automated backups, verification)
-    try {
-      const backupScheduler = require('./services/backupScheduler');
-      backupScheduler.startBackupScheduler();
-    } catch (err) {
-      console.warn('Could not start backup scheduler', err);
-    }
-
-    try {
-      const { startCodeSyncScheduler } = require('./services/ebmCodeSyncScheduler');
-      startCodeSyncScheduler();
-    } catch (err) {
-      console.warn('Could not start EBM code sync scheduler', err);
-    }
-
-    try {
-      const { startImportSyncScheduler } = require('./services/ebmImportSyncScheduler');
-      startImportSyncScheduler();
-    } catch (err) {
-      console.warn('Could not start EBM import sync scheduler', err);
-    }
-
-    try {
-      const { startPurchaseSyncScheduler } = require('./services/ebmPurchaseSyncScheduler');
-      startPurchaseSyncScheduler();
-    } catch (err) {
-      console.warn('Could not start EBM purchase sync scheduler', err);
-    }
-
-    try {
-      const { startRetryJob } = require('./services/ebmRetryJob');
-      startRetryJob();
-    } catch (err) {
-      console.warn('Could not start EBM retry job', err);
-    }
-
-    // Start report scheduler (snapshot generation for weekly/monthly/quarterly/etc.)
-    try {
-      const reportScheduler = require('./services/reportSchedulerService');
-      if (reportScheduler && typeof reportScheduler.initializeScheduler === 'function') {
-        reportScheduler.initializeScheduler(app);
-      }
-    } catch (err) {
-      console.warn('Could not initialize report scheduler', err && err.message ? err.message : err);
-    }
-
-    // Initialize Background Job Queue (BullMQ)
-    // Runs nightly aggregations, report generation, email notifications
-    try {
-      const { initializeWorkers } = require('./services/jobWorkers');
-      const { setupScheduledJobs } = require('./services/jobQueue');
-      
-      // Initialize workers to process background jobs
-      initializeWorkers();
-      
-      // Setup scheduled jobs (nightly aggregations)
-      setupScheduledJobs();
-      
-      console.log('Background job system initialized');
-    } catch (err) {
-      console.warn('Could not initialize job queue:', err.message || err);
-    }
-  }
+  // Background schedulers and BullMQ consumers live in worker.js (`npm run worker`).
+  // Background schedulers deliberately do NOT run in this process.
+  //
+  // They live in worker.js, a single process. Running them here would mean every
+  // scaled HTTP replica firing the same cron — duplicate invoices, duplicate
+  // notifications, duplicate accounting postings. This block previously held the
+  // scheduler startup guarded by `if (false && ...)`, which achieved the right
+  // outcome but read as an accident; the code has been removed rather than left
+  // dead. See worker.js for what actually starts, and
+  // `node scripts/audit-mongo-deps.js` for which schedulers are safe to add.
 
   // Verify email server connection (non-blocking)
   try {

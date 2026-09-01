@@ -1,5 +1,18 @@
-const mongoose = require('mongoose');
 const EBMSubmissionQueue = require('../models/EBMSubmissionQueue');
+
+/**
+ * Source documents an EBM queue row can point at. All are Prisma-backed.
+ * Required lazily inside the getter to avoid a require cycle at module load.
+ */
+const EBM_SOURCE_MODELS = {
+  get Invoice() { return require('../models/Invoice'); },
+  get CreditNote() { return require('../models/CreditNote'); },
+  get Purchase() { return require('../models/Purchase'); },
+  get PurchaseOrder() { return require('../models/PurchaseOrder'); },
+  get GoodsReceivedNote() { return require('../models/GoodsReceivedNote'); },
+  get StockMovement() { return require('../models/StockMovement'); },
+  get StockTransfer() { return require('../models/StockTransfer'); },
+};
 const { extractSaveSalesFiscalData } = require('../utils/vsdcPayloadSanitizer');
 const ebmService = require('./ebmService');
 const EBMQueueService = require('./ebmQueueService');
@@ -44,7 +57,12 @@ function normalizeQueuePayload(endpoint, payload) {
 }
 
 async function updateSourceDocument(queueRecord, response = null, status = 'submitted', error = null) {
-  const models = mongoose.models;
+  // Resolved by direct require, NOT via mongoose.models. The registry returns
+  // the bare `strict: false` stubs that registerBareSchema() creates for
+  // compatibility — not the Prisma-backed compat models — so writes through it
+  // would target a MongoDB connection that no longer exists. A queue row would
+  // be marked submitted while its source document was never updated.
+  const models = EBM_SOURCE_MODELS;
   const now = new Date();
   const isSales = queueRecord.endpoint === ebmService.VSDC_ENDPOINTS.SAVE_SALES;
   const data = isSales ? extractSaveSalesFiscalData(response) : (response?.data || {});
@@ -238,9 +256,15 @@ function startRetryJob() {
   return intervalHandle;
 }
 
+function stopRetryJob() {
+  if (intervalHandle) clearInterval(intervalHandle);
+  intervalHandle = null;
+}
+
 module.exports = {
   runOnce,
   startRetryJob,
+  stopRetryJob,
   processRecord,
   normalizeQueueEndpoint,
   normalizeQueuePayload,

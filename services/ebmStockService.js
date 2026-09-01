@@ -1,6 +1,7 @@
 const Company = require("../models/Company");
 const Warehouse = require("../models/Warehouse");
 const Product = require("../models/Product");
+const { loadLineProducts, getLineProduct } = require("../utils/lineProducts");
 const Supplier = require("../models/Supplier");
 const Client = require("../models/Client");
 const Invoice = require("../models/Invoice");
@@ -475,8 +476,14 @@ async function resubmitStockMasterFromReconciliation(companyId, options = {}, us
   const actorName = String(user?.name || user?.email || company?.name || 'System').slice(0, 60);
   const results = [];
 
+  // One query for every row's product instead of one per row.
+  const ebmRowProducts = await loadLineProducts(
+    Product,
+    rows.map((r) => ({ product: r.productId })),
+    companyId,
+  );
   for (const row of rows) {
-    const product = await Product.findOne({ _id: row.productId, company: companyId }).lean();
+    const product = getLineProduct(ebmRowProducts, { product: row.productId });
     if (!product) {
       results.push({ itemCd: row.itemCd, submitted: false, error: 'Local product not found.' });
       continue;

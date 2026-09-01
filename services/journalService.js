@@ -141,22 +141,16 @@ class JournalService {
       // Account balances are updated inside JournalEntry.save() for posted creates.
 
       // ── Tax Transaction Capture ─────────────────────────────────────
-      // Automatically create TaxTransaction records for any tax-relevant journal lines.
-      // This runs after account balance updates but does NOT block entry creation on failure.
-      try {
-        await TaxTransactionService.processJournalEntry(saved, {
-          companyId: doc.company,
-          userId: doc.createdBy,
-          sourceType: doc.sourceType,
-          sourceId: doc.sourceId,
-          sourceReference: doc.sourceReference,
-          sourceData: options.sourceData || {},
-          session: sess
-        });
-      } catch (taxErr) {
-        console.error('Failed to create tax transactions for journal entry:', taxErr.message);
-        // Don't throw - tax transaction creation failure shouldn't block journal entry creation
-      }
+      // Compliance ledger — must succeed or the journal entry rolls back.
+      await TaxTransactionService.processJournalEntry(saved, {
+        companyId: doc.company,
+        userId: doc.createdBy,
+        sourceType: doc.sourceType,
+        sourceId: doc.sourceId,
+        sourceReference: doc.sourceReference,
+        sourceData: options.sourceData || {},
+        session: sess
+      });
 
       await bankTransactionService.createFromJournalEntry(saved, {
         companyId: doc.company,

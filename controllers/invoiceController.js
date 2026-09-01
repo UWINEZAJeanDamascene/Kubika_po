@@ -12,6 +12,7 @@ const notificationService = require("../services/notificationHelper");
 const emailService = require("../services/emailService");
 const Company = require("../models/Company");
 const cacheService = require("../services/cacheService");
+const { loadLineProducts, getLineProduct } = require("../utils/lineProducts");
 const { BankAccount, BankTransaction } = require("../models/BankAccount");
 const JournalService = require("../services/journalService");
 const { runInTransaction } = require("../services/transactionService");
@@ -208,14 +209,27 @@ exports.createInvoice = async (req, res, next) => {
       });
     }
 
-    // Validate products and check stock
+    // Validate products and check stock.
+    //
+    // Products are fetched in ONE query rather than one per line. This loop
+    // previously issued a findOne per invoice line, so a 20-line invoice cost
+    // 20 sequential round-trips — several seconds against a remote database,
+    // paid on every invoice creation. Validation below is unchanged: the lines
+    // are still walked in order and the first failure still wins, so error
+    // messages and their precedence are identical.
     const productMap = {};
     await EBMProductService.assertProductsRegistered(companyId, invoiceLines.map((line) => line.product));
+
+    const lineProductIds = [...new Set(
+      invoiceLines.map((line) => line.product).filter(Boolean).map((id) => id.toString()),
+    )];
+    const fetchedProducts = lineProductIds.length
+      ? await Product.find({ _id: { $in: lineProductIds }, company: companyId })
+      : [];
+    const productsById = new Map(fetchedProducts.map((p) => [p._id.toString(), p]));
+
     for (const line of invoiceLines) {
-      const product = await Product.findOne({
-        _id: line.product,
-        company: companyId,
-      });
+      const product = line.product ? productsById.get(line.product.toString()) : null;
       if (!product) {
         return res.status(400).json({
           success: false,
@@ -313,11 +327,22 @@ exports.createInvoice = async (req, res, next) => {
         if (trx) {
           let totalInvoiceCOGS = 0;
 
+          // One read for every line's product. FIFO consumption below stays
+          // sequential — it must, since each consume() draws down the layers the
+          // next one sees — but the lookups themselves have no such ordering
+          // requirement and were costing a round-trip each.
+          const confirmProductIds = [...new Set(
+            invoice.lines.map((l) => l.product && (l.product._id || l.product))
+              .filter(Boolean).map((id) => id.toString()),
+          )];
+          const confirmProducts = confirmProductIds.length
+            ? await Product.find({ _id: { $in: confirmProductIds }, company: companyId })
+            : [];
+          const confirmProductsById = new Map(confirmProducts.map((p) => [p._id.toString(), p]));
+
           for (const line of invoice.lines) {
-            const product = await Product.findOne({
-              _id: line.product._id,
-              company: companyId,
-            }).session(trx);
+            const lineProductId = line.product && (line.product._id || line.product);
+            const product = lineProductId ? confirmProductsById.get(lineProductId.toString()) : null;
             if (!product) continue;
 
             const inventoryService = require("../services/inventoryService");
@@ -497,11 +522,9 @@ exports.createInvoice = async (req, res, next) => {
           // Non-transactional fallback path
           let totalInvoiceCOGS = 0;
           const inventoryService = require("../services/inventoryService");
+          const __lineProducts0 = await loadLineProducts(Product, invoice.lines, companyId);
           for (const line of invoice.lines) {
-            const product = await Product.findOne({
-              _id: line.product._id,
-              company: companyId,
-            });
+            const product = getLineProduct(__lineProducts0, line);
             if (!product) continue;
             let consumeResult;
             const qty = line.qty || line.quantity || 0;
@@ -814,11 +837,9 @@ exports.updateInvoice = async (req, res, next) => {
     // If lines are updated, validate stock and products
     if (lines) {
       // Validate products are active
+      const __lineProducts1 = await loadLineProducts(Product, lines, companyId);
       for (const line of lines) {
-        const product = await Product.findOne({
-          _id: line.product,
-          company: companyId,
-        });
+        const product = getLineProduct(__lineProducts1, line);
         if (!product) {
           return res.status(400).json({
             success: false,
@@ -1014,11 +1035,9 @@ exports.confirmInvoice = async (req, res, next) => {
     let totalInvoiceCOGS = 0;
     let hasStockableLines = false;
 
+    const __lineProducts2 = await loadLineProducts(Product, invoice.lines, companyId);
     for (const line of invoice.lines) {
-      const product = await Product.findOne({
-        _id: line.product._id,
-        company: companyId,
-      });
+      const product = getLineProduct(__lineProducts2, line);
       if (!product) {
         return res.status(400).json({
           success: false,
@@ -1233,11 +1252,9 @@ exports.confirmInvoice = async (req, res, next) => {
     invoice.stockReserved = true;
 
     // Deduct stock for each line
+    const __lineProducts3 = await loadLineProducts(Product, invoice.lines, companyId);
     for (const line of invoice.lines) {
-      const product = await Product.findOne({
-        _id: line.product._id || line.product,
-        company: companyId,
-      });
+      const product = getLineProduct(__lineProducts3, line);
       if (product && product.isStockable !== false) {
         const qty = line.qty || line.quantity || 0;
         if (qty > 0) {
@@ -1479,11 +1496,9 @@ exports.recordPayment = async (req, res, next) => {
 
     // Auto-confirm if stock not yet deducted and payment is made
     if (!invoice.stockDeducted && invoice.status === "draft") {
+      const __lineProducts4 = await loadLineProducts(Product, invoice.lines, companyId);
       for (const line of invoice.lines) {
-        const product = await Product.findOne({
-          _id: line.product._id || line.product,
-          company: companyId,
-        });
+        const product = getLineProduct(__lineProducts4, line);
 
         if (product) {
           const qty = line.qty || line.quantity || 0;
@@ -1749,11 +1764,9 @@ exports.cancelInvoice = async (req, res, next) => {
     if (invoice.stockReserved) {
       const warehouseService = require("../services/warehouseService");
 
+      const __lineProducts5 = await loadLineProducts(Product, invoice.lines, companyId);
       for (const line of invoice.lines) {
-        const product = await Product.findOne({
-          _id: line.product._id,
-          company: companyId,
-        });
+        const product = getLineProduct(__lineProducts5, line);
         if (!product) continue;
 
         const qty = line.qty || line.quantity || 0;

@@ -1,4 +1,5 @@
 const mongoose = require("mongoose");
+const { parseOptionalPagination, paginationMeta } = require('../utils/pagination');
 const BankAccount = require("../models/BankAccount");
 const FixedDeposit = require("../models/FixedDeposit");
 const InterestAccrual = require("../models/InterestAccrual");
@@ -353,11 +354,22 @@ exports.getFixedDeposits = async (req, res, next) => {
     const filter = { company: cid };
     if (status) filter.status = status;
 
-    const fds = await FixedDeposit.find(filter)
+    // Opt-in pagination — see parseOptionalPagination.
+    const { paginated, page, limit, skip } = parseOptionalPagination(req.query, { defaultLimit: 50 });
+    let query = FixedDeposit.find(filter)
       .populate("bankAccount", "name")
       .sort({ maturityDate: 1 });
+    if (paginated) query = query.skip(skip).limit(limit);
 
-    res.json({ success: true, count: fds.length, data: fds });
+    const fds = await query;
+    const total = paginated ? await FixedDeposit.countDocuments(filter) : fds.length;
+
+    res.json({
+      success: true,
+      count: fds.length,
+      data: fds,
+      pagination: paginationMeta(page, limit || fds.length || 1, total),
+    });
   } catch (e) { next(e); }
 };
 

@@ -185,11 +185,11 @@ model Invoice {
   createdAt               DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt               DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  company      Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  client       Client        @relation(fields: [clientId], references: [id])
-  lines        InvoiceLine[]
-  arAllocations ARReceiptAllocation[]
-  creditNotes  CreditNote[]
+  company           Company               @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  client            Client                @relation(fields: [clientId], references: [id])
+  lines             InvoiceLine[]
+  arAllocations     ARReceiptAllocation[]
+  creditNoteRecords CreditNote[]
 
   @@unique([companyId, referenceNo])
   @@index([companyId, status, dueDate])
