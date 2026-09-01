@@ -77,6 +77,7 @@ async function sumJournalLines(companyId, options = {}) {
     accountCodePrefixes = null,
     accountIds = null,
     minDebit = null,
+    minCredit = null,
     groupByAccountCode = true,
     groupBy = null,
     withCount = false,
@@ -141,6 +142,7 @@ async function sumJournalLines(companyId, options = {}) {
     }
   }
   if (minDebit != null) conditions.push(Prisma.sql`jel.debit > ${minDebit}`);
+  if (minCredit != null) conditions.push(Prisma.sql`jel.credit > ${minCredit}`);
 
   const where = Prisma.join(conditions, ' AND ');
   // $sum: 1 after $unwind counted lines, not entries — COUNT(*) matches.
@@ -175,6 +177,53 @@ async function sumJournalLines(companyId, options = {}) {
     WHERE ${where}
     GROUP BY ${groupColumn}
   `;
+}
+
+/**
+ * Entry-level totals — no join to journal_entry_lines.
+ *
+ * The pipelines this replaces had no `$unwind`, so they summed the entry's own
+ * debitTotal/creditTotal and counted entries. Joining lines here would multiply
+ * both by the number of lines per entry, so this deliberately does not reuse
+ * sumJournalLines.
+ *
+ * @returns {Promise<{entryCount: number, totalDebit: number, totalCredit: number}>}
+ */
+async function sumJournalEntries(companyId, options = {}) {
+  const cid = toIdString(companyId);
+  if (!cid) return { entryCount: 0, totalDebit: 0, totalCredit: 0 };
+
+  const {
+    dateFrom = null,
+    dateTo = null,
+    status = null,
+    excludeReversed = false,
+  } = options;
+
+  const conditions = [Prisma.sql`je.company_id = ${cid}`];
+  if (status) {
+    if (!JOURNAL_STATUSES.has(status)) {
+      throw new Error(`sumJournalEntries: unknown journal status "${status}"`);
+    }
+    conditions.push(Prisma.sql`je.status = ${Prisma.raw(`'${status}'`)}`);
+  }
+  if (excludeReversed) conditions.push(Prisma.sql`je.reversed = false`);
+  if (dateFrom) conditions.push(Prisma.sql`je.date >= ${dateFrom}`);
+  if (dateTo) conditions.push(Prisma.sql`je.date <= ${dateTo}`);
+
+  const rows = await dbClient().$queryRaw`
+    SELECT COUNT(*)::int AS "entryCount",
+           COALESCE(SUM(je.total_debit), 0)::float AS "totalDebit",
+           COALESCE(SUM(je.total_credit), 0)::float AS "totalCredit"
+    FROM journal_entries je
+    WHERE ${Prisma.join(conditions, ' AND ')}
+  `;
+  const row = rows[0] || {};
+  return {
+    entryCount: Number(row.entryCount) || 0,
+    totalDebit: Number(row.totalDebit) || 0,
+    totalCredit: Number(row.totalCredit) || 0,
+  };
 }
 
 function normalizeCode(code) {
@@ -466,6 +515,7 @@ module.exports = {
   resolveAccountType,
   sumLinesByAccountCode,
   sumJournalLines,
+  sumJournalEntries,
   sumCashLinesBySourceType,
   totalForAccountType,
   totalForAccountTypes,

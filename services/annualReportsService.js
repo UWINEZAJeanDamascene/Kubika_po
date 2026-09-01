@@ -21,6 +21,7 @@
 const mongoose = require('mongoose');
 const { dbClient } = require('../lib/prisma');
 const { toIdString } = require('../utils/objectId');
+const journalAgg = require('./journalAggregationService');
 
 // Format currency in Rwandan Francs
 const formatRWF = (amount) => {
@@ -1534,28 +1535,18 @@ class AnnualReportsService {
 
     const accountIds = accounts.map(a => a._id.toString());
 
-    const result = await JournalEntry.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          date: { $gte: start, $lte: end }
-        }
-      },
-      { $unwind: '$lines' },
-      {
-        $match: {
-          $or: accountIds.map(id => ({ 'lines.account': new mongoose.Types.ObjectId(id) }))
-        }
-      },
-      {
-        $group: {
-          _id: null,
-          total: { $sum: { $toDouble: '$lines.debit' } }
-        }
-      }
-    ]);
+    // NUMBER CHANGE: this returned 0 on every run before. journalLineToApi()
+    // exposes accountCode/accountName only, so `lines.account` was undefined
+    // for every line and the $or matched nothing. journal_entry_lines.account_id
+    // holds the value, so the SQL below is what the pipeline meant to compute.
+    const result = await journalAgg.sumJournalLines(companyId, {
+      dateFrom: start,
+      dateTo: end,
+      accountIds,
+      groupByAccountCode: false,
+    });
 
-    return result[0]?.total || 0;
+    return result[0]?.debit || 0;
   }
 
   static async _getInventoryValue(companyId, date) {

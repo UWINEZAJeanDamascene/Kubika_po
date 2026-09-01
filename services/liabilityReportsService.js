@@ -12,6 +12,7 @@ const mongoose = require("mongoose");
 const Loan = require("../models/Loan");
 const ChartOfAccount = require("../models/ChartOfAccount");
 const JournalEntry = require("../models/JournalEntry");
+const journalAgg = require("./journalAggregationService");
 
 class LiabilityReportsService {
   /**
@@ -320,29 +321,13 @@ class LiabilityReportsService {
     dateTo.setHours(23, 59, 59, 999);
 
     // Aggregate journal entries for liability accounts (2000-2999 range)
-    const result = await JournalEntry.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          status: "posted",
-          reversed: { $ne: true },
-          date: { $lte: dateTo },
-        },
-      },
-      { $unwind: "$lines" },
-      {
-        $match: {
-          "lines.accountCode": { $in: ["2700", "2800", "2900"] }, // Borrowings only: Short Term Loans, Accrued Interest, Long Term Loans
-        },
-      },
-      {
-        $group: {
-          _id: "$lines.accountCode",
-          total_dr: { $sum: "$lines.debit" },
-          total_cr: { $sum: "$lines.credit" },
-        },
-      },
-    ]);
+    const result = (await journalAgg.sumJournalLines(companyId, {
+      dateTo,
+      status: "posted",
+      excludeReversed: true,
+      // Borrowings only: Short Term Loans, Accrued Interest, Long Term Loans
+      accountCodes: ["2700", "2800", "2900"],
+    })).map((r) => ({ _id: r._id, total_dr: r.debit, total_cr: r.credit }));
 
     let totalBorrowings = 0;
     for (const row of result) {

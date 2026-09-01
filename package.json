@@ -50,6 +50,7 @@
     "etl:verify-parity": "node scripts/etl/verify-parity.js",
     "test:phase0-step8": "jest --runInBand test/phase0TransactionsSequences.test.js",
     "test:atomicity": "jest --runInBand test/transactionAtomicity.test.js",
+    "test:agg-parity": "jest --runInBand test/journalAggregationParity.test.js test/prismaAggregateFilters.test.js",
     "test:ai": "npm run ai:check-boundaries && jest --runInBand ai-engine --passWithNoTests",
     "test:ai:adversarial": "jest --runInBand ai-engine/tests/adversarial --passWithNoTests",
     "ai:check-boundaries": "node scripts/check-ai-boundaries.js",

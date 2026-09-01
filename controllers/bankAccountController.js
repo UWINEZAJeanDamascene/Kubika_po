@@ -9,6 +9,7 @@ const Invoice = require("../models/Invoice");
 const Purchase = require("../models/Purchase");
 const Expense = require("../models/Expense");
 const JournalEntry = require("../models/JournalEntry");
+const journalAgg = require("../services/journalAggregationService");
 const JournalService = require("../services/journalService");
 const ChartOfAccount = require("../models/ChartOfAccount");
 const { DEFAULT_ACCOUNTS, CHART_OF_ACCOUNTS } = require("../constants/chartOfAccounts");
@@ -518,12 +519,11 @@ exports.getBankAccountBalance = async (req, res, next) => {
     }).sort({ date: -1, createdAt: -1, _id: -1 }).lean();
     const bankTransactionBalance = Number(latest?.balance ?? latest?.balanceAfter ?? account.openingBalance ?? 0);
     const ledgerAccountId = String(account.ledgerAccountId || "1100");
-    const rows = await JournalEntry.aggregate([
-      { $match: { company: new mongoose.Types.ObjectId(companyId), status: "posted", "lines.accountCode": ledgerAccountId } },
-      { $unwind: "$lines" },
-      { $match: { "lines.accountCode": ledgerAccountId } },
-      { $group: { _id: null, debit: { $sum: { $toDouble: "$lines.debit" } }, credit: { $sum: { $toDouble: "$lines.credit" } } } },
-    ]);
+    const rows = await journalAgg.sumJournalLines(companyId, {
+      status: "posted",
+      accountCodes: [ledgerAccountId],
+      groupByAccountCode: false,
+    });
     const glBalance = Number(account.openingBalance?.toString?.() || account.openingBalance || 0) + (rows[0]?.debit || 0) - (rows[0]?.credit || 0);
     const difference = Math.round((bankTransactionBalance - glBalance) * 100) / 100;
     res.json({

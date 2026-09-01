@@ -29,6 +29,7 @@ const Invoice = require('../models/Invoice');
 const Purchase = require('../models/Purchase');
 const Expense = require('../models/Expense');
 const JournalEntry = require('../models/JournalEntry');
+const journalAgg = require('./journalAggregationService');
 const ChartOfAccount = require('../models/ChartOfAccount');
 const StockMovement = require('../models/StockMovement');
 const Product = require('../models/Product');
@@ -387,28 +388,18 @@ class MonthlyReportsService {
 
     const accountIds = accounts.map(a => a._id.toString());
 
-    const result = await JournalEntry.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          date: { $gte: start, $lte: end }
-        }
-      },
-      { $unwind: '$lines' },
-      {
-        $match: {
-          $or: accountIds.map(id => ({ 'lines.account': new mongoose.Types.ObjectId(id) }))
-        }
-      },
-      {
-        $group: {
-          _id: null,
-          total: { $sum: { $toDouble: '$lines.debit' } }
-        }
-      }
-    ]);
+    // NUMBER CHANGE: this returned 0 on every run before. journalLineToApi()
+    // exposes accountCode/accountName only, so `lines.account` was undefined
+    // for every line and the $or matched nothing. journal_entry_lines.account_id
+    // holds the value, so the SQL below is what the pipeline meant to compute.
+    const result = await journalAgg.sumJournalLines(companyId, {
+      dateFrom: start,
+      dateTo: end,
+      accountIds,
+      groupByAccountCode: false,
+    });
 
-    return result[0]?.total || 0;
+    return result[0]?.debit || 0;
   }
 
   /**
@@ -454,18 +445,11 @@ class MonthlyReportsService {
 
       // ALWAYS fetch JournalEntry data for ALL accounts (not just missing ones)
       // JournalEntry is the authoritative source of truth
-      const entries = await JournalEntry.aggregate([
-        { $match: { company: new mongoose.Types.ObjectId(companyId), date: { $lte: asOfDate }, status: 'posted' } },
-        { $unwind: '$lines' },
-        { $match: { 'lines.accountCode': { $in: accountCodes } } },
-        {
-          $group: {
-            _id: '$lines.accountCode',
-            debit: { $sum: { $toDouble: '$lines.debit' } },
-            credit: { $sum: { $toDouble: '$lines.credit' } }
-          }
-        }
-      ]);
+      const entries = await journalAgg.sumJournalLines(companyId, {
+        dateTo: asOfDate,
+        status: 'posted',
+        accountCodes,
+      });
 
       // Merge JournalEntry data - it takes precedence over AccountBalance
       entries.forEach(e => {
@@ -656,17 +640,16 @@ class MonthlyReportsService {
       accountByCode.set(String(a.code || '').trim(), a);
     });
 
-    const entries = await JournalEntry.aggregate([
-      { $match: { company: new mongoose.Types.ObjectId(companyId), date: { $lte: end }, status: 'posted' } },
-      { $unwind: '$lines' },
-      {
-        $group: {
-          _id: '$lines.accountCode',
-          totalDebit: { $sum: { $toDouble: '$lines.debit' } },
-          totalCredit: { $sum: { $toDouble: '$lines.credit' } }
-        }
-      }
-    ]);
+    const entryRows = await journalAgg.sumJournalLines(companyId, {
+      dateTo: end,
+      status: 'posted',
+    });
+    // This caller reads totalDebit/totalCredit rather than debit/credit.
+    const entries = entryRows.map((r) => ({
+      _id: r._id,
+      totalDebit: r.debit,
+      totalCredit: r.credit,
+    }));
 
     const items = entries.map(e => {
       const code = String(e._id || '').trim();
@@ -725,17 +708,11 @@ class MonthlyReportsService {
     });
 
     // Get all journal entries for the period
-    const entries = await JournalEntry.aggregate([
-      { $match: { company: new mongoose.Types.ObjectId(companyId), date: { $gte: start, $lte: end }, status: 'posted' } },
-      { $unwind: '$lines' },
-      {
-        $group: {
-          _id: '$lines.accountCode',
-          debit: { $sum: { $toDouble: '$lines.debit' } },
-          credit: { $sum: { $toDouble: '$lines.credit' } }
-        }
-      }
-    ]);
+    const entries = await journalAgg.sumJournalLines(companyId, {
+      dateFrom: start,
+      dateTo: end,
+      status: 'posted',
+    });
 
     // Calculate balances by account type
     let revenueTotal = 0;
@@ -802,12 +779,13 @@ class MonthlyReportsService {
     
     // Beginning cash = prior period ending (calculate backwards from current ending)
     // But if we have no prior activity, use the JournalEntry based calculation
-    const priorEntries = await JournalEntry.aggregate([
-      { $match: { company: new mongoose.Types.ObjectId(companyId), date: { $lt: start }, status: 'posted' } },
-      { $unwind: '$lines' },
-      { $match: { 'lines.accountCode': { $regex: '^10|^11' } } }, // Cash accounts 1000-1199
-      { $group: { _id: null, debit: { $sum: { $toDouble: '$lines.debit' } }, credit: { $sum: { $toDouble: '$lines.credit' } } } }
-    ]);
+    const priorEntries = await journalAgg.sumJournalLines(companyId, {
+      dateTo: start,
+      dateToInclusive: false,
+      status: 'posted',
+      accountCodePrefixes: ['10', '11'], // Cash accounts 1000-1199
+      groupByAccountCode: false,
+    });
     const priorCashActivity = priorEntries[0]?.debit - priorEntries[0]?.credit || 0;
     const beginningCash = Math.max(0, priorCashActivity); // Don't show negative beginning cash
 
@@ -1856,25 +1834,14 @@ static async getPayrollSummary(companyId, year, month) {
 
     const accountActivity = await Promise.all(
       accounts.map(async (account) => {
-        const entries = await JournalEntry.aggregate([
-          {
-            $match: {
-              company: new mongoose.Types.ObjectId(companyId),
-              date: { $gte: start, $lte: end },
-              status: 'posted'
-            }
-          },
-          { $unwind: '$lines' },
-          { $match: { 'lines.accountCode': account.code } },
-          {
-            $group: {
-              _id: null,
-              debit: { $sum: { $toDouble: '$lines.debit' } },
-              credit: { $sum: { $toDouble: '$lines.credit' } },
-              count: { $sum: 1 }
-            }
-          }
-        ]);
+        const entries = await journalAgg.sumJournalLines(companyId, {
+          dateFrom: start,
+          dateTo: end,
+          status: 'posted',
+          accountCodes: [account.code],
+          groupByAccountCode: false,
+          withCount: true,
+        });
 
         const activity = entries[0];
         if (!activity || (activity.debit === 0 && activity.credit === 0)) return null;
@@ -2063,18 +2030,11 @@ static async getPayrollSummary(companyId, year, month) {
           const typeAccounts = accounts.filter(a => accountTypes.includes(a.type));
           const accountCodes = typeAccounts.map(a => String(a.code || '').trim());
 
-          const entries = await JournalEntry.aggregate([
-            { $match: { company: new mongoose.Types.ObjectId(companyId), date: { $lte: monthEnd }, status: 'posted' } },
-            { $unwind: '$lines' },
-            { $match: { 'lines.accountCode': { $in: accountCodes } } },
-            {
-              $group: {
-                _id: '$lines.accountCode',
-                debit: { $sum: { $toDouble: '$lines.debit' } },
-                credit: { $sum: { $toDouble: '$lines.credit' } }
-              }
-            }
-          ]);
+          const entries = await journalAgg.sumJournalLines(companyId, {
+            dateTo: monthEnd,
+            status: 'posted',
+            accountCodes,
+          });
 
           const balanceMap = new Map();
           entries.forEach(e => {
@@ -2185,26 +2145,21 @@ static async getPayrollSummary(companyId, year, month) {
 
     // Calculate cash flow for a period using Direct Method
     const calculateCashFlowForPeriod = async (periodStart, periodEnd) => {
-      const movements = await JournalEntry.aggregate([
-        {
-          $match: {
-            company: new mongoose.Types.ObjectId(companyId),
-            status: 'posted',
-            reversed: { $ne: true },
-            date: { $gte: periodStart, $lte: periodEnd },
-            sourceType: { $nin: excluded }
-          }
-        },
-        { $unwind: '$lines' },
-        { $match: { 'lines.accountCode': { $in: cashAccountCodes } } },
-        {
-          $group: {
-            _id: '$sourceType',
-            total_dr: { $sum: '$lines.debit' },
-            total_cr: { $sum: '$lines.credit' }
-          }
-        }
-      ]);
+      const movementRows = await journalAgg.sumJournalLines(companyId, {
+        dateFrom: periodStart,
+        dateTo: periodEnd,
+        status: 'posted',
+        excludeReversed: true,
+        excludeSourceTypes: excluded,
+        accountCodes: cashAccountCodes,
+        groupBy: 'sourceType',
+      });
+      // sumJournalLines returns debit/credit; this caller reads total_dr/total_cr.
+      const movements = movementRows.map((r) => ({
+        _id: r._id,
+        total_dr: r.debit,
+        total_cr: r.credit,
+      }));
 
       const sections = { operating: 0, investing: 0, financing: 0 };
 
@@ -2231,24 +2186,13 @@ static async getPayrollSummary(companyId, year, month) {
     const fullPeriodFlow = await calculateCashFlowForPeriod(start, end);
 
     // Get beginning cash (prior to period start)
-    const priorEntries = await JournalEntry.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          status: 'posted',
-          date: { $lt: start }
-        }
-      },
-      { $unwind: '$lines' },
-      { $match: { 'lines.accountCode': { $in: cashAccountCodes } } },
-      {
-        $group: {
-          _id: null,
-          debit: { $sum: '$lines.debit' },
-          credit: { $sum: '$lines.credit' }
-        }
-      }
-    ]);
+    const priorEntries = await journalAgg.sumJournalLines(companyId, {
+      dateTo: start,
+      dateToInclusive: false,
+      status: 'posted',
+      accountCodes: cashAccountCodes,
+      groupByAccountCode: false,
+    });
     const beginningCash = (priorEntries[0]?.debit || 0) - (priorEntries[0]?.credit || 0);
 
     // Ending cash = beginning + net change
@@ -2809,19 +2753,17 @@ static async getPayrollSummary(companyId, year, month) {
     const totalWithholdingTax = (invoiceWHT[0]?.total || 0) + (purchaseWHT[0]?.total || 0);
 
     // Get remittances from journal entries (payments to tax authorities)
-    const taxRemittances = await JournalEntry.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          date: { $gte: start, $lte: end },
-          status: 'posted',
-          'lines.accountCode': { $regex: '^26' } // Tax payables
-        }
-      },
-      { $unwind: '$lines' },
-      { $match: { 'lines.accountCode': { $regex: '^26' }, 'lines.debit': { $gt: 0 } } },
-      { $group: { _id: '$lines.accountName', total: { $sum: { $toDouble: '$lines.debit' } } } }
-    ]);
+    // NUMBER CHANGE: this returned nothing before. The leading $match filtered
+    // on 'lines.accountCode', a path into the lines *array* that the shim's
+    // getPath cannot walk, so every entry was discarded before $unwind ran.
+    const taxRemittances = (await journalAgg.sumJournalLines(companyId, {
+      dateFrom: start,
+      dateTo: end,
+      status: 'posted',
+      accountCodePrefixes: ['26'], // Tax payables
+      minDebit: 0,
+      groupBy: 'accountName',
+    })).map((r) => ({ _id: r._id, total: r.debit }));
 
     const remittanceMap = new Map(taxRemittances.map(r => [r._id?.toLowerCase(), r.total]));
 

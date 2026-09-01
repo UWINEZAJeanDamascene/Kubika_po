@@ -4,6 +4,7 @@ const BankAccount = require("../models/BankAccount");
 const FixedDeposit = require("../models/FixedDeposit");
 const InterestAccrual = require("../models/InterestAccrual");
 const JournalEntry = require("../models/JournalEntry");
+const journalAgg = require("../services/journalAggregationService");
 const JournalService = require("../services/journalService");
 
 // Helper: get days in a given month/year
@@ -25,18 +26,13 @@ async function getAccountBalance(account, asOfDate) {
   const dateQuery = { $gte: openingBalanceDate };
   if (asOfDate) dateQuery.$lte = new Date(asOfDate);
 
-  const agg = await JournalEntry.aggregate([
-    { $match: { company: account.company, status: "posted", date: dateQuery } },
-    { $unwind: "$lines" },
-    { $match: { "lines.accountCode": ledgerAccountId } },
-    {
-      $group: {
-        _id: null,
-        totalDebits: { $sum: { $toDouble: { $ifNull: ["$lines.debit", 0] } } },
-        totalCredits: { $sum: { $toDouble: { $ifNull: ["$lines.credit", 0] } } },
-      },
-    },
-  ]);
+  const agg = (await journalAgg.sumJournalLines(account.company, {
+    dateFrom: dateQuery.$gte || null,
+    dateTo: dateQuery.$lte || null,
+    status: "posted",
+    accountCodes: [ledgerAccountId],
+    groupByAccountCode: false,
+  })).map((r) => ({ _id: null, totalDebits: r.debit, totalCredits: r.credit }));
 
   let totalDebits = 0;
   let totalCredits = 0;

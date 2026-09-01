@@ -30,6 +30,7 @@ const PurchaseReturn = require('../models/PurchaseReturn');
 const Expense = require('../models/Expense');
 const { dbClient } = require('../lib/prisma');
 const { toIdString } = require('../utils/objectId');
+const journalAgg = require('./journalAggregationService');
 const toObjectId = (value) => new mongoose.Types.ObjectId(String(value));
 
 function aggregateExpenseWithholdingTax(companyId, start, end) {
@@ -359,29 +360,19 @@ class DailyReportsService {
           .reduce((sum, t) => sum + toNumber(t.total), 0);
         
         const ledgerAccountId = account.ledgerAccountId || account.chartAccount || null;
-        const journalEntries = ledgerAccountId ? await JournalEntry.aggregate([
-          {
-            $match: {
-              company: toObjectId(companyId),
+        // NUMBER CHANGE: this returned nothing before. The leading $match
+        // filtered on 'lines.accountCode', a path into the lines *array*, which
+        // the shim's getPath cannot walk — so every entry was discarded before
+        // $unwind ran. The SQL join below is what the pipeline meant.
+        const journalEntries = ledgerAccountId
+          ? (await journalAgg.sumJournalLines(companyId, {
+              dateFrom: new Date(start),
+              dateTo: new Date(end),
               status: 'posted',
-              date: { $gte: new Date(start), $lte: new Date(end) },
-              'lines.accountCode': ledgerAccountId
-            }
-          },
-          { $unwind: '$lines' },
-          {
-            $match: {
-              'lines.accountCode': ledgerAccountId
-            }
-          },
-          {
-            $group: {
-              _id: null,
-              totalDebit: { $sum: { $toDouble: { $ifNull: ['$lines.debit', 0] } } },
-              totalCredit: { $sum: { $toDouble: { $ifNull: ['$lines.credit', 0] } } }
-            }
-          }
-        ]) : [];
+              accountCodes: [ledgerAccountId],
+              groupByAccountCode: false,
+            })).map((r) => ({ _id: null, totalDebit: r.debit, totalCredit: r.credit }))
+          : [];
         
         const journalNet = transactions.length === 0
           ? toNumber(journalEntries[0]?.totalDebit) - toNumber(journalEntries[0]?.totalCredit)

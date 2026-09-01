@@ -4,6 +4,7 @@ const BankReconciliationSession = require("../models/BankReconciliationSession")
 const BankStatementTransaction = require("../models/BankStatementTransaction");
 const { BankAccount, BankTransaction, BankReconciliationMatch } = require("../models/BankAccount");
 const JournalEntry = require("../models/JournalEntry");
+const journalAgg = require("./journalAggregationService");
 
 function objectId(value) {
   return value instanceof mongoose.Types.ObjectId ? value : new mongoose.Types.ObjectId(value);
@@ -38,24 +39,13 @@ async function getScopedBankAccount(companyId, bankAccountId) {
 async function glBalance(companyId, bankAccount, asOfDate) {
   const openingBalance = toNumber(bankAccount.openingBalance);
   const openingDate = bankAccount.openingBalanceDate || new Date(0);
-  const match = {
-    company: objectId(companyId),
+  const rows = await journalAgg.sumJournalLines(companyId, {
+    dateFrom: openingDate,
+    dateTo: new Date(asOfDate),
     status: "posted",
-    date: { $gte: openingDate, $lte: new Date(asOfDate) },
-    "lines.accountCode": String(bankAccount.ledgerAccountId || "1100"),
-  };
-  const rows = await JournalEntry.aggregate([
-    { $match: match },
-    { $unwind: "$lines" },
-    { $match: { "lines.accountCode": String(bankAccount.ledgerAccountId || "1100") } },
-    {
-      $group: {
-        _id: null,
-        debit: { $sum: { $toDouble: "$lines.debit" } },
-        credit: { $sum: { $toDouble: "$lines.credit" } },
-      },
-    },
-  ]);
+    accountCodes: [String(bankAccount.ledgerAccountId || "1100")],
+    groupByAccountCode: false,
+  });
   return round(openingBalance + toNumber(rows[0]?.debit) - toNumber(rows[0]?.credit));
 }
 

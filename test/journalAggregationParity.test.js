@@ -24,10 +24,12 @@ const hasDb = Boolean(process.env.DATABASE_URL);
 const { prisma } = require('../lib/prisma');
 const tenantContext = require('../lib/tenantContext');
 const { generateObjectId } = require('../utils/objectId');
-const { sumJournalLines } = require('../services/journalAggregationService');
+const { sumJournalLines, sumJournalEntries } = require('../services/journalAggregationService');
 const JournalEntry = require('../models/JournalEntry');
 
-const ACCOUNT_A = 'aaaaaaaaaaaaaaaaaaaaaaaa';
+// journal_entry_lines.account_id has an FK to chart_of_accounts, so this is
+// resolved from a real row rather than invented.
+let ACCOUNT_A = null;
 
 const IN_PERIOD_START = new Date('2091-03-01T00:00:00.000Z');
 const IN_PERIOD_END = new Date('2091-03-31T23:59:59.999Z');
@@ -77,6 +79,9 @@ beforeAll(async () => {
   const author = await prisma.user.findFirst({ select: { id: true } });
   if (!author) return;
   authorId = author.id;
+
+  const account = await prisma.chartOfAccount.findFirst({ select: { id: true } });
+  ACCOUNT_A = account ? account.id : null;
 
   companyId = generateObjectId();
   await prisma.company.create({
@@ -287,6 +292,97 @@ describe('Gap 4 — sumJournalLines matches the pipeline it replaces', () => {
     expect(normalize(sql)).toEqual(normalize(shim, '_id'));
     expect(normalize(sql)['1010'].debit).toBeCloseTo(119.11 + 999.99, 2);
     expect(normalize(sql)['4000'].credit).toBeCloseTo(100.25 + 777.77, 2);
+  });
+
+
+  test('group by source type, excluding some (cash movement by source)', async () => {
+    if (guard()) return;
+
+    const excluded = ['manual', 'opening_balance'];
+    const shim = await runShim([
+      { $match: { company: companyId, status: 'posted', reversed: { $ne: true }, date: { $gte: IN_PERIOD_START, $lte: IN_PERIOD_END }, sourceType: { $nin: excluded } } },
+      { $unwind: '$lines' },
+      { $match: { 'lines.accountCode': { $in: ['1010', '1110'] } } },
+      { $group: { _id: '$sourceType', debit: { $sum: '$lines.debit' }, credit: { $sum: '$lines.credit' } } },
+    ]);
+
+    const sql = await sumJournalLines(companyId, {
+      dateFrom: IN_PERIOD_START, dateTo: IN_PERIOD_END, status: 'posted',
+      excludeReversed: true, excludeSourceTypes: excluded,
+      accountCodes: ['1010', '1110'], groupBy: 'sourceType',
+    });
+
+    expect(normalize(sql)).toEqual(normalize(shim, '_id'));
+    expect(Object.keys(normalize(sql)).sort()).toEqual(['invoice', 'payment']);
+  });
+
+  test('group by account name', async () => {
+    if (guard()) return;
+
+    const shim = await runShim([
+      { $match: { company: companyId, date: { $gte: IN_PERIOD_START, $lte: IN_PERIOD_END }, status: 'posted' } },
+      { $unwind: '$lines' },
+      { $group: { _id: '$lines.accountName', debit: { $sum: { $toDouble: '$lines.debit' } }, credit: { $sum: { $toDouble: '$lines.credit' } } } },
+    ]);
+
+    const sql = await sumJournalLines(companyId, {
+      dateFrom: IN_PERIOD_START, dateTo: IN_PERIOD_END, status: 'posted', groupBy: 'accountName',
+    });
+
+    expect(normalize(sql)).toEqual(normalize(shim, '_id'));
+  });
+
+  test('minDebit keeps only lines with a debit above the threshold', async () => {
+    if (guard()) return;
+
+    const shim = await runShim([
+      { $match: { company: companyId, date: { $gte: IN_PERIOD_START, $lte: IN_PERIOD_END }, status: 'posted' } },
+      { $unwind: '$lines' },
+      { $match: { 'lines.debit': { $gt: 0 } } },
+      { $group: { _id: '$lines.accountCode', debit: { $sum: { $toDouble: '$lines.debit' } }, credit: { $sum: { $toDouble: '$lines.credit' } } } },
+    ]);
+
+    const sql = await sumJournalLines(companyId, {
+      dateFrom: IN_PERIOD_START, dateTo: IN_PERIOD_END, status: 'posted', minDebit: 0,
+    });
+
+    expect(normalize(sql)).toEqual(normalize(shim, '_id'));
+    // The credit-only lines (4000, 5000) contribute nothing once filtered.
+    expect(Object.keys(normalize(sql)).sort()).toEqual(['1010', '1110']);
+  });
+
+  test('filtering by account id matches the same lines as its code', async () => {
+    if (guard()) return;
+    if (!ACCOUNT_A) return;
+
+    const sql = await sumJournalLines(companyId, {
+      dateFrom: IN_PERIOD_START, dateTo: IN_PERIOD_END, status: 'posted',
+      accountIds: [ACCOUNT_A], groupByAccountCode: false,
+    });
+
+    // Both 1010 lines in the period carry this account id; the reversed one does not.
+    expect(sql[0].debit).toBeCloseTo(100.25 + 7.75, 2);
+  });
+
+
+  test('entry-level totals count entries, not lines', async () => {
+    if (guard()) return;
+
+    const shim = await runShim([
+      { $match: { company: companyId, status: 'posted', reversed: { $ne: true }, date: { $gte: IN_PERIOD_START, $lte: IN_PERIOD_END } } },
+      { $group: { _id: null, entry_count: { $sum: 1 }, total_debit: { $sum: '$debitTotal' }, total_credit: { $sum: '$creditTotal' } } },
+    ]);
+
+    const sql = await sumJournalEntries(companyId, {
+      dateFrom: IN_PERIOD_START, dateTo: IN_PERIOD_END, status: 'posted', excludeReversed: true,
+    });
+
+    expect(sql.entryCount).toBe(shim[0].entry_count);
+    expect(sql.totalDebit).toBeCloseTo(shim[0].total_debit, 2);
+    expect(sql.totalCredit).toBeCloseTo(shim[0].total_credit, 2);
+    // Two posted, non-reversed entries in the period — five lines between them,
+    // so a lines join would have reported 5 here.
+    expect(sql.entryCount).toBe(2);
   });
 
   test('an empty code list matches nothing rather than everything', async () => {

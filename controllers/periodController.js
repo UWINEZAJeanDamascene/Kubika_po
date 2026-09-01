@@ -240,30 +240,19 @@ exports.getCurrentPeriod = async (req, res) => {
 // Get period summary stats
 exports._getPeriodStats = async (companyId, period) => {
   try {
-    const JournalEntry = require('../models/JournalEntry');
-    const stats = await JournalEntry.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          status: 'posted',
-          reversed: { $ne: true },
-          date: {
-            $gte: new Date(period.start_date),
-            $lte: new Date(period.end_date)
-          }
-        }
-      },
-      {
-        $group: {
-          _id: null,
-          entry_count: { $sum: 1 },
-          total_debit: { $sum: '$debitTotal' },
-          total_credit: { $sum: '$creditTotal' }
-        }
-      }
-    ]);
+    const journalAgg = require('../services/journalAggregationService');
+    const totals = await journalAgg.sumJournalEntries(companyId, {
+      dateFrom: new Date(period.start_date),
+      dateTo: new Date(period.end_date),
+      status: 'posted',
+      excludeReversed: true,
+    });
 
-    const s = stats[0] || { entry_count: 0, total_debit: 0, total_credit: 0 };
+    const s = {
+      entry_count: totals.entryCount,
+      total_debit: totals.totalDebit,
+      total_credit: totals.totalCredit,
+    };
     return {
       entry_count: s.entry_count,
       total_debit: parseFloat(s.total_debit?.toString() || '0'),

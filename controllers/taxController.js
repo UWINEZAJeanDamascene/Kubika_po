@@ -6,6 +6,7 @@ const Payroll = require("../models/Payroll");
 const mongoose = require("mongoose");
 const JournalEntry = require("../models/JournalEntry");
 const JournalService = require("../services/journalService");
+const journalAgg = require("../services/journalAggregationService");
 const TaxService = require("../services/taxService");
 const TaxAutomationService = require("../services/taxAutomationService");
 const { parsePagination, paginationMeta } = require("../utils/pagination");
@@ -913,67 +914,34 @@ exports.getTaxDashboard = async (req, res) => {
     ]);
 
     // 4. Get Withholding Tax from Journal Entries (auto-detected)
-    const whtMatch = {
-      company: new mongoose.Types.ObjectId(companyId),
+    const withholdingTax = (await journalAgg.sumJournalLines(companyId, {
       status: "posted",
-      "lines.accountCode": { $in: ["2500"] }, // Withholding Tax Payable
-    };
-    if (Object.keys(dateFilter).length > 0) {
-      whtMatch.date = dateFilter;
-    }
-
-    const withholdingTax = await JournalEntry.aggregate([
-      { $match: whtMatch },
-      { $unwind: "$lines" },
-      {
-        $match: {
-          "lines.accountCode": { $in: ["2500"] },
-          "lines.credit": { $gt: 0 },
-        },
-      },
-      { $group: { _id: null, total: { $sum: "$lines.credit" } } },
-    ]);
+      accountCodes: ["2500"], // Withholding Tax Payable
+      dateFrom: dateFilter.$gte || null,
+      dateTo: dateFilter.$lte || null,
+      minCredit: 0, // the pipeline summed only credit lines
+      groupByAccountCode: false,
+    })).map((r) => ({ _id: null, total: r.credit }));
 
     // 5. Get Corporate Income Tax accruals from Journal Entries
-    const citMatch = {
-      company: new mongoose.Types.ObjectId(companyId),
+    const corporateTax = (await journalAgg.sumJournalLines(companyId, {
       status: "posted",
-      "lines.accountCode": "2400", // Income Tax Payable
-    };
-    if (Object.keys(dateFilter).length > 0) {
-      citMatch.date = dateFilter;
-    }
-
-    const corporateTax = await JournalEntry.aggregate([
-      { $match: citMatch },
-      { $unwind: "$lines" },
-      { $match: { "lines.accountCode": "2400", "lines.credit": { $gt: 0 } } },
-      { $group: { _id: null, total: { $sum: "$lines.credit" } } },
-    ]);
+      accountCodes: ["2400"], // Income Tax Payable
+      dateFrom: dateFilter.$gte || null,
+      dateTo: dateFilter.$lte || null,
+      minCredit: 0, // the pipeline summed only credit lines
+      groupByAccountCode: false,
+    })).map((r) => ({ _id: null, total: r.credit }));
 
     // 6. Get PAYE Payable balance from Journal Entries
     const payePayableCodes = ["2230"];
-    const payePayableMatch = {
-      company: new mongoose.Types.ObjectId(companyId),
+    const payePayable = (await journalAgg.sumJournalLines(companyId, {
       status: "posted",
-      "lines.accountCode": { $in: payePayableCodes },
-    };
-    if (Object.keys(dateFilter).length > 0) {
-      payePayableMatch.date = dateFilter;
-    }
-
-    const payePayable = await JournalEntry.aggregate([
-      { $match: payePayableMatch },
-      { $unwind: "$lines" },
-      { $match: { "lines.accountCode": { $in: payePayableCodes } } },
-      {
-        $group: {
-          _id: null,
-          totalCredit: { $sum: "$lines.credit" },
-          totalDebit: { $sum: "$lines.debit" },
-        },
-      },
-    ]);
+      accountCodes: payePayableCodes,
+      dateFrom: dateFilter.$gte || null,
+      dateTo: dateFilter.$lte || null,
+      groupByAccountCode: false,
+    })).map((r) => ({ _id: null, totalCredit: r.credit, totalDebit: r.debit }));
 
     // Calculate totals
     const vatOutputTotal = vatOutput[0]?.total || 0;
