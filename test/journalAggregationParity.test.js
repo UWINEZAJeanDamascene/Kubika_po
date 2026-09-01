@@ -27,6 +27,8 @@ const { generateObjectId } = require('../utils/objectId');
 const { sumJournalLines } = require('../services/journalAggregationService');
 const JournalEntry = require('../models/JournalEntry');
 
+const ACCOUNT_A = 'aaaaaaaaaaaaaaaaaaaaaaaa';
+
 const IN_PERIOD_START = new Date('2091-03-01T00:00:00.000Z');
 const IN_PERIOD_END = new Date('2091-03-31T23:59:59.999Z');
 
@@ -35,7 +37,7 @@ let authorId;
 let seeded = false;
 
 /** One entry plus its lines, written straight to the tables both paths read. */
-async function seedEntry({ entryNumber, date, status, reversed, lines }) {
+async function seedEntry({ entryNumber, date, status, reversed, sourceType = null, lines }) {
   const id = generateObjectId();
   await prisma.journalEntry.create({
     data: {
@@ -46,6 +48,7 @@ async function seedEntry({ entryNumber, date, status, reversed, lines }) {
       description: `parity ${entryNumber}`,
       status,
       reversed,
+      sourceType,
       createdById: authorId,
       totalDebit: lines.reduce((s, l) => s + l.debit, 0),
       totalCredit: lines.reduce((s, l) => s + l.credit, 0),
@@ -59,7 +62,8 @@ async function seedEntry({ entryNumber, date, status, reversed, lines }) {
       journalEntryId: id,
       lineOrder: i,
       accountCode: l.accountCode,
-      accountName: `Account ${l.accountCode}`,
+      accountName: l.accountName || `Account ${l.accountCode}`,
+      accountId: l.accountId || null,
       debit: l.debit,
       credit: l.credit,
     })),
@@ -87,18 +91,18 @@ beforeAll(async () => {
 
   await seedEntry({
     entryNumber: 'P-IN-1', date: new Date('2091-03-05T10:00:00.000Z'),
-    status: 'posted', reversed: false,
+    status: 'posted', reversed: false, sourceType: 'invoice',
     lines: [
-      { accountCode: '1010', debit: 100.25, credit: 0 },
+      { accountCode: '1010', debit: 100.25, credit: 0, accountId: ACCOUNT_A },
       { accountCode: '4000', debit: 0, credit: 100.25 },
     ],
   });
   await seedEntry({
     entryNumber: 'P-IN-2', date: new Date('2091-03-20T10:00:00.000Z'),
-    status: 'posted', reversed: false,
+    status: 'posted', reversed: false, sourceType: 'payment',
     lines: [
       { accountCode: '1110', debit: 50.5, credit: 0 },
-      { accountCode: '1010', debit: 7.75, credit: 0 },
+      { accountCode: '1010', debit: 7.75, credit: 0, accountId: ACCOUNT_A },
       { accountCode: '5000', debit: 0, credit: 58.25 },
     ],
   });

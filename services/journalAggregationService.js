@@ -126,12 +126,27 @@ async function sumJournalLines(companyId, options = {}) {
     if (patterns.length === 0) return [];
     conditions.push(Prisma.sql`jel.account_code LIKE ANY(${patterns}::text[])`);
   }
+  if (accountIds) {
+    const idList = [...new Set(accountIds.filter(Boolean).map(String))];
+    if (idList.length === 0) return [];
+    conditions.push(Prisma.sql`jel.account_id = ANY(${idList}::text[])`);
+  }
+  if (excludeSourceTypes) {
+    const excluded = [...new Set(excludeSourceTypes.filter(Boolean).map(String))];
+    if (excluded.length) {
+      // $nin in Mongo also keeps documents where the field is missing.
+      conditions.push(
+        Prisma.sql`(je.source_type IS NULL OR je.source_type <> ALL(${excluded}::text[]))`,
+      );
+    }
+  }
+  if (minDebit != null) conditions.push(Prisma.sql`jel.debit > ${minDebit}`);
 
   const where = Prisma.join(conditions, ' AND ');
   // $sum: 1 after $unwind counted lines, not entries — COUNT(*) matches.
   const countSelect = withCount ? Prisma.sql`, COUNT(*)::int AS "count"` : Prisma.empty;
 
-  if (!groupByAccountCode) {
+  if (groupKey === null) {
     const rows = await dbClient().$queryRaw`
       SELECT NULL::text AS "accountCode",
              NULL::text AS "_id",
@@ -147,16 +162,18 @@ async function sumJournalLines(companyId, options = {}) {
     return rows.filter((r) => Number(r.debit) !== 0 || Number(r.credit) !== 0 || (withCount && Number(r.count) !== 0));
   }
 
+  // Whitelisted above, so this identifier cannot carry caller input.
+  const groupColumn = Prisma.raw(GROUP_BY_COLUMNS[groupKey]);
   return dbClient().$queryRaw`
-    SELECT jel.account_code AS "accountCode",
-           jel.account_code AS "_id",
+    SELECT ${groupColumn} AS "accountCode",
+           ${groupColumn} AS "_id",
            COALESCE(SUM(jel.debit), 0)::float AS "debit",
            COALESCE(SUM(jel.credit), 0)::float AS "credit"
            ${countSelect}
     FROM journal_entry_lines jel
     INNER JOIN journal_entries je ON je.id = jel.journal_entry_id
     WHERE ${where}
-    GROUP BY jel.account_code
+    GROUP BY ${groupColumn}
   `;
 }
 
@@ -439,4 +456,19 @@ async function getActiveOutboundProductIds(companyId, sinceDate) {
       )
   `;
 
-  return rows.map((r) 
+  return rows.map((r) => String(r.productId)).filter(Boolean);
+}
+
+module.exports = {
+  DATE_MARGIN_MS,
+  withDateMargin,
+  loadChartTypeMap,
+  resolveAccountType,
+  sumLinesByAccountCode,
+  sumJournalLines,
+  sumCashLinesBySourceType,
+  totalForAccountType,
+  totalForAccountTypes,
+  balancesMapFromRows,
+  getActiveOutboundProductIds,
+};
