@@ -63,6 +63,7 @@ router.use(attachCompanyId);
 router.use(cacheMiddleware({
   type: 'report',
   ttl: 3600,
+  closedPeriodPersistent: true,
   skipCache: (req) => /\/(pdf|excel)$/.test(req.path),
 }));
 

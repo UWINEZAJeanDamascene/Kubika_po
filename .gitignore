@@ -52,4 +52,4 @@ yarn-error.log*
 config/google-credentials.json
 
 # Local performance baseline snapshots (measurement artifacts, not source)
-performance-baselines/
+performance-baselines/snapshots/

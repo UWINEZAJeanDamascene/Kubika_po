@@ -150,7 +150,9 @@ function invoiceToApi(row) {
   const taxAmount = headerTax > 0 ? headerTax : linesTax;
   const totalAmount = headerTotal > 0 ? headerTotal : linesTotal;
   const amountPaid = qtyNum(row.amountPaid);
-  const outstanding = Math.round(Math.max(0, totalAmount - amountPaid) * 100) / 100;
+  const outstanding = row.amountOutstanding != null
+    ? Math.round(Math.max(0, qtyNum(row.amountOutstanding)) * 100) / 100
+    : Math.round(Math.max(0, totalAmount - amountPaid) * 100) / 100;
   return {
     _id: row.id,
     company: row.companyId,
@@ -164,6 +166,10 @@ function invoiceToApi(row) {
     salesOrder: row.salesOrderId ?? null,
     deliveryNote: row.deliveryNoteId ?? null,
     status: row.status,
+    badDebtWrittenOff: Boolean(row.badDebtWrittenOff),
+    writtenOffAt: row.writtenOffAt ?? null,
+    writtenOffBy: row.writtenOffById ?? null,
+    badDebtReason: row.badDebtReason ?? null,
     currencyCode: row.currencyCode,
     currency: row.currencyCode,
     exchangeRate: qtyNum(row.exchangeRate),
@@ -290,6 +296,8 @@ function invoiceTranslateUpdate(update = {}) {
     currencyCode: 'currencyCode', currency: 'currencyCode', exchangeRate: 'exchangeRate',
     subtotal: 'subtotal', taxAmount: 'taxAmount', totalAmount: 'totalAmount',
     amountPaid: 'amountPaid', amountOutstanding: 'amountOutstanding',
+    badDebtWrittenOff: 'badDebtWrittenOff', writtenOffAt: 'writtenOffAt',
+    writtenOffBy: 'writtenOffById', badDebtReason: 'badDebtReason',
     invoiceDate: 'invoiceDate', dueDate: 'dueDate', paidDate: 'paidDate',
     payments: 'payments', ebm: 'ebm', notes: 'notes',
     revenueJournalEntry: 'revenueJournalEntryId', cogsJournalEntry: 'cogsJournalEntryId',
@@ -298,7 +306,7 @@ function invoiceTranslateUpdate(update = {}) {
   };
   const idTargets = new Set([
     'clientId', 'quotationId', 'salesOrderId', 'deliveryNoteId',
-    'revenueJournalEntryId', 'cogsJournalEntryId',
+    'revenueJournalEntryId', 'cogsJournalEntryId', 'writtenOffById',
   ]);
   for (const [k, t] of Object.entries(map)) {
     if (data[k] !== undefined) {

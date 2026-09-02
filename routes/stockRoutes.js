@@ -14,22 +14,34 @@ const {
 } = require('../controllers/stockController');
 const { protect, authorize } = require('../middleware/auth');
 const logAction = require('../middleware/logAction');
+const { cacheMiddleware, cacheInvalidationMiddleware } = require('../middleware/cacheMiddleware');
+
+const cacheStockReads = cacheMiddleware({
+  type: 'stock',
+  ttl: 60,
+  skipCache: (req) => req.query.refresh === '1' || req.query.refresh === 'true',
+});
+const invalidateStockReads = cacheInvalidationMiddleware({
+  types: ['stock', 'product', 'report'],
+  invalidateDashboards: true,
+});
 
 router.use(protect);
+router.use(invalidateStockReads);
 
 router.route('/movements')
-  .get(getStockMovements)
+  .get(cacheStockReads, getStockMovements)
   .post(authorize('admin'), logAction('stock'), receiveStock);
 
-router.get('/movements/:id', getStockMovement);
+router.get('/movements/:id', cacheStockReads, getStockMovement);
 router.put('/movements/:id', authorize('admin'), logAction('stock'), updateStockMovement);
 router.delete('/movements/:id', authorize('admin'), logAction('stock'), deleteStockMovement);
-router.get('/product/:productId/movements', getProductStockMovements);
+router.get('/product/:productId/movements', cacheStockReads, getProductStockMovements);
 router.post('/adjust', authorize('admin'), logAction('stock'), adjustStock);
 router.post('/opening', authorize('admin'), logAction('stock'), createOpeningStock);
-router.get('/summary', getStockSummary);
+router.get('/summary', cacheStockReads, getStockSummary);
 
 // Stock Levels endpoint - provides per-warehouse stock information
-router.get('/levels', getStockLevels);
+router.get('/levels', cacheStockReads, getStockLevels);
 
 module.exports = router;

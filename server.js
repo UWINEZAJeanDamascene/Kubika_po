@@ -1,4 +1,3 @@
-const express = require('express');
 const compression = require('compression');
 const cookieParser = require('cookie-parser');
 const dotenv = require('dotenv');
@@ -14,6 +13,9 @@ dotenv.config();
 // Sentry as early as possible so its instrumentation wraps the app. Inert
 // unless SENTRY_DSN is set, so this costs nothing in environments without it.
 require('./lib/sentry').initSentry();
+
+// Sentry must initialise before Express is imported so request tracing can patch it.
+const express = require('express');
 
 // Prefer IPv4 DNS lookups to avoid IPv6 ENETUNREACH timeouts on some hosts
 try {
@@ -104,6 +106,12 @@ async function initializeServer() {
     mongoose.plugin(tenantPlugin);
   } catch (e) {
     console.warn('Tenant plugin could not be registered:', e && e.message ? e.message : e);
+  }
+  try {
+    const maxRowsPlugin = require('./plugins/maxRowsPlugin');
+    mongoose.plugin(maxRowsPlugin);
+  } catch (e) {
+    console.warn('Max-rows plugin could not be registered:', e && e.message ? e.message : e);
   }
 
   // Populate() interception for refs migrated to PostgreSQL (User/Company/Role)
@@ -207,6 +215,12 @@ async function initializeServer() {
   const tenantContextMiddleware = require('./middleware/tenantContextMiddleware');
   app.use(tenantContextMiddleware);
 
+  // Request timing must wrap health/performance routes too; otherwise the
+  // performance endpoint cannot sample itself and the Phase 0 top-10 baseline
+  // will always report 9/10 endpoints.
+  const requestTiming = require('./middleware/requestTiming');
+  app.use(requestTiming);
+
   // Health checks — mounted before /api rate limits (must stay unthrottled)
   const healthController = require('./controllers/healthController');
   const { protect } = require('./middleware/auth');
@@ -217,6 +231,7 @@ async function initializeServer() {
   app.post('/api/health/gc', cors(), healthController.gcHint);
   // Performance metrics only — see healthController.performanceMetrics.
   app.get('/api/performance', cors(), healthController.performanceMetrics);
+  app.get('/api/performance/readiness', cors(), healthController.performanceReadiness);
 
   // CORS - must run BEFORE rate limiters so that rate-limited responses
   // (429) include proper CORS headers instead of failing the browser fetch.
@@ -284,10 +299,6 @@ async function initializeServer() {
 
   // HTTP Parameter Pollution — last duplicate query key wins (single scalar)
   app.use(hpp());
-
-  // Request timing tracker (rolling samples for health dashboard)
-  const requestTiming = require('./middleware/requestTiming');
-  app.use(requestTiming);
 
   // Input sanitisation — strip dangerous chars (after body parsed)
   const sanitizeInput = require('./middleware/sanitizeInput');
@@ -528,6 +539,9 @@ async function initializeServer() {
 
   let server;
   if (NODE_ENV !== 'test') {
+    const { assertPerformanceReadinessAtBoot } = require('./utils/performancePhase0');
+    await assertPerformanceReadinessAtBoot({ nodeEnv: NODE_ENV });
+
     server = app.listen(PORT, () => {
       console.log(`Server running in ${NODE_ENV} mode on port ${PORT}`);
     });
@@ -584,6 +598,13 @@ async function initializeServer() {
         await disconnectPrisma();
       } catch (e) {
         console.warn('Error closing Prisma connection during shutdown', e && e.message ? e.message : e);
+      }
+
+      // Flush the buffered fleet metrics before closing Redis.
+      try {
+        await require('./services/performanceMetricsStore').flush();
+      } catch (e) {
+        console.warn('Error flushing performance metrics during shutdown', e && e.message ? e.message : e);
       }
 
       // Close Redis client if available

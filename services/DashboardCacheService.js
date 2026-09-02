@@ -1,95 +1,60 @@
-const redisCache = require('../utils/redisCache');
+const cacheService = require('./cacheService');
 const { isRedisConfigured } = require('../config/redis');
 
-const CACHE_PREFIX = 'dashboard:';
-const DEFAULT_TTL_SECONDS = Number(process.env.DASHBOARD_CACHE_TTL_SECONDS || 300);
+// Use the shared cache namespace so cache metrics classify dashboard reads as
+// `dashboard` and tenant invalidation can clear them consistently.
+const CACHE_PREFIX = 'cache:dashboard:';
+const configuredTtl = Number(process.env.DASHBOARD_CACHE_TTL_SECONDS || 300);
+const DEFAULT_TTL_SECONDS = Number.isFinite(configuredTtl) ? Math.max(1, configuredTtl) : 300;
 
+/**
+ * Shared dashboard cache.
+ *
+ * Dashboard payloads are deliberately Redis-only. An in-process fallback would
+ * make each API replica report a different dashboard and would hide cache
+ * invalidation bugs during a rolling deploy. When Redis is unavailable the
+ * normal cacheService degraded path returns a miss and the dashboard service
+ * recomputes from PostgreSQL; readiness exposes that degraded state.
+ */
 class DashboardCacheService {
-  constructor() {
-    this.store = new Map();
-    this.defaultTTL = DEFAULT_TTL_SECONDS * 1000;
-    this._cleanupTimer = setInterval(() => this._cleanup(true), 5 * 60 * 1000);
-    if (this._cleanupTimer.unref) this._cleanupTimer.unref();
-  }
-
   _key(companyId, dashboardName, params = '') {
-    return `${CACHE_PREFIX}${companyId}:${dashboardName}:${params}`;
-  }
-
-  _cleanup(forceMax = false) {
-    const now = Date.now();
-    for (const [key, item] of this.store) {
-      if (item.expiresAt < now) this.store.delete(key);
-    }
+    return `${CACHE_PREFIX}${String(companyId)}:${String(dashboardName)}:${String(params)}`;
   }
 
   async get(companyId, dashboardName, params = '') {
-    if (!isRedisConfigured()) {
-      const key = this._key(companyId, dashboardName, params);
-      const item = this.store.get(key);
-      if (!item || item.expiresAt < Date.now()) return null;
-      return item.value;
-    }
-
-    const key = this._key(companyId, dashboardName, params);
-    const data = await redisCache.get(key);
-    return data;
+    return cacheService.get(this._key(companyId, dashboardName, params));
   }
 
   async set(companyId, dashboardName, data, params = '', ttlMs = null) {
-    const key = this._key(companyId, dashboardName, params);
-    const ttlSeconds = ttlMs ? Math.max(1, Math.round(ttlMs / 1000)) : DEFAULT_TTL_SECONDS;
-
-    if (!isRedisConfigured()) {
-      this.store.set(key, { value: data, expiresAt: Date.now() + ttlSeconds * 1000 });
-      return data;
-    }
-
-    await redisCache.set(key, data, ttlSeconds);
+    const requestedTtl = Number(ttlMs);
+    const ttlSeconds = ttlMs === null || ttlMs === undefined
+      ? DEFAULT_TTL_SECONDS
+      : Number.isFinite(requestedTtl) ? Math.max(1, Math.round(requestedTtl / 1000)) : DEFAULT_TTL_SECONDS;
+    await cacheService.set(this._key(companyId, dashboardName, params), data, ttlSeconds);
     return data;
   }
 
   async invalidate(companyId) {
-    const pattern = `${CACHE_PREFIX}${companyId}:*`;
-    if (!isRedisConfigured()) {
-      for (const key of this.store.keys()) {
-        if (key.startsWith(`${CACHE_PREFIX}${companyId}:`)) this.store.delete(key);
-      }
-      return;
-    }
-    await redisCache.clear(pattern);
+    return cacheService.deletePattern(`${CACHE_PREFIX}${String(companyId)}:*`);
   }
 
   async invalidateDashboard(companyId, dashboardName) {
-    const pattern = `${CACHE_PREFIX}${companyId}:${dashboardName}:*`;
-    if (!isRedisConfigured()) {
-      for (const key of this.store.keys()) {
-        if (key.startsWith(`${CACHE_PREFIX}${companyId}:${dashboardName}:`)) this.store.delete(key);
-      }
-      return;
-    }
-    await redisCache.clear(pattern);
+    return cacheService.deletePattern(`${CACHE_PREFIX}${String(companyId)}:${String(dashboardName)}:*`);
   }
 
   async clearAll() {
-    if (!isRedisConfigured()) {
-      this.store.clear();
-      return;
-    }
-    await redisCache.clear(`${CACHE_PREFIX}*`);
+    return cacheService.deletePattern(`${CACHE_PREFIX}*`);
   }
 
   async getStats() {
-    if (!isRedisConfigured()) {
-      return { size: this.store.size, keys: Array.from(this.store.keys()) };
-    }
-    const keys = await redisCache.keys(`${CACHE_PREFIX}*`);
+    const keys = await cacheService.scanKeys(`${CACHE_PREFIX}*`);
     return {
       size: keys.length,
-      keys
+      keys,
+      persistent: isRedisConfigured(),
+      metrics: await cacheService.getAggregatedMetrics(),
     };
   }
 }
 
-const dashboardCache = new DashboardCacheService();
-module.exports = dashboardCache;
+module.exports = new DashboardCacheService();

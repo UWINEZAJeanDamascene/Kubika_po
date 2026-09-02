@@ -9,6 +9,83 @@ const JWT_SECRET = config.jwt.secret;
 
 /** Cap slow Redis calls so post-login requests are not blocked for seconds each. */
 const REDIS_SESSION_TIMEOUT_MS = Number(process.env.REDIS_SESSION_TIMEOUT_MS || 500);
+const CLOSED_PERIOD_STATUSES = new Set(['closed', 'locked']);
+
+function reportDateRange(req) {
+  const query = req.query || {};
+  const year = Number(query.year);
+  const month = Number(query.month);
+  if (Number.isInteger(year) && year >= 1900 && year <= 2200) {
+    if (Number.isInteger(month) && month >= 1 && month <= 12) {
+      const start = new Date(year, month - 1, 1);
+      const end = new Date(year, month, 0, 23, 59, 59, 999);
+      return { start, end };
+    }
+    return {
+      start: new Date(year, 0, 1),
+      end: new Date(year, 11, 31, 23, 59, 59, 999),
+    };
+  }
+
+  const parseDate = (value, endOfDay = false) => {
+    if (!value) return null;
+    const date = new Date(String(value));
+    if (Number.isNaN(date.getTime())) return null;
+    if (endOfDay && /^\d{4}-\d{2}-\d{2}$/.test(String(value))) date.setHours(23, 59, 59, 999);
+    return date;
+  };
+
+  const start = parseDate(query.date_from || query.startDate || query.as_of_date || query.asOfDate || query.weekStart || query.date);
+  if (!start) return null;
+  let end = parseDate(query.date_to || query.endDate);
+  if (!end && query.weekStart) {
+    end = new Date(start);
+    end.setDate(end.getDate() + 6);
+    end.setHours(23, 59, 59, 999);
+  }
+  if (!end && query.date) end = new Date(start);
+  if (!end) return null;
+  if (query.date && /^\d{4}-\d{2}-\d{2}$/.test(String(query.date))) end.setHours(23, 59, 59, 999);
+  return { start, end };
+}
+
+/**
+ * A report can be stored without expiry only when every accounting period it
+ * covers is closed/locked. A missing period is not treated as closed: the
+ * report may still change when the period is created or transactions are
+ * backfilled.
+ */
+async function isClosedPeriodReport(req, companyId) {
+  const range = reportDateRange(req);
+  if (!range || !companyId) return false;
+  try {
+    const { dbClient } = require('../lib/prisma');
+    const periods = await dbClient().accountingPeriod.findMany({
+      where: {
+        companyId: String(companyId),
+        startDate: { lte: range.end },
+        endDate: { gte: range.start },
+      },
+      select: { startDate: true, endDate: true, status: true },
+      orderBy: { startDate: 'asc' },
+    });
+    if (!periods.length) return false;
+
+    let coveredUntil = range.start.getTime();
+    for (const period of periods) {
+      const periodStart = new Date(period.startDate).getTime();
+      const periodEnd = new Date(period.endDate).getTime();
+      if (periodStart > coveredUntil + 1 || !CLOSED_PERIOD_STATUSES.has(String(period.status))) return false;
+      coveredUntil = Math.max(coveredUntil, periodEnd);
+      if (coveredUntil >= range.end.getTime()) return true;
+    }
+    return coveredUntil >= range.end.getTime();
+  } catch (error) {
+    // Cache classification must never make a report endpoint fail.
+    console.warn('[cache] Could not determine report period status:', error.message || error);
+    return false;
+  }
+}
 
 /** GET inventory endpoints skip Redis session enrichment — JWT auth is sufficient. */
 function shouldSkipSessionEnrichment(req) {
@@ -45,8 +122,10 @@ function withRedisTimeout(promise, fallback) {
  * @param {string} options.type - Cache type (product, category, etc.)
  * @param {Function} options.keyGenerator - Function to generate cache key from req
  * @param {number} options.ttl - Custom TTL in seconds
- * @param {boolean} options.skipCache - Function to determine if should skip cache
- */
+   * @param {boolean} options.skipCache - Function to determine if should skip cache
+   * @param {boolean} options.closedPeriodPersistent - Store closed-period reports without expiry
+   * @param {boolean} options.varyByUser - Include authenticated user id in the cache key
+   */
 /**
  * Tenant that a cached response belongs to, or null when it cannot be
  * determined (most importantly a platform admin, for whom `protect` sets
@@ -67,6 +146,8 @@ const cacheMiddleware = (options = {}) => {
     keyGenerator = null,
     ttl = null,
     skipCache = null,
+    closedPeriodPersistent = false,
+    varyByUser = false,
     // Set for genuinely tenant-independent data (public/platform-wide). Without
     // it, a request with no resolvable tenant is served uncached rather than
     // risking a shared cache entry.
@@ -93,6 +174,7 @@ const cacheMiddleware = (options = {}) => {
     }
 
     try {
+      const companyId = resolveCompanyId(req);
       // Generate cache key
       let cacheKey;
       if (keyGenerator) {
@@ -102,12 +184,14 @@ const cacheMiddleware = (options = {}) => {
         const params = {
           path: req.path,
           query: req.query,
-          companyId: resolveCompanyId(req),
+          companyId,
+          ...(varyByUser ? { userId: req.user?._id || req.user?.id || null } : {}),
         };
         cacheKey = cacheService.generateKey(type, params);
       }
 
-      // Try to get cached response
+      // Try to get cached response before checking period state. A cache hit
+      // should remain a single Redis read even for a closed report.
       const cachedResponse = await cacheService.get(cacheKey);
       
       if (cachedResponse) {
@@ -116,6 +200,13 @@ const cacheMiddleware = (options = {}) => {
           ...cachedResponse,
           fromCache: true,
         });
+      }
+
+      let cacheTtl = ttl === null || ttl === undefined
+        ? cacheService.getCacheConfig(type).ttl
+        : ttl;
+      if (closedPeriodPersistent && type === 'report' && await isClosedPeriodReport(req, companyId)) {
+        cacheTtl = 0;
       }
 
       // Store original json method
@@ -127,7 +218,7 @@ const cacheMiddleware = (options = {}) => {
         if (res.statusCode === 200 && data) {
           // Cache writes must not delay the response when Redis is reconnecting
           // or unavailable. The cache is an optimization, not a dependency.
-          cacheService.set(cacheKey, data, ttl).catch((error) => {
+          cacheService.set(cacheKey, data, cacheTtl).catch((error) => {
             console.error('Cache set error:', error);
           });
         }
@@ -157,6 +248,8 @@ const cacheInvalidationMiddleware = (options = {}) => {
     keyGenerator = null,
     invalidateAll = false,
     invalidateByCompany = true,
+    types = null,
+    invalidateDashboards = false,
   } = options;
 
   return async (req, res, next) => {
@@ -173,8 +266,9 @@ const cacheInvalidationMiddleware = (options = {}) => {
       // Only invalidate on successful responses
       if (res.statusCode >= 200 && res.statusCode < 300) {
         try {
+          const targetTypes = Array.isArray(types) && types.length ? types : [type];
           if (invalidateAll) {
-            await cacheService.invalidateType(type);
+            await Promise.all(targetTypes.map((targetType) => cacheService.invalidateType(targetType)));
           } else if (keyGenerator) {
             const key = keyGenerator(req, data);
             await cacheService.delete(key);
@@ -184,7 +278,10 @@ const cacheInvalidationMiddleware = (options = {}) => {
             // req.user.company invalidated nothing, leaving stale reads behind.
             const companyId = resolveCompanyId(req);
             if (companyId) {
-              await cacheService.invalidateByCompany(companyId, type);
+              await Promise.all(targetTypes.map((targetType) => cacheService.invalidateByCompany(companyId, targetType)));
+              if (invalidateDashboards) {
+                await require('../services/DashboardCacheService').invalidate(companyId);
+              }
             }
           }
         } catch (error) {

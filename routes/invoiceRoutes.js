@@ -21,15 +21,27 @@ const {
 const { protect } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/rbacMiddleware');
 const logAction = require('../middleware/logAction');
+const { cacheMiddleware, cacheInvalidationMiddleware } = require('../middleware/cacheMiddleware');
+
+const cacheInvoiceReads = cacheMiddleware({
+  type: 'invoice',
+  ttl: 60,
+  skipCache: (req) => req.path.endsWith('/pdf') || req.query.refresh === '1' || req.query.refresh === 'true',
+});
+const invalidateInvoiceReads = cacheInvalidationMiddleware({
+  types: ['invoice', 'pos', 'stock', 'report'],
+  invalidateDashboards: true,
+});
 
 router.use(protect);
+router.use(invalidateInvoiceReads);
 
 router.route('/')
-  .get(requirePermission('sales_invoices', 'read'), getInvoices)
+  .get(requirePermission('sales_invoices', 'read'), cacheInvoiceReads, getInvoices)
   .post(requirePermission('sales_invoices', 'create'), logAction('invoice'), createInvoice);
 
 router.route('/:id')
-  .get(requirePermission('sales_invoices', 'read'), getInvoice)
+  .get(requirePermission('sales_invoices', 'read'), cacheInvoiceReads, getInvoice)
   .put(requirePermission('sales_invoices', 'update'), logAction('invoice'), updateInvoice)
   .delete(requirePermission('sales_invoices', 'delete'), logAction('invoice'), deleteInvoice);
 
@@ -57,7 +69,7 @@ router.get('/:id/pdf', requirePermission('sales_invoices', 'read'), generateInvo
 router.post('/:id/send-email', requirePermission('sales_invoices', 'send'), logAction('invoice'), sendInvoiceEmail);
 
 // Client and product specific routes
-router.get('/client/:clientId', requirePermission('sales_invoices', 'read'), getClientInvoices);
-router.get('/product/:productId', requirePermission('sales_invoices', 'read'), getProductInvoices);
+router.get('/client/:clientId', requirePermission('sales_invoices', 'read'), cacheInvoiceReads, getClientInvoices);
+router.get('/product/:productId', requirePermission('sales_invoices', 'read'), cacheInvoiceReads, getProductInvoices);
 
 module.exports = router;

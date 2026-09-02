@@ -3,7 +3,7 @@
  * Provides health status checks and integrates with monitoring services
  */
 
-const mongoose = require('mongoose');
+const { prisma } = require('../lib/prisma');
 const { redisClient, isRedisConfigured } = require('../config/redis');
 
 // Health status cache
@@ -29,21 +29,19 @@ async function getSystemHealth() {
     services: {},
   };
 
-  // Check MongoDB
+  // PostgreSQL is the system of record and therefore the readiness authority.
   try {
-    const mongoState = mongoose.connection.readyState;
-    const mongoStates = ['disconnected', 'connected', 'connecting', 'disconnecting'];
-    
-    health.services.mongodb = {
-      status: mongoState === 1 ? 'healthy' : 'unhealthy',
-      state: mongoStates[mongoState] || 'unknown',
+    await prisma.$queryRaw`SELECT 1`;
+    const { getPostgresPoolMetrics } = require('./systemMetricsService');
+    const pool = await getPostgresPoolMetrics();
+    health.services.postgresql = {
+      status: pool.status === 'unavailable' ? 'unhealthy' : pool.status === 'pressured' ? 'degraded' : 'healthy',
+      pool,
     };
-    
-    if (mongoState !== 1) {
-      health.status = 'unhealthy';
-    }
+    if (pool.status === 'pressured') health.status = 'degraded';
+    if (pool.status === 'saturated' || pool.status === 'unavailable') health.status = 'unhealthy';
   } catch (err) {
-    health.services.mongodb = {
+    health.services.postgresql = {
       status: 'unhealthy',
       error: err.message,
     };
@@ -123,11 +121,13 @@ async function getDetailedHealth() {
  */
 async function checkDatabaseHealth() {
   try {
-    // Run a simple command to verify connection
-    const result = await mongoose.connection.db.admin().ping();
+    const startedAt = Date.now();
+    await prisma.$queryRaw`SELECT 1`;
     return {
       status: 'healthy',
-      ping: result.ok === 1 ? 'success' : 'failed',
+      engine: 'postgresql',
+      ping: 'success',
+      latency: `${Date.now() - startedAt}ms`,
     };
   } catch (err) {
     return {
@@ -185,9 +185,10 @@ async function checkExternalServices() {
 async function getReadiness() {
   const health = await getSystemHealth();
   
-  // Consider unhealthy if MongoDB is not connected
-  if (health.services.mongodb?.status !== 'healthy') {
-    return { ready: false, reason: 'Database not ready' };
+  // PostgreSQL is the readiness authority; MongoDB may be absent after its
+  // remaining legacy domains are migrated.
+  if (health.services.postgresql?.status !== 'healthy') {
+    return { ready: false, reason: 'PostgreSQL not ready' };
   }
   
   return { ready: true };

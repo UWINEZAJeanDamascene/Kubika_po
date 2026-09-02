@@ -1,167 +1,106 @@
-const mongoose = require('mongoose');
-const { generateUniqueNumber } = require('./utils/autoIncrement');
+/**
+ * ARBadDebtWriteoff — PostgreSQL (Prisma) backed.
+ *
+ * The legacy Mongoose schema represented this table as a Mongo-only model even
+ * though bad-debt posting already updates PostgreSQL invoices and journals.
+ */
+const { buildTenantModel } = require('../utils/masterDataCommon');
+const { decimalToNumber, decimalToString, mapTimestamps } = require('../utils/decimalHelpers');
+const { toIdString, generateObjectId } = require('../utils/objectId');
+const { mergeUpdatePayload } = require('../utils/masterDataMappers');
 
-// ar_bad_debt_writeoffs table - stores records of written-off invoices
-const arBadDebtWriteoffSchema = new mongoose.Schema({
-  // Reference number - BDW-YYYY-NNNNN format
-  referenceNo: {
-    type: String,
-    uppercase: true,
-    unique: true
-  },
+const FIELD_MAP = {
+  _id: { target: 'id', isId: true },
+  id: { target: 'id', isId: true },
+  company: { target: 'companyId', isId: true },
+  invoice: { target: 'invoiceId', isId: true },
+  client: { target: 'clientId', isId: true },
+  writeoffDate: { target: 'writeoffDate' },
+  amount: { target: 'amount' },
+  reason: { target: 'reason' },
+  notes: { target: 'notes' },
+  journalEntry: { target: 'journalEntryId', isId: true },
+  postedBy: { target: 'postedById', isId: true },
+  status: { target: 'status' },
+  reversedAt: { target: 'reversedAt' },
+  reversedBy: { target: 'reversedById', isId: true },
+  reversalReason: { target: 'reversalReason' },
+  reverseJournalEntry: { target: 'reverseJournalEntryId', isId: true },
+  createdBy: { target: 'createdById', isId: true },
+  referenceNo: { target: 'referenceNo' },
+};
 
-  // Reference to the invoice being written off
-  invoice: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Invoice',
-    required: [true, 'Invoice is required']
-  },
+function toApi(row) {
+  if (!row) return null;
+  return {
+    _id: row.id,
+    company: row.companyId,
+    referenceNo: row.referenceNo,
+    invoice: row.invoiceId,
+    client: row.clientId,
+    writeoffDate: row.writeoffDate,
+    amount: decimalToString(row.amount, 2),
+    amountValue: decimalToNumber(row.amount, 0),
+    reason: row.reason,
+    notes: row.notes ?? null,
+    journalEntry: row.journalEntryId ?? null,
+    postedBy: row.postedById ?? null,
+    status: row.status,
+    reversedAt: row.reversedAt ?? null,
+    reversedBy: row.reversedById ?? null,
+    reversalReason: row.reversalReason ?? null,
+    reverseJournalEntry: row.reverseJournalEntryId ?? null,
+    createdBy: row.createdById,
+    ...mapTimestamps(row),
+  };
+}
 
-  // Client reference
-  client: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Client',
-    required: [true, 'Client is required']
-  },
-
-  // Write-off date
-  writeoffDate: {
-    type: Date,
-    required: [true, 'Write-off date is required'],
-    default: Date.now
-  },
-
-  // Amount being written off - DECIMAL(18,2)
-  amount: {
-    type: mongoose.Schema.Types.Decimal128,
-    required: [true, 'Amount is required'],
-    min: 0
-  },
-
-  // Reason for write-off
-  reason: {
-    type: String,
-    required: [true, 'Reason is required']
-  },
-
-  // Additional notes
-  notes: {
-    type: String,
-    default: null
-  },
-
-  // Journal entry reference
-  journalEntry: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'JournalEntry',
-    default: null
-  },
-
-  // Posted by user
-  postedBy: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
-    default: null
-  },
-
-  // Status
-  status: {
-    type: String,
-    enum: ['draft', 'posted', 'reversed'],
-    default: 'draft'
-  },
-
-  // Reversal fields
-  reversedAt: {
-    type: Date,
-    default: null
-  },
-  reversedBy: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
-    default: null
-  },
-  reversalReason: {
-    type: String,
-    default: null
-  },
-  reverseJournalEntry: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'JournalEntry',
-    default: null
-  },
-
-  // Created by user
-  createdBy: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
-    required: [true, 'Write-off must have a creator']
-  },
-
-  // Company (for multi-tenancy)
-  company: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Company',
-    required: true
+async function toCreate(data = {}) {
+  const companyId = toIdString(data.company || data.companyId);
+  let referenceNo = data.referenceNo;
+  if (!referenceNo && process.env.DATABASE_URL) {
+    const { generateUniqueNumber } = require('./utils/autoIncrement');
+    referenceNo = await generateUniqueNumber('BDW', null, companyId, 'referenceNo');
   }
-}, {
-  timestamps: true,
-  toJSON: {
-    virtuals: true,
-    transform: function(doc, ret) {
-      // Convert Decimal128 to string for JSON API
-      if (ret.amount) ret.amount = ret.amount.toString();
-      return ret;
-    }
-  },
-  toObject: {
-    virtuals: true,
-    transform: function(doc, ret) {
-      if (ret.amount) ret.amount = ret.amount.toString();
-      return ret;
-    }
+  if (!referenceNo) referenceNo = `BDW-${Date.now()}-${generateObjectId().slice(-6)}`;
+  return {
+    id: toIdString(data._id || data.id) || generateObjectId(),
+    companyId,
+    referenceNo,
+    invoiceId: toIdString(data.invoice || data.invoiceId),
+    clientId: toIdString(data.client || data.clientId),
+    writeoffDate: data.writeoffDate ? new Date(data.writeoffDate) : new Date(),
+    amount: data.amount ?? 0,
+    reason: data.reason,
+    notes: data.notes ?? null,
+    journalEntryId: toIdString(data.journalEntry || data.journalEntryId),
+    postedById: toIdString(data.postedBy || data.postedById),
+    status: data.status || 'draft',
+    reversedAt: data.reversedAt ? new Date(data.reversedAt) : null,
+    reversedById: toIdString(data.reversedBy || data.reversedById),
+    reversalReason: data.reversalReason ?? null,
+    reverseJournalEntryId: toIdString(data.reverseJournalEntry || data.reverseJournalEntryId),
+    createdById: toIdString(data.createdBy || data.createdById),
+  };
+}
+
+function toUpdate(update = {}) {
+  const data = mergeUpdatePayload(update);
+  const out = {};
+  for (const [key, mapping] of Object.entries(FIELD_MAP)) {
+    if (data[key] === undefined || key === '_id' || key === 'id' || key === 'company') continue;
+    out[mapping.target] = mapping.isId ? toIdString(data[key]) : data[key];
   }
+  return out;
+}
+
+module.exports = buildTenantModel({
+  name: 'ARBadDebtWriteoff',
+  collection: 'ar_bad_debt_writeoffs',
+  delegateName: 'arBadDebtWriteoff',
+  fieldMap: FIELD_MAP,
+  toApi,
+  translateCreate: async (data) => toCreate(data),
+  translateUpdate: toUpdate,
+  mutable: true,
 });
-
-// Compound indexes for performance
-arBadDebtWriteoffSchema.index({ company: 1, referenceNo: 1 }, { unique: true });
-arBadDebtWriteoffSchema.index({ company: 1 });
-arBadDebtWriteoffSchema.index({ company: 1, status: 1 });
-arBadDebtWriteoffSchema.index({ company: 1, invoice: 1 });
-arBadDebtWriteoffSchema.index({ company: 1, client: 1 });
-arBadDebtWriteoffSchema.index({ company: 1, writeoffDate: 1 });
-arBadDebtWriteoffSchema.index({ invoice: 1 });
-arBadDebtWriteoffSchema.index({ journalEntry: 1 });
-
-// Auto-generate reference number - BDW-YYYY-NNNNN format
-arBadDebtWriteoffSchema.pre('save', async function(next) {
-  if (this.isNew && !this.referenceNo) {
-    try {
-      // Need company - get from invoice or client lookup
-      let companyId = this.company;
-      if (!companyId && this.invoice) {
-        const Invoice = require('./Invoice');
-        const inv = await Invoice.findById(this.invoice).select('company');
-        if (inv) companyId = inv.company;
-      }
-      if (!companyId && this.client) {
-        const Client = require('./Client');
-        const cl = await Client.findById(this.client).select('company');
-        if (cl) companyId = cl.company;
-      }
-      if (companyId) {
-        this.referenceNo = await generateUniqueNumber('BDW', mongoose.model('ARBadDebtWriteoff'), companyId, 'referenceNo');
-      }
-    } catch (err) {
-      // Ignore errors - reference may be set manually
-    }
-  }
-  next();
-});
-
-// Virtual for amount as number
-arBadDebtWriteoffSchema.virtual('amountValue').get(function() {
-  return parseFloat(this.amount) || 0;
-});
-
-module.exports = mongoose.model('ARBadDebtWriteoff', arBadDebtWriteoffSchema);

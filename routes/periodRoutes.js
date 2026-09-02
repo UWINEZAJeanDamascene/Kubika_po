@@ -14,7 +14,9 @@ const { cacheMiddleware, cacheInvalidationMiddleware } = require('../middleware/
 // are not), so these handlers invalidate the report type as well.
 const cachePeriods = cacheMiddleware({ type: 'period', ttl: 600 });
 const invalidatePeriods = cacheInvalidationMiddleware({ type: 'period', invalidateAll: true });
-const invalidateReports = cacheInvalidationMiddleware({ type: 'report', invalidateAll: true });
+// Closed-period report entries are persistent, so a close/reopen/lock must
+// invalidate this tenant's report namespace without evicting other companies.
+const invalidateReports = cacheInvalidationMiddleware({ type: 'report' });
 
 // All period routes require auth and company context
 router.use(protect);

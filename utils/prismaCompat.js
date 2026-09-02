@@ -69,8 +69,10 @@ const IMPOSSIBLE = Symbol('impossible-filter');
  *
  * Run in warn mode until the logs are quiet, then enforce.
  */
-const QUERY_MAX_ROWS = Math.max(1, Number(process.env.QUERY_MAX_ROWS) || 5000);
-const QUERY_ENFORCE_MAX_ROWS = String(process.env.QUERY_ENFORCE_MAX_ROWS || '').toLowerCase() === 'true';
+const QUERY_MAX_ROWS = Math.min(5000, Math.max(1, Number(process.env.QUERY_MAX_ROWS) || 500));
+// Enforce the ceiling by default. A legacy export can temporarily opt out with
+// QUERY_ENFORCE_MAX_ROWS=false while it is converted to explicit paging.
+const QUERY_ENFORCE_MAX_ROWS = String(process.env.QUERY_ENFORCE_MAX_ROWS || 'true').toLowerCase() !== 'false';
 
 /** Call sites already reported, so a hot endpoint logs once rather than per request. */
 const reportedUnbounded = new Set();
@@ -938,7 +940,10 @@ function makeCompatModel(config) {
         for (const alias of projectionAliases(field)) keep.add(alias);
       }
       for (const key of Object.keys(item)) {
-        if (!keep.has(key)) delete item[key];
+        if (keep.has(key)) continue;
+        // Preserve compat doc methods (toObject, save, …) and internal markers.
+        if (typeof item[key] === 'function' || key.startsWith('__')) continue;
+        delete item[key];
       }
       return item;
     };
@@ -1447,4 +1452,6 @@ module.exports = {
   IMPOSSIBLE,
   toId,
   containsInvalidNullFilter,
+  QUERY_MAX_ROWS,
+  reportUnboundedRead,
 };

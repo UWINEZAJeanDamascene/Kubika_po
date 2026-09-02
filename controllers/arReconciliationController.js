@@ -1,6 +1,7 @@
 const ARTransactionLedger = require('../models/ARTransactionLedger');
 const ARTrackingService = require('../services/arTrackingService');
 const { getARTransactions } = require('../services/ledgerReadService');
+const { dbClient } = require('../lib/prisma');
 
 /**
  * AR Reconciliation Controller
@@ -296,8 +297,6 @@ exports.getCurrentReceivables = async (req, res, next) => {
     const { clientId, page = 1, limit = 50 } = req.query;
 
     const Invoice = require('../models/Invoice');
-    const Client = require('../models/Client');
-    const mongoose = require('mongoose');
 
     // Build query for outstanding invoices
     // Note: amountOutstanding is Decimal128, so we need special handling
@@ -312,65 +311,68 @@ exports.getCurrentReceivables = async (req, res, next) => {
 
     if (clientId) query.client = clientId;
 
-    // Get invoices that have amountOutstanding > 0 (handling Decimal128)
-    const invoices = await Invoice.find(query)
-      .populate('client', 'name code')
-      .sort({ invoiceDate: -1 })
-      .lean();
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 50));
+    const skip = (pageNum - 1) * limitNum;
 
-    // Filter invoices with outstanding amount > 0 (convert Decimal128 to number)
-    const outstandingInvoices = invoices.filter(inv => {
-      const outstanding = inv.amountOutstanding ? parseFloat(inv.amountOutstanding.toString()) : 0;
-      return outstanding > 0;
-    });
+    // The response contract is unchanged, but the list is now paged by
+    // PostgreSQL. Do not fetch a tenant's whole invoice history to display one
+    // 50-row page.
+    const [total, invoices] = await Promise.all([
+      Invoice.countDocuments(query),
+      Invoice.find(query)
+        .populate('client', 'name code')
+        .sort({ invoiceDate: -1 })
+        .skip(skip)
+        .limit(limitNum)
+        .lean(),
+    ]);
 
-    // Paginate manually
-    const total = outstandingInvoices.length;
-    const paginatedInvoices = outstandingInvoices
-      .slice((page - 1) * limit, page * limit);
-
-    // Calculate summary
+    // Summary and the top-client panel describe the complete filtered set, so
+    // aggregate them in Postgres instead of deriving them from the page.
+    const { dbClient } = require('../lib/prisma');
+    const params = [String(companyId)];
+    let clientPredicate = '';
+    if (clientId) {
+      params.push(String(clientId));
+      clientPredicate = ` AND i.client_id = $${params.length}`;
+    }
+    const whereSql = `i.company_id = $1 AND i.status IN ('confirmed', 'partially_paid') AND i.amount_outstanding > 0${clientPredicate}`;
+    const [summaryRows, clientRows] = await Promise.all([
+      dbClient().$queryRawUnsafe(
+        `SELECT COALESCE(SUM(i.amount_outstanding), 0)::text AS "totalOutstanding",
+                COUNT(*)::int AS "totalInvoices",
+                COALESCE(SUM(CASE WHEN i.due_date < NOW() THEN i.amount_outstanding ELSE 0 END), 0)::text AS "overdueAmount",
+                COUNT(*) FILTER (WHERE i.due_date < NOW())::int AS "overdueCount"
+           FROM invoices i WHERE ${whereSql}`,
+        ...params,
+      ),
+      dbClient().$queryRawUnsafe(
+        `SELECT i.client_id AS "_id", c.name, c.code,
+                COALESCE(SUM(i.amount_outstanding), 0)::text AS "totalOutstanding",
+                COUNT(*)::int AS "invoiceCount"
+           FROM invoices i JOIN clients c ON c.id = i.client_id
+          WHERE ${whereSql}
+          GROUP BY i.client_id, c.name, c.code
+          ORDER BY SUM(i.amount_outstanding) DESC
+          LIMIT 10`,
+        ...params,
+      ),
+    ]);
+    const aggregate = summaryRows[0] || {};
     const summary = {
-      totalOutstanding: 0,
-      totalInvoices: outstandingInvoices.length,
-      overdueAmount: 0,
-      overdueCount: 0
+      totalOutstanding: Number(aggregate.totalOutstanding || 0),
+      totalInvoices: Number(aggregate.totalInvoices || 0),
+      overdueAmount: Number(aggregate.overdueAmount || 0),
+      overdueCount: Number(aggregate.overdueCount || 0),
     };
-
-    const clientSummary = {};
-    const now = new Date();
-
-    outstandingInvoices.forEach(inv => {
-      const outstanding = inv.amountOutstanding ? parseFloat(inv.amountOutstanding.toString()) : 0;
-      summary.totalOutstanding += outstanding;
-
-      // Check if overdue
-      if (inv.dueDate && new Date(inv.dueDate) < now) {
-        summary.overdueAmount += outstanding;
-        summary.overdueCount += 1;
-      }
-
-      // Client summary
-      const clientId = inv.client?._id?.toString();
-      if (clientId) {
-        if (!clientSummary[clientId]) {
-          clientSummary[clientId] = {
-            _id: inv.client._id,
-            client: inv.client,
-            totalOutstanding: 0,
-            invoiceCount: 0
-          };
-        }
-        clientSummary[clientId].totalOutstanding += outstanding;
-        clientSummary[clientId].invoiceCount += 1;
-      }
-    });
-
-    // Sort client summary by outstanding amount
-    const sortedClientSummary = Object.values(clientSummary)
-      .sort((a, b) => b.totalOutstanding - a.totalOutstanding)
-      .slice(0, 10);
-
+    const sortedClientSummary = clientRows.map((client) => ({
+      _id: client._id,
+      client: { _id: client._id, name: client.name, code: client.code },
+      totalOutstanding: Number(client.totalOutstanding || 0),
+      invoiceCount: Number(client.invoiceCount || 0),
+    }));
+    const paginatedInvoices = invoices;
     // Convert Decimal128 fields in invoices to plain numbers for JSON serialization
     const serializedInvoices = paginatedInvoices.map(inv => ({
       ...inv,
@@ -388,8 +390,9 @@ exports.getCurrentReceivables = async (req, res, next) => {
         clientSummary: sortedClientSummary,
         pagination: {
           total,
-          pages: Math.ceil(total / limit),
-          currentPage: parseInt(page)
+          pages: Math.ceil(total / limitNum),
+          currentPage: pageNum,
+          limit: limitNum
         }
       }
     });
@@ -433,17 +436,17 @@ exports.getDashboard = async (req, res, next) => {
       })
     ]);
 
-    // Get transaction type breakdown
-    const typeBreakdown = await ARTransactionLedger.aggregate([
-      { $match: { company: companyId } },
-      {
-        $group: {
-          _id: '$transactionType',
-          count: { $sum: 1 },
-          totalAmount: { $sum: '$amount' }
-        }
-      }
-    ]);
+    // Group in PostgreSQL instead of materialising the full tenant ledger in
+    // the compatibility aggregation executor.
+    const typeBreakdown = await dbClient().$queryRaw`
+      SELECT transaction_type AS "_id",
+             COUNT(*)::int AS count,
+             COALESCE(SUM(amount), 0)::double precision AS "totalAmount"
+        FROM ar_transaction_ledger
+       WHERE company_id = ${String(companyId)}
+       GROUP BY transaction_type
+       ORDER BY transaction_type`;
+
 
     // Get recent activity
     const recentActivity = await ARTransactionLedger.find({ company: companyId })
@@ -480,12 +483,11 @@ exports.verifyAllPending = async (req, res, next) => {
     const userId = req.user.id;
 
     const ARTransactionLedger = require('../models/ARTransactionLedger');
-    const mongoose = require('mongoose');
 
     // Update all pending transactions to verified
     const result = await ARTransactionLedger.updateMany(
       {
-        company: new mongoose.Types.ObjectId(companyId),
+        company: companyId,
         reconciliationStatus: 'pending'
       },
       {

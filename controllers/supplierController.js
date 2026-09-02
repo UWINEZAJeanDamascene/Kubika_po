@@ -37,10 +37,13 @@ exports.getSuppliers = async (req, res, next) => {
 
     const suppliers = await supplierQuery;
 
-    const transformedSuppliers = suppliers.map(supplier => ({
-      ...supplier.toObject(),
-      productsCount: supplier.productsSupplied ? supplier.productsSupplied.length : 0
-    }));
+    const transformedSuppliers = suppliers.map(supplier => {
+      const plain = typeof supplier.toObject === 'function' ? supplier.toObject() : { ...supplier };
+      return {
+        ...plain,
+        productsCount: supplier.productsSupplied ? supplier.productsSupplied.length : 0
+      };
+    });
 
     res.json({
       success: true,

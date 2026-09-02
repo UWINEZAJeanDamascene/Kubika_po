@@ -5,7 +5,13 @@
 
 const { dbClient } = require('../lib/prisma');
 const { Prisma } = require('@prisma/client');
-const { translateFilter, translateSort, IMPOSSIBLE } = require('../utils/prismaCompat');
+const {
+  translateFilter,
+  translateSort,
+  IMPOSSIBLE,
+  QUERY_MAX_ROWS,
+  reportUnboundedRead,
+} = require('../utils/prismaCompat');
 const { getCompanyId } = require('../utils/prismaTenant');
 const { buildTenantModel, STANDARD_TENANT_FIELD_MAP } = require('../utils/masterDataCommon');
 const {
@@ -233,8 +239,12 @@ async function productCustomFind(filter, opts, { many = false } = {}) {
     // low_stock_threshold) — to get the matching, sorted, paginated ID page.
     // Then let Prisma's own client load + shape those rows (correct camelCase
     // fields, relations, decimals) exactly like every other query path.
-    const explicitLimit = opts.limit != null ? Number(opts.limit) : 50;
-    const explicitSkip = opts.skip != null ? Number(opts.skip) : 0;
+    const requestedLimit = opts.limit != null ? Number(opts.limit) : 50;
+    const explicitLimit = Math.max(
+      1,
+      Math.min(QUERY_MAX_ROWS, Number.isFinite(requestedLimit) && requestedLimit > 0 ? requestedLimit : 50),
+    );
+    const explicitSkip = Math.max(0, Number(opts.skip) || 0);
 
     const sortField = translateSort(opts.sort, FULL_FIELD_MAP);
     const sortOrder = sortField && sortField[0] ? (sortField[0].order || 'asc') : 'asc';
@@ -264,6 +274,7 @@ async function productCustomFind(filter, opts, { many = false } = {}) {
 
     const rows = await dbClient().product.findMany({
       where: { id: { in: pageIds } },
+      take: pageIds.length,
       ...productQueryShape(opts),
     });
     const byId = new Map(rows.map((r) => [r.id, r]));
@@ -272,13 +283,24 @@ async function productCustomFind(filter, opts, { many = false } = {}) {
     return many ? ordered : (ordered[0] || null);
   }
 
-  let rows = await dbClient().product.findMany({
+  const requestedLimit = opts.limit != null ? Number(opts.limit) : null;
+  const explicitLimit = Number.isFinite(requestedLimit) && requestedLimit > 0
+    ? Math.min(QUERY_MAX_ROWS, requestedLimit)
+    : null;
+  const baseQuery = {
     where,
     orderBy: translateSort(opts.sort, FIELD_MAP),
-    take: opts.limit || undefined,
-    skip: opts.skip || undefined,
+    skip: Math.max(0, Number(opts.skip) || 0) || undefined,
     ...productQueryShape(opts),
+  };
+  let rows = await dbClient().product.findMany({
+    ...baseQuery,
+    take: explicitLimit || QUERY_MAX_ROWS + 1,
   });
+  if (!explicitLimit && rows.length > QUERY_MAX_ROWS) {
+    reportUnboundedRead(rows.length);
+    rows = rows.slice(0, QUERY_MAX_ROWS);
+  }
 
   return many ? rows : (rows[0] || null);
 }

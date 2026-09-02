@@ -1,5 +1,6 @@
-const mongoose = require('mongoose');
 const APTransactionLedger = require('../models/APTransactionLedger');
+const { dbClient } = require('../lib/prisma');
+const { generateObjectId } = require('../utils/objectId');
 const APPayment = require('../models/APPayment');
 const APPaymentAllocation = require('../models/APPaymentAllocation');
 const GoodsReceivedNote = require('../models/GoodsReceivedNote');
@@ -229,27 +230,41 @@ class APTrackingService {
     const discrepancies = [...(ledgerVerification.discrepancies || [])];
 
     // Check supplier balances
-    const suppliers = supplierId
-      ? await Supplier.find({ _id: supplierId, company: companyId })
-      : await Supplier.find({ company: companyId });
+    const params = [String(companyId)];
+    let supplierWhere = '';
+    if (supplierId) {
+      params.push(String(supplierId));
+      supplierWhere = 'AND s.id = $2';
+    }
+    const supplierRows = await dbClient().$queryRawUnsafe(`
+      SELECT s.id AS "supplierId", s.name AS "supplierName",
+             COALESCE(latest.supplier_balance_after, 0)::double precision AS "ledgerBalance",
+             COALESCE(grn_totals.actual_balance, 0)::double precision AS "actualBalance"
+        FROM suppliers s
+        LEFT JOIN LATERAL (
+          SELECT supplier_balance_after
+            FROM ap_transaction_ledger atl
+           WHERE atl.company_id = s.company_id AND atl.supplier_id = s.id
+           ORDER BY atl.transaction_date DESC, atl.created_at DESC, atl.id DESC
+           LIMIT 1
+        ) latest ON TRUE
+        LEFT JOIN LATERAL (
+          SELECT COALESCE(SUM(balance), 0) AS actual_balance
+            FROM goods_received_notes g
+           WHERE g.company_id = s.company_id AND g.supplier_id = s.id AND g.balance > 0
+        ) grn_totals ON TRUE
+       WHERE s.company_id = $1 ${supplierWhere}`,
+      ...params,
+    );
 
-    for (const supplier of suppliers) {
-      const ledgerBalance = await this.getSupplierBalance(companyId, supplier._id);
-
-      // Calculate actual balance from GRNs
-      const grns = await GoodsReceivedNote.find({
-        supplier: supplier._id,
-        company: companyId,
-        balance: { $gt: 0 }
-      });
-
-      const actualBalance = grns.reduce((sum, grn) => sum + (parseFloat(grn.balance) || 0), 0);
-
+    for (const supplier of supplierRows) {
+      const ledgerBalance = Number(supplier.ledgerBalance || 0);
+      const actualBalance = Number(supplier.actualBalance || 0);
       if (Math.abs(ledgerBalance - actualBalance) > 0.01) {
         discrepancies.push({
           type: 'supplier_balance_mismatch',
-          supplierId: supplier._id,
-          supplierName: supplier.name,
+          supplierId: supplier.supplierId,
+          supplierName: supplier.supplierName,
           ledgerBalance: ledgerBalance.toFixed(2),
           actualBalance: actualBalance.toFixed(2),
           difference: (ledgerBalance - actualBalance).toFixed(2)
@@ -274,7 +289,7 @@ class APTrackingService {
       // No discrepancies found - mark all pending transactions as verified
       const updateResult = await APTransactionLedger.updateMany(
         {
-          company: new mongoose.Types.ObjectId(companyId),
+          company: companyId,
           reconciliationStatus: 'pending'
         },
         {
@@ -311,7 +326,7 @@ class APTrackingService {
           direction: adjustmentAmount > 0 ? 'decrease' : 'increase',
           supplierBalanceAfter: newBalance,
           sourceType: 'manual',
-          sourceId: new mongoose.Types.ObjectId(),
+          sourceId: generateObjectId(),
           sourceReference: 'ADJ-' + Date.now(),
           createdBy: userId,
           reconciliationStatus: 'corrected',
@@ -362,17 +377,17 @@ class APTrackingService {
       this.verifyIntegrity(companyId)
     ]);
 
-    // Get transaction type breakdown
-    const typeBreakdown = await APTransactionLedger.aggregate([
-      { $match: { company: new mongoose.Types.ObjectId(companyId) } },
-      {
-        $group: {
-          _id: '$transactionType',
-          count: { $sum: 1 },
-          totalAmount: { $sum: { $toDouble: '$amount' } }
-        }
-      }
-    ]);
+    // Get transaction type breakdown in PostgreSQL. The old compatibility
+    // aggregate fetched the whole tenant ledger into Node before grouping.
+    const typeBreakdown = await dbClient().$queryRaw`
+      SELECT transaction_type AS "_id",
+             COUNT(*)::int AS count,
+             COALESCE(SUM(amount), 0)::double precision AS "totalAmount"
+        FROM ap_transaction_ledger
+       WHERE company_id = ${String(companyId)}
+       GROUP BY transaction_type
+       ORDER BY transaction_type`;
+
 
     // Get recent activity
     const recentActivity = await APTransactionLedger.find({ company: companyId })

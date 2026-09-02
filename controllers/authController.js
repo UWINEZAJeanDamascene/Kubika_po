@@ -91,6 +91,7 @@ exports.login = async (req, res, next) => {
 
       return res.json({
         success: true,
+        token,
         data: userWithoutPassword,
         requirePasswordChange: user.mustChangePassword || false,
         isPlatformAdmin: true
@@ -239,6 +240,7 @@ exports.login = async (req, res, next) => {
 
      res.json({
        success: true,
+       token,
        data: userWithoutPassword,
        company: user.company,
        requirePasswordChange

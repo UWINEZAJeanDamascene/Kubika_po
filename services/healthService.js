@@ -1,4 +1,3 @@
-const mongoose = require('mongoose');
 const v8 = require('v8');
 const { redisClient, isRedisConfigured } = require('../config/redis');
 const { buildAdvancedMetrics } = require('./systemMetricsService');
@@ -105,22 +104,14 @@ async function checkDatabase() {
   const start = Date.now();
 
   // PostgreSQL is the system of record: it is what "the database is up" means.
-  // This previously pinged MongoDB only, so with MONGODB_URI unset — the
-  // intended end state of the migration — a fully healthy server reported
-  // status "down" and every uptime probe would have paged on it.
+  // PostgreSQL is the system of record. Keeping this probe on Prisma avoids
+  // waking or waiting on legacy MongoDB for every uptime check.
   try {
     const { prisma } = require('../lib/prisma');
     await prisma.$queryRaw`SELECT 1`;
     const ping_ms = Date.now() - start;
     const result = { status: 'ok', ping_ms, engine: 'postgresql' };
 
-    // Mongo is reported alongside only while it is still configured, and never
-    // decides overall health.
-    if (mongoose.connection.readyState === 1) {
-      result.mongo = { status: 'ok' };
-    } else if (process.env.MONGODB_URI) {
-      result.mongo = { status: 'error' };
-    }
     return result;
   } catch (e) {
     return {
@@ -133,7 +124,8 @@ async function checkDatabase() {
 }
 
 /**
- * Redis / cache; when not configured, treated as ok (app runs without cache).
+ * Redis / cache. The API can only run without it through the explicit
+ * PERFORMANCE_REQUIRE_REDIS=false compatibility opt-out.
  */
 async function checkCache() {
   if (!isRedisConfigured()) {

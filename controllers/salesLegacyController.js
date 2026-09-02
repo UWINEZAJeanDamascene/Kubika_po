@@ -6,7 +6,14 @@ const Warehouse = require('../models/Warehouse');
 const Company = require('../models/Company');
 const { BankAccount } = require('../models/BankAccount');
 const TillSession = require('../models/TillSession');
-const mongoose = require('mongoose');
+
+function escapeRegex(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function isObjectIdString(value) {
+  return /^[0-9a-fA-F]{24}$/.test(String(value || '').trim());
+}
 const { runInTransaction } = require('../services/transactionService');
 const inventoryService = require('../services/inventoryService');
 const JournalService = require('../services/journalService');
@@ -577,6 +584,7 @@ exports.getPosProducts = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const { search, warehouseId, category, limit = 50 } = req.query;
+    const resultLimit = Math.min(100, Math.max(1, parseInt(limit, 10) || 50));
     const toNumber = (value) => {
       if (value == null) return 0;
       if (typeof value === 'number') return value;
@@ -587,15 +595,21 @@ exports.getPosProducts = async (req, res, next) => {
 
     let query = { company: companyId, isActive: { $ne: false } };
     
-    if (search) {
+    if (search && String(search).trim()) {
+      const term = escapeRegex(String(search).trim());
+      // Prefix predicates keep the B-tree/trigram indexes usable for the hot
+      // POS lookup. Barcode and SKU also get exact-match clauses so scans and
+      // scanner input resolve without a leading-wildcard substring query.
       query.$or = [
-        { name: { $regex: search, $options: 'i' } },
-        { sku: { $regex: search, $options: 'i' } },
-        { barcode: { $regex: search, $options: 'i' } }
+        { barcode: { $regex: `^${term}$`, $options: 'i' } },
+        { sku: { $regex: `^${term}$`, $options: 'i' } },
+        { barcode: { $regex: `^${term}`, $options: 'i' } },
+        { sku: { $regex: `^${term}`, $options: 'i' } },
+        { name: { $regex: `^${term}`, $options: 'i' } },
       ];
     }
-    if (mongoose.Types.ObjectId.isValid(search)) {
-      query.$or.push({ _id: search });
+    if (isObjectIdString(search)) {
+      query.$or.push({ _id: String(search).trim() });
     }
     
     if (category) {
@@ -604,7 +618,7 @@ exports.getPosProducts = async (req, res, next) => {
 
     const products = await Product.find(query)
       .select('name sku sellingPrice unit taxRate taxCode currentStock averageCost barcode category isStockable')
-      .limit(Number(limit))
+.limit(resultLimit)
       .sort({ name: 1 });
 
     // Enhance with availability info

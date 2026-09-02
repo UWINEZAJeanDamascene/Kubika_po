@@ -1,0 +1,277 @@
+{
+  "description": "Latest Phase 0 performance baselines for the top-10 API endpoints. Snapshots live in snapshots/ (gitignored); this manifest is committed so CI and operators can see when baselines were last captured.",
+  "latest": {
+    "label": "top10",
+    "captured_at": "2026-09-01T17:11:34.577Z",
+    "source": "http://localhost:3000/api/performance?limit=50",
+    "snapshot_file": "snapshots/top10-2026-09-01T17-11-34-575Z.json",
+    "overall": {
+      "total_requests": 28,
+      "p50_ms": 8676,
+      "p95_ms": 17887,
+      "p99_ms": 19009,
+      "apdex": 0.036,
+      "cache_hit_ratio": 55.6
+    },
+    "top_endpoints": [
+      {
+        "id": "products_list",
+        "label": "Product list",
+        "route_pattern": "GET /api/products",
+        "warm_path": "/api/products?limit=50&page=1&isArchived=false",
+        "sampled": true,
+        "count": 3,
+        "p50_ms": 9365,
+        "p95_ms": 11614,
+        "p99_ms": 11614,
+        "error_rate": 0
+      },
+      {
+        "id": "stock_levels",
+        "label": "Stock levels",
+        "route_pattern": "GET /api/stock/levels",
+        "warm_path": "/api/stock/levels?page=1&limit=50",
+        "sampled": true,
+        "count": 3,
+        "p50_ms": 8676,
+        "p95_ms": 10829,
+        "p99_ms": 10829,
+        "error_rate": 0
+      },
+      {
+        "id": "pos_products",
+        "label": "POS product lookup",
+        "route_pattern": "GET /api/sales-legacy/products",
+        "warm_path": "/api/sales-legacy/products?limit=50",
+        "sampled": true,
+        "count": 3,
+        "p50_ms": 7413,
+        "p95_ms": 10306,
+        "p99_ms": 10306,
+        "error_rate": 0
+      },
+      {
+        "id": "sales_invoices",
+        "label": "Invoice list",
+        "route_pattern": "GET /api/sales-invoices",
+        "warm_path": "/api/sales-invoices?limit=50&page=1",
+        "sampled": true,
+        "count": 3,
+        "p50_ms": 13665,
+        "p95_ms": 14620,
+        "p99_ms": 14620,
+        "error_rate": 0
+      },
+      {
+        "id": "sales_orders",
+        "label": "Sales order list",
+        "route_pattern": "GET /api/sales-orders",
+        "warm_path": "/api/sales-orders?limit=50&page=1",
+        "sampled": true,
+        "count": 3,
+        "p50_ms": 6455,
+        "p95_ms": 9023,
+        "p99_ms": 9023,
+        "error_rate": 0
+      },
+      {
+        "id": "dashboard_stats",
+        "label": "Dashboard stats",
+        "route_pattern": "GET /api/dashboard/stats",
+        "warm_path": "/api/dashboard/stats",
+        "sampled": true,
+        "count": 3,
+        "p50_ms": 17887,
+        "p95_ms": 19009,
+        "p99_ms": 19009,
+        "error_rate": 0
+      },
+      {
+        "id": "suppliers_picker",
+        "label": "Supplier picker",
+        "route_pattern": "GET /api/suppliers",
+        "warm_path": "/api/suppliers?limit=100&isActive=true&forPicker=1",
+        "sampled": true,
+        "count": 3,
+        "p50_ms": 7698,
+        "p95_ms": 9267,
+        "p99_ms": 9267,
+        "error_rate": 0
+      },
+      {
+        "id": "clients_list",
+        "label": "Client list",
+        "route_pattern": "GET /api/clients",
+        "warm_path": "/api/clients?limit=50&page=1",
+        "sampled": true,
+        "count": 3,
+        "p50_ms": 9109,
+        "p95_ms": 9202,
+        "p99_ms": 9202,
+        "error_rate": 0
+      },
+      {
+        "id": "stock_movements",
+        "label": "Stock movements",
+        "route_pattern": "GET /api/stock/movements",
+        "warm_path": "/api/stock/movements?limit=50&page=1",
+        "sampled": true,
+        "count": 3,
+        "p50_ms": 8018,
+        "p95_ms": 12055,
+        "p99_ms": 12055,
+        "error_rate": 0
+      },
+      {
+        "id": "performance_metrics",
+        "label": "Performance metrics (meta)",
+        "route_pattern": "GET /api/performance",
+        "warm_path": "/api/performance?limit=50",
+        "sampled": false,
+        "count": 0,
+        "p50_ms": null,
+        "p95_ms": null,
+        "p99_ms": null,
+        "error_rate": null
+      }
+    ]
+  },
+  "history": [
+    {
+      "label": "top10",
+      "captured_at": "2026-09-01T17:11:34.577Z",
+      "source": "http://localhost:3000/api/performance?limit=50",
+      "snapshot_file": "snapshots/top10-2026-09-01T17-11-34-575Z.json",
+      "overall": {
+        "total_requests": 28,
+        "p50_ms": 8676,
+        "p95_ms": 17887,
+        "p99_ms": 19009,
+        "apdex": 0.036,
+        "cache_hit_ratio": 55.6
+      },
+      "top_endpoints": [
+        {
+          "id": "products_list",
+          "label": "Product list",
+          "route_pattern": "GET /api/products",
+          "warm_path": "/api/products?limit=50&page=1&isArchived=false",
+          "sampled": true,
+          "count": 3,
+          "p50_ms": 9365,
+          "p95_ms": 11614,
+          "p99_ms": 11614,
+          "error_rate": 0
+        },
+        {
+          "id": "stock_levels",
+          "label": "Stock levels",
+          "route_pattern": "GET /api/stock/levels",
+          "warm_path": "/api/stock/levels?page=1&limit=50",
+          "sampled": true,
+          "count": 3,
+          "p50_ms": 8676,
+          "p95_ms": 10829,
+          "p99_ms": 10829,
+          "error_rate": 0
+        },
+        {
+          "id": "pos_products",
+          "label": "POS product lookup",
+          "route_pattern": "GET /api/sales-legacy/products",
+          "warm_path": "/api/sales-legacy/products?limit=50",
+          "sampled": true,
+          "count": 3,
+          "p50_ms": 7413,
+          "p95_ms": 10306,
+          "p99_ms": 10306,
+          "error_rate": 0
+        },
+        {
+          "id": "sales_invoices",
+          "label": "Invoice list",
+          "route_pattern": "GET /api/sales-invoices",
+          "warm_path": "/api/sales-invoices?limit=50&page=1",
+          "sampled": true,
+          "count": 3,
+          "p50_ms": 13665,
+          "p95_ms": 14620,
+          "p99_ms": 14620,
+          "error_rate": 0
+        },
+        {
+          "id": "sales_orders",
+          "label": "Sales order list",
+          "route_pattern": "GET /api/sales-orders",
+          "warm_path": "/api/sales-orders?limit=50&page=1",
+          "sampled": true,
+          "count": 3,
+          "p50_ms": 6455,
+          "p95_ms": 9023,
+          "p99_ms": 9023,
+          "error_rate": 0
+        },
+        {
+          "id": "dashboard_stats",
+          "label": "Dashboard stats",
+          "route_pattern": "GET /api/dashboard/stats",
+          "warm_path": "/api/dashboard/stats",
+          "sampled": true,
+          "count": 3,
+          "p50_ms": 17887,
+          "p95_ms": 19009,
+          "p99_ms": 19009,
+          "error_rate": 0
+        },
+        {
+          "id": "suppliers_picker",
+          "label": "Supplier picker",
+          "route_pattern": "GET /api/suppliers",
+          "warm_path": "/api/suppliers?limit=100&isActive=true&forPicker=1",
+          "sampled": true,
+          "count": 3,
+          "p50_ms": 7698,
+          "p95_ms": 9267,
+          "p99_ms": 9267,
+          "error_rate": 0
+        },
+        {
+          "id": "clients_list",
+          "label": "Client list",
+          "route_pattern": "GET /api/clients",
+          "warm_path": "/api/clients?limit=50&page=1",
+          "sampled": true,
+          "count": 3,
+          "p50_ms": 9109,
+          "p95_ms": 9202,
+          "p99_ms": 9202,
+          "error_rate": 0
+        },
+        {
+          "id": "stock_movements",
+          "label": "Stock movements",
+          "route_pattern": "GET /api/stock/movements",
+          "warm_path": "/api/stock/movements?limit=50&page=1",
+          "sampled": true,
+          "count": 3,
+          "p50_ms": 8018,
+          "p95_ms": 12055,
+          "p99_ms": 12055,
+          "error_rate": 0
+        },
+        {
+          "id": "performance_metrics",
+          "label": "Performance metrics (meta)",
+          "route_pattern": "GET /api/performance",
+          "warm_path": "/api/performance?limit=50",
+          "sampled": false,
+          "count": 0,
+          "p50_ms": null,
+          "p95_ms": null,
+          "p99_ms": null,
+          "error_rate": null
+        }
+      ]
+    }
+  ]
+}

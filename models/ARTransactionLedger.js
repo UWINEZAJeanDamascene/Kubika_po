@@ -2,8 +2,7 @@
  * ARTransactionLedger — PostgreSQL (Prisma) backed.
  *
  * Append-only audit trail of every event that moves a client's receivable
- * balance. The Mongoose statics below are preserved because
- * arTrackingService and the AR reconciliation controller call them directly.
+ * balance. The legacy statics are preserved for existing callers.
  */
 
 const { dbClient } = require('../lib/prisma');
@@ -26,15 +25,10 @@ const ARTransactionLedger = buildTenantModel({
   translateUpdate: arLedgerTranslateUpdate,
 });
 
-/** Mongo: `new this(data).save()`. */
 ARTransactionLedger.recordTransaction = async function recordTransaction(data) {
   return ARTransactionLedger.create(data);
 };
 
-/**
- * Client balance as at a date — the balance recorded by the most recent entry
- * on or before it. Ties on transactionDate break by createdAt, as in Mongo.
- */
 ARTransactionLedger.getClientBalanceAtDate = async function getClientBalanceAtDate(companyId, clientId, date) {
   const row = await ARTransactionLedger.findOne({
     company: companyId,
@@ -56,22 +50,12 @@ ARTransactionLedger.getInvoiceBalanceAtDate = async function getInvoiceBalanceAt
 };
 
 /**
- * Ledger entries whose recorded balance no longer matches the live invoice or
- * client balance.
- *
- * Reimplemented against Prisma rather than translated from the Mongo pipeline.
- * That pipeline used `$lookup` + `$addFields` + `$cond`, which the aggregate
- * compatibility layer does not cover; relying on it would have failed quietly
- * or returned wrong rows. Prisma joins the two relations in one query and the
- * comparison happens here, where it is explicit.
- *
- * Comparison is on a rounded-to-cents difference, not equality: the Mongo
- * version compared Decimal128 values with `$ne`, which flags a discrepancy for
- * a representational difference that is not a real one.
+ * Compare ledger balances with current invoice/client balances in PostgreSQL.
+ * The ledger rows are streamed in bounded pages, while invoice balances are
+ * joined in each page, preventing a full tenant history from entering Node.
  */
 ARTransactionLedger.findDiscrepancies = async function findDiscrepancies(companyId, options = {}) {
   const { startDate, endDate, clientId } = options;
-
   const where = {
     companyId: String(companyId),
     reconciliationStatus: { in: ['pending', 'discrepancy'] },
@@ -83,49 +67,71 @@ ARTransactionLedger.findDiscrepancies = async function findDiscrepancies(company
     if (endDate) where.transactionDate.lte = new Date(endDate);
   }
 
-  const rows = await dbClient().arTransactionLedger.findMany({
-    where,
-    orderBy: { transactionDate: 'desc' },
-    include: {
-      client: { select: { id: true, name: true, outstandingBalance: true } },
-    },
-  });
+  const discrepancies = [];
+  const batchSize = Math.min(2000, Math.max(100, Number(process.env.RECONCILIATION_BATCH_SIZE) || 500));
+  let skip = 0;
+  for (;;) {
+    const rows = await dbClient().arTransactionLedger.findMany({
+      where,
+      orderBy: [
+        { transactionDate: 'desc' },
+        { createdAt: 'desc' },
+        { id: 'desc' },
+      ],
+      take: batchSize,
+      skip,
+    });
+    if (!rows.length) break;
 
-  // Invoice balances in one follow-up query rather than one per row.
-  const invoiceIds = [...new Set(rows.map((r) => r.invoiceId).filter(Boolean))];
-  const invoices = invoiceIds.length
-    ? await dbClient().invoice.findMany({
-      where: { id: { in: invoiceIds } },
-      select: { id: true, amountOutstanding: true },
-    })
-    : [];
-  const invoiceById = new Map(invoices.map((i) => [i.id, i]));
+    const invoiceIds = [...new Set(rows.map((row) => row.invoiceId).filter(Boolean))];
+    const invoices = [];
+    for (let index = 0; index < invoiceIds.length; index += 500) {
+      const ids = invoiceIds.slice(index, index + 500);
+      invoices.push(...await dbClient().invoice.findMany({
+        where: { id: { in: ids } },
+        select: { id: true, amountOutstanding: true },
+        take: ids.length,
+      }));
+    }
+    const invoiceById = new Map(invoices.map((invoice) => [invoice.id, invoice]));
+    const clientIds = [...new Set(rows.map((row) => row.clientId).filter(Boolean))];
+    const clients = [];
+    for (let index = 0; index < clientIds.length; index += 500) {
+      const ids = clientIds.slice(index, index + 500);
+      clients.push(...await dbClient().client.findMany({
+        where: { id: { in: ids } },
+        select: { id: true, name: true, outstandingBalance: true },
+        take: ids.length,
+      }));
+    }
+    const clientById = new Map(clients.map((client) => [client.id, client]));
 
-  const differs = (a, b) => Math.abs((Number(a) || 0) - (Number(b) || 0)) > 0.005;
-
-  return rows
-    .map((row) => {
-      const currentInvoice = row.invoiceId ? invoiceById.get(row.invoiceId) : null;
-      const currentInvoiceBalance = currentInvoice ? decimalToNumber(currentInvoice.amountOutstanding) : null;
-      const currentClientBalance = row.client ? decimalToNumber(row.client.outstandingBalance) : null;
-
+    for (const row of rows) {
+      const invoice = row.invoiceId ? invoiceById.get(row.invoiceId) : null;
+      const client = clientById.get(row.clientId);
+      const currentInvoiceBalance = invoice ? decimalToNumber(invoice.amountOutstanding) : null;
+      const currentClientBalance = client ? decimalToNumber(client.outstandingBalance) : null;
+      const differs = (a, b) => Math.abs((Number(a) || 0) - (Number(b) || 0)) > 0.005;
       const invoiceDiscrepancy = row.invoiceId != null
         && currentInvoiceBalance != null
         && differs(decimalToNumber(row.invoiceBalanceAfter), currentInvoiceBalance);
       const clientDiscrepancy = currentClientBalance != null
         && differs(decimalToNumber(row.clientBalanceAfter), currentClientBalance);
+      if (!invoiceDiscrepancy && !clientDiscrepancy) continue;
 
-      if (!invoiceDiscrepancy && !clientDiscrepancy) return null;
-
-      return {
+      discrepancies.push({
         ...arLedgerToApi(row),
         currentInvoiceBalance,
         currentClientBalance,
         invoiceDiscrepancy,
         clientDiscrepancy,
-      };
-    })
-    .filter(Boolean);
+      });
+    }
+
+    if (rows.length < batchSize) break;
+    skip += rows.length;
+  }
+  return discrepancies;
 };
 
 module.exports = ARTransactionLedger;

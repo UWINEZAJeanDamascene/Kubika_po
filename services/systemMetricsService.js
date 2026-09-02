@@ -1,11 +1,12 @@
 /**
  * System Metrics Service
- * Collects advanced operational metrics: DB stats, request timing,
- * company dataset sizes, capacity estimates, and event loop health.
+ * Collects advanced operational metrics: PostgreSQL stats, request timing,
+ * company dataset sizes, capacity estimates, pool saturation, and event-loop health.
  */
 
-const mongoose = require('mongoose');
 const os = require('os');
+const { prisma, getPrismaOperationMetrics } = require('../lib/prisma');
+const persistentMetrics = require('./performanceMetricsStore');
 
 // ── Request Timing Tracker ──────────────────────────────────────────────
 //
@@ -61,6 +62,10 @@ function recordRequest(durationMs, statusCode, route) {
   requestStats.totalMs += durationMs;
   if (durationMs > 500) requestStats.slowCount++;
   if (statusCode >= 400) requestStats.errors++;
+
+  // Queue a non-blocking Redis write. The persistent store batches events so
+  // telemetry never adds a network round trip to the request path.
+  persistentMetrics.recordRequest({ durationMs, statusCode, route });
 
   requestStats.samples.push({
     timestamp: Date.now(),
@@ -138,6 +143,11 @@ function getRequestMetrics() {
   };
 }
 
+async function getAggregatedRequestMetrics() {
+  const metrics = await persistentMetrics.getRequestMetrics();
+  return metrics || getRequestMetrics();
+}
+
 /**
  * Per-route breakdown, slowest p95 first — the ranking you actually optimise
  * from. `limit` caps how many rows are returned, not how many are tracked.
@@ -165,6 +175,11 @@ function getRouteMetrics(limit = 20) {
   };
 }
 
+async function getAggregatedRouteMetrics(limit = 20) {
+  const metrics = await persistentMetrics.getRouteMetrics(limit);
+  return metrics || getRouteMetrics(limit);
+}
+
 // ── Event Loop Lag Monitor ──────────────────────────────────────────────
 let lastEventLoopLag = 0;
 const eventLoopSamples = [];
@@ -177,6 +192,7 @@ function measureEventLoopLag() {
     lastEventLoopLag = Number(end - start) / 1_000_000; // ns -> ms
     eventLoopSamples.push(lastEventLoopLag);
     if (eventLoopSamples.length > MAX_LOOP_SAMPLES) eventLoopSamples.shift();
+    persistentMetrics.recordEventLoopSample(lastEventLoopLag);
   });
 }
 
@@ -200,43 +216,41 @@ function getEventLoopMetrics() {
   };
 }
 
+async function getAggregatedEventLoopMetrics() {
+  const metrics = await persistentMetrics.getEventLoopMetrics();
+  return metrics || getEventLoopMetrics();
+}
+
 // ── Database Stats ──────────────────────────────────────────────────────
 async function getDatabaseStats() {
   try {
-    if (mongoose.connection.readyState !== 1) return null;
-    const db = mongoose.connection.db;
-    if (!db) return null;
-
-    const stats = await db.admin().command({ listDatabases: 1 });
-    const ourDbName = db.databaseName;
-    const ourDb = stats.databases.find((d) => d.name === ourDbName);
-    const dbSizeOnDisk = ourDb ? ourDb.sizeOnDisk : 0;
-
-    // Collection stats for top collections
-    const collections = await db.listCollections().toArray();
-    const collectionStats = [];
-    for (const col of collections.slice(0, 30)) {
-      // Skip system collections and views
-      if (col.name.startsWith('system.') || col.type === 'view') continue;
-      try {
-        const colStats = await db.command({ collStats: col.name });
-        collectionStats.push({
-          name: col.name,
-          documents: colStats.count || 0,
-          size_mb: Math.round((colStats.size || 0) / 1024 / 1024 * 100) / 100,
-          avg_obj_size: colStats.avgObjSize || 0,
-          indexes: colStats.nindexes || 0,
-        });
-      } catch (e) {
-        // Some collections may not support stats
-      }
-    }
-    collectionStats.sort((a, b) => b.documents - a.documents);
-
+    const rows = await prisma.$queryRaw`
+      SELECT
+        current_database() AS database_name,
+        COALESCE(SUM(pg_total_relation_size(relid)), 0)::bigint AS total_size_bytes,
+        COUNT(*)::int AS tables_count
+      FROM pg_catalog.pg_statio_user_tables
+    `;
+    const tableRows = await prisma.$queryRaw`
+      SELECT
+        relname AS table_name,
+        COALESCE(n_live_tup, 0)::bigint AS documents,
+        pg_total_relation_size(relid)::bigint AS size_bytes
+      FROM pg_catalog.pg_stat_user_tables
+      ORDER BY n_live_tup DESC
+      LIMIT 30
+    `;
+    const row = rows[0] || {};
+    const collectionStats = tableRows.map((table) => ({
+      name: table.table_name,
+      documents: Number(table.documents || 0),
+      size_mb: Math.round((Number(table.size_bytes || 0) / 1024 / 1024) * 100) / 100,
+    }));
     return {
-      name: ourDbName,
-      total_size_mb: Math.round(dbSizeOnDisk / 1024 / 1024 * 100) / 100,
-      collections_count: collections.length,
+      engine: 'postgresql',
+      name: row.database_name || null,
+      total_size_mb: Math.round((Number(row.total_size_bytes || 0) / 1024 / 1024) * 100) / 100,
+      collections_count: Number(row.tables_count || 0),
       top_collections: collectionStats.slice(0, 8),
     };
   } catch (e) {
@@ -244,41 +258,79 @@ async function getDatabaseStats() {
   }
 }
 
+// ── PostgreSQL Pool Metrics ─────────────────────────────────────────────
+async function getPostgresPoolMetrics() {
+  const configuredLimit = Number(process.env.PRISMA_CONNECTION_LIMIT || 20);
+  try {
+    const rows = await prisma.$queryRaw`
+      SELECT
+        COUNT(*)::int AS total_connections,
+        COUNT(*) FILTER (WHERE state = 'active')::int AS active_connections,
+        COUNT(*) FILTER (WHERE state = 'idle')::int AS idle_connections,
+        COUNT(*) FILTER (WHERE wait_event IS NOT NULL)::int AS waiting_connections
+      FROM pg_stat_activity
+      WHERE application_name = ${process.env.PRISMA_APPLICATION_NAME || 'stock-management-api'}
+    `;
+    const row = rows[0] || {};
+    const total = Number(row.total_connections || 0);
+    const active = Number(row.active_connections || 0);
+    return {
+      engine: 'postgresql',
+      configured_pool_limit: configuredLimit,
+      total_connections: total,
+      active_connections: active,
+      idle_connections: Number(row.idle_connections || 0),
+      waiting_connections: Number(row.waiting_connections || 0),
+      in_flight_operations: getPrismaOperationMetrics(),
+      saturation_percent: configuredLimit > 0 ? Math.round((total / configuredLimit) * 10000) / 100 : null,
+      status: total >= configuredLimit ? 'saturated' : total >= configuredLimit * 0.8 ? 'pressured' : 'ok',
+    };
+  } catch (error) {
+    return {
+      engine: 'postgresql',
+      configured_pool_limit: configuredLimit,
+      total_connections: null,
+      active_connections: null,
+      idle_connections: null,
+      waiting_connections: null,
+      in_flight_operations: getPrismaOperationMetrics(),
+      saturation_percent: null,
+      status: 'unavailable',
+      error: error.message,
+    };
+  }
+}
+
 // ── Company Dataset Stats ───────────────────────────────────────────────
 async function getCompanyDatasetStats() {
   try {
-    if (mongoose.connection.readyState !== 1) return null;
-    const db = mongoose.connection.db;
-    if (!db) return null;
-
-    // Estimate per-company document counts from key collections
-    const Company = require('../models/Company');
-    const totalCompanies = await Company.countDocuments();
-    const activeCompanies = await Company.countDocuments({ isActive: true });
-
-    // Key tenant-scoped collections
-    const tenantCollections = [
-      'products', 'salesorders', 'purchaseorders', 'invoices',
-      'journalentries', 'stockmovements', 'grns', 'clients', 'suppliers',
+    const tenantTables = [
+      'products', 'sales_orders', 'purchase_orders', 'invoices',
+      'journal_entries', 'stock_movements', 'goods_received_notes', 'clients', 'suppliers',
     ];
-
-    const collectionDocs = [];
-    for (const colName of tenantCollections) {
-      try {
-        const count = await db.collection(colName).countDocuments();
-        collectionDocs.push({ collection: colName, documents: count });
-      } catch (e) {
-        collectionDocs.push({ collection: colName, documents: 0 });
-      }
-    }
-    const totalTenantDocs = collectionDocs.reduce((s, c) => s + c.documents, 0);
-    const avgDocsPerCompany = totalCompanies > 0 ? Math.round(totalTenantDocs / totalCompanies) : 0;
-
+    const [companyCounts, tableRows] = await Promise.all([
+      prisma.company.groupBy({
+        by: ['isActive'],
+        _count: { _all: true },
+      }),
+      prisma.$queryRaw`
+        SELECT relname AS table_name, COALESCE(n_live_tup, 0)::bigint AS documents
+        FROM pg_catalog.pg_stat_user_tables
+      `,
+    ]);
+    const totalCompanies = companyCounts.reduce((sum, row) => sum + Number(row._count?._all || 0), 0);
+    const activeCompanies = Number(companyCounts.find((row) => row.isActive)?._count?._all || 0);
+    const collectionDocs = tenantTables.map((tableName) => ({
+      collection: tableName,
+      documents: Number(tableRows.find((row) => row.table_name === tableName)?.documents || 0),
+    }));
+    const totalTenantDocs = collectionDocs.reduce((sum, row) => sum + row.documents, 0);
     return {
+      engine: 'postgresql',
       total_companies: totalCompanies,
       active_companies: activeCompanies,
       total_tenant_documents: totalTenantDocs,
-      avg_documents_per_company: avgDocsPerCompany,
+      avg_documents_per_company: totalCompanies > 0 ? Math.round(totalTenantDocs / totalCompanies) : 0,
       collection_breakdown: collectionDocs.sort((a, b) => b.documents - a.documents),
     };
   } catch (e) {
@@ -301,8 +353,8 @@ function getCapacityEstimate(memory, dbStats, companyStats, requestMetrics) {
   const maxHeapMb = Math.round((v8Stats.heap_size_limit || 0) / 1024 / 1024 * 100) / 100;
   const heapHeadroomMb = Math.max(0, maxHeapMb - memory.heap_used_mb);
 
-  // 3. DB headroom: use MongoDB's dataSize + indexSize as the real ceiling
-  // If we can't query server status, estimate from collection sizes
+  // 3. DB headroom: use PostgreSQL relation sizes as the real ceiling.
+  // If the database cannot be queried, estimate from the configured ceiling.
   let dbLimitMb = 5120; // Start with 5GB generic assumption
   try {
     // Try to get real wiredTiger cache limit or server disk info
@@ -390,49 +442,59 @@ async function buildAdvancedMetrics(memorySnapshot) {
     getDatabaseStats(),
     getCompanyDatasetStats(),
   ]);
-
-  const requests = getRequestMetrics();
-  const capacity = getCapacityEstimate(memorySnapshot, dbStats, companyStats, {
-    requests_per_min: requests.requests_per_min,
-    event_loop_lag_ms: lastEventLoopLag,
-  });
   const system = getSystemLoad();
 
-  // Cache stats are read defensively: metrics must never be the thing that
-  // breaks a health endpoint.
+  // Cache and persistent metrics are read defensively: metrics must never be
+  // the thing that breaks a health endpoint.
   let cache = null;
   try {
-    cache = require('./cacheService').getMetrics();
+    cache = await require('./cacheService').getAggregatedMetrics();
   } catch (e) {
     cache = { error: e.message };
   }
 
+  const [requests, routes, eventLoop, pool] = await Promise.all([
+    getAggregatedRequestMetrics(),
+    getAggregatedRouteMetrics(),
+    getAggregatedEventLoopMetrics(),
+    getPostgresPoolMetrics(),
+  ]);
+  const capacity = getCapacityEstimate(memorySnapshot, dbStats, companyStats, {
+    requests_per_min: requests.requests_per_min,
+    event_loop_lag_ms: eventLoop.current_ms,
+  });
+
   return {
     requests,
-    routes: getRouteMetrics(),
+    routes,
     cache,
     database_stats: dbStats,
     company_stats: companyStats,
+    database_pool: pool,
     capacity,
     system,
-    event_loop_lag_ms: Math.round(lastEventLoopLag * 100) / 100,
+    event_loop_lag_ms: Math.round(eventLoop.current_ms * 100) / 100,
     // A single instantaneous sample can miss a spike entirely; the window shows
     // whether the loop is intermittently blocked, which is what actually
     // degrades every endpoint at once.
-    event_loop_lag: getEventLoopMetrics(),
-    active_connections: mongoose.connection.readyState === 1
-      ? (mongoose.connection.db?.serverConfig?.connections?.length || 1)
-      : 0,
+    event_loop_lag: eventLoop,
+    // Backwards-compatible scalar, now sourced from PostgreSQL pg_stat_activity.
+    active_connections: pool.active_connections ?? 0,
+    metrics_storage: persistentMetrics.getStorageStatus(),
   };
 }
 
 module.exports = {
   recordRequest,
   getRequestMetrics,
+  getAggregatedRequestMetrics,
   getRouteMetrics,
+  getAggregatedRouteMetrics,
   getEventLoopMetrics,
+  getAggregatedEventLoopMetrics,
   getDatabaseStats,
   getCompanyDatasetStats,
+  getPostgresPoolMetrics,
   getCapacityEstimate,
   getSystemLoad,
   buildAdvancedMetrics,

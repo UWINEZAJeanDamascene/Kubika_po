@@ -142,6 +142,7 @@ model Company {
   quotations     Quotation[]
   salesOrders    SalesOrder[]
   invoices       Invoice[]
+  arBadDebtWriteoffs ArBadDebtWriteoff[]
   creditNotes    CreditNote[]
   deliveryNotes  DeliveryNote[]
   pickPacks      PickPack[]
@@ -767,6 +768,7 @@ model Client {
   quotations Quotation[]
   salesOrders SalesOrder[]
   invoices Invoice[]
+  arBadDebtWriteoffs ArBadDebtWriteoff[]
   creditNotes CreditNote[]
   deliveryNotes DeliveryNote[]
   pickPacks PickPack[]
@@ -1820,6 +1822,10 @@ model Invoice {
   salesOrderId            String?   @map("sales_order_id") @db.Char(24)
   deliveryNoteId          String?   @map("delivery_note_id") @db.Char(24)
   status                  String    @default("draft")
+  badDebtWrittenOff       Boolean   @default(false) @map("bad_debt_written_off")
+  writtenOffAt            DateTime? @map("written_off_at") @db.Timestamptz(3)
+  writtenOffById          String?   @map("written_off_by") @db.Char(24)
+  badDebtReason           String?   @map("bad_debt_reason")
   currencyCode            String    @default("RWF") @map("currency_code")
   exchangeRate            Decimal   @default(1) @map("exchange_rate") @db.Decimal(19, 6)
   subtotal                Decimal   @default(0) @db.Decimal(19, 2)
@@ -1850,6 +1856,7 @@ model Invoice {
   lines        InvoiceLine[]
   arAllocations ARReceiptAllocation[]
   creditNotes  CreditNote[]
+  arBadDebtWriteoffs ArBadDebtWriteoff[]
   receiptMetadata InvoiceReceiptMetadata[]
 
   @@unique([companyId, referenceNo])
@@ -4373,6 +4380,39 @@ model TaxTransaction {
 /// `metadata` and `discrepancyDetails` stay JSON. They were nested optional
 /// objects in Mongo, are written wholesale and never filtered on, so columns
 /// would add width without buying a query.
+model ArBadDebtWriteoff {
+  id                   String    @id @db.Char(24)
+  companyId            String    @map("company_id") @db.Char(24)
+  referenceNo          String    @map("reference_no")
+  invoiceId            String    @map("invoice_id") @db.Char(24)
+  clientId             String    @map("client_id") @db.Char(24)
+  writeoffDate         DateTime  @default(now()) @map("writeoff_date") @db.Timestamptz(3)
+  amount               Decimal   @db.Decimal(19, 2)
+  reason               String
+  notes                String?
+  journalEntryId       String?   @map("journal_entry_id") @db.Char(24)
+  postedById           String?   @map("posted_by") @db.Char(24)
+  status               String    @default("draft")
+  reversedAt           DateTime? @map("reversed_at") @db.Timestamptz(3)
+  reversedById         String?   @map("reversed_by") @db.Char(24)
+  reversalReason       String?   @map("reversal_reason")
+  reverseJournalEntryId String?  @map("reverse_journal_entry_id") @db.Char(24)
+  createdById          String    @map("created_by") @db.Char(24)
+  createdAt            DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt            DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  invoice Invoice @relation(fields: [invoiceId], references: [id])
+  client Client @relation(fields: [clientId], references: [id])
+
+  @@unique([companyId, referenceNo])
+  @@index([companyId, status])
+  @@index([companyId, invoiceId])
+  @@index([companyId, clientId])
+  @@index([companyId, writeoffDate(sort: Desc)])
+  @@map("ar_bad_debt_writeoffs")
+}
+
 model ArTransactionLedger {
   id        String @id @db.Char(24)
   companyId String @map("company_id") @db.Char(24)

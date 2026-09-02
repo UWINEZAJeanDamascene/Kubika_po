@@ -13,13 +13,19 @@ const env = require('../src/config/environment');
 const config = env.getConfig();
 const cacheConfig = config.cache;
 
-// Redis configuration with connection pooling for high performance
+// Redis configuration with connection pooling for high performance.
 // Supports: Local Redis, Redis Cloud, Render Redis, Upstash, AWS ElastiCache, etc.
-// Uses REDIS_URL if available, or UPSTASH_REDIS_REST_URL for Upstash serverless Redis
+// Uses REDIS_URL if available, or UPSTASH_REDIS_REST_URL for Upstash serverless Redis.
 
-// Check if Redis is configured at all
-const isRedisConfigured = () => {
-  return cacheConfig.isConfigured;
+// Redis is infrastructure for caching, sessions, and fleet-wide Phase 0
+// metrics. The no-op client remains only as an explicit compatibility fallback
+// for tests or PERFORMANCE_REQUIRE_REDIS=false; readiness rejects it otherwise.
+const isRedisConfigured = () => cacheConfig.isConfigured;
+const isRedisRequired = () => {
+  const nodeEnv = process.env.NODE_ENV || 'development';
+  if (nodeEnv === 'test') return false;
+  const override = String(process.env.PERFORMANCE_REQUIRE_REDIS || '').trim().toLowerCase();
+  return !['false', '0', 'no'].includes(override);
 };
 
 // Create a no-op client for when Redis is not available
@@ -100,8 +106,12 @@ const createRedisClient = () => {
 
   // Check if Redis is configured
   if (!isRedisConfigured()) {
-    console.log('⚠️  Redis is not configured. Running in non-cached mode.');
-    console.log('   To enable Redis, set one of: REDIS_URL, UPSTASH_REDIS_REST_URL, or REDIS_HOST');
+    const message = 'Redis is not configured. Set REDIS_URL, UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN, or REDIS_HOST.';
+    if (isRedisRequired()) {
+      console.error(`[Phase 0] ${message} Boot readiness will fail.`);
+    } else {
+      console.warn(`[Phase 0] ${message} Using explicit process-local fallback.`);
+    }
     return createNoOpClient();
   }
 
@@ -186,6 +196,11 @@ if (redisClient && typeof redisClient.on === 'function') {
 const gracefulShutdown = async () => {
   console.log('Closing Redis connection...');
   try {
+    // Flush the Phase 0 buffer while Redis is still available. This prevents a
+    // short shutdown window from losing the last request samples.
+    try { await require('../services/performanceMetricsStore').flush(); } catch (e) {
+      console.warn('Could not flush performance metrics during Redis shutdown:', e.message || e);
+    }
     if (redisClient) {
       if (typeof redisClient.quit === 'function') {
         await redisClient.quit();
@@ -243,6 +258,7 @@ module.exports = {
   createRedisClient,
   createQueueConnection,
   isRedisConfigured,
+  isRedisRequired,
   // Helper to get a client for specific operations (e.g., different DB)
   getClient: (db = 0) => {
     if (!isRedisConfigured()) {

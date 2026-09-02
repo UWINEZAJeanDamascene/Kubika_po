@@ -1,4 +1,5 @@
 const { redisClient } = require('../config/redis');
+const persistentMetrics = require('./performanceMetricsStore');
 
 // Cache configuration
 const DEFAULT_TTL = 300; // 5 minutes default
@@ -14,8 +15,9 @@ const CACHE_CONFIGS = {
   company: { ttl: 300, prefix: 'company' },
   // User caching - 5 minutes
   user: { ttl: 300, prefix: 'user' },
-  // Dashboard stats - 1 minute (very dynamic)
-  dashboard: { ttl: 60, prefix: 'dashboard' },
+  // Dashboard payloads are Redis-backed; keep the same five-minute default
+  // across the dedicated dashboard services and the generic cache layer.
+  dashboard: { ttl: 300, prefix: 'dashboard' },
   // Stock levels - 1 minute
   stock: { ttl: 60, prefix: 'stock' },
   // Supplier/client master data feeds the high-frequency form pickers.
@@ -37,10 +39,17 @@ const CACHE_CONFIGS = {
   // Budgets: heavily read (74 endpoints) and edited in bursts during planning.
   // Short TTL because budget-vs-actual moves whenever a transaction posts.
   budget: { ttl: 300, prefix: 'budget' },
-  // Reports - 15 minutes (expensive queries); override with FINANCIAL_REPORT_CACHE_TTL_SECONDS
+  // Reports - 15 minutes while open; closed-period entries are promoted to
+  // persistent Redis keys by cacheMiddleware and invalidated on reopen.
   report: { ttl: 900, prefix: 'report' },
-  // Financial ratios API — 5 minutes (dashboard widget uses in-memory cache separately)
+  // Financial ratios API — 5 minutes (dashboard widget uses Redis separately)
   financial_ratios: { ttl: 300, prefix: 'financial_ratios' },
+  // Hot transactional read paths. Writes invalidate the whole tenant namespace.
+  sales_order: { ttl: 30, prefix: 'sales_order' },
+  invoice: { ttl: 60, prefix: 'invoice' },
+  pos: { ttl: 60, prefix: 'pos' },
+  stock_transfer: { ttl: 30, prefix: 'stock_transfer' },
+  pick_pack: { ttl: 30, prefix: 'pick_pack' },
   general_ledger: { ttl: 60, prefix: 'general_ledger' },
   general_ledger_summary: { ttl: 60, prefix: 'general_ledger_summary' },
   // Default
@@ -70,6 +79,7 @@ function recordCacheEvent(key, outcome) {
   if (outcome === 'hit') s.hits++;
   else if (outcome === 'miss') s.misses++;
   else s.errors++;
+  persistentMetrics.recordCacheEvent(type, outcome);
 }
 
 /** Hit ratio overall and per type, worst ratio first. */
@@ -229,6 +239,16 @@ class CacheService {
     return getCacheMetrics();
   }
 
+  async getAggregatedMetrics() {
+    const metrics = await persistentMetrics.getCacheMetrics();
+    if (metrics) return metrics;
+    return {
+      ...getCacheMetrics(),
+      scope: 'process-local',
+      persistent: false,
+    };
+  }
+
   async get(key) {
     try {
       const data = await withCacheTimeout(redisClient.get(key));
@@ -256,8 +276,20 @@ class CacheService {
    */
   async set(key, data, ttl = DEFAULT_TTL) {
     try {
+      // `ttl === 0` means immutable/persistent. Closed-period reports use a
+      // plain Redis SET so the result survives process restarts and never
+      // expires until the report namespace is invalidated after a reopen.
+      const numericTtl = ttl === null || ttl === undefined ? DEFAULT_TTL : Number(ttl);
+      const payload = JSON.stringify(data);
+      const write = numericTtl === 0
+        ? redisClient.set(key, payload)
+        : redisClient.setex(
+          key,
+          Number.isFinite(numericTtl) && numericTtl > 0 ? Math.ceil(numericTtl) : DEFAULT_TTL,
+          payload,
+        );
       // Bound direct callers too; cache failure must not become API latency.
-      await withCacheTimeout(redisClient.setex(key, ttl, JSON.stringify(data)), null, CACHE_WRITE_TIMEOUT_MS);
+      await withCacheTimeout(write, null, CACHE_WRITE_TIMEOUT_MS);
       return true;
     } catch (error) {
       console.error('Cache set error:', error);
@@ -322,7 +354,7 @@ class CacheService {
   async cacheQuery(type, params, data, customTTL = null) {
     const config = this.getCacheConfig(type);
     const key = this.generateKey(config.prefix, params);
-    const ttl = customTTL || config.ttl;
+    const ttl = customTTL === null || customTTL === undefined ? config.ttl : customTTL;
 
     await this.set(key, data, ttl);
     return key;
@@ -439,7 +471,7 @@ class CacheService {
 
     // Execute function and cache result
     const data = await fn();
-    const cacheTTL = ttl || config.ttl;
+    const cacheTTL = ttl === null || ttl === undefined ? config.ttl : ttl;
     await this.set(key, data, cacheTTL);
 
     return { data, fromCache: false };
@@ -456,6 +488,8 @@ class CacheService {
       return {
         totalKeys: keys.length,
         memoryUsed: info,
+        metrics: await this.getAggregatedMetrics(),
+        storage: persistentMetrics.getStorageStatus(),
       };
     } catch (error) {
       console.error('Cache stats error:', error);
@@ -514,7 +548,7 @@ class CacheService {
       const data = await queryFn();
       
       // Cache the result
-      const cacheTTL = ttl || config.ttl;
+      const cacheTTL = ttl === null || ttl === undefined ? config.ttl : ttl;
       await this.set(key, data, cacheTTL);
 
       return { data, fromCache: false };

@@ -3,7 +3,103 @@ const APTransactionLedger = require('../models/APTransactionLedger');
 const { getAPTransactions } = require('../services/ledgerReadService');
 const GoodsReceivedNote = require('../models/GoodsReceivedNote');
 const Supplier = require('../models/Supplier');
-const mongoose = require('mongoose');
+const { dbClient } = require('../lib/prisma');
+const { parsePagination } = require('../utils/pagination');
+
+function buildOutstandingPayablesSql(companyId, supplierId) {
+  const params = [String(companyId)];
+  let supplierClause = '';
+  if (supplierId) {
+    params.push(String(supplierId));
+    supplierClause = ` AND supplier_id = $${params.length}`;
+  }
+  const sql = `
+    SELECT id AS "_id", 'grn'::text AS type, reference_no AS reference,
+           supplier_id AS "supplierId", received_date AS date,
+           total_amount::double precision AS "totalAmount",
+           amount_paid::double precision AS "amountPaid",
+           balance::double precision AS balance
+      FROM goods_received_notes
+     WHERE company_id = $1 AND balance > 0${supplierClause}
+    UNION ALL
+    SELECT id AS "_id", 'purchase'::text AS type, purchase_number AS reference,
+           supplier_id AS "supplierId", purchase_date AS date,
+           total_amount::double precision AS "totalAmount",
+           COALESCE((
+             SELECT SUM(COALESCE((payment ->> 'amount')::numeric, 0))
+               FROM jsonb_array_elements(COALESCE(payments, '[]'::jsonb)) AS payment
+           ), 0)::double precision AS "amountPaid",
+           total_amount::double precision AS balance
+      FROM purchases
+     WHERE company_id = $1 AND total_amount > 0${supplierClause}`;
+  return { sql, params };
+}
+
+async function readOutstandingPayables(companyId, supplierId, page, limit) {
+  const { page: safePage, limit: safeLimit, skip } = parsePagination(
+    { page, limit },
+    { defaultLimit: 50, maxLimit: 100 },
+  );
+  const base = buildOutstandingPayablesSql(companyId, supplierId);
+  const summaryRows = await dbClient().$queryRawUnsafe(
+    `WITH payables AS (${base.sql})
+     SELECT COUNT(*)::int AS total,
+            COALESCE(SUM(balance), 0)::double precision AS "totalOutstanding"
+       FROM payables`,
+    ...base.params,
+  );
+  const total = Number(summaryRows[0]?.total || 0);
+  const totalOutstanding = Number(summaryRows[0]?.totalOutstanding || 0);
+  const pages = Math.max(1, Math.ceil(total / safeLimit));
+  const currentPage = Math.min(safePage, pages);
+  const params = [...base.params, safeLimit, (currentPage - 1) * safeLimit];
+  const rows = await dbClient().$queryRawUnsafe(
+    `WITH payables AS (${base.sql})
+     SELECT * FROM payables
+      ORDER BY date DESC NULLS LAST, "_id" DESC
+      LIMIT $${params.length - 1} OFFSET $${params.length}`,
+    ...params,
+  );
+
+  const grnIds = rows.filter((row) => row.type === 'grn').map((row) => String(row._id));
+  const purchaseIds = rows.filter((row) => row.type === 'purchase').map((row) => String(row._id));
+  const Purchase = require('../models/Purchase');
+  const [grns, purchases] = await Promise.all([
+    grnIds.length
+      ? GoodsReceivedNote.find({ _id: { $in: grnIds }, company: companyId })
+        .populate('supplier', 'name code')
+        .limit(grnIds.length)
+        .lean()
+      : [],
+    purchaseIds.length
+      ? Purchase.find({ _id: { $in: purchaseIds }, company: companyId })
+        .populate('supplier', 'name code')
+        .limit(purchaseIds.length)
+        .lean()
+      : [],
+  ]);
+  const rawById = new Map([...grns, ...purchases].map((row) => [String(row._id), row]));
+  const data = rows.map((row) => {
+    const raw = rawById.get(String(row._id)) || {};
+    return {
+      ...raw,
+      _id: row._id,
+      _apType: row.type,
+      reference: row.reference,
+      supplier: raw.supplier || row.supplierId,
+      date: row.date,
+      totalAmount: Number(row.totalAmount || 0),
+      amountPaid: Number(row.amountPaid || 0),
+      balance: Number(row.balance || 0),
+    };
+  });
+  return {
+    data,
+    total,
+    totalOutstanding,
+    pagination: { total, page: currentPage, limit: safeLimit, pages },
+  };
+}
 
 /**
  * AP Reconciliation Controller
@@ -17,7 +113,7 @@ const apReconciliationController = {
     try {
       const companyId = req.user.company._id;
       const dashboard = await APTrackingService.getDashboardStats(companyId);
-      
+
       // Convert Decimal128 fields in recentActivity to plain numbers
       if (dashboard.recentActivity) {
         dashboard.recentActivity = dashboard.recentActivity.map(tx => ({
@@ -27,7 +123,7 @@ const apReconciliationController = {
           grnBalanceAfter: tx.grnBalanceAfter ? parseFloat(tx.grnBalanceAfter) : null
         }));
       }
-      
+
       res.json(dashboard);
     } catch (error) {
       next(error);
@@ -68,7 +164,7 @@ const apReconciliationController = {
         pagination: {
           total,
           page: currentPage,
-          limit: parseInt(limit, 10),
+          limit: Math.min(100, Math.max(1, parseInt(limit, 10) || 50)),
           pages,
         },
       });
@@ -152,90 +248,15 @@ const apReconciliationController = {
     try {
       const companyId = req.user.company._id;
       const { supplierId, page = 1, limit = 50 } = req.query;
-
-      const query = {
-        company: companyId,
-        balance: { $gt: 0 }
-      };
-
-      if (supplierId) query.supplier = supplierId;
-      // Include both GRNs and direct Purchases as outstanding payables
-      const Purchase = require('../models/Purchase');
-
-      const grnQuery = { ...query };
-      const purchaseQuery = { ...query };
-
-      // Count both
-      const [grnCount, purchaseCount] = await Promise.all([
-        GoodsReceivedNote.countDocuments(grnQuery),
-        Purchase.countDocuments(purchaseQuery)
-      ]);
-
-      const [grns, purchases] = await Promise.all([
-        GoodsReceivedNote.find(grnQuery).populate('supplier', 'name code').lean(),
-        Purchase.find(purchaseQuery).populate('supplier', 'name code').lean()
-      ]);
-
-      // Normalize entries and merge
-      const normalizedGRNs = grns.map(g => ({
-        _id: g._id,
-        type: 'grn',
-        reference: g.referenceNo || g.grnNumber,
-        supplier: g.supplier,
-        date: g.receivedDate,
-        totalAmount: parseFloat(g.totalAmount || 0),
-        amountPaid: parseFloat(g.amountPaid || 0),
-        balance: parseFloat(g.balance || 0),
-        raw: g
-      }));
-
-      const normalizedPurchases = purchases.map(p => ({
-        _id: p._id,
-        type: 'purchase',
-        reference: p.purchaseNumber || p.supplierInvoiceNumber,
-        supplier: p.supplier,
-        date: p.receivedDate || p.purchaseDate,
-        totalAmount: parseFloat(p.grandTotal || p.roundedAmount || 0),
-        amountPaid: parseFloat(p.amountPaid || 0),
-        balance: parseFloat(p.balance || 0),
-        raw: p
-      }));
-
-      const all = [...normalizedGRNs, ...normalizedPurchases];
-
-      // sort by date desc
-      all.sort((a, b) => {
-        const da = a.date ? new Date(a.date).getTime() : 0;
-        const db = b.date ? new Date(b.date).getTime() : 0;
-        return db - da;
-      });
-
-      const total = grnCount + purchaseCount;
-      const pages = Math.max(1, Math.ceil(total / parseInt(limit)));
-      const start = (page - 1) * limit;
-      const pageItems = all.slice(start, start + parseInt(limit));
-
-      const totalOutstanding = all.reduce((s, it) => s + (it.balance || 0), 0);
+      const result = await readOutstandingPayables(companyId, supplierId, page, limit);
 
       res.json({
         success: true,
         data: {
-          grns: pageItems.map(i => ({
-            ...i.raw,
-            _apType: i.type,
-            reference: i.reference,
-            totalAmount: i.totalAmount,
-            amountPaid: i.amountPaid,
-            balance: i.balance
-          })),
-          summary: { totalOutstanding, totalGRNs: total },
-          pagination: {
-            total,
-            page: parseInt(page),
-            limit: parseInt(limit),
-            pages
-          }
-        }
+          grns: result.data,
+          summary: { totalOutstanding: result.totalOutstanding, totalGRNs: result.total },
+          pagination: result.pagination,
+        },
       });
     } catch (error) {
       next(error);
@@ -275,25 +296,14 @@ const apReconciliationController = {
         return res.status(404).json({ success: false, message: 'Supplier not found' });
       }
 
-      // Get current balance
       const currentBalance = await APTrackingService.getSupplierBalance(companyId, supplierId);
-
-      // Get transaction summary
-      const transactions = await APTransactionLedger.find({
-        company: companyId,
-        supplier: supplierId
-      });
-
-      const summary = {
-        totalTransactions: transactions.length,
-        totalIncreases: transactions
-          .filter(t => t.direction === 'increase')
-          .reduce((sum, t) => sum + parseFloat(t.amount), 0),
-        totalDecreases: transactions
-          .filter(t => t.direction === 'decrease')
-          .reduce((sum, t) => sum + parseFloat(t.amount), 0),
-        currentBalance
-      };
+      const summaryRows = await dbClient().$queryRaw`
+        SELECT COUNT(*)::int AS "totalTransactions",
+               COALESCE(SUM(amount) FILTER (WHERE direction = 'increase'), 0)::double precision AS "totalIncreases",
+               COALESCE(SUM(amount) FILTER (WHERE direction = 'decrease'), 0)::double precision AS "totalDecreases"
+          FROM ap_transaction_ledger
+         WHERE company_id = ${String(companyId)} AND supplier_id = ${String(supplierId)}`;
+      const summaryRow = summaryRows[0] || {};
 
       res.json({
         success: true,
@@ -303,7 +313,12 @@ const apReconciliationController = {
             name: supplier.name,
             code: supplier.code
           },
-          summary
+          summary: {
+            totalTransactions: Number(summaryRow.totalTransactions || 0),
+            totalIncreases: Number(summaryRow.totalIncreases || 0),
+            totalDecreases: Number(summaryRow.totalDecreases || 0),
+            currentBalance
+          }
         }
       });
     } catch (error) {
@@ -319,6 +334,7 @@ const apReconciliationController = {
       const companyId = req.user.company._id;
       const { supplierId } = req.params;
       const { startDate, endDate, page = 1, limit = 50 } = req.query;
+      const { page: pageNum, limit: limitNum, skip } = parsePagination({ page, limit }, { defaultLimit: 50, maxLimit: 100 });
 
       // Verify supplier
       const supplier = await Supplier.findOne({ _id: supplierId, company: companyId });
@@ -326,36 +342,51 @@ const apReconciliationController = {
         return res.status(404).json({ success: false, message: 'Supplier not found' });
       }
 
-      // Get GRNs
+      const dateFilter = {};
+      if (startDate) dateFilter.$gte = new Date(startDate);
+      if (endDate) dateFilter.$lte = new Date(endDate);
       const grnQuery = { supplier: supplierId, company: companyId };
-      if (startDate || endDate) {
-        grnQuery.receivedDate = {};
-        if (startDate) grnQuery.receivedDate.$gte = new Date(startDate);
-        if (endDate) grnQuery.receivedDate.$lte = new Date(endDate);
+      if (Object.keys(dateFilter).length) grnQuery.receivedDate = dateFilter;
+      const grnParams = [String(companyId), String(supplierId)];
+      const grnWhere = ['company_id = $1', 'supplier_id = $2'];
+      if (startDate) {
+        grnParams.push(new Date(startDate));
+        grnWhere.push(`received_date >= $${grnParams.length}`);
       }
-      const grns = await GoodsReceivedNote.find(grnQuery)
-        .populate('createdBy', 'name')
-        .sort({ receivedDate: 1 });
+      if (endDate) {
+        grnParams.push(new Date(endDate));
+        grnWhere.push(`received_date <= $${grnParams.length}`);
+      }
+      const [grnStats, grns] = await Promise.all([
+        dbClient().$queryRawUnsafe(`
+          SELECT COUNT(*)::int AS count,
+                 COALESCE(SUM(total_amount), 0)::double precision AS total,
+                 COALESCE(SUM(amount_paid), 0)::double precision AS paid,
+                 COALESCE(SUM(balance), 0)::double precision AS outstanding
+            FROM goods_received_notes
+           WHERE ${grnWhere.join(' AND ')}`,
+          ...grnParams,
+        ),
+        GoodsReceivedNote.find(grnQuery)
+          .populate('createdBy', 'name')
+          .sort({ receivedDate: 1 })
+          .skip(skip)
+          .limit(limitNum),
+      ]);
 
-      // Get transaction history
       const transactions = await APTrackingService.getSupplierHistory(companyId, supplierId, {
         startDate: startDate ? new Date(startDate) : null,
         endDate: endDate ? new Date(endDate) : null,
-        limit: parseInt(limit),
-        skip: (page - 1) * limit
+        limit: limitNum,
+        skip,
       });
-
       const totalTransactions = await APTransactionLedger.countDocuments({
         company: companyId,
         supplier: supplierId,
-        ...(startDate && { transactionDate: { $gte: new Date(startDate) } }),
-        ...(endDate && { transactionDate: { $lte: new Date(endDate) } })
+        ...(startDate || endDate ? { transactionDate: dateFilter } : {}),
       });
-
-      // Calculate totals
-      const totalGRNs = grns.reduce((sum, g) => sum + (parseFloat(g.totalAmount) || 0), 0);
-      const totalPaid = grns.reduce((sum, g) => sum + (parseFloat(g.amountPaid) || 0), 0);
-      const totalOutstanding = grns.reduce((sum, g) => sum + (parseFloat(g.balance) || 0), 0);
+      const stats = grnStats[0] || {};
+      const grnCount = Number(stats.count || 0);
 
       res.json({
         success: true,
@@ -376,17 +407,17 @@ const apReconciliationController = {
               status: g.paymentStatus
             })),
             summary: {
-              totalGRNs: totalGRNs.toFixed(2),
-              totalPaid: totalPaid.toFixed(2),
-              totalOutstanding: totalOutstanding.toFixed(2),
-              grnCount: grns.length
+              totalGRNs: Number(stats.total || 0).toFixed(2),
+              totalPaid: Number(stats.paid || 0).toFixed(2),
+              totalOutstanding: Number(stats.outstanding || 0).toFixed(2),
+              grnCount
             }
           },
           transactions: {
             data: transactions,
             total: totalTransactions,
-            pages: Math.ceil(totalTransactions / limit),
-            currentPage: parseInt(page)
+            pages: Math.max(1, Math.ceil(totalTransactions / limitNum)),
+            currentPage: pageNum
           }
         }
       });
@@ -430,7 +461,7 @@ const apReconciliationController = {
       // Update all pending transactions to verified
       const result = await APTransactionLedger.updateMany(
         {
-          company: new mongoose.Types.ObjectId(companyId),
+          company: companyId,
           reconciliationStatus: 'pending'
         },
         {

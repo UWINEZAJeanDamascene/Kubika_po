@@ -32,10 +32,30 @@ Add to your environment files:
 ```env
 # .env.staging
 SENTRY_DSN=https://xxxxx@sentry.io/staging-project
+SENTRY_TRACES_SAMPLE_RATE=0.1
+APDEX_T_MS=1000
+SENTRY_APDEX_PROJECT_T_MS=1000
+SENTRY_APDEX_PROJECT_CONFIGURED=true
 
 # .env.production
 SENTRY_DSN=https://xxxxx@sentry.io/production-project
+SENTRY_TRACES_SAMPLE_RATE=0.1
+APDEX_T_MS=1000
+SENTRY_APDEX_PROJECT_T_MS=1000
+SENTRY_APDEX_PROJECT_CONFIGURED=true
 ```
+
+`SENTRY_APDEX_PROJECT_CONFIGURED=true` is an operator acknowledgement, not a
+secret. Before setting it, configure the same threshold in the Sentry project:
+
+**Project → Settings → Performance → Response Time Threshold (Apdex)**
+
+The Node SDK does not expose this Sentry project threshold as an SDK option or
+as a documented project API field. The application therefore uses `APDEX_T_MS`
+for its own Apdex calculation, tags transactions with the declared value, and
+fails Phase 0 readiness until the Sentry project setting has been confirmed.
+The readiness endpoint reports the threshold, project path, and confirmation
+state so deployment checks can verify the contract.
 
 ---
 
@@ -90,7 +110,8 @@ Sentry.captureException(err);
 ### Performance Monitoring
 - Transaction tracking
 - Endpoint response times
-- Database query performance
+- PostgreSQL query and pool performance
+- Application Apdex using the declared `APDEX_T_MS` contract
 
 ### Release Tracking
 - Links errors to deployment
@@ -100,11 +121,11 @@ Sentry.captureException(err);
 
 ## Environment Setup
 
-| Environment | DSN | Sample Rate |
-|-------------|-----|-------------|
-| Development | Optional | 100% |
-| Staging | staging project | 50% |
-| Production | production project | 10% |
+| Environment | DSN | Sample Rate | Apdex contract |
+|-------------|-----|-------------|----------------|
+| Development | Optional | 10% default | Optional |
+| Staging | Required | 10% | Required and confirmed |
+| Production | Required | 10% | Required and confirmed |
 
 ---
 

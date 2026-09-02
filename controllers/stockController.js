@@ -1,4 +1,5 @@
-﻿const mongoose = require('mongoose');
+﻿const { dbClient } = require('../lib/prisma');
+const cacheService = require('../services/cacheService');
 const { wantsCursor, cursorFilter, cursorSort, cursorPage } = require('../utils/cursorPagination');
 const StockMovement = require('../models/StockMovement');
 const Product = require('../models/Product');
@@ -10,6 +11,41 @@ const { runInTransaction } = require('../services/transactionService');
 const EBMStockService = require('../services/ebmStockService');
 const OpeningStockService = require('../services/openingStockService');
 const inventoryService = require('../services/inventoryService');
+
+const STOCK_LEVEL_SORT_COLUMNS = {
+  productName: 'p.name',
+  productSku: 'p.sku',
+  quantity: 'ib.quantity',
+  availableQuantity: 'ib.available_quantity',
+  reservedQuantity: 'ib.reserved_quantity',
+  unitCost: 'ib.unit_cost',
+  totalCost: 'ib.total_cost',
+  expiryDate: 'ib.expiry_date',
+  warehouseName: 'w.name',
+};
+
+const LIKE_ESCAPE = /[\\%_]/g;
+function escapeLike(value) {
+  return String(value).replace(LIKE_ESCAPE, (char) => `\\${char}`);
+}
+
+async function getActiveWarehouseOptions(companyId) {
+  const params = { companyId: String(companyId), active: true };
+  const cached = await cacheService.getCachedQuery('warehouse', params);
+  if (Array.isArray(cached)) return cached;
+
+  const warehouses = await Warehouse.find({ company: companyId, isActive: true })
+    .select('name _id')
+    .sort({ isDefault: -1, name: 1 })
+    .limit(1000)
+    .lean();
+  const options = warehouses.map((warehouse) => ({
+    _id: warehouse._id,
+    name: warehouse.name,
+  }));
+  await cacheService.cacheQuery('warehouse', params, options);
+  return options;
+}
 
 // @desc    Get all stock movements
 // @route   GET /api/stock/movements
@@ -557,202 +593,135 @@ exports.updateStockMovement = async (req, res, next) => {
 // @access  Private
 exports.getStockLevels = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
-    const { 
-      warehouse, 
-      product, 
-      lowStock, 
-      search, 
-      page = 1, 
+    const companyId = String(req.user.company._id);
+    const {
+      warehouse,
+      product,
+      lowStock,
+      search,
+      page = 1,
       limit = 50,
       sortBy = 'productName',
-      order = 'asc'
+      order = 'asc',
     } = req.query;
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 50));
+    const skip = (pageNum - 1) * limitNum;
+    const sortColumn = STOCK_LEVEL_SORT_COLUMNS[sortBy] || STOCK_LEVEL_SORT_COLUMNS.productName;
+    const sortDirection = String(order).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
 
-    // Use already imported models
-    // Build aggregation pipeline
-    const matchStage = { company: companyId };
-    
-    if (warehouse) {
-      matchStage.warehouse = warehouse;
+    // The fallback is still useful for products whose stock has not been
+    // materialised into inventory_batches. Its reads are bounded and warehouse
+    // options are served from the shared reference-data cache.
+    const batchWhere = ['ib.company_id = $1'];
+    const params = [companyId];
+    const addParam = (value) => {
+      params.push(value);
+      return `$${params.length}`;
+    };
+    if (warehouse) batchWhere.push(`ib.warehouse_id = ${addParam(String(warehouse))}`);
+    if (product) batchWhere.push(`ib.product_id = ${addParam(String(product))}`);
+    if (lowStock === 'true') batchWhere.push('ib.available_quantity <= (ib.quantity * 0.2)');
+    if (search && String(search).trim()) {
+      const term = addParam(escapeLike(String(search).trim()));
+      batchWhere.push(`(p.name ILIKE ${term} || '%' ESCAPE '\\' OR p.sku ILIKE ${term} || '%' ESCAPE '\\' OR w.name ILIKE ${term} || '%' ESCAPE '\\')`);
     }
-    
-    if (product) {
-      matchStage.product = product;
-    }
+    const whereSql = batchWhere.join(' AND ');
+    const countSql = `
+      SELECT COUNT(*)::int AS total
+      FROM inventory_batches ib
+      LEFT JOIN products p ON p.id = ib.product_id
+      LEFT JOIN warehouses w ON w.id = ib.warehouse_id
+      WHERE ${whereSql}`;
+    const pageSql = `
+      SELECT ib.id AS "_id", ib.product_id AS "productId", p.name AS "productName",
+             p.sku AS "productSku", ib.warehouse_id AS "warehouseId", w.name AS "warehouseName",
+             ib.quantity::double precision AS quantity,
+             ib.available_quantity::double precision AS "availableQuantity",
+             ib.reserved_quantity::double precision AS "reservedQuantity",
+             ib.unit_cost::double precision AS "unitCost",
+             ib.total_cost::double precision AS "totalCost",
+             ib.batch_number AS "batchNumber", ib.expiry_date AS "expiryDate",
+             ib.status, ib.updated_at AS "lastMovement"
+      FROM inventory_batches ib
+      LEFT JOIN products p ON p.id = ib.product_id
+      LEFT JOIN warehouses w ON w.id = ib.warehouse_id
+      WHERE ${whereSql}
+      ORDER BY ${sortColumn} ${sortDirection}, ib.id ASC
+      LIMIT ${limitNum} OFFSET ${skip}`;
 
-    // Filter for low stock (available <= 20% of threshold or below reorder point)
-    if (lowStock === 'true') {
-      matchStage.$expr = { $lte: ['$availableQuantity', '$quantity * 0.2'] };
-    }
+    const [countRows, batchRows] = await Promise.all([
+      dbClient().$queryRawUnsafe(countSql, ...params),
+      dbClient().$queryRawUnsafe(pageSql, ...params),
+    ]);
+    const total = Number(countRows[0]?.total || 0);
+    const warehouses = await getActiveWarehouseOptions(companyId);
 
-    // Get total count from InventoryBatch
-    let total = await InventoryBatch.countDocuments(matchStage);
-
-    // If no inventory batches found but we have products with default warehouse, also show those
-    // This handles the case where products have currentStock but no InventoryBatch records
     if (total === 0) {
-      // NOTE: filter semantics are deliberately unchanged from the original —
-      // the top-level `$or` is what routes this through productCustomFind(),
-      // which resolves Product's full field map. Restructuring it would silently
-      // switch code paths. (Pre-existing quirk kept as-is: when `search` is
-      // supplied it replaces the stock condition rather than narrowing it.)
-      const productQuery = {
-        company: companyId,
-        $or: [
-          { currentStock: { $gt: 0 } },
-          { defaultWarehouse: { $exists: true, $ne: null } }
-        ]
+      const productWhere = ['p.company_id = $1', '(p.current_stock > 0 OR p.default_warehouse_id IS NOT NULL)'];
+      const productParams = [companyId];
+      const addProductParam = (value) => {
+        productParams.push(value);
+        return `$${productParams.length}`;
       };
-      if (product) {
-        productQuery._id = product;
+      if (product) productWhere.push(`p.id = ${addProductParam(String(product))}`);
+      if (search && String(search).trim()) {
+        const term = addProductParam(escapeLike(String(search).trim()));
+        productWhere.push(`(p.name ILIKE ${term} || '%' ESCAPE '\\' OR p.sku ILIKE ${term} || '%' ESCAPE '\\')`);
       }
-      if (search) {
-        productQuery.$or = [
-          { name: { $regex: search, $options: 'i' } },
-          { sku: { $regex: search, $options: 'i' } }
-        ];
-      }
-
-      // Page in the database. Fetching every product to slice 10 rows off the
-      // end made this — the most-visited screen in the app — scale with catalog
-      // size instead of page size.
-      const pageNum = Math.max(1, parseInt(page, 10) || 1);
-      const limitNum = Math.max(1, parseInt(limit, 10) || 50);
-      const PRODUCT_SORT_FIELDS = {
-        productName: 'name',
-        productSku: 'sku',
-        quantity: 'currentStock',
-        availableQuantity: 'currentStock',
-        unitCost: 'costPrice'
-      };
-      const productSortField = PRODUCT_SORT_FIELDS[sortBy] || 'name';
-
-      const productsWithStock = await Product.find(productQuery)
-        .sort({ [productSortField]: order === 'asc' ? 1 : -1 })
-        .skip((pageNum - 1) * limitNum)
-        .limit(limitNum)
-        .lean();
-      // Guard stays keyed on the fetched rows, exactly as before, so a count
-      // that resolves differently can never blank out a page that has data.
-      if (productsWithStock.length > 0) {
-        const countedProducts = await Product.countDocuments(productQuery);
-        const productTotal = countedProducts > 0
-          ? countedProducts
-          : (pageNum - 1) * limitNum + productsWithStock.length;
-        // Get all warehouses to show product stock (default warehouse or all)
-        const warehouses = await Warehouse.find({ company: companyId, isActive: true }).lean();
-        
-        const stockFromProducts = productsWithStock.map(p => ({
-          _id: p._id,
-          product: p._id,
-          productId: p._id,
-          productName: p.name,
-          productSku: p.sku,
-          warehouse: p.defaultWarehouse || (warehouses[0]?._id || null),
-          warehouseId: p.defaultWarehouse || (warehouses[0]?._id || null),
-          warehouseName: p.defaultWarehouse 
-            ? (warehouses.find(w => w._id.toString() === p.defaultWarehouse?.toString())?.name || 'Default')
-            : (warehouses[0]?.name || 'Unassigned'),
-          quantity: Number(p.currentStock || 0),
-          availableQuantity: Number(p.currentStock || 0),
-          reservedQuantity: 0,
-          unitCost: Number(p.costPrice || p.averageCost || 0),
-          totalCost: Number(p.currentStock || 0) * Number(p.costPrice || p.averageCost || 0),
-          status: 'active',
-          source: 'product' // Mark as from product currentStock
-        }));
-
-        // `stockFromProducts` is already exactly one page — the database applied
-        // the skip/limit — so it is returned as-is. `productTotal` is the full
-        // match count used for the page arithmetic.
+      if (lowStock === 'true') productWhere.push('p.current_stock <= p.low_stock_threshold');
+      const productWhereSql = productWhere.join(' AND ');
+      const productSort = {
+        productName: 'p.name',
+        productSku: 'p.sku',
+        quantity: 'p.current_stock',
+        availableQuantity: 'p.current_stock',
+        unitCost: 'p.cost_price',
+      }[sortBy] || 'p.name';
+      const [productCountRows, products] = await Promise.all([
+        dbClient().$queryRawUnsafe(`SELECT COUNT(*)::int AS total FROM products p WHERE ${productWhereSql}`, ...productParams),
+        dbClient().$queryRawUnsafe(`
+          SELECT p.id AS "_id", p.name AS "productName", p.sku AS "productSku",
+                 p.default_warehouse_id AS "warehouseId", w.name AS "warehouseName",
+                 p.current_stock::double precision AS quantity,
+                 p.current_stock::double precision AS "availableQuantity",
+                 0::double precision AS "reservedQuantity",
+                 COALESCE(NULLIF(p.cost_price, 0), p.average_cost)::double precision AS "unitCost",
+                 (p.current_stock * COALESCE(NULLIF(p.cost_price, 0), p.average_cost))::double precision AS "totalCost"
+          FROM products p
+          LEFT JOIN warehouses w ON w.id = p.default_warehouse_id
+          WHERE ${productWhereSql}
+          ORDER BY ${productSort} ${sortDirection}, p.id ASC
+          LIMIT ${limitNum} OFFSET ${skip}`, ...productParams),
+      ]);
+      const productTotal = Number(productCountRows[0]?.total || 0);
+      if (productTotal > 0) {
         return res.json({
           success: true,
-          data: stockFromProducts,
-          warehouses: warehouses,
-          pagination: {
-            total: productTotal,
-            page: pageNum,
-            limit: limitNum,
-            pages: Math.ceil(productTotal / limitNum)
-          }
+          data: products.map((row) => ({
+            ...row,
+            product: row._id,
+            warehouse: row.warehouseId || warehouses[0]?._id || null,
+            warehouseId: row.warehouseId || warehouses[0]?._id || null,
+            warehouseName: row.warehouseName || warehouses[0]?.name || 'Unassigned',
+            status: 'active',
+            source: 'product',
+          })),
+          warehouses,
+          pagination: { total: productTotal, page: pageNum, limit: limitNum, pages: Math.ceil(productTotal / limitNum) },
         });
       }
     }
 
-    // Aggregation to get stock levels with product and warehouse info
-    const stockLevels = await InventoryBatch.aggregate([
-      { $match: matchStage },
-      {
-        $lookup: {
-          from: 'products',
-          localField: 'product',
-          foreignField: '_id',
-          as: 'productInfo'
-        }
-      },
-      { $unwind: { path: '$productInfo', preserveNullAndEmptyArrays: true } },
-      {
-        $lookup: {
-          from: 'warehouses',
-          localField: 'warehouse',
-          foreignField: '_id',
-          as: 'warehouseInfo'
-        }
-      },
-      { $unwind: { path: '$warehouseInfo', preserveNullAndEmptyArrays: true } },
-      // Search filter
-      ...(search ? [{
-        $match: {
-          $or: [
-            { 'productInfo.name': { $regex: search, $options: 'i' } },
-            { 'productInfo.sku': { $regex: search, $options: 'i' } },
-            { 'warehouseInfo.name': { $regex: search, $options: 'i' } }
-          ]
-        }
-      }] : []),
-      // Project final fields
-      {
-        $project: {
-          _id: 1,
-          product: { $concat: ['$productInfo.name', ' (', '$productInfo.sku', ')'] },
-          productId: '$product',
-          productName: '$productInfo.name',
-          productSku: '$productInfo.sku',
-          warehouse: { $concat: ['$warehouseInfo.name'] },
-          warehouseId: '$warehouse',
-          warehouseName: '$warehouseInfo.name',
-          quantity: 1,
-          availableQuantity: 1,
-          reservedQuantity: 1,
-          unitCost: 1,
-          totalCost: 1,
-          batchNumber: 1,
-          expiryDate: 1,
-          status: 1,
-          lastMovement: '$updatedAt'
-        }
-      },
-      // Sort
-      { $sort: { [sortBy]: order === 'asc' ? 1 : -1 } },
-      // Pagination
-      { $skip: (page - 1) * limit },
-      { $limit: parseInt(limit) }
-    ]);
-
-    // Get warehouses for filter dropdown
-    const warehouses = await Warehouse.find({ company: companyId, isActive: true }).select('name _id');
-
-    res.json({
+    return res.json({
       success: true,
-      data: stockLevels,
+      data: batchRows.map((row) => ({
+        ...row,
+        product: `${row.productName || ''} (${row.productSku || ''})`.trim(),
+        warehouse: row.warehouseName || null,
+      })),
       warehouses,
-      pagination: {
-        total,
-        page: parseInt(page),
-        limit: parseInt(limit),
-        pages: Math.ceil(total / limit)
-      }
+      pagination: { total, page: pageNum, limit: limitNum, pages: Math.ceil(total / limitNum) },
     });
   } catch (error) {
     next(error);

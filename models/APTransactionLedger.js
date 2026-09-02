@@ -79,20 +79,29 @@ APTransactionLedger.verifyIntegrity = async function verifyIntegrity(companyId, 
     if (endDate) where.transactionDate.lte = new Date(endDate);
   }
 
-  const rows = await dbClient().apTransactionLedger.findMany({
-    where,
-    orderBy: [
-      { supplierId: 'asc' },
-      { transactionDate: 'asc' },
-      { createdAt: 'asc' },
-    ],
-  });
-
   const discrepancies = [];
   let currentSupplier = null;
   let expectedBalance = 0;
+  const batchSize = Math.min(2000, Math.max(100, Number(process.env.RECONCILIATION_BATCH_SIZE) || 500));
+  let skip = 0;
 
-  for (const row of rows) {
+  // Replay in bounded database pages. Reconciliation must inspect every row,
+  // but it must never materialise a tenant's entire ledger in Node memory.
+  for (;;) {
+    const rows = await dbClient().apTransactionLedger.findMany({
+      where,
+      orderBy: [
+        { supplierId: 'asc' },
+        { transactionDate: 'asc' },
+        { createdAt: 'asc' },
+        { id: 'asc' },
+      ],
+      skip,
+      take: batchSize,
+    });
+    if (!rows.length) break;
+
+    for (const row of rows) {
     if (row.supplierId !== currentSupplier) {
       currentSupplier = row.supplierId;
       expectedBalance = 0;
@@ -113,6 +122,9 @@ APTransactionLedger.verifyIntegrity = async function verifyIntegrity(companyId, 
         date: row.transactionDate,
       });
     }
+    }
+    if (rows.length < batchSize) break;
+    skip += rows.length;
   }
 
   return {

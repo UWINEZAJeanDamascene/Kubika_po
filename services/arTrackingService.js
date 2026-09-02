@@ -511,29 +511,22 @@ class ARTrackingService {
    */
   static async getClientARSummary(companyId, clientId) {
     try {
-      const summary = await ARTransactionLedger.aggregate([
-        {
-          $match: {
-            company: new mongoose.Types.ObjectId(companyId),
-            client: new mongoose.Types.ObjectId(clientId)
-          }
-        },
-        {
-          $group: {
-            _id: '$transactionType',
-            count: { $sum: 1 },
-            totalAmount: { $sum: '$amount' },
-            lastTransaction: { $max: '$transactionDate' }
-          }
-        }
-      ]);
-
+      const { dbClient } = require('../lib/prisma');
+      const summary = await dbClient().$queryRaw`
+        SELECT transaction_type AS "_id",
+               COUNT(*)::int AS count,
+               COALESCE(SUM(amount), 0)::double precision AS "totalAmount",
+               MAX(transaction_date) AS "lastTransaction"
+          FROM ar_transaction_ledger
+         WHERE company_id = ${String(companyId)} AND client_id = ${String(clientId)}
+         GROUP BY transaction_type
+         ORDER BY transaction_type`;
       const currentBalance = await this.getCurrentClientBalance(companyId, clientId);
 
       return {
         currentBalance,
         transactionSummary: summary,
-        totalTransactions: summary.reduce((sum, s) => sum + s.count, 0)
+        totalTransactions: summary.reduce((sum, row) => sum + Number(row.count || 0), 0),
       };
     } catch (error) {
       console.error('ARTrackingService.getClientARSummary error:', error);
@@ -584,81 +577,92 @@ class ARTrackingService {
     const discrepancies = [];
 
     try {
-      // Build query for transactions to verify
-      const query = { company: new mongoose.Types.ObjectId(companyId) };
-      if (clientId) query.client = new mongoose.Types.ObjectId(clientId);
-      if (startDate || endDate) {
-        query.transactionDate = {};
-        if (startDate) query.transactionDate.$gte = new Date(startDate);
-        if (endDate) query.transactionDate.$lte = new Date(endDate);
+      const { dbClient } = require('../lib/prisma');
+      const params = [String(companyId)];
+      const where = ['atl.company_id = $1'];
+      if (clientId) {
+        params.push(String(clientId));
+        where.push(`atl.client_id = $${params.length}`);
       }
+      if (invoiceId) {
+        params.push(String(invoiceId));
+        where.push(`atl.invoice_id = $${params.length}`);
+      }
+      if (startDate) {
+        params.push(new Date(startDate));
+        where.push(`atl.transaction_date >= $${params.length}`);
+      }
+      if (endDate) {
+        params.push(new Date(endDate));
+        where.push(`atl.transaction_date <= $${params.length}`);
+      }
+      const whereSql = where.join(' AND ');
 
-      // Get all unique invoices from transactions
-      const invoiceIds = await ARTransactionLedger.distinct('invoice', query);
-      
-      // One query for the invoices; getCurrentInvoiceBalance stays per-invoice
-      // because it aggregates that invoice's own ledger rows.
-      const reconInvoiceRows = await Invoice.find({
-        _id: { $in: invoiceIds.filter(Boolean) },
-      });
-      const reconInvoicesById = new Map(
-        (reconInvoiceRows || []).map((i) => [String(i._id), i]),
-      );
+      // Compare the latest ledger balance with live balances in set-based SQL.
+      // DISTINCT ON selects the same (date, createdAt) winner as the legacy
+      // findOne().sort() call, without one query per invoice/client.
+      const [invoiceRows, clientRows] = await Promise.all([
+        dbClient().$queryRawUnsafe(`
+          WITH latest AS (
+            SELECT DISTINCT ON (invoice_id) invoice_id,
+                   invoice_balance_after AS ledger_balance
+              FROM ar_transaction_ledger atl
+             WHERE ${whereSql} AND invoice_id IS NOT NULL
+             ORDER BY invoice_id, transaction_date DESC, created_at DESC, id DESC
+          )
+          SELECT l.invoice_id AS id, i.reference_no AS reference,
+                 COALESCE(l.ledger_balance, 0)::double precision AS "ledgerBalance",
+                 COALESCE(i.amount_outstanding, 0)::double precision AS "actualBalance"
+            FROM latest l JOIN invoices i ON i.id = l.invoice_id
+           WHERE i.company_id = $1`, ...params),
+        dbClient().$queryRawUnsafe(`
+          WITH latest AS (
+            SELECT DISTINCT ON (client_id) client_id,
+                   client_balance_after AS ledger_balance
+              FROM ar_transaction_ledger atl
+             WHERE ${whereSql}
+             ORDER BY client_id, transaction_date DESC, created_at DESC, id DESC
+          )
+          SELECT l.client_id AS id, c.name,
+                 COALESCE(l.ledger_balance, 0)::double precision AS "ledgerBalance",
+                 COALESCE(c.outstanding_balance, 0)::double precision AS "actualBalance"
+            FROM latest l JOIN clients c ON c.id = l.client_id
+           WHERE c.company_id = $1`, ...params),
+      ]);
 
-      for (const invId of invoiceIds) {
-        if (!invId) continue;
-
-        const ledgerBalance = await this.getCurrentInvoiceBalance(companyId, invId);
-        const invoice = reconInvoicesById.get(String(invId)) || null;
-        
-        if (invoice) {
-          const actualBalance = parseFloat(invoice.amountOutstanding) || parseFloat(invoice.balance) || 0;
-          
-          if (Math.abs(ledgerBalance - actualBalance) > 0.01) {
-            discrepancies.push({
-              type: 'invoice',
-              id: invId,
-              reference: invoice.referenceNo || invoice.invoiceNumber,
-              ledgerBalance,
-              actualBalance,
-              difference: ledgerBalance - actualBalance
-            });
-          }
+      for (const invoice of invoiceRows) {
+        const ledgerBalance = Number(invoice.ledgerBalance || 0);
+        const actualBalance = Number(invoice.actualBalance || 0);
+        if (Math.abs(ledgerBalance - actualBalance) > 0.01) {
+          discrepancies.push({
+            type: 'invoice',
+            id: invoice.id,
+            reference: invoice.reference,
+            ledgerBalance,
+            actualBalance,
+            difference: ledgerBalance - actualBalance,
+          });
         }
       }
-
-      // Get all unique clients from transactions
-      const clientIds = await ARTransactionLedger.distinct('client', query);
-      
-      // Clients fetched together; the per-client ledger aggregate below still
-      // runs individually because it sums that client's own rows.
-      const reconClientRows = await Client.find({ _id: { $in: clientIds.filter(Boolean) } });
-      const reconClientsById = new Map((reconClientRows || []).map((c) => [String(c._id), c]));
-
-      for (const clId of clientIds) {
-        const ledgerBalance = await this.getCurrentClientBalance(companyId, clId);
-        const client = reconClientsById.get(String(clId)) || null;
-        
-        if (client) {
-          const actualBalance = parseFloat(client.outstandingBalance) || 0;
-          
-          if (Math.abs(ledgerBalance - actualBalance) > 0.01) {
-            discrepancies.push({
-              type: 'client',
-              id: clId,
-              name: client.name,
-              ledgerBalance,
-              actualBalance,
-              difference: ledgerBalance - actualBalance
-            });
-          }
+      for (const client of clientRows) {
+        const ledgerBalance = Number(client.ledgerBalance || 0);
+        const actualBalance = Number(client.actualBalance || 0);
+        if (Math.abs(ledgerBalance - actualBalance) > 0.01) {
+          discrepancies.push({
+            type: 'client',
+            id: client.id,
+            name: client.name,
+            ledgerBalance,
+            actualBalance,
+            difference: ledgerBalance - actualBalance,
+          });
         }
       }
 
       return {
         verified: discrepancies.length === 0,
         discrepancies,
-        totalChecked: invoiceIds.length + clientIds.length
+        totalChecked: invoiceRows.length + clientRows.length
       };
     } catch (error) {
       console.error('ARTrackingService.verifyIntegrity error:', error);
@@ -680,7 +684,7 @@ class ARTrackingService {
       // No discrepancies found - mark all pending transactions as verified
       const updateResult = await ARTransactionLedger.updateMany(
         { 
-          company: new mongoose.Types.ObjectId(companyId),
+          company: companyId,
           reconciliationStatus: 'pending'
         },
         {

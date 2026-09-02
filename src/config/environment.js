@@ -174,7 +174,12 @@ function buildConfig() {
       redisPassword: process.env.REDIS_PASSWORD || undefined,
       redisDb: number(process.env.REDIS_DB, 0),
       clusterNodes: process.env.REDIS_CLUSTER_NODES ? array(process.env.REDIS_CLUSTER_NODES) : null,
-      isConfigured: !!(process.env.UPSTASH_REDIS_REST_URL || process.env.REDIS_URL || process.env.REDIS_HOST || process.env.REDIS_CLUSTER_NODES),
+      isConfigured: Boolean(
+        process.env.REDIS_URL
+        || process.env.REDIS_HOST
+        || process.env.REDIS_CLUSTER_NODES
+        || (process.env.UPSTASH_REDIS_REST_URL && process.env.UPSTASH_REDIS_REST_TOKEN),
+      ),
     },
     
     // =====================

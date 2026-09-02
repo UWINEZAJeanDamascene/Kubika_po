@@ -63,6 +63,9 @@ async function startWorker() {
 
   await startJobSystem();
 
+  const { assertPerformanceReadinessAtBoot } = require('./utils/performancePhase0');
+  await assertPerformanceReadinessAtBoot();
+
   console.log(`[worker] PostgreSQL-backed background work initialized: exchange-rates, ${started.join(', ')}.`);
 }
 

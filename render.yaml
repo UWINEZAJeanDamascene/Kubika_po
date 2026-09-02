@@ -9,14 +9,44 @@ services:
         value: production
       - key: PORT
         value: 10000
-      - key: MONGODB_URI
+      - key: DATABASE_URL
         sync: false
+      - key: DIRECT_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: SENTRY_DSN
+        sync: false
+      - key: APDEX_T_MS
+        value: "1000"
+      - key: SENTRY_APDEX_PROJECT_T_MS
+        value: "1000"
+      - key: SENTRY_APDEX_PROJECT_CONFIGURED
+        value: "true"
+      - key: SENTRY_TRACES_SAMPLE_RATE
+        value: "0.1"
+      - key: PRISMA_CONNECTION_LIMIT
+        value: "20"
+      - key: PRISMA_POOL_TIMEOUT
+        value: "10"
+      - key: PRISMA_APPLICATION_NAME
+        value: stock-management-api
+      - key: QUERY_MAX_ROWS
+        value: "500"
+      - key: QUERY_ENFORCE_MAX_ROWS
+        value: "true"
+      - key: RECONCILIATION_BATCH_SIZE
+        value: "500"
       - key: JWT_SECRET
         sync: false
       - key: JWT_EXPIRE
         value: 30d
-      - key: REDIS_URL
-        sync: false
+      - key: PERFORMANCE_REQUIRE_REDIS
+        value: "true"
+      - key: PERFORMANCE_REQUIRE_SENTRY
+        value: "true"
+      - key: PERFORMANCE_REQUIRE_SENTRY_APDEX
+        value: "true"
       - key: EMAIL_PROVIDER
         value: gmail
       - key: GMAIL_USER

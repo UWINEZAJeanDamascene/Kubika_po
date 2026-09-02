@@ -1,6 +1,5 @@
 const healthService = require('../services/healthService');
 const { getHealthReport } = require('../services/accountingHealthService');
-const { redisClient, isRedisConfigured } = require('../config/redis');
 const redisCache = require('../utils/redisCache');
 const v8 = require('v8');
 
@@ -38,33 +37,55 @@ exports.systemHealth = async (req, res) => {
  * full health payload gathers. Cheap enough to poll, and it is what a baseline
  * capture reads.
  *
- * Counters are per-process and reset on restart: a number here describes this
- * instance since it booted, not the fleet.
+ * When Redis is configured, the returned counters are retained and aggregated
+ * across API replicas. Development/test without Redis exposes the process
+ * fallback and its storage status instead of silently claiming fleet coverage.
  */
 exports.performanceMetrics = async (req, res) => {
   try {
     const {
-      getRequestMetrics,
-      getRouteMetrics,
-      getEventLoopMetrics,
+      getAggregatedRequestMetrics,
+      getAggregatedRouteMetrics,
+      getAggregatedEventLoopMetrics,
+      getPostgresPoolMetrics,
     } = require('../services/systemMetricsService');
     const cacheService = require('../services/cacheService');
+    const persistentMetrics = require('../services/performanceMetricsStore');
 
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
+    const [requests, routes, cache, eventLoop, databasePool] = await Promise.all([
+      getAggregatedRequestMetrics(),
+      getAggregatedRouteMetrics(limit),
+      cacheService.getAggregatedMetrics(),
+      getAggregatedEventLoopMetrics(),
+      getPostgresPoolMetrics(),
+    ]);
 
     res.json({
       timestamp: new Date().toISOString(),
       uptime_seconds: Math.floor(process.uptime()),
-      requests: getRequestMetrics(),
-      routes: getRouteMetrics(limit),
-      cache: cacheService.getMetrics(),
-      event_loop_lag: getEventLoopMetrics(),
+      requests,
+      routes,
+      cache,
+      event_loop_lag: eventLoop,
+      database_pool: databasePool,
+      storage: persistentMetrics.getStorageStatus(),
     });
   } catch (e) {
     res.status(503).json({ error: e.message });
   }
 };
 
+/** GET /api/performance/readiness — Phase 0 deployment/readiness signal. */
+exports.performanceReadiness = async (_req, res) => {
+  try {
+    const { getPerformanceReadiness } = require('../services/performanceReadinessService');
+    const readiness = await getPerformanceReadiness();
+    res.status(readiness.ready ? 200 : 503).json({ timestamp: new Date().toISOString(), ...readiness });
+  } catch (error) {
+    res.status(503).json({ ready: false, failures: [error.message] });
+  }
+};
 // GET /api/health/accounting
 exports.accountingHealth = async (req, res, next) => {
   try {

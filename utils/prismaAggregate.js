@@ -499,6 +499,7 @@ function detectInclude(pipeline, defaultInclude) {
 
 async function fetchMatchDocs(matchStage, config, fullPipeline = [], metrics = null) {
   const { translateFilter, IMPOSSIBLE, containsInvalidNullFilter } = require('./prismaCompat');
+  const { remapFilterKeys } = require('./aggregateMatch');
   // `config.delegate` is makeCompatModel's tx-aware delegate (see its only
   // caller, prismaCompat's createAggregateMethod({ delegate, ... })), so these
   // reads already join the ambient interactive transaction. Keep it that way:
@@ -538,17 +539,20 @@ async function fetchMatchDocs(matchStage, config, fullPipeline = [], metrics = n
 
   if (needsInMemory) {
     const rows = await fetch(companyOnly);
-    return rows.map((r) => config.toApi(r)).filter((d) => matchDoc(d, matchStage));
+    const apiFilter = remapFilterKeys(matchStage, config.fieldMap);
+    return rows.map((r) => config.toApi(r)).filter((d) => matchDoc(d, matchStage) || matchDoc(d, apiFilter));
   }
 
   try {
     const rows = await fetch(where);
     // Still apply original match in memory for fields Prisma couldn't express.
-    return rows.map((r) => config.toApi(r)).filter((d) => matchDoc(d, matchStage));
+    const apiFilter = remapFilterKeys(matchStage, config.fieldMap);
+    return rows.map((r) => config.toApi(r)).filter((d) => matchDoc(d, matchStage) || matchDoc(d, apiFilter));
   } catch (error) {
     if (error && error.code === 'AGGREGATE_ROW_LIMIT') throw error;
     const rows = await fetch(companyOnly);
-    return rows.map((r) => config.toApi(r)).filter((d) => matchDoc(d, matchStage));
+    const apiFilter = remapFilterKeys(matchStage, config.fieldMap);
+    return rows.map((r) => config.toApi(r)).filter((d) => matchDoc(d, matchStage) || matchDoc(d, apiFilter));
   }
 }
 
