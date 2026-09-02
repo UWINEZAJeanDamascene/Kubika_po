@@ -44,17 +44,17 @@ const cacheClosedReport = (ttl) => cacheMiddleware({
 
 // General Ledger routes
 // GET /api/reports/general-ledger (requires: account_id, date_from, date_to)
-router.get('/general-ledger', getGeneralLedger);
+router.get('/general-ledger', cacheClosedReport(900), getGeneralLedger);
 // GET /api/reports/general-ledger/summary (requires: date_from, date_to)
-router.get('/general-ledger/summary', getGeneralLedgerSummary);
+router.get('/general-ledger/summary', cacheClosedReport(300), getGeneralLedgerSummary);
 
 // Trial Balance route
 // GET /api/reports/trial-balance (requires: date_from, date_to)
-router.get('/trial-balance', getTrialBalance);
+router.get('/trial-balance', cacheClosedReport(300), getTrialBalance);
 
 // P&L Statement route (detailed)
 // GET /api/reports/profit-and-loss (requires: date_from, date_to)
-router.get('/profit-and-loss', getPLStatement);
+router.get('/profit-and-loss', cacheClosedReport(300), getPLStatement);
 
 // Balance Sheet route
 router.get('/balance-sheet', cacheClosedReport(300), getBalanceSheet);
@@ -73,7 +73,7 @@ router.get('/debt-maturity', cacheClosedReport(300), getDebtMaturitySchedule);
 router.get('/interest-expense', cacheClosedReport(300), getInterestExpenseAnalysis);
 
 // Budget vs Actual route
-router.get('/budget-vs-actual', async (req, res) => {
+router.get('/budget-vs-actual', cacheClosedReport(300), async (req, res) => {
   try {
     const companyId = req.companyId;
     const { budgetId } = req.query;
@@ -93,7 +93,7 @@ router.get('/budget-vs-actual', async (req, res) => {
 });
 
 // Labor Cost Analysis routes
-router.get('/labor-cost-analysis', laborCostReportController.getLaborCostAnalysis);
-router.get('/payroll-audit-trail', laborCostReportController.getPayrollAuditTrail);
+router.get('/labor-cost-analysis', cacheClosedReport(300), laborCostReportController.getLaborCostAnalysis);
+router.get('/payroll-audit-trail', cacheClosedReport(300), laborCostReportController.getPayrollAuditTrail);
 
 module.exports = router;

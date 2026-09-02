@@ -21,7 +21,10 @@ router.use(attachCompanyId);
 // transactions, which do not go through these routes. Journal posting clears
 // the 'budget' type via cacheService.invalidateFinancialReportCaches().
 router.use(cacheMiddleware({ type: "budget", ttl: 300 }));
-router.use(cacheInvalidationMiddleware({ type: "budget" }));
+router.use(cacheInvalidationMiddleware({
+  types: ["budget", "report"],
+  invalidateDashboards: true,
+}));
 
 // ── Forecasts (must be before /:id routes to avoid conflicts) ──────────
 router.get(
