@@ -283,6 +283,29 @@ exports.createStockTransfer = async (req, res, next) => {
     // Products for every line are loaded together; the loop still validates in
     // order so the first failure and its message are unchanged.
     const transferLineProducts = await loadLineProducts(Product, items, companyId);
+    // Load all source batches in one query as well. This validation used to
+    // issue one InventoryBatch query per transfer line; a multi-line transfer
+    // now performs a single indexed read and retains the same per-line error
+    // ordering below.
+    const transferProductIds = [...new Set(
+      items.map((item) => item.product?._id || item.product).filter(Boolean).map(String),
+    )];
+    const sourceBatches = transferProductIds.length
+      ? await InventoryBatch.find({
+        company: companyId,
+        product: { $in: transferProductIds },
+        warehouse: fromWarehouseId,
+        status: { $nin: ["exhausted"] },
+        availableQuantity: { $gt: 0 },
+      })
+      : [];
+    const sourceBatchesByProduct = new Map();
+    for (const batch of sourceBatches) {
+      const key = String(batch.product?._id || batch.product);
+      const rows = sourceBatchesByProduct.get(key) || [];
+      rows.push(batch);
+      sourceBatchesByProduct.set(key, rows);
+    }
     for (const item of items) {
       const product = getLineProduct(transferLineProducts, item);
       if (!product) {
@@ -296,13 +319,7 @@ exports.createStockTransfer = async (req, res, next) => {
       let availableQty = 0;
 
       // Check if there are inventory batches in the source warehouse
-      const batches = await InventoryBatch.find({
-        company: companyId,
-        product: item.product,
-        warehouse: fromWarehouseId,
-        status: { $nin: ["exhausted"] },
-        availableQuantity: { $gt: 0 },
-      });
+      const batches = sourceBatchesByProduct.get(String(item.product?._id || item.product)) || [];
 
       if (batches.length > 0) {
         // Use batch-based inventory

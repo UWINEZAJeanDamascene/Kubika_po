@@ -167,12 +167,19 @@ exports.createPurchase = async (req, res, next) => {
     const processedItems = [];
     let headerSubtotal = 0;
     let headerTax = 0;
+    // Tax defaults are the only product data needed below. Resolve every
+    // referenced product in one query rather than turning a 100-line purchase
+    // into 100 sequential database round-trips.
+    const itemProductIds = [...new Set(
+      (items || []).map((item) => item.product?._id || item.product).filter(Boolean).map(String),
+    )];
+    const itemProducts = itemProductIds.length
+      ? await Product.find({ _id: { $in: itemProductIds }, company: companyId })
+      : [];
+    const productsById = new Map(itemProducts.map((product) => [String(product._id), product]));
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
-      const product = await Product.findOne({
-        _id: item.product,
-        company: companyId,
-      });
+      const product = productsById.get(String(item.product?._id || item.product));
       const qty = Number(item.quantity ?? item.qty ?? 0) || 0;
       const unitCost = Number(item.unitCost ?? 0) || 0;
       const subtotal = qty * unitCost;

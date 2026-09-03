@@ -14,6 +14,7 @@ const EBMStockService = require('../services/ebmStockService');
 const EBMReadinessService = require('../services/ebmReadinessService');
 const EBMSalesSyncService = require('../services/ebmSalesSyncService');
 const EBMItemSyncService = require('../services/ebmItemSyncService');
+const { wantsCursor, cursorFilter, cursorSort, cursorPage } = require('../utils/cursorPagination');
 
 function getCompanyId(req) {
   return req.companyId || req.company?._id || req.user?.company?._id || req.user?.company;
@@ -336,8 +337,23 @@ exports.listSubmissionQueue = async (req, res, next) => {
       if (req.query.toDate) filter.createdAt.$lte = new Date(req.query.toDate);
     }
 
-    const page = Math.max(1, Number(req.query.page || 1));
     const pageSize = Math.min(Math.max(1, Number(req.query.pageSize || req.query.limit || 20)), 100);
+    if (wantsCursor(req.query)) {
+      // Queue status can change while an operator is browsing it, so use the
+      // immutable creation timestamp (plus _id tiebreaker) as the keyset.
+      // The existing status/retry ordering remains available to page-number
+      // clients for backwards compatibility.
+      const cursorQuery = { ...filter, ...cursorFilter(req.query.cursor, 'desc') };
+      const rows = await EBMSubmissionQueue.find(cursorQuery)
+        .sort(cursorSort('createdAt', 'desc'))
+        .limit(pageSize + 1)
+        .populate('companyId', 'name code')
+        .lean();
+      const { data, pagination } = cursorPage(rows, pageSize, 'createdAt');
+      return res.json({ success: true, data: { queue: data, records: data, pagination } });
+    }
+
+    const page = Math.max(1, Number(req.query.page || 1));
     const skip = (page - 1) * pageSize;
     const queue = await EBMSubmissionQueue.find(filter)
       .sort({ ebmStatus: 1, nextRetryAt: 1, createdAt: -1 })
@@ -542,4 +558,3 @@ exports.syncRegisteredItems = async (req, res, next) => {
     next(error);
   }
 };
-
