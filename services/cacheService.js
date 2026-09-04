@@ -1,9 +1,35 @@
-const { redisClient } = require('../config/redis');
+const { redisClient, isRedisConfigured } = require('../config/redis');
 const persistentMetrics = require('./performanceMetricsStore');
 
 // Cache configuration
 const DEFAULT_TTL = 300; // 5 minutes default
 const CACHE_PREFIX = 'cache:';
+const CACHE_LOCK_PREFIX = `${CACHE_PREFIX}lock:`;
+const CACHE_LOCK_TIMEOUT_MS = Math.max(1000, Number(process.env.CACHE_STAMPEDE_LOCK_MS || 15000));
+const CACHE_LOCK_WAIT_MS = Math.max(100, Number(process.env.CACHE_STAMPEDE_WAIT_MS || 5000));
+const CACHE_LOCK_POLL_MS = Math.max(25, Number(process.env.CACHE_STAMPEDE_POLL_MS || 100));
+const CACHE_MAX_RESPONSE_BYTES = Math.max(1024, Number(process.env.CACHE_MAX_RESPONSE_BYTES || 2 * 1024 * 1024));
+const CACHE_ALERT_MIN_LOOKUPS = Math.max(1, Number(process.env.CACHE_ALERT_MIN_LOOKUPS || 100));
+const CACHE_ALERT_THRESHOLD_PERCENT = Math.min(100, Math.max(0, Number(process.env.CACHE_ALERT_HIT_RATIO_THRESHOLD_PERCENT || 50)));
+const CACHE_ALERT_TYPES = new Set(
+  String(process.env.CACHE_ALERT_TYPES || 'report,dashboard,stock,product')
+    .split(',')
+    .map((type) => type.trim())
+    .filter(Boolean),
+);
+const CACHE_ALERT_COOLDOWN_MS = Math.max(30000, Number(process.env.CACHE_ALERT_COOLDOWN_MS || 15 * 60 * 1000));
+const singleFlights = new Map();
+const emittedCacheAlerts = new Map();
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((nextResolve) => { resolve = nextResolve; });
+  return { promise, resolve };
+}
+
+function lockToken() {
+  return `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+}
 
 // Cache configuration per model type
 const CACHE_CONFIGS = {
@@ -34,8 +60,8 @@ const CACHE_CONFIGS = {
   period: { ttl: 600, prefix: 'period' },
   // Currencies and rates change at most daily but are read constantly by every
   // multi-currency screen.
-  currency: { ttl: 3600, prefix: 'currency' },
-  exchange_rate: { ttl: 3600, prefix: 'exchange_rate' },
+  currency: { ttl: 3600, prefix: 'currency', scope: 'global' },
+  exchange_rate: { ttl: 3600, prefix: 'exchange_rate', scope: 'tenant' },
   // Budgets: heavily read (74 endpoints) and edited in bursts during planning.
   // Short TTL because budget-vs-actual moves whenever a transaction posts.
   budget: { ttl: 300, prefix: 'budget' },
@@ -73,11 +99,12 @@ function recordCacheEvent(key, outcome) {
   const type = cacheTypeOf(key);
   let s = cacheStats.get(type);
   if (!s) {
-    s = { hits: 0, misses: 0, errors: 0 };
+    s = { hits: 0, misses: 0, errors: 0, skipped: 0 };
     cacheStats.set(type, s);
   }
   if (outcome === 'hit') s.hits++;
   else if (outcome === 'miss') s.misses++;
+  else if (outcome === 'skip') s.skipped++;
   else s.errors++;
   persistentMetrics.recordCacheEvent(type, outcome);
 }
@@ -88,16 +115,19 @@ function getCacheMetrics() {
   let misses = 0;
   let errors = 0;
   const byType = [];
+  let skipped = 0;
   for (const [type, s] of cacheStats) {
     hits += s.hits;
     misses += s.misses;
     errors += s.errors;
+    skipped += s.skipped || 0;
     const lookups = s.hits + s.misses;
     byType.push({
       type,
       hits: s.hits,
       misses: s.misses,
       errors: s.errors,
+      skipped: s.skipped || 0,
       hit_ratio: lookups ? Math.round((s.hits / lookups) * 1000) / 10 : null,
     });
   }
@@ -107,6 +137,7 @@ function getCacheMetrics() {
     hits,
     misses,
     errors,
+    skipped,
     hit_ratio: lookups ? Math.round((hits / lookups) * 1000) / 10 : null,
     by_type: byType,
   };
@@ -120,6 +151,58 @@ function withCacheTimeout(promise, fallback = null, timeoutMs = CACHE_GET_TIMEOU
     promise,
     new Promise((resolve) => setTimeout(() => resolve(fallback), timeoutMs)),
   ]);
+}
+
+function cacheTypeFromKey(key) {
+  return cacheTypeOf(key);
+}
+
+function cacheAlertRows(metrics) {
+  const rows = Array.isArray(metrics?.by_type) ? metrics.by_type : [];
+  return rows
+    .filter((row) => CACHE_ALERT_TYPES.has(String(row.type)) && (row.hits || 0) + (row.misses || 0) >= CACHE_ALERT_MIN_LOOKUPS)
+    .filter((row) => row.hit_ratio !== null && Number(row.hit_ratio) < CACHE_ALERT_THRESHOLD_PERCENT)
+    .map((row) => ({
+      type: String(row.type),
+      hit_ratio: Number(row.hit_ratio),
+      threshold_percent: CACHE_ALERT_THRESHOLD_PERCENT,
+      lookups: Number(row.hits || 0) + Number(row.misses || 0),
+      errors: Number(row.errors || 0),
+    }));
+}
+
+function reportCacheAlerts(alerts) {
+  if (!alerts.length) return;
+  const now = Date.now();
+  let Sentry = null;
+  if (process.env.SENTRY_DSN) {
+    try { Sentry = require('@sentry/node'); } catch (_) { /* optional telemetry */ }
+  }
+  for (const alert of alerts) {
+    const lastEmitted = emittedCacheAlerts.get(alert.type) || 0;
+    if (now - lastEmitted < CACHE_ALERT_COOLDOWN_MS) continue;
+    emittedCacheAlerts.set(alert.type, now);
+    const message = `[cache] ${alert.type} hit ratio ${alert.hit_ratio}% below ${alert.threshold_percent}% (${alert.lookups} lookups)`;
+    if (Sentry && typeof Sentry.captureMessage === 'function') {
+      Sentry.captureMessage(message, {
+        level: 'warning',
+        tags: { cache_type: alert.type, alert: 'cache_hit_ratio' },
+        extra: alert,
+      });
+    } else {
+      console.warn(message, alert);
+    }
+  }
+}
+
+async function releaseRedisLock(key, token) {
+  if (!isRedisConfigured() || typeof redisClient.get !== 'function' || typeof redisClient.del !== 'function') return;
+  try {
+    const current = await withCacheTimeout(redisClient.get(key), null, CACHE_WRITE_TIMEOUT_MS);
+    if (current === token) await withCacheTimeout(redisClient.del(key), null, CACHE_WRITE_TIMEOUT_MS);
+  } catch (_) {
+    // Lock expiry is the safety net; release failures must not affect the response.
+  }
 }
 
 class CacheService {
@@ -176,6 +259,16 @@ class CacheService {
    * Keys include company id so invalidateByCompany can delete `prefix:companyId:*` without scanning hashes.
    */
   generateKey(prefix, params = {}) {
+    // Global scope must hash to the same key for every caller. Stripping
+    // companyId/company here too (not just at the cacheMiddleware call site)
+    // means a future caller that accidentally passes both `scope: 'global'`
+    // and a tenant id still gets one shared entry instead of a silent
+    // per-tenant split that looks global but is not.
+    if (params.scope === 'global') {
+      const globalParams = { ...params, companyId: undefined, company: undefined };
+      const hash = this.hashString(JSON.stringify(globalParams));
+      return `${CACHE_PREFIX}${prefix}:global:${hash}`;
+    }
     const paramString = JSON.stringify(params);
     const hash = this.hashString(paramString);
     const cid =
@@ -241,11 +334,21 @@ class CacheService {
 
   async getAggregatedMetrics() {
     const metrics = await persistentMetrics.getCacheMetrics();
-    if (metrics) return metrics;
-    return {
+    const result = metrics || {
       ...getCacheMetrics(),
       scope: 'process-local',
       persistent: false,
+    };
+    const alerts = cacheAlertRows(result);
+    reportCacheAlerts(alerts);
+    return {
+      ...result,
+      alerts,
+      alert_policy: {
+        min_lookups: CACHE_ALERT_MIN_LOOKUPS,
+        threshold_percent: CACHE_ALERT_THRESHOLD_PERCENT,
+        types: [...CACHE_ALERT_TYPES],
+      },
     };
   }
 
@@ -268,6 +371,107 @@ class CacheService {
     }
   }
 
+  async _tryAcquireLock(key, token) {
+    if (!isRedisConfigured() || typeof redisClient.set !== 'function') return null;
+    const lockKey = `${CACHE_LOCK_PREFIX}${this.hashString(key)}`;
+    try {
+      let result;
+      try {
+        result = await withCacheTimeout(
+          redisClient.set(lockKey, token, 'PX', CACHE_LOCK_TIMEOUT_MS, 'NX'),
+          null,
+          CACHE_WRITE_TIMEOUT_MS,
+        );
+      } catch (_) {
+        // Upstash uses an options object while ioredis uses command arguments.
+        result = await withCacheTimeout(
+          redisClient.set(lockKey, token, { px: CACHE_LOCK_TIMEOUT_MS, nx: true }),
+          null,
+          CACHE_WRITE_TIMEOUT_MS,
+        );
+      }
+      return result === 'OK' || result === true;
+    } catch (error) {
+      console.error('Cache lock error:', error);
+      return null;
+    }
+  }
+
+  async _waitForCacheOrLock(key) {
+    const lockKey = `${CACHE_LOCK_PREFIX}${this.hashString(key)}`;
+    const deadline = Date.now() + CACHE_LOCK_WAIT_MS;
+    while (Date.now() < deadline) {
+      const cached = await this.get(key);
+      if (cached !== null) return cached;
+      if (typeof redisClient.exists !== 'function') {
+        await new Promise((resolve) => setTimeout(resolve, CACHE_LOCK_POLL_MS));
+        continue;
+      }
+      const lockExists = await withCacheTimeout(redisClient.exists(lockKey), 0, CACHE_GET_TIMEOUT_MS);
+      if (!lockExists) return undefined;
+      await new Promise((resolve) => setTimeout(resolve, CACHE_LOCK_POLL_MS));
+    }
+    return undefined;
+  }
+
+  async withSingleFlight(key, work) {
+    const current = singleFlights.get(key);
+    if (current) {
+      await current.promise.catch(() => {});
+      const cached = await this.get(key);
+      return cached !== null ? { data: cached, fromCache: true } : work();
+    }
+
+    const token = lockToken();
+    const distributed = await this._tryAcquireLock(key, token);
+    if (distributed === false) {
+      const cached = await this._waitForCacheOrLock(key);
+      if (cached !== undefined) return { data: cached, fromCache: true };
+    }
+
+    const flight = deferred();
+    singleFlights.set(key, flight);
+    try {
+      return await work();
+    } finally {
+      singleFlights.delete(key);
+      flight.resolve();
+      if (distributed === true) {
+        await releaseRedisLock(`${CACHE_LOCK_PREFIX}${this.hashString(key)}`, token);
+      }
+    }
+  }
+
+  /**
+   * Request middleware helper. Followers wait for the owner to populate the
+   * response cache; if the owner fails, the follower is allowed to recompute.
+   */
+  async beginRequestFlight(key) {
+    const current = singleFlights.get(key);
+    if (current) {
+      const cached = await this._waitForCacheOrLock(key);
+      return { acquired: false, cached };
+    }
+    const token = lockToken();
+    const distributed = await this._tryAcquireLock(key, token);
+    if (distributed === false) {
+      const cached = await this._waitForCacheOrLock(key);
+      if (cached !== undefined) return { acquired: false, cached };
+    }
+    const flight = deferred();
+    singleFlights.set(key, { ...flight, token, distributed });
+    return {
+      acquired: true,
+      release: async () => {
+        if (singleFlights.get(key)?.promise === flight.promise) singleFlights.delete(key);
+        flight.resolve();
+        if (distributed === true) {
+          await releaseRedisLock(`${CACHE_LOCK_PREFIX}${this.hashString(key)}`, token);
+        }
+      },
+    };
+  }
+
   /**
    * Set cached data with TTL
    * @param {string} key - Cache key
@@ -281,6 +485,10 @@ class CacheService {
       // expires until the report namespace is invalidated after a reopen.
       const numericTtl = ttl === null || ttl === undefined ? DEFAULT_TTL : Number(ttl);
       const payload = JSON.stringify(data);
+      if (Buffer.byteLength(payload, 'utf8') > CACHE_MAX_RESPONSE_BYTES) {
+        recordCacheEvent(key, 'skip');
+        return false;
+      }
       const write = numericTtl === 0
         ? redisClient.set(key, payload)
         : redisClient.setex(
@@ -292,6 +500,7 @@ class CacheService {
       await withCacheTimeout(write, null, CACHE_WRITE_TIMEOUT_MS);
       return true;
     } catch (error) {
+      recordCacheEvent(key, 'error');
       console.error('Cache set error:', error);
       return false;
     }
@@ -425,6 +634,29 @@ class CacheService {
       total += await this.invalidateByCompany(companyId, t);
     }
     return total;
+  }
+
+  /**
+   * Product/stock browse caches. `Product.currentStock` is a denormalized
+   * field mutated directly by GRN confirmation, purchase receipt, delivery-note
+   * confirm/cancel, and credit-note (goods-return) confirm — none of which
+   * write through `/api/products` or `/api/stock/*`, so the route-level
+   * invalidation middleware on those routes never fires for them. Call this
+   * alongside `bumpCompanyFinancialCaches` at every place that mutates stock
+   * outside its own cached route, or the product/stock list can keep serving
+   * a pre-commit quantity for up to the cache TTL (120s/60s).
+   */
+  async bumpCompanyStockCaches(companyId) {
+    try {
+      await this.invalidateByCompany(companyId, 'product');
+    } catch (e) {
+      console.error('Product cache invalidation failed:', e);
+    }
+    try {
+      await this.invalidateByCompany(companyId, 'stock');
+    } catch (e) {
+      console.error('Stock cache invalidation failed:', e);
+    }
   }
 
   /**

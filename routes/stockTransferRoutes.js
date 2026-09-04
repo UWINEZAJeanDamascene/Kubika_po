@@ -10,7 +10,10 @@ const cacheStockTransferReads = cacheMiddleware({
   skipCache: (req) => req.query.refresh === '1' || req.query.refresh === 'true',
 });
 const invalidateStockTransferReads = cacheInvalidationMiddleware({
-  types: ['stock_transfer', 'stock', 'report'],
+  // Confirm/cancel mutate Product.currentStock directly (stockTransferService),
+  // so 'product' must be invalidated alongside 'stock' — otherwise
+  // /api/products keeps serving the pre-transfer quantity for its own TTL.
+  types: ['stock_transfer', 'stock', 'product', 'report'],
   invalidateDashboards: true,
 });
 

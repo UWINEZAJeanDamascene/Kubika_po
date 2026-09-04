@@ -2,7 +2,6 @@
  * Shared helpers for Phase 2 master-data Prisma shims.
  */
 
-const mongoose = require('mongoose');
 const { prisma } = require('../lib/prisma');
 const { makeCompatModel } = require('./prismaCompat');
 
@@ -17,15 +16,7 @@ const STANDARD_TENANT_FIELD_MAP = {
   updatedAt: { target: 'updatedAt' },
 };
 
-function registerBareSchema(name, collection) {
-  if (!mongoose.models[name]) {
-    mongoose.model(name, new mongoose.Schema({}, { strict: false, collection }));
-  }
-}
-
-/**
- * Build a tenant-scoped Mongoose-compatible model backed by Prisma.
- */
+/** Build a tenant-scoped Prisma-backed model with the legacy query facade. */
 function buildTenantModel({
   name,
   collection,
@@ -41,7 +32,6 @@ function buildTenantModel({
   tenantField = 'companyId',
   ...rest
 }) {
-  registerBareSchema(name, collection);
   return makeCompatModel({
     delegate: () => prisma[delegateName],
     // Required by prismaCompat to select the same delegate on an ambient
@@ -60,9 +50,7 @@ function buildTenantModel({
   });
 }
 
-/**
- * Build a global (non-tenant) Mongoose-compatible model backed by Prisma.
- */
+/** Build a global Prisma-backed model with the legacy query facade. */
 function buildGlobalModel({
   name,
   collection,
@@ -75,7 +63,6 @@ function buildGlobalModel({
   mutable,
   customFind,
 }) {
-  registerBareSchema(name, collection);
   return makeCompatModel({
     delegate: () => prisma[delegateName],
     delegateName,
@@ -97,7 +84,6 @@ function buildGlobalModel({
 
 module.exports = {
   STANDARD_TENANT_FIELD_MAP,
-  registerBareSchema,
   buildTenantModel,
   buildGlobalModel,
 };

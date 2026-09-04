@@ -1,4 +1,6 @@
 const mongoose = require('mongoose');
+const { Prisma } = require('@prisma/client');
+const { dbClient } = require('../lib/prisma');
 const Budget = require('../models/Budget');
 const BudgetLine = require('../models/BudgetLine');
 const ChartOfAccount = require('../models/ChartOfAccount');
@@ -17,7 +19,6 @@ const Project = require('../models/Project');
 const User = require('../models/User');
 const Role = require('../models/Role');
 const projectService = require('./projectService');
-const { aggregateWithTimeout } = require('../utils/mongoAggregation');
 
 const BUDGET_OVERRUN_THRESHOLD = 0.9; // 90% utilized = warning
 
@@ -33,6 +34,73 @@ const MANAGER_ROLES = new Set([
 ]);
 
 const normalizeRoleName = (name) => String(name || '').trim().toLowerCase().replace(/\s+/g, '_');
+
+async function getBudgetActualMap(companyId, accountIds, start, end) {
+  const ids = [...new Set((accountIds || []).filter(Boolean).map((id) => String(id)))];
+  if (!ids.length) return {};
+
+  const rows = await dbClient().journalEntryLine.groupBy({
+    by: ['accountId'],
+    where: {
+      companyId: String(companyId),
+      accountId: { in: ids },
+      journalEntry: {
+        date: { gte: start, lte: end },
+        status: 'posted',
+        reversed: false,
+      },
+    },
+    _sum: { debit: true, credit: true },
+  });
+
+  const map = {};
+  for (const row of rows) {
+    const accountId = String(row.accountId || '');
+    if (!accountId) continue;
+    const debit = Number(row._sum?.debit || 0);
+    const credit = Number(row._sum?.credit || 0);
+    map[accountId] = debit - credit;
+  }
+  return map;
+}
+
+async function getBudgetActualSum(companyId, accountIds, start, end) {
+  const map = await getBudgetActualMap(companyId, accountIds, start, end);
+  return Object.values(map).reduce((sum, value) => sum + Number(value || 0), 0);
+}
+
+async function getMonthlyJournalTotals(companyId, start, end, accountTypes, direction) {
+  const sign = direction === 'revenue' ? Prisma.sql`jel.credit - jel.debit` : Prisma.sql`jel.debit - jel.credit`;
+  return dbClient().$queryRaw(Prisma.sql`
+    SELECT EXTRACT(YEAR FROM je.date)::int AS year,
+           EXTRACT(MONTH FROM je.date)::int AS month,
+           COALESCE(SUM(${sign}), 0) AS amount,
+           COUNT(*)::int AS count
+    FROM journal_entry_lines jel
+    JOIN journal_entries je ON je.id = jel.journal_entry_id
+    JOIN chart_of_accounts coa ON coa.code = jel.account_code AND coa.company_id = je.company_id
+    WHERE je.company_id = ${String(companyId)}
+      AND je.status = 'posted'
+      AND je.reversed = false
+      AND je.date >= ${start}
+      AND je.date <= ${end}
+      AND coa.type IN (${Prisma.join(accountTypes)})
+    GROUP BY EXTRACT(YEAR FROM je.date), EXTRACT(MONTH FROM je.date)
+    ORDER BY year, month
+  `);
+}
+
+async function getJournalAccountBalance(companyId, accountCode) {
+  const result = await dbClient().journalEntryLine.aggregate({
+    where: {
+      companyId: String(companyId),
+      accountCode,
+      journalEntry: { status: 'posted', reversed: false },
+    },
+    _sum: { debit: true, credit: true },
+  });
+  return Number(result._sum.debit || 0) - Number(result._sum.credit || 0);
+}
 
 class BudgetService {
   static async canUserApproveWorkflowStep(companyId, approval, step, userId) {
@@ -192,6 +260,14 @@ class BudgetService {
       .sort({ document_date: -1, createdAt: -1 });
   }
 
+  static async calculateBudgetActualTotals({ companyId, accountIds, periodStart, periodEnd }) {
+    return getBudgetActualSum(companyId, accountIds, periodStart, periodEnd);
+  }
+
+  static async calculateBudgetActualByAccount({ companyId, accountIds, periodStart, periodEnd }) {
+    return getBudgetActualMap(companyId, accountIds, periodStart, periodEnd);
+  }
+
   // ── CREATE ───────────────────────────────────────────────────────────
   static async create(companyId, data, userId) {
     const budgetData = {
@@ -288,47 +364,12 @@ class BudgetService {
       const periodEnd = budget.periodEnd || new Date(budget.fiscal_year, 11, 31, 23, 59, 59);
       const accountIds = [...new Set(lines.map(l => l.account_id?.toString()).filter(Boolean))];
 
-      let totalActual = 0;
-      if (accountIds.length > 0) {
-        const actualTotals = await aggregateWithTimeout(JournalEntry, [
-          { $unwind: '$lines' },
-          {
-            $match: {
-              company: new mongoose.Types.ObjectId(companyId),
-              status: 'posted',
-              reversed: { $ne: true },
-              date: { $gte: periodStart, $lte: periodEnd },
-              'lines.accountCode': { $exists: true }
-            }
-          },
-          {
-            $lookup: {
-              from: 'chartofaccounts',
-              let: { accountCode: '$lines.accountCode' },
-              pipeline: [
-                { $match: { $expr: { $eq: ['$$accountCode', '$code'] }, company: new mongoose.Types.ObjectId(companyId) } },
-                { $project: { _id: 1 } }
-              ],
-              as: 'account'
-            }
-          },
-          { $unwind: { path: '$account', preserveNullAndEmptyArrays: false } },
-          { $match: { 'account._id': { $in: accountIds.map(id => new mongoose.Types.ObjectId(id)) } } },
-          {
-            $group: {
-              _id: '$account._id',
-              total_dr: { $sum: '$lines.debit' },
-              total_cr: { $sum: '$lines.credit' }
-            }
-          }
-        ]);
-
-        totalActual = actualTotals.reduce((sum, row) => {
-          const dr = row.total_dr ? Number(row.total_dr.toString()) : 0;
-          const cr = row.total_cr ? Number(row.total_cr.toString()) : 0;
-          return sum + (dr - cr);
-        }, 0);
-      }
+      const totalActual = await BudgetService.calculateBudgetActualTotals({
+        companyId,
+        accountIds,
+        periodStart,
+        periodEnd,
+      });
 
       const totalVariance = totalBudgeted - totalActual;
       const utilization = totalBudgeted !== 0 ? (totalActual / totalBudgeted) * 100 : 0;
@@ -1265,47 +1306,12 @@ class BudgetService {
 
       const accountIds = [...new Set(lines.map(l => l.account_id.toString()))];
 
-      let actualAmount = 0;
-      if (accountIds.length > 0) {
-        const actualTotals = await aggregateWithTimeout(JournalEntry, [
-          { $unwind: '$lines' },
-          {
-            $match: {
-              company: new mongoose.Types.ObjectId(companyId),
-              status: 'posted',
-              reversed: { $ne: true },
-              date: { $gte: periodStart, $lte: periodEnd },
-              'lines.accountCode': { $exists: true }
-            }
-          },
-          {
-            $lookup: {
-              from: 'chartofaccounts',
-              let: { accountCode: '$lines.accountCode' },
-              pipeline: [
-                { $match: { $expr: { $eq: ['$$accountCode', '$code'] }, company: new mongoose.Types.ObjectId(companyId) } },
-                { $project: { _id: 1 } }
-              ],
-              as: 'account'
-            }
-          },
-          { $unwind: { path: '$account', preserveNullAndEmptyArrays: false } },
-          { $match: { 'account._id': { $in: accountIds.map(id => new mongoose.Types.ObjectId(id)) } } },
-          {
-            $group: {
-              _id: '$account._id',
-              total_dr: { $sum: '$lines.debit' },
-              total_cr: { $sum: '$lines.credit' }
-            }
-          }
-        ]);
-
-        actualAmount = actualTotals.reduce((sum, row) => {
-          const dr = row.total_dr ? Number(row.total_dr.toString()) : 0;
-          const cr = row.total_cr ? Number(row.total_cr.toString()) : 0;
-          return sum + (dr - cr);
-        }, 0);
-      }
+      const actualAmount = await BudgetService.calculateBudgetActualTotals({
+        companyId,
+        accountIds,
+        periodStart,
+        periodEnd,
+      });
 
       const variance = budgetedAmount - actualAmount;
       const variancePercent = budgetedAmount !== 0 ? (variance / budgetedAmount) * 100 : 0;
@@ -1387,47 +1393,12 @@ class BudgetService {
 
       const accountIds = [...new Set(lines.map(l => l.account_id.toString()))];
 
-      let actualAmount = 0;
-      if (accountIds.length > 0) {
-        const actualTotals = await aggregateWithTimeout(JournalEntry, [
-          { $unwind: '$lines' },
-          {
-            $match: {
-              company: new mongoose.Types.ObjectId(companyId),
-              status: 'posted',
-              reversed: { $ne: true },
-              date: { $gte: periodStart, $lte: periodEnd },
-              'lines.accountCode': { $exists: true }
-            }
-          },
-          {
-            $lookup: {
-              from: 'chartofaccounts',
-              let: { accountCode: '$lines.accountCode' },
-              pipeline: [
-                { $match: { $expr: { $eq: ['$$accountCode', '$code'] }, company: new mongoose.Types.ObjectId(companyId) } },
-                { $project: { _id: 1 } }
-              ],
-              as: 'account'
-            }
-          },
-          { $unwind: { path: '$account', preserveNullAndEmptyArrays: false } },
-          { $match: { 'account._id': { $in: accountIds.map(id => new mongoose.Types.ObjectId(id)) } } },
-          {
-            $group: {
-              _id: '$account._id',
-              total_dr: { $sum: '$lines.debit' },
-              total_cr: { $sum: '$lines.credit' }
-            }
-          }
-        ]);
-
-        actualAmount = actualTotals.reduce((sum, row) => {
-          const dr = row.total_dr ? Number(row.total_dr.toString()) : 0;
-          const cr = row.total_cr ? Number(row.total_cr.toString()) : 0;
-          return sum + (dr - cr);
-        }, 0);
-      }
+      const actualAmount = await BudgetService.calculateBudgetActualTotals({
+        companyId,
+        accountIds,
+        periodStart,
+        periodEnd,
+      });
 
       const variance = budgetedAmount - actualAmount;
       const variancePercent = budgetedAmount !== 0 ? (variance / budgetedAmount) * 100 : 0;
@@ -1511,51 +1482,15 @@ class BudgetService {
 
     // Get actual totals from journal for each account in period
     // scoped to this company only
-    const actualTotals = await aggregateWithTimeout(JournalEntry, [
-      { $unwind: '$lines' },
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          status: 'posted',
-          reversed: { $ne: true },
-          date: {
-            $gte: startDate,
-            $lte: endDate
-          },
-          'lines.accountCode': { $exists: true }
-        }
-      },
-      {
-        $lookup: {
-          from: 'chartofaccounts',
-          let: { accountCode: '$lines.accountCode' },
-          pipeline: [
-            { $match: { $expr: { $eq: ['$$accountCode', '$code'] }, company: new mongoose.Types.ObjectId(companyId) } },
-            { $project: { _id: 1 } }
-          ],
-          as: 'account'
-        }
-      },
-      { $unwind: { path: '$account', preserveNullAndEmptyArrays: false } },
-      {
-        $match: {
-          'account._id': { $in: accountIds.map(id => new mongoose.Types.ObjectId(id)) }
-        }
-      },
-      {
-        $group: {
-          _id: '$account._id',
-          total_dr: { $sum: '$lines.debit' },
-          total_cr: { $sum: '$lines.credit' }
-        }
-      }
-    ]);
+    const actualMap = await BudgetService.calculateBudgetActualByAccount({
+      companyId,
+      accountIds,
+      periodStart: startDate,
+      periodEnd: endDate,
+    });
 
     // Build lookup map for actuals
-    const actualMap = {};
-    for (const row of actualTotals) {
-      actualMap[row._id.toString()] = row;
-    }
+    const actualLookup = actualMap;
 
     // Get account codes for reference
     const accountCodes = await ChartOfAccount.find({
@@ -1570,16 +1505,7 @@ class BudgetService {
     // Merge budget lines with actuals
     const lines = budgetLines.map(budgetLine => {
       const account = accountMap[budgetLine.account_id.toString()];
-      const actual = actualMap[budgetLine.account_id.toString()];
-
-      const actualDr = actual?.total_dr ? Number(actual.total_dr.toString()) : 0;
-      const actualCr = actual?.total_cr ? Number(actual.total_cr.toString()) : 0;
-
-      // Determine normal balance from account type
-      // Expense accounts (type === 'expense'): normal balance is DR
-      // Revenue accounts (type === 'revenue' or 'income'): normal balance is CR
-      // For simplicity, we use DR - CR (same as expense accounts)
-      const actualAmount = actualDr - actualCr;
+      const actualAmount = Number(actualLookup[budgetLine.account_id.toString()] || 0);
 
       const budgetedAmount = Number(budgetLine.budgeted_amount.toString());
       const variance = budgetedAmount - actualAmount;
@@ -1685,51 +1611,12 @@ class BudgetService {
     const lookbackStart = new Date(now.getFullYear(), now.getMonth() - lookbackMonths, 1);
 
     // Get monthly revenue from journal entries (posted, non-reversed)
-    const historical = await aggregateWithTimeout(JournalEntry, [
-      { $unwind: '$lines' },
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          status: 'posted',
-          reversed: { $ne: true },
-          date: { $gte: lookbackStart, $lte: now },
-          'lines.accountCode': { $exists: true }
-        }
-      },
-      {
-        $lookup: {
-          from: 'chartofaccounts',
-          let: { accountCode: '$lines.accountCode' },
-          pipeline: [
-            {
-              $match: {
-                $expr: { $eq: ['$$accountCode', '$code'] },
-                company: new mongoose.Types.ObjectId(companyId),
-                type: 'revenue'
-              }
-            },
-            { $project: { _id: 1 } }
-          ],
-          as: 'account'
-        }
-      },
-      { $unwind: { path: '$account', preserveNullAndEmptyArrays: false } },
-      {
-        $group: {
-          _id: { year: { $year: '$date' }, month: { $month: '$date' } },
-          revenue: {
-            $sum: { $subtract: ['$lines.credit', '$lines.debit'] }
-          },
-          count: { $sum: 1 }
-        }
-      },
-      { $sort: { '_id.year': 1, '_id.month': 1 } }
-    ]);
+    const historical = await getMonthlyJournalTotals(companyId, lookbackStart, now, ['revenue'], 'revenue');
 
     const monthlyData = historical.map(h => ({
-      year: h._id.year,
-      month: h._id.month,
-      revenue: Math.round(Number(h.revenue.toString()) * 100) / 100,
+      year: h.year,
+      month: h.month,
+      revenue: Math.round(Number(h.amount) * 100) / 100,
       count: h.count
     }));
 
@@ -1762,51 +1649,12 @@ class BudgetService {
     const lookbackStart = new Date(now.getFullYear(), now.getMonth() - lookbackMonths, 1);
 
     // Get monthly expenses from journal entries (posted, non-reversed)
-    const historical = await aggregateWithTimeout(JournalEntry, [
-      { $unwind: '$lines' },
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          status: 'posted',
-          reversed: { $ne: true },
-          date: { $gte: lookbackStart, $lte: now },
-          'lines.accountCode': { $exists: true }
-        }
-      },
-      {
-        $lookup: {
-          from: 'chartofaccounts',
-          let: { accountCode: '$lines.accountCode' },
-          pipeline: [
-            {
-              $match: {
-                $expr: { $eq: ['$$accountCode', '$code'] },
-                company: new mongoose.Types.ObjectId(companyId),
-                type: { $in: ['expense', 'cogs'] }
-              }
-            },
-            { $project: { _id: 1 } }
-          ],
-          as: 'account'
-        }
-      },
-      { $unwind: { path: '$account', preserveNullAndEmptyArrays: false } },
-      {
-        $group: {
-          _id: { year: { $year: '$date' }, month: { $month: '$date' } },
-          expense: {
-            $sum: { $subtract: ['$lines.debit', '$lines.credit'] }
-          },
-          count: { $sum: 1 }
-        }
-      },
-      { $sort: { '_id.year': 1, '_id.month': 1 } }
-    ]);
+    const historical = await getMonthlyJournalTotals(companyId, lookbackStart, now, ['expense', 'cogs'], 'expense');
 
     const monthlyData = historical.map(h => ({
-      year: h._id.year,
-      month: h._id.month,
-      expense: Math.round(Number(h.expense.toString()) * 100) / 100,
+      year: h.year,
+      month: h.month,
+      expense: Math.round(Number(h.amount) * 100) / 100,
       count: h.count
     }));
 
@@ -1865,44 +1713,11 @@ class BudgetService {
     }
 
     // Current position: sum of receivables and payables
-    const receivables = await aggregateWithTimeout(JournalEntry, [
-      { $unwind: '$lines' },
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          status: 'posted',
-          reversed: { $ne: true },
-          'lines.accountCode': { $in: ['1300'] } // Accounts Receivable
-        }
-      },
-      {
-        $group: {
-          _id: null,
-          total: { $sum: { $subtract: ['$lines.debit', '$lines.credit'] } }
-        }
-      }
+    const [receivablesTotal, payablesDebitCredit] = await Promise.all([
+      getJournalAccountBalance(companyId, '1300'),
+      getJournalAccountBalance(companyId, '2000'),
     ]);
-
-    const payables = await aggregateWithTimeout(JournalEntry, [
-      { $unwind: '$lines' },
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          status: 'posted',
-          reversed: { $ne: true },
-          'lines.accountCode': { $in: ['2000'] } // Accounts Payable
-        }
-      },
-      {
-        $group: {
-          _id: null,
-          total: { $sum: { $subtract: ['$lines.credit', '$lines.debit'] } }
-        }
-      }
-    ]);
-
-    const receivablesTotal = receivables.length > 0 ? Number(receivables[0].total.toString()) : 0;
-    const payablesTotal = payables.length > 0 ? Number(payables[0].total.toString()) : 0;
+    const payablesTotal = -payablesDebitCredit;
 
     const avgRevenue = revenueForecast.summary.averageMonthlyRevenue;
     const avgExpense = expenseForecast.summary.averageMonthlyExpense;

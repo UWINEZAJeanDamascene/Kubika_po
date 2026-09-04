@@ -7,6 +7,7 @@ const StockSerialNumber = require("../models/StockSerialNumber");
 const StockMovement = require("../models/StockMovement");
 const Product = require("../models/Product");
 const { loadLineProducts, getLineProduct } = require("../utils/lineProducts");
+const { emitDataChanged } = require("../lib/realtimeEvents");
 const Supplier = require("../models/Supplier");
 const Company = require("../models/Company");
 const { generateUniqueNumber } = require('../models/utils/autoIncrement');
@@ -21,6 +22,7 @@ const DEFAULT_ACCOUNTS =
   require("../constants/chartOfAccounts").DEFAULT_ACCOUNTS;
 const StockLevel = require("../models/StockLevel");
 const { toIdString } = require("../utils/objectId");
+const { parseBoundedPage } = require("../utils/querySafety");
 
 function resolveRefId(value) {
   return toIdString(value);
@@ -1017,6 +1019,8 @@ exports.confirmGRN = async (req, res, next) => {
       }
     }
 
+    emitDataChanged(companyId, "grn", { affectsStock: true });
+    await cacheService.bumpCompanyStockCaches(companyId);
     res.json({
       success: true,
       message: "GRN confirmed",
@@ -1044,9 +1048,8 @@ exports.listGRNs = async (req, res, next) => {
       ebmStatus,
       date_from,
       date_to,
-      page = 1,
-      limit = 20,
     } = req.query;
+    const { page, limit, skip } = parseBoundedPage(req.query, { defaultLimit: 20, maxLimit: 100 });
 
     const query = { company: companyId };
 
@@ -1059,17 +1062,16 @@ exports.listGRNs = async (req, res, next) => {
       if (date_to) query.receivedDate.$lte = new Date(date_to);
     }
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-
     const grns = await GoodsReceivedNote.find(query)
       .populate("purchaseOrder", "referenceNo")
       .populate("supplier", "name code")
       .populate("warehouse", "name code")
-      .populate("lines.product", "name sku")
       .populate("createdBy", "name email")
-      .sort({ createdAt: -1 })
+      .populate("-lines")
+      .select("_id company referenceNo purchaseOrder supplier warehouse receivedDate status supplierInvoiceNo totalAmount balance amountPaid paymentStatus paymentDueDate journalEntry freight ebm ebmImportReference createdBy confirmedBy confirmedAt createdAt updatedAt")
+      .sort({ createdAt: -1, _id: -1 })
       .skip(skip)
-      .limit(parseInt(limit))
+      .limit(limit)
       .lean();
 
     const total = await GoodsReceivedNote.countDocuments(query);

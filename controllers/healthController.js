@@ -47,18 +47,20 @@ exports.performanceMetrics = async (req, res) => {
       getAggregatedRequestMetrics,
       getAggregatedRouteMetrics,
       getAggregatedEventLoopMetrics,
+      getAggregatedClientMetrics,
       getPostgresPoolMetrics,
     } = require('../services/systemMetricsService');
     const cacheService = require('../services/cacheService');
     const persistentMetrics = require('../services/performanceMetricsStore');
 
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
-    const [requests, routes, cache, eventLoop, databasePool] = await Promise.all([
+    const [requests, routes, cache, eventLoop, databasePool, client] = await Promise.all([
       getAggregatedRequestMetrics(),
       getAggregatedRouteMetrics(limit),
       cacheService.getAggregatedMetrics(),
       getAggregatedEventLoopMetrics(),
       getPostgresPoolMetrics(),
+      getAggregatedClientMetrics(),
     ]);
 
     res.json({
@@ -67,6 +69,7 @@ exports.performanceMetrics = async (req, res) => {
       requests,
       routes,
       cache,
+      client,
       event_loop_lag: eventLoop,
       database_pool: databasePool,
       storage: persistentMetrics.getStorageStatus(),
@@ -85,6 +88,30 @@ exports.performanceReadiness = async (_req, res) => {
   } catch (error) {
     res.status(503).json({ ready: false, failures: [error.message] });
   }
+};
+
+/**
+ * POST /api/performance/client — accept bounded anonymous browser timings.
+ * Client telemetry is best-effort and never participates in a user request.
+ */
+exports.clientPerformance = (req, res) => {
+  const body = req.body && typeof req.body === 'object' ? req.body : {};
+  const metrics = Array.isArray(body.metrics) ? body.metrics.slice(0, 20) : [];
+  const route = typeof body.route === 'string' ? body.route.split('?')[0].slice(0, 120) : undefined;
+  const { recordClientMetric } = require('../services/systemMetricsService');
+  let accepted = 0;
+
+  for (const item of metrics) {
+    if (!item || typeof item !== 'object') continue;
+    if (recordClientMetric(item.name, item.value, {
+      unit: item.unit,
+      route,
+    })) {
+      accepted += 1;
+    }
+  }
+
+  res.status(202).json({ accepted, received: metrics.length });
 };
 // GET /api/health/accounting
 exports.accountingHealth = async (req, res, next) => {

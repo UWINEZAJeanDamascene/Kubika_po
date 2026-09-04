@@ -3,7 +3,6 @@
  * Provides aggregated weekly data with performance optimizations
  */
 
-const mongoose = require('mongoose');
 const Invoice = require('../models/Invoice');
 const SalesOrder = require('../models/SalesOrder');
 const Product = require('../models/Product');
@@ -21,8 +20,6 @@ const Employee = require('../models/Employee');
 const { BankAccount, BankTransaction } = require('../models/BankAccount');
 const { dbClient } = require('../lib/prisma');
 const { toIdString } = require('../utils/objectId');
-
-const toObjectId = (value) => new mongoose.Types.ObjectId(String(value));
 
 const toNumber = (value) => {
   if (value === null || value === undefined || value === '') return 0;
@@ -51,13 +48,13 @@ const CONFIRMED_INVOICE_STATUSES = ['fully_paid', 'partially_paid', 'confirmed']
 const ACTIVE_SALES_ORDER_STATUSES = ['confirmed', 'picking', 'packed', 'delivered', 'invoiced', 'closed'];
 
 const invoiceMatchStage = (companyId, start, end) => ({
-  company: toObjectId(companyId),
+  company: toIdString(companyId),
   invoiceDate: { $gte: start, $lte: end },
   status: { $in: CONFIRMED_INVOICE_STATUSES },
 });
 
 const salesOrderMatchStage = (companyId, start, end) => ({
-  company: toObjectId(companyId),
+  company: toIdString(companyId),
   orderDate: { $gte: start, $lte: end },
   status: { $in: ACTIVE_SALES_ORDER_STATUSES },
 });
@@ -238,7 +235,7 @@ class WeeklyReportsService {
   static async getWeeklyInventoryReorder(companyId) {
     // Get all products and filter in JS to handle Decimal128 properly
     const allProducts = await Product.find({
-      company: toObjectId(companyId),
+      company: toIdString(companyId),
       status: { $ne: 'discontinued' }
     }, {
       name: 1,
@@ -305,7 +302,7 @@ class WeeklyReportsService {
     
     // Get all suppliers
     const suppliers = await Supplier.find({
-      company: toObjectId(companyId)
+      company: toIdString(companyId)
     }, { name: 1 }).lean();
     
     // Get POs raised this week
@@ -396,7 +393,7 @@ class WeeklyReportsService {
     
     // Get all outstanding invoices
     const outstandingInvoices = await Invoice.find({
-      company: toObjectId(companyId),
+      company: toIdString(companyId),
       status: { $in: ['partially_paid', 'confirmed', 'sent'] },
       amountOutstanding: { $gt: 0 }
     }, {
@@ -481,7 +478,7 @@ class WeeklyReportsService {
 
     const [unpaidGrns, unpaidOrders] = await Promise.all([
       GoodsReceivedNote.find({
-        company: toObjectId(companyId),
+        company: toIdString(companyId),
         status: 'confirmed',
         balance: { $gt: 0 }
       }, {
@@ -625,7 +622,7 @@ class WeeklyReportsService {
     
     // Get Cash/Bank account codes
     const cashBankAccounts = await ChartOfAccount.find({
-      company: toObjectId(companyId),
+      company: toIdString(companyId),
       $or: [
         { subtype: { $in: ['Cash', 'Bank', 'cash', 'bank'] } },
         { name: { $regex: /cash|bank/i } }
@@ -746,7 +743,7 @@ class WeeklyReportsService {
     });
 
     let currentPayrollRun = await PayrollRun.findOne({
-      company: toObjectId(companyId),
+      company: toIdString(companyId),
       status: { $in: inProgressStatuses },
       pay_period_start: { $lte: today },
       pay_period_end: { $gte: today }
@@ -756,7 +753,7 @@ class WeeklyReportsService {
 
     if (!currentPayrollRun) {
       currentPayrollRun = await PayrollRun.findOne({
-        company: toObjectId(companyId),
+        company: toIdString(companyId),
         status: { $in: inProgressStatuses }
       })
         .sort({ updatedAt: -1 })
@@ -765,7 +762,7 @@ class WeeklyReportsService {
 
     if (currentPayrollRun) {
       const payrollRecords = await Payroll.find({
-        company: toObjectId(companyId),
+        company: toIdString(companyId),
         payroll_run_id: currentPayrollRun._id
       }).lean();
 
@@ -803,7 +800,7 @@ class WeeklyReportsService {
     }
 
     const activeEmployees = await Employee.find({
-      company: toObjectId(companyId),
+      company: toIdString(companyId),
       status: 'active'
     }, {
       employeeId: 1,

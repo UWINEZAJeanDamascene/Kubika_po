@@ -1,7 +1,5 @@
-const mongoose = require('mongoose');
 const ChartOfAccount = require('../models/ChartOfAccount');
-const JournalEntry = require('../models/JournalEntry');
-const { aggregateWithTimeout } = require('../utils/mongoAggregation');
+const { dbClient } = require('../lib/prisma');
 const ChartOfAccountsService = require('./chartOfAccountsService');
 
 /**
@@ -26,8 +24,8 @@ class GeneralLedgerService {
 
     // Verify account belongs to this company
     const account = await ChartOfAccount.findOne({
-      _id: new mongoose.Types.ObjectId(accountId),
-      company: new mongoose.Types.ObjectId(companyId)
+      _id: accountId,
+      company: companyId
     }).lean();
 
     if (!account) throw new Error('ACCOUNT_NOT_FOUND');
@@ -42,39 +40,38 @@ class GeneralLedgerService {
 
     // Get all posted journal lines for this account in the period
     // Using embedded lines approach with $unwind
-    const lines = await aggregateWithTimeout(JournalEntry, [
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
+    const rows = await dbClient().journalEntryLine.findMany({
+      where: {
+        companyId: String(companyId),
+        accountCode: account.code,
+        journalEntry: {
           status: 'posted',
-          date: {
-            $gte: new Date(dateFrom),
-            $lte: new Date(dateTo)
-          }
-        }
+          date: { gte: new Date(dateFrom), lte: new Date(dateTo) },
+        },
       },
-      { $unwind: '$lines' },
-      {
-        $match: {
-          'lines.accountCode': account.code
-        }
+      select: {
+        id: true,
+        debit: true,
+        credit: true,
+        description: true,
+        journalEntry: {
+          select: { id: true, date: true, entryNumber: true, description: true, sourceType: true, sourceId: true },
+        },
       },
-      {
-        $project: {
-          entry_date: '$date',
-          reference_no: '$entryNumber',
-          narration: '$description',
-          source_type: '$sourceType',
-          source_id: '$sourceId',
-          dr_amount: '$lines.debit',
-          cr_amount: '$lines.credit',
-          description: '$lines.description',
-          journal_entry_id: '$_id',
-          line_id: '$lines._id'
-        }
-      },
-      { $sort: { entry_date: 1, journal_entry_id: 1 } }
-    ]);
+      orderBy: [{ journalEntry: { date: 'asc' } }, { journalEntryId: 'asc' }],
+    });
+    const lines = rows.map((row) => ({
+      entry_date: row.journalEntry.date,
+      reference_no: row.journalEntry.entryNumber,
+      narration: row.journalEntry.description,
+      source_type: row.journalEntry.sourceType,
+      source_id: row.journalEntry.sourceId,
+      dr_amount: row.debit,
+      cr_amount: row.credit,
+      description: row.description,
+      journal_entry_id: row.journalEntry.id,
+      line_id: row.id,
+    }));
 
     // Compute running balance after each line
     let runningBalance = openingBalance;
@@ -134,7 +131,7 @@ class GeneralLedgerService {
    */
   static async getAllAccountsSummary(companyId, { dateFrom, dateTo }) {
     const accounts = await ChartOfAccount.find({
-      company: new mongoose.Types.ObjectId(companyId),
+      company: companyId,
       isActive: true
     }).sort({ code: 1 }).lean();
 
@@ -168,15 +165,15 @@ class GeneralLedgerService {
    * @param {string} journalEntryId - Journal Entry ID
    */
   static async getEntriesByJournalEntry(companyId, journalEntryId) {
-    const entry = await JournalEntry.findOne({
-      _id: new mongoose.Types.ObjectId(journalEntryId),
-      company: new mongoose.Types.ObjectId(companyId)
-    }).lean();
+    const entry = await dbClient().journalEntry.findFirst({
+      where: { id: String(journalEntryId), companyId: String(companyId) },
+      include: { lines: { orderBy: { lineOrder: 'asc' } } },
+    });
 
     if (!entry) throw new Error('JOURNAL_ENTRY_NOT_FOUND');
 
     return {
-      entry_id: entry._id,
+      entry_id: entry.id,
       entry_number: entry.entryNumber,
       date: entry.date,
       description: entry.description,
@@ -201,18 +198,6 @@ class GeneralLedgerService {
    * @param {object} options - { dateFrom, dateTo, limit }
    */
   static async searchLedger(companyId, accountId, searchTerm, { dateFrom, dateTo, limit = 50 }) {
-    const matchStage = {
-      company: new mongoose.Types.ObjectId(companyId),
-      status: 'posted'
-    };
-
-    if (dateFrom && dateTo) {
-      matchStage.date = {
-        $gte: new Date(dateFrom),
-        $lte: new Date(dateTo)
-      };
-    }
-
     // First get the account code if accountId provided
     let accountCode = null;
     if (accountId) {
@@ -221,53 +206,47 @@ class GeneralLedgerService {
       accountCode = account.code;
     }
 
-    // Build the pipeline
-    const pipeline = [
-      { $match: matchStage },
-      { $unwind: '$lines' }
-    ];
-
-    // Add account filter if specified
-    if (accountCode) {
-      pipeline.push({
-        $match: { 'lines.accountCode': accountCode }
-      });
-    }
-
-    // Add search filter
-    if (searchTerm) {
-      const searchRegex = new RegExp(searchTerm, 'i');
-      pipeline.push({
-        $match: {
-          $or: [
-            { 'lines.description': searchRegex },
-            { 'lines.reference': searchRegex },
-            { description: searchRegex },
-            { entryNumber: searchRegex }
-          ]
-        }
-      });
-    }
-
-    pipeline.push(
-      { $sort: { date: -1, _id: -1 } },
-      { $limit: limit },
-      {
-        $project: {
-          entry_date: '$date',
-          reference_no: '$entryNumber',
-          narration: '$description',
-          account_code: '$lines.accountCode',
-          account_name: '$lines.accountName',
-          dr_amount: '$lines.debit',
-          cr_amount: '$lines.credit',
-          description: '$lines.description',
-          journal_entry_id: '$_id'
-        }
-      }
-    );
-
-    return aggregateWithTimeout(JournalEntry, pipeline, 'report');
+    const text = searchTerm ? String(searchTerm) : null;
+    const rows = await dbClient().journalEntryLine.findMany({
+      where: {
+        companyId: String(companyId),
+        ...(accountCode ? { accountCode } : {}),
+        ...(text ? {
+          OR: [
+            { description: { contains: text, mode: 'insensitive' } },
+            { reference: { contains: text, mode: 'insensitive' } },
+            { journalEntry: { description: { contains: text, mode: 'insensitive' } } },
+            { journalEntry: { entryNumber: { contains: text, mode: 'insensitive' } } },
+          ],
+        } : {}),
+        journalEntry: {
+          status: 'posted',
+          ...(dateFrom && dateTo ? { date: { gte: new Date(dateFrom), lte: new Date(dateTo) } } : {}),
+        },
+      },
+      select: {
+        debit: true,
+        credit: true,
+        accountCode: true,
+        accountName: true,
+        description: true,
+        journalEntry: { select: { id: true, date: true, entryNumber: true, description: true, sourceType: true } },
+      },
+      orderBy: [{ journalEntry: { date: 'desc' } }, { journalEntryId: 'desc' }],
+      take: Math.min(Number(limit) || 50, 200),
+    });
+    return rows.map((row) => ({
+      entry_date: row.journalEntry.date,
+      reference_no: row.journalEntry.entryNumber,
+      narration: row.journalEntry.description,
+      source_type: row.journalEntry.sourceType,
+      account_code: row.accountCode,
+      account_name: row.accountName,
+      dr_amount: row.debit,
+      cr_amount: row.credit,
+      description: row.description,
+      journal_entry_id: row.journalEntry.id,
+    }));
   }
 }
 

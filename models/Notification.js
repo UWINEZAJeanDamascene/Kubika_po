@@ -23,6 +23,7 @@ const Notification = buildTenantModel({
   toApi: notificationToApi,
   translateCreate: notificationTranslateCreate,
   translateUpdate: notificationTranslateUpdate,
+  mutable: true,
 });
 
 /**

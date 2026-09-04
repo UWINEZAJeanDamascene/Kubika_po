@@ -27,12 +27,16 @@ const requestStats = {
 const MAX_SAMPLES = 200;
 
 /** Apdex satisfaction threshold in ms. Satisfied <= T, tolerating <= 4T. */
-const APDEX_T_MS = Number(process.env.APDEX_T_MS) || 1000;
+const { getSentryPerformanceConfig } = require('../config/sentryPerformance');
+const APDEX_T_MS = getSentryPerformanceConfig().satisfaction_threshold_ms;
 
 /** Per-route rolling stats. Bounded so a surprise route explosion cannot leak. */
 const routeStats = new Map();
 const MAX_ROUTES = Number(process.env.METRICS_MAX_ROUTES) || 200;
 const MAX_ROUTE_SAMPLES = 100;
+const MAX_CLIENT_METRICS = Math.max(5, Number(process.env.PERFORMANCE_CLIENT_METRICS_MAX || 20));
+const MAX_CLIENT_SAMPLES = Math.max(20, Number(process.env.PERFORMANCE_CLIENT_METRICS_SAMPLES || 100));
+const clientStats = new Map();
 
 function percentile(sortedAsc, p) {
   if (!sortedAsc.length) return 0;
@@ -221,6 +225,67 @@ async function getAggregatedEventLoopMetrics() {
   return metrics || getEventLoopMetrics();
 }
 
+// ── Browser Performance Metrics ──────────────────────────────────────────
+function normalizeClientMetricName(name) {
+  return String(name || '').trim().toLowerCase().replace(/[^a-z0-9_.-]/g, '_');
+}
+
+function recordClientMetric(name, value, context = {}) {
+  const metric = normalizeClientMetricName(name);
+  const numericValue = Number(value);
+  if (!metric || !Number.isFinite(numericValue) || numericValue < 0) return false;
+
+  let entry = clientStats.get(metric);
+  if (!entry) {
+    if (clientStats.size >= MAX_CLIENT_METRICS) return false;
+    entry = {
+      name: metric,
+      unit: context.unit === 'score' ? 'score' : 'ms',
+      count: 0,
+      total: 0,
+      samples: [],
+    };
+    clientStats.set(metric, entry);
+  }
+  entry.count += 1;
+  entry.total += numericValue;
+  if (entry.samples.length < MAX_CLIENT_SAMPLES) {
+    entry.samples.push(Math.round(numericValue * 100) / 100);
+  }
+
+  persistentMetrics.recordClientMetric(metric, numericValue, context);
+  return true;
+}
+
+function getClientMetrics() {
+  const metrics = [...clientStats.values()].map((entry) => {
+    const summary = summarize(entry.samples);
+    return {
+      name: entry.name,
+      unit: entry.unit,
+      count: entry.count,
+      avg: entry.count ? Math.round((entry.total / entry.count) * 100) / 100 : 0,
+      p50: summary.p50_ms,
+      p95: summary.p95_ms,
+      p99: summary.p99_ms,
+      max: summary.max_ms,
+      sample_window: summary.count,
+    };
+  });
+  metrics.sort((a, b) => b.p95 - a.p95);
+  return {
+    metrics,
+    tracked_metrics: clientStats.size,
+    truncated: clientStats.size >= MAX_CLIENT_METRICS,
+    scope: 'process-memory',
+  };
+}
+
+async function getAggregatedClientMetrics() {
+  const metrics = await persistentMetrics.getClientMetrics();
+  return metrics || getClientMetrics();
+}
+
 // ── Database Stats ──────────────────────────────────────────────────────
 async function getDatabaseStats() {
   try {
@@ -235,8 +300,14 @@ async function getDatabaseStats() {
       SELECT
         relname AS table_name,
         COALESCE(n_live_tup, 0)::bigint AS documents,
-        pg_total_relation_size(relid)::bigint AS size_bytes
-      FROM pg_catalog.pg_stat_user_tables
+        pg_total_relation_size(relid)::bigint AS size_bytes,
+        COALESCE((
+          SELECT COUNT(*)
+          FROM pg_catalog.pg_indexes AS indexes
+          WHERE indexes.schemaname = stats.schemaname
+            AND indexes.tablename = stats.relname
+        ), 0)::int AS indexes
+      FROM pg_catalog.pg_stat_user_tables AS stats
       ORDER BY n_live_tup DESC
       LIMIT 30
     `;
@@ -245,6 +316,10 @@ async function getDatabaseStats() {
       name: table.table_name,
       documents: Number(table.documents || 0),
       size_mb: Math.round((Number(table.size_bytes || 0) / 1024 / 1024) * 100) / 100,
+      avg_obj_size: Number(table.documents || 0) > 0
+        ? Math.round(Number(table.size_bytes || 0) / Number(table.documents || 1))
+        : 0,
+      indexes: Number(table.indexes || 0),
     }));
     return {
       engine: 'postgresql',
@@ -453,11 +528,12 @@ async function buildAdvancedMetrics(memorySnapshot) {
     cache = { error: e.message };
   }
 
-  const [requests, routes, eventLoop, pool] = await Promise.all([
+  const [requests, routes, eventLoop, pool, client] = await Promise.all([
     getAggregatedRequestMetrics(),
     getAggregatedRouteMetrics(),
     getAggregatedEventLoopMetrics(),
     getPostgresPoolMetrics(),
+    getAggregatedClientMetrics(),
   ]);
   const capacity = getCapacityEstimate(memorySnapshot, dbStats, companyStats, {
     requests_per_min: requests.requests_per_min,
@@ -473,6 +549,7 @@ async function buildAdvancedMetrics(memorySnapshot) {
     database_pool: pool,
     capacity,
     system,
+    client,
     event_loop_lag_ms: Math.round(eventLoop.current_ms * 100) / 100,
     // A single instantaneous sample can miss a spike entirely; the window shows
     // whether the loop is intermittently blocked, which is what actually
@@ -492,6 +569,9 @@ module.exports = {
   getAggregatedRouteMetrics,
   getEventLoopMetrics,
   getAggregatedEventLoopMetrics,
+  recordClientMetric,
+  getClientMetrics,
+  getAggregatedClientMetrics,
   getDatabaseStats,
   getCompanyDatasetStats,
   getPostgresPoolMetrics,

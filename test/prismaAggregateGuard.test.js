@@ -52,4 +52,34 @@ describe('Prisma compatibility aggregation guard', () => {
     expect(result).toEqual([{ _id: null, total: 3 }]);
     expect(delegate.findMany).toHaveBeenCalledWith(expect.objectContaining({ take: 4 }));
   });
+
+  test('aggregate safety probes are marked internal instead of treated as oversized HTTP takes', async () => {
+    process.env.AGG_MAX_ROWS = '3';
+    jest.resetModules();
+    const { runReadContext } = require('../lib/readContext');
+    const { createAggregateMethod } = require('../utils/prismaAggregate');
+    const contexts = [];
+    const delegate = {
+      findMany: jest.fn(async () => {
+        contexts.push(require('../lib/readContext').getReadContext());
+        return [{ companyId: 'c1', quantity: 1 }];
+      }),
+    };
+    const aggregate = createAggregateMethod({
+      modelName: 'stockMovement',
+      delegate: () => delegate,
+      fieldMap: { company: { target: 'companyId', isId: true } },
+      toApi: (row) => row,
+    });
+
+    await runReadContext({ kind: 'http', maxRows: 500 }, () => aggregate([
+      { $match: { company: 'c1' } },
+      { $group: { _id: null, total: { $sum: '$quantity' } } },
+    ]));
+
+    expect(contexts).toHaveLength(1);
+    expect(contexts[0].kind).toBe('http');
+    expect(contexts[0].internalProbe).toBe(true);
+    expect(delegate.findMany).toHaveBeenCalledWith(expect.objectContaining({ take: 4 }));
+  });
 });

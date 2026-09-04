@@ -229,6 +229,7 @@ class UserService {
       access_token: accessToken,
       refresh_token: refreshToken,
       userId: user.id,
+      user: loginUser,
       memberships: [{
         companyId: companyIdStr || undefined,
         role: user.role,

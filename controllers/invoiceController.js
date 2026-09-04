@@ -1,4 +1,3 @@
-const mongoose = require("mongoose");
 const Invoice = require("../models/Invoice");
 const Product = require("../models/Product");
 const Client = require("../models/Client");
@@ -19,6 +18,7 @@ const { runInTransaction } = require("../services/transactionService");
 const { DEFAULT_ACCOUNTS } = require("../constants/chartOfAccounts");
 const EBMProductService = require("../services/ebmProductService");
 const EBMSalesService = require("../services/ebmSalesService");
+const { parseBoundedPage } = require("../utils/querySafety");
 const {
   drawEbmCertificationBlock,
   drawTaxBreakdown,
@@ -35,15 +35,72 @@ const {
   notifyInvoiceSent,
 } = require("../services/notificationHelper");
 
+const normalizeId = (value) => {
+  if (!value) return null;
+  if (typeof value === 'string' || typeof value === 'number') return String(value);
+  return String(value._id || value.id || value);
+};
+
+async function hydrateInvoiceRelations(docOrDocs, companyId) {
+  const docs = Array.isArray(docOrDocs) ? docOrDocs : [docOrDocs];
+  const valid = docs.filter(Boolean);
+  if (!valid.length) return docOrDocs;
+
+  const clientIds = [...new Set(valid.map((doc) => normalizeId(doc.client)).filter(Boolean))];
+  const userIds = [...new Set(valid.flatMap((doc) => [doc.createdBy, doc.confirmedBy, doc.cancelledBy, doc.updatedBy].map(normalizeId)).filter(Boolean))];
+  const productIds = [...new Set(valid.flatMap((doc) => (doc.lines || []).map((line) => normalizeId(line.product)).filter(Boolean)))];
+  const quotationIds = [...new Set(valid.map((doc) => normalizeId(doc.quotation)).filter(Boolean))];
+  const warehouseIds = [...new Set(valid.flatMap((doc) => (doc.lines || []).map((line) => normalizeId(line.warehouse)).filter(Boolean)))];
+
+  const tenantFilter = companyId ? { company: companyId } : {};
+  const [clients, users, products, quotations, warehouses] = await Promise.all([
+    clientIds.length ? Client.find({ ...tenantFilter, _id: { $in: clientIds } }, 'name code contact type taxId').limit(clientIds.length).lean() : [],
+    userIds.length ? require('../models/User').find({ _id: { $in: userIds } }, 'name email').limit(userIds.length).lean() : [],
+    productIds.length ? Product.find({ ...tenantFilter, _id: { $in: productIds } }, 'name sku unit').limit(productIds.length).lean() : [],
+    quotationIds.length ? require('../models/Quotation').find({ ...tenantFilter, _id: { $in: quotationIds } }, 'referenceNo').limit(quotationIds.length).lean() : [],
+    warehouseIds.length ? require('../models/Warehouse').find({ ...tenantFilter, _id: { $in: warehouseIds } }, 'name code').limit(warehouseIds.length).lean() : [],
+  ]);
+
+  const clientMap = new Map(clients.map((client) => [normalizeId(client._id), client]));
+  const userMap = new Map(users.map((user) => [normalizeId(user._id), user]));
+  const productMap = new Map(products.map((product) => [normalizeId(product._id), product]));
+  const quotationMap = new Map(quotations.map((quotation) => [normalizeId(quotation._id), quotation]));
+  const warehouseMap = new Map(warehouses.map((warehouse) => [normalizeId(warehouse._id), warehouse]));
+
+  for (const doc of valid) {
+    const clientId = normalizeId(doc.client);
+    if (clientId && clientMap.has(clientId)) doc.client = clientMap.get(clientId);
+    const createdById = normalizeId(doc.createdBy);
+    if (createdById && userMap.has(createdById)) doc.createdBy = userMap.get(createdById);
+    const quotationId = normalizeId(doc.quotation);
+    if (quotationId && quotationMap.has(quotationId)) doc.quotation = quotationMap.get(quotationId);
+    for (const line of doc.lines || []) {
+      const pid = normalizeId(line.product);
+      if (pid && productMap.has(pid)) line.product = productMap.get(pid);
+      if (line.warehouse) {
+        const wid = normalizeId(line.warehouse);
+        if (wid && warehouseMap.has(wid)) line.warehouse = warehouseMap.get(wid);
+      }
+    }
+    if (doc.payments) {
+      for (const payment of doc.payments) {
+        const recordedById = normalizeId(payment.recordedBy);
+        if (recordedById && userMap.has(recordedById)) payment.recordedBy = userMap.get(recordedById);
+      }
+    }
+  }
+
+  return Array.isArray(docOrDocs) ? valid : valid[0];
+}
+
 // @desc    Get all invoices
 // @route   GET /api/invoices
 // @access  Private
 exports.getInvoices = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
+    const { page, limit, skip } = parseBoundedPage(req.query, { defaultLimit: 20, maxLimit: 100 });
     const {
-      page = 1,
-      limit = 20,
       status,
       clientId,
       startDate,
@@ -107,23 +164,22 @@ exports.getInvoices = async (req, res, next) => {
 
     const total = await Invoice.countDocuments(query);
     const invoices = await Invoice.find(query)
-      .populate("client", "name code contact")
-      .populate("lines.product", "name sku unit")
-      .populate("createdBy", "name email")
-      .populate("quotation", "referenceNo")
-      .populate("revenueJournalEntry")
-      .populate("cogsJournalEntry")
-      .sort({ createdAt: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit);
+      .select({ client: 1, createdBy: 1, quotation: 1, referenceNo: 1, status: 1, invoiceDate: 1, dueDate: 1, totalAmount: 1, amountPaid: 1, amountOutstanding: 1, company: 1, createdAt: 1 })
+      .populate('-lines')
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(limit)
+      .skip(skip)
+      .lean();
+
+    const hydratedInvoices = await hydrateInvoiceRelations(invoices, companyId);
 
     res.json({
       success: true,
-      count: invoices.length,
+      count: hydratedInvoices.length,
       total,
       pages: Math.ceil(total / limit),
       currentPage: page,
-      data: invoices,
+      data: hydratedInvoices,
     });
   } catch (error) {
     next(error);
@@ -139,17 +195,11 @@ exports.getInvoice = async (req, res, next) => {
     const invoice = await Invoice.findOne({
       _id: req.params.id,
       company: companyId,
-    })
-      .populate("client", "name code contact type taxId")
-      .populate("lines.product", "name sku unit")
-      .populate("createdBy", "name email")
-      .populate("quotation", "referenceNo")
-      .populate("payments.recordedBy", "name email")
-      .populate("revenueJournalEntry")
-      .populate("cogsJournalEntry")
-      .populate("lines.warehouse");
+    }).select({ client: 1, lines: 1, createdBy: 1, quotation: 1, payments: 1, revenueJournalEntry: 1, cogsJournalEntry: 1, referenceNo: 1, status: 1, totalAmount: 1, company: 1 }).lean();
 
-    if (!invoice) {
+    const hydratedInvoice = await hydrateInvoiceRelations(invoice, companyId);
+
+    if (!hydratedInvoice) {
       return res.status(404).json({
         success: false,
         message: "Invoice not found",
@@ -165,7 +215,7 @@ exports.getInvoice = async (req, res, next) => {
     res.json({
       success: true,
       data: {
-        ...invoice.toObject(),
+        ...hydratedInvoice,
         receiptMetadata,
       },
     });
@@ -314,7 +364,7 @@ exports.createInvoice = async (req, res, next) => {
       createdBy: req.user.id,
     });
 
-    await invoice.populate("client lines.product createdBy");
+    const hydratedInvoice = await hydrateInvoiceRelations(invoice);
 
     // Atomically consume inventory layers, create stock movements, update product stock,
     // and post COGS + Sales journal entries using the central transaction helper.
@@ -787,10 +837,15 @@ exports.createInvoice = async (req, res, next) => {
         });
       } catch (ebmError) {
         console.error("EBM sales submission failed after auto-confirm:", ebmError.message);
-        responseInvoice = ebmError.invoice || await Invoice.findOne({
-          _id: invoice._id,
-          company: companyId,
-        }).populate("client lines.product createdBy");
+        if (ebmError.invoice) {
+          responseInvoice = ebmError.invoice;
+        } else {
+          responseInvoice = await Invoice.findOne({
+            _id: invoice._id,
+            company: companyId,
+          }).select({ client: 1, lines: 1, createdBy: 1, referenceNo: 1, status: 1, totalAmount: 1, company: 1 }).lean();
+          responseInvoice = await hydrateInvoiceRelations(responseInvoice);
+        }
       }
     }
 
@@ -929,7 +984,8 @@ exports.updateInvoice = async (req, res, next) => {
       { _id: req.params.id, company: companyId },
       req.body,
       { new: true, runValidators: true },
-    ).populate("client lines.product createdBy");
+    );
+    invoice = await hydrateInvoiceRelations(invoice);
 
     res.json({
       success: true,
@@ -986,7 +1042,30 @@ exports.confirmInvoice = async (req, res, next) => {
     const invoice = await Invoice.findOne({
       _id: req.params.id,
       company: companyId,
-    }).populate("lines.product");
+    }).select({
+      lines: 1,
+      client: 1,
+      status: 1,
+      company: 1,
+      referenceNo: 1,
+      invoiceNumber: 1,
+      totalAmount: 1,
+      roundedAmount: 1,
+      amountPaid: 1,
+      grandTotal: 1,
+      taxAmount: 1,
+      subtotal: 1,
+    }).lean();
+
+    if (Array.isArray(invoice?.lines)) {
+      const productIds = [...new Set(invoice.lines.map((line) => normalizeId(line.product)).filter(Boolean))];
+      const productRows = productIds.length ? await Product.find({ _id: { $in: productIds } }, 'name sku unit taxRate taxCode isStockable').lean() : [];
+      const productMap = new Map(productRows.map((product) => [normalizeId(product._id), product]));
+      invoice.lines = invoice.lines.map((line) => ({
+        ...line,
+        product: productMap.get(normalizeId(line.product)) || line.product,
+      }));
+    }
 
     if (!invoice) {
       return res.status(404).json({
@@ -1349,7 +1428,8 @@ exports.confirmInvoice = async (req, res, next) => {
     const responseInvoice = await Invoice.findOne({
       _id: invoice._id,
       company: companyId,
-    }).populate("client lines.product createdBy");
+    }).select({ client: 1, lines: 1, createdBy: 1, referenceNo: 1, status: 1, totalAmount: 1, company: 1 }).lean();
+    await hydrateInvoiceRelations(responseInvoice);
 
     EBMSalesService.submitInvoiceAsync(invoice._id, { companyId });
 
@@ -1424,7 +1504,33 @@ exports.recordPayment = async (req, res, next) => {
     const invoice = await Invoice.findOne({
       _id: req.params.id,
       company: companyId,
-    }).populate("lines.product");
+    }).select({
+      lines: 1,
+      client: 1,
+      status: 1,
+      company: 1,
+      referenceNo: 1,
+      invoiceNumber: 1,
+      totalAmount: 1,
+      roundedAmount: 1,
+      amountPaid: 1,
+      grandTotal: 1,
+      taxAmount: 1,
+      subtotal: 1,
+      amountOutstanding: 1,
+      balance: 1,
+      payments: 1,
+    }).lean();
+
+    if (Array.isArray(invoice?.lines)) {
+      const productIds = [...new Set(invoice.lines.map((line) => normalizeId(line.product)).filter(Boolean))];
+      const productRows = productIds.length ? await Product.find({ _id: { $in: productIds } }, 'name sku unit taxRate taxCode isStockable').lean() : [];
+      const productMap = new Map(productRows.map((product) => [normalizeId(product._id), product]));
+      invoice.lines = invoice.lines.map((line) => ({
+        ...line,
+        product: productMap.get(normalizeId(line.product)) || line.product,
+      }));
+    }
 
     if (!invoice) {
       return res.status(404).json({
@@ -1702,7 +1808,8 @@ exports.recordPayment = async (req, res, next) => {
     const fresh = await Invoice.findOne({
       _id: invoice._id,
       company: companyId,
-    }).populate("client lines.product createdBy");
+    }).select({ client: 1, lines: 1, createdBy: 1, referenceNo: 1, status: 1, totalAmount: 1, company: 1, payments: 1 }).lean();
+    await hydrateInvoiceRelations(fresh);
 
     res.json({
       success: true,
@@ -1726,7 +1833,35 @@ exports.cancelInvoice = async (req, res, next) => {
     const invoice = await Invoice.findOne({
       _id: req.params.id,
       company: companyId,
-    }).populate("lines.product");
+    }).select({
+      lines: 1,
+      client: 1,
+      status: 1,
+      company: 1,
+      referenceNo: 1,
+      invoiceNumber: 1,
+      totalAmount: 1,
+      roundedAmount: 1,
+      amountPaid: 1,
+      grandTotal: 1,
+      taxAmount: 1,
+      subtotal: 1,
+      amountOutstanding: 1,
+      balance: 1,
+      payments: 1,
+      stockReserved: 1,
+      stockDeducted: 1,
+    }).lean();
+
+    if (Array.isArray(invoice?.lines)) {
+      const productIds = [...new Set(invoice.lines.map((line) => normalizeId(line.product)).filter(Boolean))];
+      const productRows = productIds.length ? await Product.find({ _id: { $in: productIds } }, 'name sku unit taxRate taxCode isStockable').lean() : [];
+      const productMap = new Map(productRows.map((product) => [normalizeId(product._id), product]));
+      invoice.lines = invoice.lines.map((line) => ({
+        ...line,
+        product: productMap.get(normalizeId(line.product)) || line.product,
+      }));
+    }
 
     if (!invoice) {
       return res.status(404).json({
@@ -1937,9 +2072,10 @@ exports.getClientInvoices = async (req, res, next) => {
       client: req.params.clientId,
       company: companyId,
     })
-      .populate("lines.product", "name sku")
-      .populate("createdBy", "name email")
-      .sort({ invoiceDate: -1 });
+      .select({ client: 1, lines: 1, createdBy: 1, referenceNo: 1, status: 1, invoiceDate: 1, totalAmount: 1, amountPaid: 1, amountOutstanding: 1 })
+      .sort({ invoiceDate: -1 })
+      .lean();
+    await hydrateInvoiceRelations(invoices);
 
     res.json({
       success: true,
@@ -1961,9 +2097,10 @@ exports.getProductInvoices = async (req, res, next) => {
       "lines.product": req.params.productId,
       company: companyId,
     })
-      .populate("client", "name code")
-      .populate("createdBy", "name email")
-      .sort({ invoiceDate: -1 });
+      .select({ client: 1, lines: 1, createdBy: 1, referenceNo: 1, status: 1, invoiceDate: 1, totalAmount: 1, amountPaid: 1, amountOutstanding: 1 })
+      .sort({ invoiceDate: -1 })
+      .lean();
+    await hydrateInvoiceRelations(invoices);
 
     res.json({
       success: true,
@@ -1984,10 +2121,8 @@ exports.generateInvoicePDF = async (req, res, next) => {
     const invoice = await Invoice.findOne({
       _id: req.params.id,
       company: companyId,
-    })
-      .populate("client")
-      .populate("lines.product")
-      .populate("createdBy");
+    }).select({ client: 1, lines: 1, createdBy: 1, referenceNo: 1, invoiceNumber: 1, status: 1, invoiceDate: 1, dueDate: 1, items: 1, payments: 1, ebm: 1, terms: 1, notes: 1 }).lean();
+    await hydrateInvoiceRelations(invoice);
 
     if (!invoice) {
       return res.status(404).json({
@@ -2389,7 +2524,8 @@ exports.sendInvoiceEmail = async (req, res, next) => {
     const invoice = await Invoice.findOne({
       _id: req.params.id,
       company: companyId,
-    }).populate("client");
+    }).select({ client: 1, customerEmail: 1, referenceNo: 1, invoiceNumber: 1, status: 1, totalAmount: 1, lines: 1 }).lean();
+    await hydrateInvoiceRelations(invoice);
 
     if (!invoice) {
       return res.status(404).json({

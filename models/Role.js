@@ -5,21 +5,12 @@
  * keep calling `Role.findOne(...)`, `Role.findById(...)`, etc. Returned
  * documents use the legacy field names (company_id, is_system_role).
  *
- * A minimal Mongoose schema is still registered under the name 'Role' so
- * legacy `ref: 'Role'` populate() calls in unmigrated Mongo models do not
- * crash (they resolve against the historical Mongo collection).
  */
 
-const mongoose = require('mongoose');
 const { prisma } = require('../lib/prisma');
 const { makeCompatModel } = require('../utils/prismaCompat');
 const { generateObjectId, toIdString } = require('../utils/objectId');
 const { roleToApi } = require('../utils/authMappers');
-
-// Register a bare schema for legacy populate() compatibility only.
-if (!mongoose.models.Role) {
-  mongoose.model('Role', new mongoose.Schema({}, { strict: false, collection: 'roles' }));
-}
 
 const FIELD_MAP = {
   _id: { target: 'id', isId: true },

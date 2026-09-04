@@ -1,53 +1,75 @@
-const JournalEntry = require('../models/JournalEntry');
-const InventoryBatch = require('../models/InventoryBatch');
 const Product = require('../models/Product');
-const { aggregateWithTimeout } = require('../utils/mongoAggregation');
+const { dbClient } = require('../lib/prisma');
+
+async function journalLineTotals(companyId, accountCodes) {
+  return dbClient().journalEntryLine.aggregate({
+    where: {
+      companyId: String(companyId),
+      accountCode: { in: accountCodes },
+      journalEntry: { status: 'posted', reversed: false },
+    },
+    _sum: { debit: true, credit: true },
+  });
+}
 
 async function getJournalTotals(companyId) {
-  const jeAgg = await aggregateWithTimeout(JournalEntry, [
-    { $match: { company: companyId, status: 'posted' } },
-    { $group: { _id: null, totalDebit: { $sum: '$totalDebit' }, totalCredit: { $sum: '$totalCredit' }, count: { $sum: 1 } } }
-  ]);
-  const jeTotals = jeAgg && jeAgg.length ? jeAgg[0] : { totalDebit: 0, totalCredit: 0, count: 0 };
-  const diff = (jeTotals.totalDebit || 0) - (jeTotals.totalCredit || 0);
-  return { totals: jeTotals, difference: diff, healthy: Math.abs(diff) < 0.01 };
+  const jeTotals = await dbClient().journalEntry.aggregate({
+    where: { companyId: String(companyId), status: 'posted' },
+    _sum: { totalDebit: true, totalCredit: true },
+    _count: { _all: true },
+  });
+  const totals = {
+    totalDebit: Number(jeTotals._sum.totalDebit || 0),
+    totalCredit: Number(jeTotals._sum.totalCredit || 0),
+    count: jeTotals._count._all,
+  };
+  const diff = totals.totalDebit - totals.totalCredit;
+  return { totals, difference: diff, healthy: Math.abs(diff) < 0.01 };
 }
 
 async function getStockDiscrepancies(companyId) {
-  const batchAgg = await aggregateWithTimeout(InventoryBatch, [
-    { $match: { company: companyId } },
-    { $group: { _id: '$product', totalAvailable: { $sum: '$availableQuantity' }, batches: { $sum: 1 } } },
-    { $lookup: { from: 'products', localField: '_id', foreignField: '_id', as: 'product' } },
-    { $unwind: { path: '$product', preserveNullAndEmptyArrays: true } },
-    { $project: { productId: '$_id', totalAvailable: 1, batches: 1, currentStock: '$product.currentStock', name: '$product.name' } }
-  ]);
+  const batchAgg = await dbClient().inventoryBatch.groupBy({
+    by: ['productId'],
+    where: { companyId: String(companyId) },
+    _sum: { availableQuantity: true },
+    _count: { _all: true },
+  });
+  const productIds = batchAgg.map((row) => row.productId);
+  const products = await Product.find({
+    company: companyId,
+    $or: [
+      ...(productIds.length ? [{ _id: { $in: productIds } }] : []),
+      { currentStock: { $ne: null, $ne: 0 } },
+    ],
+  }, 'name currentStock').lean();
+  const productMap = new Map(products.map((product) => [String(product._id), product]));
 
-  const productsWithStock = await Product.find({ company: companyId, currentStock: { $ne: null, $ne: 0 } }).select('_id currentStock name').lean();
   const batchMap = new Map();
-  batchAgg.forEach(b => batchMap.set(String(b.productId), b));
+  batchAgg.forEach((row) => batchMap.set(String(row.productId), row));
 
   const discrepancies = [];
   batchAgg.forEach(entry => {
     const pid = entry.productId ? String(entry.productId) : null;
-    const currentStock = (entry.currentStock || 0);
-    const totalAvailable = (entry.totalAvailable || 0);
+    const product = productMap.get(pid);
+    const currentStock = Number(product?.currentStock || 0);
+    const totalAvailable = Number(entry._sum.availableQuantity || 0);
     const diff = Number(currentStock) - Number(totalAvailable);
     if (Math.abs(diff) > 0.0001) {
-      discrepancies.push({ productId: pid, name: entry.name || null, currentStock: Number(currentStock), totalAvailable: Number(totalAvailable), difference: Number(diff) });
+      discrepancies.push({ productId: pid, name: product?.name || null, currentStock, totalAvailable, difference: Number(diff) });
     }
   });
 
-  productsWithStock.forEach(p => {
+  products.forEach(p => {
     const pid = String(p._id);
     if (!batchMap.has(pid)) {
-      const currentStock = (p.currentStock || 0);
+      const currentStock = Number(p.currentStock || 0);
       if (Math.abs(Number(currentStock)) > 0.0001) {
         discrepancies.push({ productId: pid, name: p.name || null, currentStock: Number(currentStock), totalAvailable: 0, difference: Number(currentStock) });
       }
     }
   });
 
-  return { discrepancies, discrepanciesCount: discrepancies.length, healthy: discrepancies.length === 0, checked: batchAgg.length + productsWithStock.length };
+  return { discrepancies, discrepanciesCount: discrepancies.length, healthy: discrepancies.length === 0, checked: batchAgg.length + products.length };
 }
 
 // ── TAX RECONCILIATION CHECKS ────────────────────────────────────────
@@ -62,31 +84,17 @@ async function getVatReconciliation(companyId) {
   const vatInputCodes = ['2210'];
 
   // VAT Output balance (credits - debits)
-  const outputAgg = await aggregateWithTimeout(JournalEntry, [
-    { $match: { company: companyId, status: 'posted', reversed: { $ne: true } } },
-    { $unwind: '$lines' },
-    { $match: { 'lines.accountCode': { $in: vatOutputCodes } } },
-    { $group: {
-      _id: null,
-      totalCredit: { $sum: '$lines.credit' },
-      totalDebit: { $sum: '$lines.debit' }
-    }}
-  ]);
+  const outputAgg = await journalLineTotals(companyId, vatOutputCodes);
 
   // VAT Input balance (debits - credits)
-  const inputAgg = await aggregateWithTimeout(JournalEntry, [
-    { $match: { company: companyId, status: 'posted', reversed: { $ne: true } } },
-    { $unwind: '$lines' },
-    { $match: { 'lines.accountCode': { $in: vatInputCodes } } },
-    { $group: {
-      _id: null,
-      totalCredit: { $sum: '$lines.credit' },
-      totalDebit: { $sum: '$lines.debit' }
-    }}
-  ]);
+  const inputAgg = await journalLineTotals(companyId, vatInputCodes);
 
-  const outputBalance = (outputAgg[0]?.totalCredit || 0) - (outputAgg[0]?.totalDebit || 0);
-  const inputBalance = (inputAgg[0]?.totalDebit || 0) - (inputAgg[0]?.totalCredit || 0);
+  const outputCredit = Number(outputAgg._sum.credit || 0);
+  const outputDebit = Number(outputAgg._sum.debit || 0);
+  const inputCredit = Number(inputAgg._sum.credit || 0);
+  const inputDebit = Number(inputAgg._sum.debit || 0);
+  const outputBalance = outputCredit - outputDebit;
+  const inputBalance = inputDebit - inputCredit;
   const netVat = outputBalance - inputBalance;
 
   return {
@@ -105,19 +113,10 @@ async function getVatReconciliation(companyId) {
 async function getPayeReconciliation(companyId) {
   const payeCodes = ['2230'];
 
-  const payeAgg = await aggregateWithTimeout(JournalEntry, [
-    { $match: { company: companyId, status: 'posted', reversed: { $ne: true } } },
-    { $unwind: '$lines' },
-    { $match: { 'lines.accountCode': { $in: payeCodes } } },
-    { $group: {
-      _id: null,
-      totalCredit: { $sum: '$lines.credit' },
-      totalDebit: { $sum: '$lines.debit' }
-    }}
-  ]);
+  const payeAgg = await journalLineTotals(companyId, payeCodes);
 
-  const payeWithheld = payeAgg[0]?.totalCredit || 0;
-  const payeRemitted = payeAgg[0]?.totalDebit || 0;
+  const payeWithheld = Number(payeAgg._sum.credit || 0);
+  const payeRemitted = Number(payeAgg._sum.debit || 0);
   const payeBalance = payeWithheld - payeRemitted;
 
   return {
@@ -136,19 +135,10 @@ async function getPayeReconciliation(companyId) {
 async function getRssbReconciliation(companyId) {
   const rssbCodes = ['2240'];
 
-  const rssbAgg = await aggregateWithTimeout(JournalEntry, [
-    { $match: { company: companyId, status: 'posted', reversed: { $ne: true } } },
-    { $unwind: '$lines' },
-    { $match: { 'lines.accountCode': { $in: rssbCodes } } },
-    { $group: {
-      _id: null,
-      totalCredit: { $sum: '$lines.credit' },
-      totalDebit: { $sum: '$lines.debit' }
-    }}
-  ]);
+  const rssbAgg = await journalLineTotals(companyId, rssbCodes);
 
-  const rssbContributed = rssbAgg[0]?.totalCredit || 0;
-  const rssbRemitted = rssbAgg[0]?.totalDebit || 0;
+  const rssbContributed = Number(rssbAgg._sum.credit || 0);
+  const rssbRemitted = Number(rssbAgg._sum.debit || 0);
   const rssbBalance = rssbContributed - rssbRemitted;
 
   return {

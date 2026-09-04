@@ -1,9 +1,4 @@
-const mongoose = require('mongoose');
-const {
-  incrementSequence,
-  bumpSequence,
-} = require('./postgresSequenceStore');
-const { isMongoEnabled } = require('./transactionService');
+const { incrementSequence } = require('./postgresSequenceStore');
 
 function padSeq(n, digits = 5) {
   return String(n).padStart(digits, '0');
@@ -24,42 +19,6 @@ async function nextGlobalSequence(companyId, name, digits = 7, options = {}) {
 async function nextSequence(companyId, name, options = {}) {
   const year = options.year ?? new Date().getFullYear();
   let value = await incrementSequence(companyId, name, year, options.tx || null);
-
-  // When Mongo is still available, reconcile fixed_asset against existing docs
-  // to avoid duplicate reference numbers left by prior test runs.
-  if (name === 'fixed_asset' && isMongoEnabled()) {
-    try {
-      const coll = mongoose.connection.collection('fixedassets');
-      const regex = `^AST-${year}-\\d{5}$`;
-
-      let companyObjId;
-      if (mongoose.Types.ObjectId.isValid(companyId)) {
-        companyObjId = new mongoose.Types.ObjectId(companyId);
-      } else {
-        return padSeq(value);
-      }
-
-      const docs = await coll
-        .find({ company: companyObjId, referenceNo: { $regex: regex } })
-        .sort({ referenceNo: -1 })
-        .limit(1)
-        .toArray();
-
-      const doc = docs?.[0];
-      if (doc?.referenceNo) {
-        const parts = doc.referenceNo.split('-');
-        const maxNum = parseInt(parts[2], 10);
-        if (!Number.isNaN(maxNum) && maxNum >= value) {
-          value = await bumpSequence(companyId, name, year, maxNum - value + 1, options.tx || null);
-        }
-      }
-    } catch (e) {
-      console.warn(
-        'sequenceService: fixed_asset seeding check failed',
-        e && e.message ? e.message : e,
-      );
-    }
-  }
 
   return padSeq(value);
 }

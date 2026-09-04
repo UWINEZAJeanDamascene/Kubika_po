@@ -1,149 +1,53 @@
-const mongoose = require("mongoose");
+'use strict';
 
-const interestAccrualSchema = new mongoose.Schema(
-  {
-    company: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Company",
-      required: true,
-      index: true,
-    },
-    bankAccount: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "BankAccount",
-      default: null,
-    },
-    fixedDeposit: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "FixedDeposit",
-      default: null,
-    },
-    period: {
-      month: { type: Number, required: true, min: 1, max: 12 },
-      year: { type: Number, required: true },
-    },
-    principal: {
-      type: mongoose.Schema.Types.Decimal128,
-      required: true,
-      get: function (value) {
-        return value ? parseFloat(value.toString()) : 0;
-      },
-    },
-    rate: {
-      type: Number,
-      required: true,
-    },
-    daysInPeriod: {
-      type: Number,
-      default: 0,
-    },
-    calculatedInterest: {
-      type: mongoose.Schema.Types.Decimal128,
-      required: true,
-      get: function (value) {
-        return value ? parseFloat(value.toString()) : 0;
-      },
-    },
-    method: {
-      type: String,
-      enum: ["simple", "compound_monthly", "compound_quarterly", "daily_average"],
-      required: true,
-    },
-    status: {
-      type: String,
-      enum: ["pending", "posted", "confirmed", "reversed"],
-      default: "pending",
-    },
-    // Two-step posting
-    accrualJournalEntryId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "JournalEntry",
-      default: null,
-    },
-    receiptJournalEntryId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "JournalEntry",
-      default: null,
-    },
-    // For single-step posting
-    journalEntryId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "JournalEntry",
-      default: null,
-    },
-    source: {
-      type: String,
-      enum: ["auto", "manual"],
-      default: "auto",
-    },
-    sourceTag: {
-      type: String,
-      default: "interest_income_auto",
-    },
-    confirmedAt: {
-      type: Date,
-      default: null,
-    },
-    confirmedBy: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "User",
-      default: null,
-    },
-    notes: {
-      type: String,
-      trim: true,
-      default: null,
-    },
-    withholdingTax: {
-      type: mongoose.Schema.Types.Decimal128,
-      default: 0,
-      get: function (value) {
-        return value ? parseFloat(value.toString()) : 0;
-      },
-    },
-    grossInterest: {
-      type: mongoose.Schema.Types.Decimal128,
-      default: 0,
-      get: function (value) {
-        return value ? parseFloat(value.toString()) : 0;
-      },
-    },
-    createdBy: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "User",
-    },
-  },
-  {
-    timestamps: true,
+const { buildTenantModel } = require('../utils/masterDataCommon');
+const { generateObjectId, toIdString } = require('../utils/objectId');
+const { decimalToNumber } = require('../utils/decimalHelpers');
+
+const map = { company: 'companyId', bankAccount: 'bankAccountId', fixedDeposit: 'fixedDepositId', principal: 'principal', rate: 'rate', daysInPeriod: 'daysInPeriod', calculatedInterest: 'calculatedInterest', method: 'method', status: 'status', accrualJournalEntryId: 'accrualJournalEntryId', receiptJournalEntryId: 'receiptJournalEntryId', journalEntryId: 'journalEntryId', source: 'source', sourceTag: 'sourceTag', confirmedAt: 'confirmedAt', confirmedBy: 'confirmedBy', notes: 'notes', withholdingTax: 'withholdingTax', grossInterest: 'grossInterest', createdBy: 'createdBy' };
+const FIELD_MAP = { _id: { target: 'id', isId: true }, id: { target: 'id', isId: true }, 'period.month': { target: 'periodMonth' }, 'period.year': { target: 'periodYear' } };
+for (const [source, target] of Object.entries(map)) FIELD_MAP[source] = { target, isId: /Id$/.test(target) || target === 'companyId' };
+
+function toApi(row) {
+  if (!row) return null;
+  const result = { _id: row.id, period: { month: row.periodMonth, year: row.periodYear } };
+  for (const [source, target] of Object.entries(map)) result[source] = row[target];
+  for (const field of ['principal', 'calculatedInterest', 'withholdingTax', 'grossInterest']) result[field] = decimalToNumber(row[field], 0);
+  result.createdAt = row.createdAt;
+  result.updatedAt = row.updatedAt;
+  return result;
+}
+
+function translateCreate(data = {}) {
+  const period = data.period || {};
+  const result = { id: toIdString(data._id || data.id) || generateObjectId(), periodMonth: period.month, periodYear: period.year };
+  for (const [source, target] of Object.entries(map)) {
+    if (data[source] !== undefined) result[target] = /Id$/.test(target) || target === 'companyId' ? (data[source] ? toIdString(data[source]) : null) : data[source];
   }
-);
+  return result;
+}
 
-// Prevent duplicate accruals for same period and same account
-interestAccrualSchema.index(
-  { company: 1, bankAccount: 1, "period.month": 1, "period.year": 1 },
-  { unique: true, partialFilterExpression: { bankAccount: { $ne: null } } }
-);
-interestAccrualSchema.index(
-  { company: 1, fixedDeposit: 1, "period.month": 1, "period.year": 1 },
-  { unique: true, partialFilterExpression: { fixedDeposit: { $ne: null } } }
-);
+function translateUpdate(update = {}) {
+  const source = update.$set ? { ...update, ...update.$set } : { ...update };
+  delete source.$set;
+  delete source.$unset;
+  const result = {};
+  if (source.period?.month !== undefined) result.periodMonth = source.period.month;
+  if (source.period?.year !== undefined) result.periodYear = source.period.year;
+  for (const [sourceKey, target] of Object.entries(map)) {
+    if (source[sourceKey] !== undefined) result[target] = /Id$/.test(target) || target === 'companyId' ? (source[sourceKey] ? toIdString(source[sourceKey]) : null) : source[sourceKey];
+  }
+  return result;
+}
 
-interestAccrualSchema.set("toJSON", {
-  transform: function (doc, ret) {
-    if (ret.principal && ret.principal.$numberDecimal) {
-      ret.principal = parseFloat(ret.principal.$numberDecimal);
-    }
-    if (ret.calculatedInterest && ret.calculatedInterest.$numberDecimal) {
-      ret.calculatedInterest = parseFloat(ret.calculatedInterest.$numberDecimal);
-    }
-    if (ret.withholdingTax && ret.withholdingTax.$numberDecimal) {
-      ret.withholdingTax = parseFloat(ret.withholdingTax.$numberDecimal);
-    }
-    if (ret.grossInterest && ret.grossInterest.$numberDecimal) {
-      ret.grossInterest = parseFloat(ret.grossInterest.$numberDecimal);
-    }
-    return ret;
-  },
+module.exports = buildTenantModel({
+  name: 'InterestAccrual',
+  collection: 'interest_accruals',
+  delegateName: 'interestAccrual',
+  fieldMap: FIELD_MAP,
+  toApi,
+  translateCreate,
+  translateUpdate,
+  tenantField: 'companyId',
+  mutable: true,
 });
-
-module.exports = mongoose.model("InterestAccrual", interestAccrualSchema);

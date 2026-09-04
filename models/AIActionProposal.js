@@ -1,105 +1,113 @@
 'use strict';
 
-const mongoose = require('mongoose');
+const { buildGlobalModel } = require('../utils/masterDataCommon');
+const { generateObjectId, toIdString } = require('../utils/objectId');
 
-const AIActionProposalSchema = new mongoose.Schema({
-  proposalId: {
-    type: String,
-    required: true,
-    index: true,
-  },
-  company: {
-    type: String,
-    required: true,
-    index: true,
-  },
-  createdBy: {
-    type: String,
-    required: true,
-    index: true,
-  },
-  type: {
-    type: String,
-    enum: [
-      'purchase_order_draft',
-      'payment_reminder_draft',
-      'stock_adjustment_review_request',
-      'supplier_follow_up_task',
-      'customer_follow_up_task',
-    ],
-    required: true,
-    index: true,
-  },
-  status: {
-    type: String,
-    enum: ['draft', 'pending_approval', 'approved', 'rejected', 'executed', 'failed'],
-    default: 'draft',
-    index: true,
-  },
-  payload: {
-    type: mongoose.Schema.Types.Mixed,
-    default: {},
-  },
-  evidenceFactIds: [{
-    type: String,
-  }],
-  sourceRecommendationIds: [{
-    type: String,
-  }],
-  sourceFindingIds: [{
-    type: String,
-  }],
-  riskLevel: {
-    type: String,
-    enum: ['low', 'medium', 'high', 'critical'],
-    required: true,
-    index: true,
-  },
-  approvalRequiredByRole: [{
-    type: String,
-  }],
-  approvedBy: {
-    type: String,
-    default: null,
-  },
-  approvedAt: {
-    type: Date,
-    default: null,
-  },
-  rejectedBy: {
-    type: String,
-    default: null,
-  },
-  rejectedAt: {
-    type: Date,
-    default: null,
-  },
-  rejectionReason: {
-    type: String,
-    default: null,
-  },
-  executedBy: {
-    type: String,
-    default: null,
-  },
-  executedAt: {
-    type: Date,
-    default: null,
-  },
-  executionResult: {
-    type: mongoose.Schema.Types.Mixed,
-    default: null,
-  },
-  metadata: {
-    type: mongoose.Schema.Types.Mixed,
-    default: {},
-  },
-}, {
-  timestamps: true,
+const FIELD_MAP = {
+  _id: { target: 'id', isId: true },
+  id: { target: 'id', isId: true },
+  proposalId: { target: 'proposalId' },
+  company: { target: 'company' },
+  createdBy: { target: 'createdBy' },
+  evidenceFactIds: { target: 'evidenceFactIds' },
+  sourceRecommendationIds: { target: 'sourceRecommendationIds' },
+  sourceFindingIds: { target: 'sourceFindingIds' },
+  riskLevel: { target: 'riskLevel' },
+  approvalRequiredByRole: { target: 'approvalRequiredByRole' },
+  approvedBy: { target: 'approvedBy' },
+  approvedAt: { target: 'approvedAt' },
+  rejectedBy: { target: 'rejectedBy' },
+  rejectedAt: { target: 'rejectedAt' },
+  rejectionReason: { target: 'rejectionReason' },
+  executedBy: { target: 'executedBy' },
+  executedAt: { target: 'executedAt' },
+  executionResult: { target: 'executionResult' },
+  createdAt: { target: 'createdAt' },
+  updatedAt: { target: 'updatedAt' },
+};
+
+function toApi(row) {
+  if (!row) return null;
+  return {
+    _id: row.id,
+    proposalId: row.proposalId,
+    company: row.company,
+    createdBy: row.createdBy,
+    type: row.type,
+    status: row.status,
+    payload: row.payload || {},
+    evidenceFactIds: row.evidenceFactIds || [],
+    sourceRecommendationIds: row.sourceRecommendationIds || [],
+    sourceFindingIds: row.sourceFindingIds || [],
+    riskLevel: row.riskLevel,
+    approvalRequiredByRole: row.approvalRequiredByRole || [],
+    approvedBy: row.approvedBy ?? null,
+    approvedAt: row.approvedAt ?? null,
+    rejectedBy: row.rejectedBy ?? null,
+    rejectedAt: row.rejectedAt ?? null,
+    rejectionReason: row.rejectionReason ?? null,
+    executedBy: row.executedBy ?? null,
+    executedAt: row.executedAt ?? null,
+    executionResult: row.executionResult ?? null,
+    metadata: row.metadata || {},
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function translateCreate(data = {}) {
+  return {
+    id: toIdString(data._id || data.id) || generateObjectId(),
+    proposalId: data.proposalId,
+    company: toIdString(data.company),
+    createdBy: toIdString(data.createdBy),
+    type: data.type,
+    status: data.status || 'draft',
+    payload: data.payload || {},
+    evidenceFactIds: data.evidenceFactIds || [],
+    sourceRecommendationIds: data.sourceRecommendationIds || [],
+    sourceFindingIds: data.sourceFindingIds || [],
+    riskLevel: data.riskLevel,
+    approvalRequiredByRole: data.approvalRequiredByRole || [],
+    approvedBy: data.approvedBy ? toIdString(data.approvedBy) : null,
+    approvedAt: data.approvedAt || null,
+    rejectedBy: data.rejectedBy ? toIdString(data.rejectedBy) : null,
+    rejectedAt: data.rejectedAt || null,
+    rejectionReason: data.rejectionReason ?? null,
+    executedBy: data.executedBy ? toIdString(data.executedBy) : null,
+    executedAt: data.executedAt || null,
+    executionResult: data.executionResult ?? null,
+    metadata: data.metadata || {},
+  };
+}
+
+function translateUpdate(update = {}) {
+  const source = update.$set ? { ...update, ...update.$set } : { ...update };
+  delete source.$set;
+  delete source.$setOnInsert;
+  delete source.$inc;
+  delete source.$unset;
+  const data = {};
+  const fields = ['proposalId', 'company', 'createdBy', 'type', 'status', 'payload', 'evidenceFactIds', 'sourceRecommendationIds', 'sourceFindingIds', 'riskLevel', 'approvalRequiredByRole', 'rejectionReason', 'metadata'];
+  for (const field of fields) {
+    if (source[field] !== undefined) data[field] = ['company', 'createdBy'].includes(field) ? toIdString(source[field]) : source[field];
+  }
+  for (const field of ['approvedBy', 'rejectedBy', 'executedBy']) {
+    if (source[field] !== undefined) data[field] = source[field] ? toIdString(source[field]) : null;
+  }
+  for (const field of ['approvedAt', 'rejectedAt', 'executedAt', 'executionResult']) {
+    if (source[field] !== undefined) data[field] = source[field];
+  }
+  return data;
+}
+
+module.exports = buildGlobalModel({
+  name: 'AIActionProposal',
+  collection: 'ai_action_proposals',
+  delegateName: 'aIActionProposal',
+  fieldMap: FIELD_MAP,
+  toApi,
+  translateCreate,
+  translateUpdate,
+  mutable: true,
 });
-
-AIActionProposalSchema.index({ company: 1, proposalId: 1 }, { unique: true });
-AIActionProposalSchema.index({ company: 1, status: 1, updatedAt: -1 });
-AIActionProposalSchema.index({ company: 1, type: 1, status: 1 });
-
-module.exports = mongoose.model('AIActionProposal', AIActionProposalSchema);

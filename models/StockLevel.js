@@ -3,7 +3,6 @@
  * Preserves snake_case API fields and static helpers for GRN/transfers.
  */
 
-const mongoose = require('mongoose');
 const { prisma, dbClient } = require('../lib/prisma');
 const { makeCompatModel, translateFilter, translateSort, IMPOSSIBLE, toId } = require('../utils/prismaCompat');
 const { getCompanyId } = require('../utils/prismaTenant');
@@ -33,10 +32,6 @@ const FIELD_MAP = {
   createdAt: { target: 'createdAt' },
   updatedAt: { target: 'updatedAt' },
 };
-
-if (!mongoose.models.StockLevel) {
-  mongoose.model('StockLevel', new mongoose.Schema({}, { strict: false, collection: 'stocklevels' }));
-}
 
 function applyTenant(where, opts = {}) {
   if (where === IMPOSSIBLE) return where;

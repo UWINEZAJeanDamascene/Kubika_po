@@ -126,7 +126,9 @@ function updateManifest(entry) {
 }
 
 (async () => {
-  const url = `${baseUrl.replace(/\/$/, '')}/api/performance?limit=50`;
+  // Request the full bounded route table so a low-volume top-10 endpoint is
+  // not hidden by unrelated historical routes. The API caps this at 100.
+  const url = `${baseUrl.replace(/\/$/, '')}/api/performance?limit=100`;
   console.log(`Capturing baseline from ${url}\n`);
 
   let data;

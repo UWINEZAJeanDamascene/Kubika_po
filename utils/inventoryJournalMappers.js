@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Maps Prisma Phase 3 (inventory) + Phase 4 (journal) rows to legacy Mongoose JSON shapes.
  */
 
@@ -354,7 +354,8 @@ function stockTransferLineToApi(row) {
 
 function stockTransferToApi(row) {
   if (!row) return null;
-  const items = (row.lines || []).map((l) => l.id);
+  const lineCount = row._count?.lines != null ? Number(row._count.lines) : (row.lines || []).length;
+  const items = row.lines ? row.lines.map((l) => l.id) : [];
   return {
     _id: row.id,
     company: row.companyId,
@@ -362,6 +363,7 @@ function stockTransferToApi(row) {
     fromWarehouse: row.fromWarehouseId,
     toWarehouse: row.toWarehouseId,
     items,
+    lineCount,
     status: row.status,
     transferDate: row.transferDate,
     completedDate: row.completedDate ?? null,

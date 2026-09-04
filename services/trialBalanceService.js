@@ -1,7 +1,5 @@
-const mongoose = require('mongoose');
 const ChartOfAccount = require('../models/ChartOfAccount');
-const JournalEntry = require('../models/JournalEntry');
-const { aggregateWithTimeout } = require('../utils/mongoAggregation');
+const { dbClient } = require('../lib/prisma');
 
 /**
  * Trial Balance Service
@@ -27,27 +25,18 @@ class TrialBalanceService {
 
     // Step 1 — Aggregate all posted journal lines by account in period
     // Using embedded lines approach with $unwind
-    const lineAggregation = await aggregateWithTimeout(JournalEntry, [
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
+    const lineAggregation = await dbClient().journalEntryLine.groupBy({
+      by: ['accountCode'],
+      where: {
+        companyId: String(companyId),
+        journalEntry: {
           status: 'posted',
-          date: {
-            $gte: new Date(dateFrom),
-            $lte: new Date(dateTo)
-          }
-        }
+          date: { gte: new Date(dateFrom), lte: new Date(dateTo) },
+        },
       },
-      { $unwind: '$lines' },
-      {
-        $group: {
-          _id: '$lines.accountCode',
-          total_dr: { $sum: '$lines.debit' },
-          total_cr: { $sum: '$lines.credit' }
-        }
-      },
-      { $sort: { _id: 1 } }
-    ]);
+      _sum: { debit: true, credit: true },
+      orderBy: { accountCode: 'asc' },
+    });
 
     if (lineAggregation.length === 0) {
       return {
@@ -64,10 +53,10 @@ class TrialBalanceService {
     }
 
     // Step 2 — Enrich with account details from chart of accounts
-    const accountCodes = lineAggregation.map(l => l._id);
+    const accountCodes = lineAggregation.map(l => l.accountCode);
     const accounts = await ChartOfAccount.find({
       code: { $in: accountCodes },
-      company: new mongoose.Types.ObjectId(companyId)
+      company: companyId
     }).lean();
 
     const accountMap = {};
@@ -77,17 +66,19 @@ class TrialBalanceService {
 
     // Step 3 — Build trial balance lines
     const lines = lineAggregation.map(row => {
-      const account = accountMap[row._id];
-      const netDr = row.total_dr > row.total_cr ? row.total_dr - row.total_cr : 0;
-      const netCr = row.total_cr > row.total_dr ? row.total_cr - row.total_dr : 0;
+      const totalDr = Number(row._sum.debit || 0);
+      const totalCr = Number(row._sum.credit || 0);
+      const account = accountMap[row.accountCode];
+      const netDr = totalDr > totalCr ? totalDr - totalCr : 0;
+      const netCr = totalCr > totalDr ? totalCr - totalDr : 0;
 
       return {
         account_id: account?._id || null,
-        account_code: row._id,
+        account_code: row.accountCode,
         account_name: account?.name || 'Unknown Account',
         account_type: account?.type || 'unknown',
-        total_dr: Math.round((row.total_dr || 0) * 100) / 100,
-        total_cr: Math.round((row.total_cr || 0) * 100) / 100,
+        total_dr: Math.round(totalDr * 100) / 100,
+        total_cr: Math.round(totalCr * 100) / 100,
         // Net columns — shown in traditional two-column TB format
         net_dr: Math.round(netDr * 100) / 100,
         net_cr: Math.round(netCr * 100) / 100

@@ -2,6 +2,10 @@ jest.mock('../services/cacheService', () => ({
   generateKey: jest.fn(() => 'cache:report:company-1:test'),
   get: jest.fn(),
   set: jest.fn(() => Promise.resolve()),
+  beginRequestFlight: jest.fn(async () => ({
+    acquired: true,
+    release: jest.fn(() => Promise.resolve()),
+  })),
   invalidateByCompany: jest.fn(() => Promise.resolve(1)),
   invalidateType: jest.fn(() => Promise.resolve(1)),
   getCacheConfig: jest.fn(() => ({ ttl: 900 })),

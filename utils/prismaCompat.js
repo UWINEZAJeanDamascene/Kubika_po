@@ -23,6 +23,12 @@ const { getCompanyId } = require('./prismaTenant');
 const { createAggregateMethod } = require('./prismaAggregate');
 const { generateObjectId } = require('./objectId');
 const { getActiveTx } = require('../lib/txContext');
+const { getReadContext, runReadContext } = require('../lib/readContext');
+const {
+  assertReadLimit,
+  guardResultRows,
+  recordQuerySafetyViolation,
+} = require('./querySafety');
 
 /**
  * Prisma delegate for `config`, bound to the ambient transaction client when
@@ -789,6 +795,7 @@ class CompatQuery {
   setOptions(opts = {}) {
     if (opts.skipTenant !== undefined) this._options.skipTenant = opts.skipTenant;
     if (opts.companyId !== undefined) this._options.companyId = opts.companyId;
+    if (opts.readContext !== undefined) this._options.readContext = opts.readContext;
     return this;
   }
   populate(path, select) {
@@ -1016,7 +1023,11 @@ function makeCompatModel(config) {
   async function createOne(data) {
     const createData = await translateCreate(data);
     const row = await delegate().create({ data: createData, include: buildInclude([]) });
-    return wrapResult(toApi(row), config);
+    const api = toApi(row);
+    // Small compatibility guarantee for hand-written shims/tests whose mapper
+    // returns Prisma's `id` shape instead of the legacy `_id` shape.
+    if (api && api._id === undefined && api.id !== undefined) api._id = api.id;
+    return wrapResult(api, config);
   }
 
   /**
@@ -1046,6 +1057,7 @@ function makeCompatModel(config) {
       const cid = getCompanyId();
       if (cid) q._options.companyId = cid;
     }
+    q._options.readContext = getReadContext();
     return q;
   }
 
@@ -1121,7 +1133,12 @@ function makeCompatModel(config) {
     findOne(filter = {}) {
       return tenantQuery(async (opts) => {
         if (config.customFind && (filter.$expr || filter.$text || filter.$or)) {
-          const row = await config.customFind(filter, opts);
+          const readContext = opts.readContext || getReadContext();
+          const row = await config.customFind(filter, opts, {
+            many: false,
+            readContext,
+            maxRows: readContext.maxRows,
+          });
           const include = buildInclude(opts.populate);
           return finish(row ? toApi(row) : null, opts, include);
         }
@@ -1139,10 +1156,41 @@ function makeCompatModel(config) {
 
     find(filter = {}) {
       return tenantQuery(async (opts) => {
+        const readContext = opts.readContext || getReadContext();
+        const explicitLimit = Number(opts.limit) > 0 ? Number(opts.limit) : null;
+        if (explicitLimit) {
+          try {
+            assertReadLimit(explicitLimit, readContext, { name: 'limit' });
+          } catch (error) {
+            recordQuerySafetyViolation({
+              code: error.code,
+              operation: `${config.name || config.delegateName || 'model'}.find`,
+              purpose: readContext.purpose,
+            });
+            throw error;
+          }
+        }
         if (config.customFind && (filter.$expr || filter.$text || filter.$or)) {
-          const rows = await config.customFind(filter, opts, { many: true });
+          const rows = await config.customFind(filter, opts, {
+            many: true,
+            readContext,
+            maxRows: readContext.maxRows,
+          });
+          const boundedRows = guardResultRows(rows || [], {
+            context: readContext,
+            maxRows: explicitLimit || readContext.maxRows,
+            name: `${config.name || config.delegateName || 'model'}.find`,
+            report: (rowCount, maxRows) => {
+              reportUnboundedRead(rowCount);
+              recordQuerySafetyViolation({
+                code: 'UNBOUNDED_READ',
+                operation: `${config.name || config.delegateName || 'model'}.find`,
+                purpose: `${readContext.purpose}:max=${maxRows}`,
+              });
+            },
+          });
           const include = buildInclude(opts.populate);
-          return finish((rows || []).map((r) => toApi(r)), opts, include);
+          return finish(boundedRows.map((r) => toApi(r)), opts, include);
         }
         const where = applyTenant(translateFilter(filter, fieldMap), opts);
         if (where === IMPOSSIBLE) return [];
@@ -1154,8 +1202,8 @@ function makeCompatModel(config) {
           ...queryShape(opts, include),
         };
 
-        // An explicit .limit(n) is the caller being deliberate — honour it as-is.
-        const explicitLimit = Number(opts.limit) > 0 ? Number(opts.limit) : null;
+        // An explicit .limit(n) is deliberate only when it stays inside the
+        // request/job read contract. Larger exports must use a read context.
         if (explicitLimit) {
           const rows = await delegate().findMany({ ...baseQuery, take: explicitLimit });
           return finish(rows.map((r) => toApi(r)), opts, include);
@@ -1163,11 +1211,20 @@ function makeCompatModel(config) {
 
         // No limit: probe one row past the cap so we can tell "exactly at the cap"
         // from "more than the cap".
-        let rows = await delegate().findMany({ ...baseQuery, take: QUERY_MAX_ROWS + 1 });
-        if (rows.length > QUERY_MAX_ROWS) {
+        const maxRows = Math.max(1, Number(readContext.maxRows || QUERY_MAX_ROWS));
+        let rows = await runReadContext(
+          { ...readContext, internalProbe: true },
+          () => delegate().findMany({ ...baseQuery, take: maxRows + 1 }),
+        );
+        if (rows.length > maxRows) {
           reportUnboundedRead(rows.length);
+          recordQuerySafetyViolation({
+            code: 'UNBOUNDED_READ',
+            operation: `${config.name || config.delegateName || 'model'}.find`,
+            purpose: `${readContext.purpose}:max=${maxRows}`,
+          });
           rows = QUERY_ENFORCE_MAX_ROWS
-            ? rows.slice(0, QUERY_MAX_ROWS)
+            ? rows.slice(0, maxRows)
             : await delegate().findMany(baseQuery);
         }
         return finish(rows.map((r) => toApi(r)), opts, include);
@@ -1365,7 +1422,7 @@ function makeCompatModel(config) {
       if (!path) return docs;
       const ids = [...new Set(list.map((d) => toId(d && d[path])).filter(Boolean))];
       if (!ids.length) return docs;
-      const rows = await delegate().findMany({ where: { id: { in: ids } } });
+      const rows = await delegate().findMany({ where: { id: { in: ids } }, take: ids.length });
       const byId = new Map(rows.map((r) => [r.id, toApi(r)]));
       for (const doc of list) {
         if (doc && doc[path] != null) {

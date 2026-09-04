@@ -1,58 +1,70 @@
-const mongoose = require('mongoose');
+'use strict';
 
-const testimonialSchema = new mongoose.Schema({
-  name: {
-    type: String,
-    required: [true, 'Please provide a name'],
-    trim: true
-  },
-  role: {
-    type: String,
-    required: [true, 'Please provide a role'],
-    trim: true
-  },
-  company: {
-    type: String,
-    required: [true, 'Please provide a company name'],
-    trim: true
-  },
-  avatar: {
-    type: String,
-    default: null
-  },
-  content: {
-    type: String,
-    required: [true, 'Please provide testimonial content'],
-    trim: true
-  },
-  rating: {
-    type: Number,
-    required: [true, 'Please provide a rating'],
-    min: 1,
-    max: 5,
-    default: 5
-  },
-  isActive: {
-    type: Boolean,
-    default: true
-  },
-  order: {
-    type: Number,
-    default: 0
-  },
-  createdBy: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User'
+const { buildGlobalModel } = require('../utils/masterDataCommon');
+const { generateObjectId, toIdString } = require('../utils/objectId');
+
+const FIELD_MAP = {
+  _id: { target: 'id', isId: true },
+  id: { target: 'id', isId: true },
+  createdBy: { target: 'createdBy' },
+  isActive: { target: 'isActive' },
+  order: { target: 'order' },
+  createdAt: { target: 'createdAt' },
+  updatedAt: { target: 'updatedAt' },
+};
+
+function testimonialToApi(row) {
+  if (!row) return null;
+  return {
+    _id: row.id,
+    name: row.name,
+    role: row.role,
+    company: row.company,
+    avatar: row.avatar ?? null,
+    content: row.content,
+    rating: Number(row.rating ?? 5),
+    isActive: row.isActive,
+    order: row.order,
+    createdBy: row.createdBy ?? null,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+function translateCreate(data = {}) {
+  return {
+    id: toIdString(data._id || data.id) || generateObjectId(),
+    name: data.name,
+    role: data.role,
+    company: data.company,
+    avatar: data.avatar ?? null,
+    content: data.content,
+    rating: data.rating ?? 5,
+    isActive: data.isActive ?? true,
+    order: data.order ?? 0,
+    createdBy: data.createdBy ? toIdString(data.createdBy) : null,
+  };
+}
+
+function translateUpdate(update = {}) {
+  const source = update.$set ? { ...update, ...update.$set } : { ...update };
+  delete source.$set;
+  delete source.$unset;
+  const data = {};
+  for (const field of ['name', 'role', 'company', 'avatar', 'content', 'rating', 'isActive', 'order']) {
+    if (source[field] !== undefined) data[field] = source[field];
   }
-}, {
-  timestamps: true
+  if (source.createdBy !== undefined) data.createdBy = source.createdBy ? toIdString(source.createdBy) : null;
+  return data;
+}
+
+module.exports = buildGlobalModel({
+  name: 'Testimonial',
+  collection: 'testimonials',
+  delegateName: 'testimonial',
+  fieldMap: FIELD_MAP,
+  toApi: testimonialToApi,
+  translateCreate,
+  translateUpdate,
+  mutable: true,
 });
-
-// Index for ordering
-testimonialSchema.index({ order: 1 });
-testimonialSchema.index({ isActive: 1 });
-
-testimonialSchema.set('toJSON', { virtuals: true });
-testimonialSchema.set('toObject', { virtuals: true });
-
-module.exports = mongoose.model('Testimonial', testimonialSchema);

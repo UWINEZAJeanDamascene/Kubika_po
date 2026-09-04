@@ -20,7 +20,20 @@ router.use(attachCompanyId);
 // Note the TTL is short because budget-vs-actual is derived from posted
 // transactions, which do not go through these routes. Journal posting clears
 // the 'budget' type via cacheService.invalidateFinancialReportCaches().
-router.use(cacheMiddleware({ type: "budget", ttl: 300 }));
+//
+// Live-commitment exception: period-lock checks and encumbrance/actual-
+// consumption balances are read immediately before a caller decides whether
+// to liquidate/release an encumbrance, execute a transfer, or approve a step.
+// A cached "not locked" or stale available-balance answer here is the same
+// class of bug as a stale stock quantity at POS/GRN time, so these paths
+// always read live rather than serving up to 300s of staleness.
+const LIVE_BUDGET_READ_SUFFIXES = ['/period-locks/check', '/encumbrances/summary', '/actual-consumptions'];
+router.use(cacheMiddleware({
+  type: "budget",
+  ttl: 300,
+  skipCache: (req) => req.query.refresh === '1' || req.query.refresh === 'true'
+    || LIVE_BUDGET_READ_SUFFIXES.some((suffix) => req.path.endsWith(suffix)),
+}));
 router.use(cacheInvalidationMiddleware({
   types: ["budget", "report"],
   invalidateDashboards: true,

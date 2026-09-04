@@ -1,8 +1,8 @@
 // Module 7 - Error Codes
-const mongoose = require("mongoose");
 const DeliveryNote = require("../models/DeliveryNote");
 const Quotation = require("../models/Quotation");
 const Invoice = require("../models/Invoice");
+const JournalEntry = require("../models/JournalEntry");
 const Product = require("../models/Product");
 const { loadLineProducts, getLineProduct } = require("../utils/lineProducts");
 const StockMovement = require("../models/StockMovement");
@@ -16,6 +16,7 @@ const { runInTransaction } = require("../services/transactionService");
 const StockLevel = require("../models/StockLevel");
 const emailService = require("../services/emailService");
 const Client = require("../models/Client");
+const { emitDataChanged } = require("../lib/realtimeEvents");
 
 const ERR_DELIVERY_NOT_FOUND = "ERR_DELIVERY_NOT_FOUND";
 const ERR_DELIVERY_CONFIRMED = "ERR_DELIVERY_CONFIRMED";
@@ -41,6 +42,82 @@ const toNumber = (value) => {
 };
 const ERR_COGS_ADJUSTMENT_FAILED = "ERR_COGS_ADJUSTMENT_FAILED";
 
+const normalizeId = (value) => {
+  if (!value) return null;
+  if (typeof value === 'string' || typeof value === 'number') return String(value);
+  return String(value._id || value.id || value);
+};
+
+async function hydrateDeliveryNoteRelations(docOrDocs) {
+  const items = Array.isArray(docOrDocs) ? docOrDocs : [docOrDocs];
+  const valid = items.filter(Boolean);
+  if (!valid.length) return docOrDocs;
+
+  const clientIds = [...new Set(valid.map((n) => normalizeId(n.client)).filter(Boolean))];
+  const quotationIds = [...new Set(valid.map((n) => normalizeId(n.quotation)).filter(Boolean))];
+  const salesOrderIds = [...new Set(valid.map((n) => normalizeId(n.salesOrder)).filter(Boolean))];
+  const invoiceIds = [...new Set(valid.map((n) => normalizeId(n.invoice)).filter(Boolean))];
+  const warehouseIds = [...new Set(valid.map((n) => normalizeId(n.warehouse)).filter(Boolean))];
+  const userIds = [...new Set(valid.flatMap((n) => [n.createdBy, n.confirmedBy, n.cancelledBy, n.deliveredBy].map(normalizeId)).filter(Boolean))];
+  const productIds = [...new Set(valid.flatMap((n) => (n.lines || []).map((line) => normalizeId(line.product)).concat((n.items || []).map((line) => normalizeId(line.product))).filter(Boolean)))];
+
+  const [clients, quotations, salesOrders, invoices, warehouses, users, products] = await Promise.all([
+    clientIds.length ? Client.find({ _id: { $in: clientIds } }, 'name code contact taxId address type email').lean() : [],
+    quotationIds.length ? Quotation.find({ _id: { $in: quotationIds } }, 'referenceNo status items').lean() : [],
+    salesOrderIds.length ? require('../models/SalesOrder').find({ _id: { $in: salesOrderIds } }, 'referenceNo quotation status').lean() : [],
+    invoiceIds.length ? Invoice.find({ _id: { $in: invoiceIds } }, 'referenceNo status grandTotal currencyCode').lean() : [],
+    warehouseIds.length ? require('../models/Warehouse').find({ _id: { $in: warehouseIds } }, 'name code').lean() : [],
+    userIds.length ? require('../models/User').find({ _id: { $in: userIds } }, 'name email').lean() : [],
+    productIds.length ? Product.find({ _id: { $in: productIds } }, 'name sku unit trackingType isStockable').lean() : [],
+  ]);
+
+  const clientMap = new Map(clients.map((c) => [normalizeId(c._id), c]));
+  const quotationMap = new Map(quotations.map((q) => [normalizeId(q._id), q]));
+  const salesOrderMap = new Map(salesOrders.map((s) => [normalizeId(s._id), s]));
+  const invoiceMap = new Map(invoices.map((i) => [normalizeId(i._id), i]));
+  const warehouseMap = new Map(warehouses.map((w) => [normalizeId(w._id), w]));
+  const userMap = new Map(users.map((u) => [normalizeId(u._id), u]));
+  const productMap = new Map(products.map((p) => [normalizeId(p._id), p]));
+
+  for (const note of valid) {
+    const clientId = normalizeId(note.client);
+    if (clientId && clientMap.has(clientId)) note.client = clientMap.get(clientId);
+    const quotationId = normalizeId(note.quotation);
+    if (quotationId && quotationMap.has(quotationId)) note.quotation = quotationMap.get(quotationId);
+    const salesOrderId = normalizeId(note.salesOrder);
+    if (salesOrderId && salesOrderMap.has(salesOrderId)) {
+      const so = salesOrderMap.get(salesOrderId);
+      if (so.quotation) {
+        const quotationRefId = normalizeId(so.quotation);
+        if (quotationRefId && quotationMap.has(quotationRefId)) so.quotation = quotationMap.get(quotationRefId);
+      }
+      note.salesOrder = so;
+    }
+    const invoiceId = normalizeId(note.invoice);
+    if (invoiceId && invoiceMap.has(invoiceId)) note.invoice = invoiceMap.get(invoiceId);
+    const warehouseId = normalizeId(note.warehouse);
+    if (warehouseId && warehouseMap.has(warehouseId)) note.warehouse = warehouseMap.get(warehouseId);
+    if (note.createdBy) {
+      const userId = normalizeId(note.createdBy);
+      if (userId && userMap.has(userId)) note.createdBy = userMap.get(userId);
+    }
+    if (note.confirmedBy) { const uid = normalizeId(note.confirmedBy); if (uid && userMap.has(uid)) note.confirmedBy = userMap.get(uid); }
+    if (note.cancelledBy) { const uid = normalizeId(note.cancelledBy); if (uid && userMap.has(uid)) note.cancelledBy = userMap.get(uid); }
+    if (note.deliveredBy) { const uid = normalizeId(note.deliveredBy); if (uid && userMap.has(uid)) note.deliveredBy = userMap.get(uid); }
+
+    for (const line of note.lines || []) {
+      const pid = normalizeId(line.product);
+      if (pid && productMap.has(pid)) line.product = productMap.get(pid);
+    }
+    for (const line of note.items || []) {
+      const pid = normalizeId(line.product);
+      if (pid && productMap.has(pid)) line.product = productMap.get(pid);
+    }
+  }
+
+  return Array.isArray(docOrDocs) ? valid : valid[0];
+}
+
 // COGS adjustment tolerance (0.01 = 1 cent)
 const COGS_TOLERANCE = 0.01;
 
@@ -51,17 +128,30 @@ const sendDeliveryNoteEmail = async (deliveryNote, companyId, action) => {
       return;
     }
 
-    const invoice = await Invoice.findById(deliveryNote.invoice).populate('client');
-    const client = invoice?.client;
+    const invoice = await Invoice.findById(deliveryNote.invoice).lean();
+    const invoiceClientId = normalizeId(invoice?.client);
+    const client = invoiceClientId ? await Client.findById(invoiceClientId, 'name contact email').lean() : null;
     const clientEmail = client?.contact?.email || client?.email;
     if (!clientEmail) {
       console.warn('[DeliveryNote] No client email found');
       return;
     }
 
-    const noteWithProducts = await DeliveryNote.findById(deliveryNote._id)
-      .populate('lines.product', 'name')
-      .populate('warehouse', 'name');
+    const noteWithProducts = await DeliveryNote.findById(deliveryNote._id).lean();
+    if (noteWithProducts?.lines?.length) {
+      const productIds = [...new Set(noteWithProducts.lines.map((line) => normalizeId(line.product)).filter(Boolean))];
+      const productRows = productIds.length ? await Product.find({ _id: { $in: productIds } }, 'name unit').lean() : [];
+      const productMap = new Map(productRows.map((product) => [normalizeId(product._id), product]));
+      for (const line of noteWithProducts.lines) {
+        const productId = normalizeId(line.product);
+        if (productId && productMap.has(productId)) line.product = productMap.get(productId);
+      }
+    }
+    if (noteWithProducts?.warehouse) {
+      const warehouseId = normalizeId(noteWithProducts.warehouse);
+      const warehouse = warehouseId ? await require('../models/Warehouse').findById(warehouseId, 'name').lean() : null;
+      noteWithProducts.warehouse = warehouse;
+    }
 
     const actionText = { confirmed: 'Completed', cancelled: 'Cancelled' }[action] || 'Updated';
     const subject = `Delivery Note ${deliveryNote.referenceNo} - ${actionText}`;
@@ -262,27 +352,27 @@ exports.getDeliveryNotes = async (req, res, next) => {
 
     const total = await DeliveryNote.countDocuments(query);
     let deliveryNotes = await DeliveryNote.find(query)
-      .populate("client", "name code contact taxId")
-      .populate("quotation", "referenceNo")
-      .populate("salesOrder", "referenceNo quotation")
-      .populate("invoice", "referenceNo status grandTotal currencyCode") // include referenceNo
-      .populate("warehouse", "name code")
-      .populate("lines.product", "name sku unit")
-      .populate("items.product", "name sku unit") // Legacy
-      .populate("createdBy", "name email")
-      .populate("confirmedBy", "name email")
+      .select({
+        client: 1,
+        quotation: 1,
+        salesOrder: 1,
+        invoice: 1,
+        warehouse: 1,
+        lines: 1,
+        items: 1,
+        createdBy: 1,
+        confirmedBy: 1,
+        referenceNo: 1,
+        status: 1,
+        deliveryDate: 1,
+        createdAt: 1,
+      })
       .sort({ createdAt: -1 })
       .limit(limit * 1)
-      .skip((page - 1) * limit);
+      .skip((page - 1) * limit)
+      .lean();
 
-    // Populate nested salesOrder.quotation
-    await Promise.all(deliveryNotes.map(async (dn) => {
-      if (dn.salesOrder?.quotation) {
-        await dn.salesOrder.populate('quotation', 'referenceNo');
-      }
-    }));
-
-    // Enhance with computed fields for frontend compatibility
+    deliveryNotes = await hydrateDeliveryNoteRelations(deliveryNotes);
     deliveryNotes = enhanceDeliveryNotes(deliveryNotes);
 
     res.json({
@@ -307,24 +397,24 @@ exports.getDeliveryNote = async (req, res, next) => {
     let deliveryNote = await DeliveryNote.findOne({
       _id: req.params.id,
       company: companyId,
-    })
-      .populate("client", "name code contact type taxId address")
-      .populate("quotation", "referenceNo status items")
-      .populate("salesOrder", "referenceNo quotation")
-      .populate("invoice", "referenceNo status grandTotal currencyCode")
-      .populate("warehouse", "name code")
-      .populate("lines.product", "name sku unit trackingType")
-      .populate("items.product", "name sku unit") // Legacy
-      .populate("createdBy", "name email")
-      .populate("confirmedBy", "name email")
-      .populate("cancelledBy", "name email");
+    }).select({
+      client: 1,
+      quotation: 1,
+      salesOrder: 1,
+      invoice: 1,
+      warehouse: 1,
+      lines: 1,
+      items: 1,
+      createdBy: 1,
+      confirmedBy: 1,
+      cancelledBy: 1,
+      referenceNo: 1,
+      status: 1,
+      deliveryDate: 1,
+      createdAt: 1,
+    }).lean();
 
-    // Populate nested salesOrder.quotation
-    if (deliveryNote.salesOrder?.quotation) {
-      await deliveryNote.salesOrder.populate('quotation', 'referenceNo');
-    }
-
-    // Enhance with computed fields for frontend compatibility
+    deliveryNote = await hydrateDeliveryNoteRelations(deliveryNote);
     deliveryNote = enhanceDeliveryNotes(deliveryNote);
 
     if (!deliveryNote) {
@@ -499,9 +589,7 @@ exports.createDeliveryNote = async (req, res, next) => {
       createdBy: req.user.id,
     });
 
-    await deliveryNote.populate(
-      "client lines.product warehouse createdBy invoice",
-    );
+    deliveryNote = await hydrateDeliveryNoteRelations(deliveryNote);
 
     res.status(201).json({
       success: true,
@@ -591,9 +679,8 @@ exports.updateDeliveryNote = async (req, res, next) => {
       }
     }
 
-    deliveryNote = await deliveryNote
-      .save()
-      .populate("client lines.product warehouse createdBy invoice");
+    deliveryNote = await deliveryNote.save();
+    deliveryNote = await hydrateDeliveryNoteRelations(deliveryNote);
 
     res.json({
       success: true,
@@ -663,10 +750,8 @@ exports.confirmDelivery = async (req, res, next) => {
     let deliveryNote = await DeliveryNote.findOne({
       _id: deliveryNoteId,
       company: companyId,
-    })
-      .populate("lines.product")
-      .populate("invoice")
-      .populate("warehouse");
+    }).select({ lines: 1, invoice: 1, warehouse: 1, status: 1, company: 1, referenceNo: 1 }).lean();
+    deliveryNote = await hydrateDeliveryNoteRelations(deliveryNote);
 
     if (!deliveryNote) {
       return res.status(404).json({
@@ -1175,9 +1260,7 @@ exports.confirmDelivery = async (req, res, next) => {
       await deliveryNote.save({ session });
     });
 
-    await deliveryNote.populate(
-      "lines.product warehouse createdBy confirmedBy invoice",
-    );
+    deliveryNote = await hydrateDeliveryNoteRelations(deliveryNote);
 
     try {
       const cacheService = require("../services/cacheService");
@@ -1191,6 +1274,8 @@ exports.confirmDelivery = async (req, res, next) => {
       await sendDeliveryNoteEmail(deliveryNote, companyId, 'confirmed');
     }
 
+    emitDataChanged(companyId, "deliveryNotes", { affectsStock: true });
+    await require("../services/cacheService").bumpCompanyStockCaches(companyId);
     res.json({
       success: true,
       message: "Delivery note confirmed successfully",
@@ -1381,9 +1466,8 @@ exports.cancelDeliveryNote = async (req, res, next) => {
     let deliveryNote = await DeliveryNote.findOne({
       _id: req.params.id,
       company: companyId,
-    })
-      .populate("lines.product")
-      .populate("warehouse");
+    }).select({ lines: 1, warehouse: 1, status: 1, company: 1, invoice: 1 });
+    deliveryNote = await hydrateDeliveryNoteRelations(deliveryNote);
 
     if (!deliveryNote) {
       return res.status(404).json({
@@ -1516,14 +1600,11 @@ exports.cancelDeliveryNote = async (req, res, next) => {
 
       // ========== Reverse COGS adjustment if exists ==========
       // Find COGS adjustment journal entries for this delivery note
-      const cogsAdjustments = await mongoose
-        .model("JournalEntry")
-        .find({
-          company: companyId,
-          sourceType: "cogs_adjustment",
-          sourceId: deliveryNote._id,
-        })
-        .session(session);
+      const cogsAdjustments = await JournalEntry.find({
+        company: companyId,
+        sourceType: "cogs_adjustment",
+        sourceId: deliveryNote._id,
+      }).session(session);
 
       // Aggregate reversal entries and mark originals as reversed, then post atomically
       const reversalEntries = [];
@@ -1572,10 +1653,16 @@ exports.cancelDeliveryNote = async (req, res, next) => {
       await deliveryNote.save({ session });
     });
 
-    await deliveryNote.populate(
-      "lines.product warehouse createdBy cancelledBy invoice",
-    );
+    await hydrateDeliveryNoteRelations(deliveryNote);
 
+    emitDataChanged(companyId, "deliveryNotes", { affectsStock: true });
+    // Cancellation both restores stock and posts a COGS reversal journal
+    // entry above, so report/GL caches must be invalidated alongside stock —
+    // stock-only invalidation would leave reversed COGS out of cached P&L/GL
+    // reports until their TTL (or indefinitely for closed-period entries).
+    const deliveryNoteCacheService = require("../services/cacheService");
+    await deliveryNoteCacheService.bumpCompanyStockCaches(companyId);
+    await deliveryNoteCacheService.bumpCompanyFinancialCaches(companyId);
     res.json({
       success: true,
       message: "Delivery note cancelled successfully",
@@ -1597,11 +1684,8 @@ exports.createInvoiceFromDeliveryNote = async (req, res, next) => {
     let deliveryNote = await DeliveryNote.findOne({
       _id: req.params.id,
       company: companyId,
-    })
-      .populate("lines.product")
-      .populate("items.product")
-      .populate("client")
-      .populate("salesOrder");
+    });
+    await hydrateDeliveryNoteRelations(deliveryNote);
 
     if (!deliveryNote) {
       return res.status(404).json({
@@ -1631,8 +1715,7 @@ exports.createInvoiceFromDeliveryNote = async (req, res, next) => {
       const existingInvoice = await Invoice.findOne({
         _id: existingId,
         company: companyId,
-      })
-        .populate("client createdBy lines.product");
+      }).lean();
 
       if (confirmDelivery && deliveryNote.status === "draft") {
         deliveryNote.status = "confirmed";
@@ -1782,12 +1865,12 @@ exports.createInvoiceFromDeliveryNote = async (req, res, next) => {
       });
     }
 
-    await invoice.populate("client createdBy");
+    const hydratedInvoice = await Invoice.findById(invoice._id).lean();
 
     res.status(201).json({
       success: true,
       message: "Invoice created successfully from delivery note",
-      data: invoice,
+      data: hydratedInvoice || invoice,
     });
   } catch (error) {
     next(error);
@@ -1800,17 +1883,14 @@ exports.createInvoiceFromDeliveryNote = async (req, res, next) => {
 exports.getInvoiceDeliveryNotes = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const deliveryNotes = await DeliveryNote.find({
+    let deliveryNotes = await DeliveryNote.find({
       invoice: req.params.invoiceId,
       company: companyId,
     })
-      .populate("client", "name code")
-      .populate("warehouse", "name code")
-      .populate("lines.product", "name sku")
-      .populate("createdBy", "name email")
-      .populate("confirmedBy", "name email")
-      .populate("invoice", "currencyCode")
-      .sort({ createdAt: -1 });
+      .select({ client: 1, quotation: 1, salesOrder: 1, invoice: 1, warehouse: 1, lines: 1, items: 1, createdBy: 1, confirmedBy: 1, referenceNo: 1, status: 1, deliveryDate: 1, createdAt: 1 })
+      .sort({ createdAt: -1 })
+      .lean();
+    deliveryNotes = await hydrateDeliveryNoteRelations(deliveryNotes);
 
     // Enhance with computed fields for frontend compatibility
     deliveryNotes = enhanceDeliveryNotes(deliveryNotes);
@@ -1830,15 +1910,14 @@ exports.getInvoiceDeliveryNotes = async (req, res, next) => {
 exports.getQuotationDeliveryNotes = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const deliveryNotes = await DeliveryNote.find({
+    let deliveryNotes = await DeliveryNote.find({
       quotation: req.params.quotationId,
       company: companyId,
     })
-      .populate("client", "name code")
-      .populate("items.product", "name sku")
-      .populate("createdBy", "name email")
-      .populate("invoice", "currencyCode")
-      .sort({ createdAt: -1 });
+      .select({ client: 1, quotation: 1, salesOrder: 1, invoice: 1, warehouse: 1, lines: 1, items: 1, createdBy: 1, referenceNo: 1, status: 1, deliveryDate: 1, createdAt: 1 })
+      .sort({ createdAt: -1 })
+      .lean();
+    deliveryNotes = await hydrateDeliveryNoteRelations(deliveryNotes);
 
     // Enhance with computed fields for frontend compatibility
     deliveryNotes = enhanceDeliveryNotes(deliveryNotes);
@@ -1859,14 +1938,14 @@ exports.getQuotationDeliveryNotes = async (req, res, next) => {
 exports.generateDeliveryNotePDF = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const deliveryNote = await DeliveryNote.findOne({
+    let deliveryNote = await DeliveryNote.findOne({
       _id: req.params.id,
       company: companyId,
-    })
-      .populate("client")
-      .populate("quotation")
-      .populate("items.product")
-      .populate("company");
+    }).select({ client: 1, quotation: 1, salesOrder: 1, invoice: 1, warehouse: 1, items: 1, company: 1, referenceNo: 1, deliveryNumber: 1, deliveryDate: 1, notes: 1, deliveredBy: 1, vehicle: 1, receivedBy: 1, receivedDate: 1, clientStamp: 1 }).lean();
+    deliveryNote = await hydrateDeliveryNoteRelations(deliveryNote);
+    if (deliveryNote?.company) {
+      deliveryNote.company = await Company.findById(normalizeId(deliveryNote.company), 'name taxId address').lean();
+    }
 
     if (!deliveryNote) {
       return res.status(404).json({
@@ -2251,7 +2330,7 @@ exports.updateLineDeliveryQty = async (req, res, next) => {
 
     await deliveryNote.save();
 
-    await deliveryNote.populate("lines.product warehouse createdBy invoice");
+    await hydrateDeliveryNoteRelations(deliveryNote);
 
     res.json({
       success: true,
@@ -2316,7 +2395,7 @@ exports.updateItemDeliveryQty = async (req, res, next) => {
 
     await deliveryNote.save();
 
-    await deliveryNote.populate("client items.product createdBy");
+    await hydrateDeliveryNoteRelations(deliveryNote);
 
     res.json({
       success: true,

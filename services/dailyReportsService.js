@@ -15,7 +15,6 @@
  * 8. Daily Tax Collected
  */
 
-const mongoose = require('mongoose');
 const Invoice = require('../models/Invoice');
 const Purchase = require('../models/Purchase');
 const GoodsReceivedNote = require('../models/GoodsReceivedNote');
@@ -31,22 +30,14 @@ const Expense = require('../models/Expense');
 const { dbClient } = require('../lib/prisma');
 const { toIdString } = require('../utils/objectId');
 const journalAgg = require('./journalAggregationService');
-const toObjectId = (value) => new mongoose.Types.ObjectId(String(value));
 
-function aggregateExpenseWithholdingTax(companyId, start, end) {
-  return Expense.aggregate([
-    {
-      $match: {
-        company: toObjectId(companyId),
-        $or: [
-          { expense_date: { $gte: new Date(start), $lte: new Date(end) } },
-          { date: { $gte: new Date(start), $lte: new Date(end) } }
-        ],
-        withholdingTax: { $exists: true, $gt: 0 }
-      }
-    },
-    { $group: { _id: null, total: { $sum: { $toDouble: '$withholdingTax' } }, count: { $sum: 1 } } }
-  ]);
+async function aggregateExpenseWithholdingTax(companyId, start, end) {
+  const result = await dbClient().expense.aggregate({
+    where: { companyId: String(companyId), expenseDate: { gte: new Date(start), lte: new Date(end) }, withholdingTax: { gt: 0 } },
+    _sum: { withholdingTax: true },
+    _count: { _all: true },
+  });
+  return [{ total: Number(result._sum?.withholdingTax || 0), count: result._count?._all || 0 }];
 }
 
 const toNumber = (value) => {
@@ -745,114 +736,36 @@ class DailyReportsService {
     
     // Get tax data from invoices - use taxAmount (actual field), not taxTotal (alias)
     const [invoiceTax, creditNoteTax, invoiceWHT, purchaseWHT, expenseWHT] = await Promise.all([
-      Invoice.aggregate([
-        {
-          $match: {
-            company: toObjectId(companyId),
-            invoiceDate: { $gte: new Date(start), $lte: new Date(end) },
-            status: { $in: ['fully_paid', 'partially_paid', 'confirmed'] }
-          }
-        },
-        {
-          $group: {
-            _id: null,
-            totalTax: { $sum: { $toDouble: { $ifNull: ['$taxAmount', 0] } } },
-            subtotal: { $sum: { $toDouble: { $ifNull: ['$subtotal', 0] } } },
-            totalDiscount: { $sum: { $toDouble: { $ifNull: ['$totalDiscount', '$discount'] } } },
-            total: { $sum: { $toDouble: { $ifNull: ['$totalAmount', '$total'] } } },
-            invoiceCount: { $sum: 1 }
-          }
-        }
-      ]),
-      CreditNote.aggregate([
-        {
-          $match: {
-            company: toObjectId(companyId),
-            creditDate: { $gte: new Date(start), $lte: new Date(end) },
-            status: { $in: ['confirmed', 'issued', 'applied', 'partially_refunded', 'refunded'] }
-          }
-        },
-        {
-          $group: {
-            _id: null,
-            totalTax: { $sum: { $toDouble: { $ifNull: ['$taxAmount', 0] } } },
-            total: { $sum: { $toDouble: { $ifNull: ['$totalAmount', 0] } } },
-            noteCount: { $sum: 1 }
-          }
-        }
-      ]),
-      Invoice.aggregate([
-        {
-          $match: {
-            company: toObjectId(companyId),
-            invoiceDate: { $gte: new Date(start), $lte: new Date(end) },
-            status: { $in: ['fully_paid', 'partially_paid', 'confirmed'] },
-            withholdingTax: { $exists: true, $gt: 0 }
-          }
-        },
-        { $group: { _id: null, total: { $sum: { $toDouble: '$withholdingTax' } }, count: { $sum: 1 } } }
-      ]),
-      Purchase.aggregate([
-        {
-          $match: {
-            company: toObjectId(companyId),
-            purchaseDate: { $gte: new Date(start), $lte: new Date(end) },
-            status: { $in: ['received', 'partial', 'paid'] },
-            withholdingTax: { $exists: true, $gt: 0 }
-          }
-        },
-        { $group: { _id: null, total: { $sum: { $toDouble: '$withholdingTax' } }, count: { $sum: 1 } } }
-      ]),
+      dbClient().invoice.aggregate({
+        where: { companyId: String(companyId), invoiceDate: { gte: start, lte: end }, status: { in: ['fully_paid', 'partially_paid', 'confirmed'] } },
+        _sum: { taxAmount: true, subtotal: true, totalDiscount: true, totalAmount: true }, _count: { _all: true },
+      }),
+      dbClient().creditNote.aggregate({
+        where: { companyId: String(companyId), creditDate: { gte: start, lte: end }, status: { in: ['confirmed', 'issued', 'applied', 'partially_refunded', 'refunded'] } },
+        _sum: { taxAmount: true, totalAmount: true }, _count: { _all: true },
+      }),
+      dbClient().taxTransaction.aggregate({ where: { companyId: String(companyId), taxType: 'withholding', direction: 'withheld', sourceType: { in: ['invoice', 'sale', 'sales_invoice'] }, status: 'posted', date: { gte: start, lte: end } }, _sum: { amount: true }, _count: { _all: true } }),
+      dbClient().taxTransaction.aggregate({ where: { companyId: String(companyId), taxType: 'withholding', direction: 'withheld', sourceType: { in: ['purchase', 'purchase_invoice'] }, status: 'posted', date: { gte: start, lte: end } }, _sum: { amount: true }, _count: { _all: true } }),
       aggregateExpenseWithholdingTax(companyId, start, end)
     ]);
     
     // Get tax breakdown by tax code from invoice lines
-    const taxBreakdown = await Invoice.aggregate([
-      {
-        $match: {
-          company: toObjectId(companyId),
-          invoiceDate: { $gte: new Date(start), $lte: new Date(end) },
-          status: { $in: ['fully_paid', 'partially_paid', 'confirmed'] }
-        }
-      },
-      { $unwind: { path: '$lines', preserveNullAndEmptyArrays: true } },
-      {
-        $match: {
-          'lines.taxCode': { $exists: true, $ne: null }
-        }
-      },
-      {
-        $group: {
-          _id: '$lines.taxCode',
-          taxCode: { $first: '$lines.taxCode' },
-          taxRate: { $first: '$lines.taxRate' },
-          taxableAmount: {
-            $sum: {
-              $subtract: [
-                { $toDouble: { $ifNull: ['$lines.lineSubtotal', 0] } },
-                {
-                  $multiply: [
-                    { $toDouble: { $ifNull: ['$lines.lineSubtotal', 0] } },
-                    { $divide: [{ $toDouble: { $ifNull: ['$lines.discountPct', 0] } }, 100] }
-                  ]
-                }
-              ]
-            }
-          },
-          taxAmount: {
-            $sum: { $toDouble: { $ifNull: ['$lines.lineTax', 0] } }
-          }
-        }
-      },
-      { $sort: { taxRate: 1 } }
-    ]);
+    const taxBreakdown = await dbClient().$queryRaw`
+      SELECT il.tax_code AS "taxCode", MIN(il.tax_rate) AS "taxRate",
+             COALESCE(SUM(il.line_subtotal - il.line_subtotal * il.discount_pct / 100), 0) AS "taxableAmount",
+             COALESCE(SUM(il.line_tax), 0) AS "taxAmount"
+      FROM invoice_lines il JOIN invoices i ON i.id = il.invoice_id
+      WHERE i.company_id = ${String(companyId)} AND i.invoice_date >= ${start} AND i.invoice_date <= ${end}
+        AND i.status IN ('fully_paid', 'partially_paid', 'confirmed') AND il.tax_code IS NOT NULL
+      GROUP BY il.tax_code ORDER BY "taxRate"
+    `;
     
-    const taxData = invoiceTax[0] || { totalTax: 0, subtotal: 0, totalDiscount: 0, total: 0, invoiceCount: 0 };
-    const reversalData = creditNoteTax[0] || { totalTax: 0, total: 0, noteCount: 0 };
+    const taxData = { totalTax: invoiceTax._sum?.taxAmount, subtotal: invoiceTax._sum?.subtotal, totalDiscount: invoiceTax._sum?.totalDiscount, total: invoiceTax._sum?.totalAmount, invoiceCount: invoiceTax._count?._all };
+    const reversalData = { totalTax: creditNoteTax._sum?.taxAmount, total: creditNoteTax._sum?.totalAmount, noteCount: creditNoteTax._count?._all };
     const taxableSales = Math.max(0, toNumber(taxData.subtotal) - toNumber(taxData.totalDiscount));
     const totalOutputVAT = Math.max(0, toNumber(taxData.totalTax) - toNumber(reversalData.totalTax));
-    const withholdingTaxCollected = toNumber(invoiceWHT[0]?.total);
-    const withholdingTaxPaid = toNumber(purchaseWHT[0]?.total) + toNumber(expenseWHT[0]?.total);
+    const withholdingTaxCollected = toNumber(invoiceWHT._sum?.amount);
+    const withholdingTaxPaid = toNumber(purchaseWHT._sum?.amount) + toNumber(expenseWHT[0]?.total);
     
     return {
       reportName: 'Daily Tax Collected',
@@ -878,8 +791,8 @@ class DailyReportsService {
         taxAmount: toNumber(t.taxAmount)
       })),
       withholdingBreakdown: [
-        { taxType: 'Sales WHT Collected', source: 'Invoices', count: toNumber(invoiceWHT[0]?.count), amount: withholdingTaxCollected },
-        { taxType: 'Purchase WHT Withheld', source: 'Purchases', count: toNumber(purchaseWHT[0]?.count), amount: toNumber(purchaseWHT[0]?.total) },
+        { taxType: 'Sales WHT Collected', source: 'Invoices', count: toNumber(invoiceWHT._count?._all), amount: withholdingTaxCollected },
+        { taxType: 'Purchase WHT Withheld', source: 'Purchases', count: toNumber(purchaseWHT._count?._all), amount: toNumber(purchaseWHT._sum?.amount) },
         { taxType: 'Expense WHT Withheld', source: 'Expenses', count: toNumber(expenseWHT[0]?.count), amount: toNumber(expenseWHT[0]?.total) }
       ].filter(item => item.amount > 0 || item.count > 0),
       generatedAt: new Date().toISOString()

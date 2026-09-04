@@ -1,41 +1,46 @@
-const mongoose = require('mongoose');
-const Decimal = mongoose.Types.Decimal128;
 const StockTransfer = require('../models/StockTransfer');
 const StockTransferLine = require('../models/StockTransferLine');
-const InventoryBatch = require('../models/InventoryBatch');
 const InventoryLayer = require('../models/InventoryLayer');
 const Product = require('../models/Product');
+const { dbClient } = require('../lib/prisma');
 const { loadLineProducts, getLineProduct } = require('../utils/lineProducts');
 const StockMovement = require('../models/StockMovement');
 const { runInTransaction } = require('./transactionService');
-const WarehouseInventoryCost = require('../models/WarehouseInventoryCost');
-const { aggregateWithTimeout } = require('../utils/mongoAggregation');
 
-async function _ensureActiveAndStockable(productIds) {
-  const prods = await Product.find({ _id: { $in: productIds } });
-  for (const p of prods) {
-    if (!p.isActive) throw { code: 'PRODUCT_INACTIVE', product: p._id };
-    if (!p.isStockable) throw { code: 'PRODUCT_NOT_STOCKABLE', product: p._id };
+async function _ensureActiveAndStockable(productIds, companyId) {
+  const products = await loadLineProducts(Product, productIds.map((product) => ({ product })), companyId);
+  for (const productId of productIds) {
+    const product = products.get(String(productId));
+    if (!product) throw { code: 'PRODUCT_NOT_FOUND', product: productId };
+    if (!product.isActive) throw { code: 'PRODUCT_INACTIVE', product: product._id };
+    if (!product.isStockable) throw { code: 'PRODUCT_NOT_STOCKABLE', product: product._id };
   }
 }
 
 async function _checkAvailability(companyId, fromWarehouse, lines) {
-  // For each line check qty_available at source (onHand - reserved).
-  // Products are resolved in one query; the per-line aggregate below still runs
-  // in order so the first insufficient line still decides the thrown error.
+  // Resolve products once and aggregate all source batches in one indexed query.
   const availabilityProducts = await loadLineProducts(Product, lines, companyId);
+  const productIds = [...new Set(lines.map((line) => String(line.product?._id || line.product)).filter(Boolean))];
+  const batchGroups = productIds.length
+    ? await dbClient().inventoryBatch.groupBy({
+      by: ['productId'],
+      where: { companyId: String(companyId), warehouseId: String(fromWarehouse), productId: { in: productIds } },
+      _sum: { reservedQuantity: true, quantity: true },
+    })
+    : [];
+  const availabilityByProduct = new Map(batchGroups.map((group) => [
+    String(group.productId),
+    {
+      reserved: Number(group._sum?.reservedQuantity || 0),
+      onHand: group._sum?.quantity == null ? null : Number(group._sum.quantity),
+    },
+  ]));
   for (const line of lines) {
     const prod = getLineProduct(availabilityProducts, line);
     if (!prod) throw { code: 'PRODUCT_NOT_FOUND', product: line.product };
-    const agg = await aggregateWithTimeout(InventoryBatch, [
-      { $match: { company: companyId, product: prod._id, warehouse: fromWarehouse } },
-      { $group: { _id: null, reserved: { $sum: { $ifNull: ['$reservedQuantity', 0] } }, onHand: { $sum: { $ifNull: ['$quantity', 0] } } } }
-    ]);
-    const reservedRaw = agg[0] && agg[0].reserved ? agg[0].reserved : 0;
-    const onHandRaw = agg[0] && agg[0].onHand ? agg[0].onHand : (prod.currentStock || 0);
-    const reserved = reservedRaw && reservedRaw.toString ? Number(reservedRaw.toString()) : Number(reservedRaw || 0);
-    const onHand = onHandRaw && onHandRaw.toString ? Number(onHandRaw.toString()) : Number(onHandRaw || 0);
-    const available = onHand - reserved;
+    const grouped = availabilityByProduct.get(String(prod._id));
+    const onHand = grouped?.onHand == null ? Number(prod.currentStock || 0) : grouped.onHand;
+    const available = onHand - (grouped?.reserved || 0);
     const qty = line.qty && line.qty.toString ? Number(line.qty.toString()) : Number(line.qty || 0);
     if (available < qty) throw { code: 'INSUFFICIENT_STOCK', product: prod._id };
   }
@@ -45,17 +50,41 @@ async function _resolveCostsAndConsumeLots(session, companyId, fromWarehouse, li
   // For each line determine unitCost and, for FIFO, consume lots and produce consumedLots array
   const results = [];
   const costingProducts = await loadLineProducts(Product, lines, companyId);
+  const productIds = [...new Set(lines.map((line) => String(line.product?._id || line.product)).filter(Boolean))];
+  const [costRows, layerRows] = await Promise.all([
+    dbClient().warehouseInventoryCost.findMany({
+      where: { companyId: String(companyId), warehouseId: String(fromWarehouse), productId: { in: productIds } },
+      select: { productId: true, totalQty: true, totalValue: true },
+      take: productIds.length || 1,
+    }),
+    InventoryLayer.find({
+      company: companyId,
+      warehouse: fromWarehouse,
+      product: { $in: productIds },
+      qtyRemaining: { $gt: 0 },
+    }).sort({ receiptDate: 1, _id: 1 }).limit(500).session(session),
+  ]);
+  const costsByProduct = new Map(costRows.map((row) => [String(row.productId), row]));
+  const layersByProduct = new Map();
+  for (const layer of layerRows) {
+    const key = String(layer.productId);
+    const rows = layersByProduct.get(key) || [];
+    rows.push(layer);
+    layersByProduct.set(key, rows);
+  }
   for (const line of lines) {
     const product = getLineProduct(costingProducts, line);
     const qty = Number(line.qty.toString());
     if (product.costingMethod === 'wac' || product.costingMethod === 'avg' || !product.costingMethod) {
       // Prefer per-warehouse ledger for accurate WAC; fall back to product averageCost
-      const ledger = await WarehouseInventoryCost.findOne({ company: companyId, warehouse: fromWarehouse, product: product._id }).session(session);
-      const unitCost = ledger ? Number(ledger.getAvgCost()) : Number(product.averageCost || 0);
+      const ledger = costsByProduct.get(String(product._id));
+      const unitCost = ledger
+        ? Number(ledger.totalQty || 0) > 0 ? Number(ledger.totalValue || 0) / Number(ledger.totalQty) : 0
+        : Number(product.averageCost || 0);
       results.push({ lineId: line._id, product: product._id, qty, unitCost, consumedLots: [] });
     } else {
-      // FIFO: consume InventoryBatch / InventoryLayer from source warehouse ordered by receivedDate asc
-      const layers = await InventoryLayer.find({ company: companyId, product: product._id, qtyRemaining: { $gt: 0 }, warehouse: fromWarehouse }).sort({ receiptDate: 1 }).session(session);
+      // FIFO layers are loaded once for the whole transfer and consumed in order.
+      const layers = layersByProduct.get(String(product._id)) || [];
       let remaining = qty;
       const consumedLots = [];
       let totalCost = 0;
@@ -64,7 +93,7 @@ async function _resolveCostsAndConsumeLots(session, companyId, fromWarehouse, li
         if (remaining <= 0) break;
         const take = Math.min(remaining, Number(l.qtyRemaining.toString()));
         // decrement
-        l.qtyRemaining = Decimal.fromString((Number(l.qtyRemaining.toString()) - take).toString());
+        l.qtyRemaining = Number(l.qtyRemaining) - take;
         await l.save({ session });
         consumedLots.push({ layerId: l._id, qty: take, unitCost: Number(l.unitCost ? l.unitCost.toString() : 0), receiptDate: l.receiptDate });
         totalCost += take * (Number(l.unitCost ? l.unitCost.toString() : 0));
@@ -81,25 +110,26 @@ async function _resolveCostsAndConsumeLots(session, companyId, fromWarehouse, li
 
 async function confirmTransfer(transferId, opts = {}) {
   return runInTransaction(async (session) => {
-    const transfer = await StockTransfer.findById(transferId).session(session);
+    const transfer = await StockTransfer.findById(transferId).populate('-lines').session(session);
     if (!transfer) throw { code: 'NOT_FOUND' };
     if (transfer.status !== 'draft') throw { code: 'INVALID_STATUS' };
     // load lines
     const lines = await StockTransferLine.find({ transfer: transfer._id }).session(session);
     if (transfer.fromWarehouse.toString() === transfer.toWarehouse.toString()) throw { code: 'SAME_WAREHOUSE' };
     // validations
-    await _ensureActiveAndStockable(lines.map(l => l.product));
+    await _ensureActiveAndStockable(lines.map(l => l.product), transfer.company);
     await _checkAvailability(transfer.company, transfer.fromWarehouse, lines);
 
     // resolve costs and consume lots (mutates layers)
     const resolved = await _resolveCostsAndConsumeLots(session, transfer.company, transfer.fromWarehouse, lines);
+    const productsById = await loadLineProducts(Product, lines, transfer.company);
 
     // create stock movements and update stock levels
     let transferValue = 0;
     for (const r of resolved) {
       const line = lines.find(x => String(x._id) === String(r.lineId));
       // update line unitCost
-      line.unitCost = Decimal.fromString(String(r.unitCost));
+      line.unitCost = Number(r.unitCost) || 0;
       await line.save({ session });
 
       const qty = r.qty;
@@ -108,14 +138,15 @@ async function confirmTransfer(transferId, opts = {}) {
       transferValue += totalCost;
 
       // transfer out movement (source)
-      await StockMovement.create([{ company: transfer.company, product: r.product, warehouse: transfer.fromWarehouse, type: 'out', reason: 'transfer_out', referenceType: 'other', referenceModel: 'StockTransfer', referenceDocument: transfer._id, quantity: Decimal.fromString(String(qty)), unitCost: Decimal.fromString(String(unitCost)), totalCost: Decimal.fromString(String(totalCost)) }], { session });
+      await StockMovement.create([{ company: transfer.company, product: r.product, warehouse: transfer.fromWarehouse, type: 'out', reason: 'transfer_out', referenceType: 'other', referenceModel: 'StockTransfer', referenceDocument: transfer._id, quantity: qty, unitCost, totalCost }], { session });
       // transfer in movement (destination)
-      await StockMovement.create([{ company: transfer.company, product: r.product, warehouse: transfer.toWarehouse, type: 'in', reason: 'transfer_in', referenceType: 'other', referenceModel: 'StockTransfer', referenceDocument: transfer._id, quantity: Decimal.fromString(String(qty)), unitCost: Decimal.fromString(String(unitCost)), totalCost: Decimal.fromString(String(totalCost)) }], { session });
+      await StockMovement.create([{ company: transfer.company, product: r.product, warehouse: transfer.toWarehouse, type: 'in', reason: 'transfer_in', referenceType: 'other', referenceModel: 'StockTransfer', referenceDocument: transfer._id, quantity: qty, unitCost, totalCost }], { session });
 
       // update product currentStock and warehouse-level onHand via InventoryBatch/Layer adjustments
       // Decrement source onHand (assume Product.currentStock represents company-wide; warehouse-specific handled by layers/batches already)
-      const prod = await Product.findById(r.product).session(session);
-      prod.currentStock = Decimal.fromString(String(Number(prod.currentStock || 0) - qty));
+      const prod = productsById.get(String(r.product));
+      if (!prod) throw { code: 'PRODUCT_NOT_FOUND', product: r.product };
+      prod.currentStock = Number(prod.currentStock || 0) - qty;
       await prod.save({ session });
 
       // For destination WAC/FIFO handling: create new layers for FIFO or update averages
@@ -128,12 +159,12 @@ async function confirmTransfer(transferId, opts = {}) {
         const prevQty = existingQty - qty;
         const newQty = prevQty + qty;
         const newAvg = newQty > 0 ? ((prevAvg * prevQty) + totalCost) / newQty : prevAvg;
-        prod.averageCost = Decimal.fromString(String(newAvg));
+        prod.averageCost = newAvg;
         await prod.save({ session });
       } else {
           // FIFO: create InventoryLayer entries to mirror consumed lots
           for (const lot of r.consumedLots) {
-            await InventoryLayer.create([{ company: transfer.company, product: r.product, qtyReceived: lot.qty, qtyRemaining: lot.qty, originTransfer: transfer._id, originQty: lot.qty, unitCost: Decimal.fromString(String(lot.unitCost)), receiptDate: new Date() , warehouse: transfer.toWarehouse }], { session });
+            await InventoryLayer.create([{ company: transfer.company, product: r.product, qtyReceived: lot.qty, qtyRemaining: lot.qty, originTransfer: transfer._id, originQty: lot.qty, unitCost: Number(lot.unitCost) || 0, receiptDate: new Date() , warehouse: transfer.toWarehouse }], { session });
           }
         }
     }
@@ -192,11 +223,11 @@ async function cancelTransfer(transferId, opts = {}) {
       const qty = Number(line.qty.toString());
       const unitCost = line.unitCost ? Number(line.unitCost.toString()) : 0;
       const totalCost = qty * unitCost;
-      await StockMovement.create([{ company: transfer.company, product: line.product, warehouse: transfer.toWarehouse, type: 'out', reason: 'transfer_out', referenceType: 'other', referenceModel: 'StockTransfer', referenceDocument: transfer._id, quantity: Decimal.fromString(String(qty)), unitCost: Decimal.fromString(String(unitCost)), totalCost: Decimal.fromString(String(totalCost)) }], { session });
-      await StockMovement.create([{ company: transfer.company, product: line.product, warehouse: transfer.fromWarehouse, type: 'in', reason: 'transfer_in', referenceType: 'other', referenceModel: 'StockTransfer', referenceDocument: transfer._id, quantity: Decimal.fromString(String(qty)), unitCost: Decimal.fromString(String(unitCost)), totalCost: Decimal.fromString(String(totalCost)) }], { session });
+      await StockMovement.create([{ company: transfer.company, product: line.product, warehouse: transfer.toWarehouse, type: 'out', reason: 'transfer_out', referenceType: 'other', referenceModel: 'StockTransfer', referenceDocument: transfer._id, quantity: qty, unitCost, totalCost }], { session });
+      await StockMovement.create([{ company: transfer.company, product: line.product, warehouse: transfer.fromWarehouse, type: 'in', reason: 'transfer_in', referenceType: 'other', referenceModel: 'StockTransfer', referenceDocument: transfer._id, quantity: qty, unitCost, totalCost }], { session });
       // restore product currentStock
       const prod = await Product.findById(line.product).session(session);
-      prod.currentStock = Decimal.fromString(String(Number(prod.currentStock || 0) + qty));
+      prod.currentStock = Number(prod.currentStock || 0) + qty;
       await prod.save({ session });
     }
 

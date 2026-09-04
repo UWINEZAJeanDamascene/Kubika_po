@@ -42,6 +42,13 @@ const init = (server, options = {}) => {
         const room = `user_${uid}`;
         socket.join(room);
       }
+      // Tenant-wide room: lets a write from one user's tab invalidate every
+      // other connected user's React Query cache for the same company,
+      // instead of only the acting user's own tabs.
+      const companyId = socket.user && socket.user.companyId;
+      if (companyId) {
+        socket.join(`company_${companyId}`);
+      }
 
       socket.on('disconnect', () => {
         // clean up if needed
@@ -64,6 +71,17 @@ const emitToUser = (userId, event, payload) => {
   }
 };
 
+/** Broadcast to every connected session for a tenant (cross-user signal). */
+const emitToCompany = (companyId, event, payload) => {
+  if (!io || !companyId) return;
+  try {
+    const room = `company_${companyId}`;
+    io.to(room).emit(event, payload);
+  } catch (err) {
+    console.error('Failed to emit company socket event', err);
+  }
+};
+
 const getIo = () => io;
 
-module.exports = { init, emitToUser, getIo };
+module.exports = { init, emitToUser, emitToCompany, getIo };

@@ -11,6 +11,7 @@ const {
   notifyOutOfStock,
 } = require("../services/notificationHelper");
 const cacheService = require("../services/cacheService");
+const { emitDataChanged } = require("../lib/realtimeEvents");
 const { BankAccount, BankTransaction } = require("../models/BankAccount");
 const JournalService = require("../services/journalService");
 const inventoryService = require("../services/inventoryService");
@@ -19,6 +20,7 @@ const mongoose = require("mongoose");
 const { runInTransaction } = require("../services/transactionService");
 const EBMPurchaseService = require("../services/ebmPurchaseService");
 const EBMStockService = require("../services/ebmStockService");
+const { parseBoundedPage } = require("../utils/querySafety");
 
 const sendPurchaseEmail = async (purchase, action, companyId) => {
   try {
@@ -48,9 +50,8 @@ const sendPurchaseEmail = async (purchase, action, companyId) => {
 exports.getPurchases = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
+    const { page, limit, skip } = parseBoundedPage(req.query, { defaultLimit: 20, maxLimit: 100 });
     const {
-      page = 1,
-      limit = 20,
       status,
       ebmPurchaseMatchStatus,
       supplierId,
@@ -80,11 +81,12 @@ exports.getPurchases = async (req, res, next) => {
     const total = await Purchase.countDocuments(query);
     const purchases = await Purchase.find(query)
       .populate("supplier", "name code contact")
-      .populate("items.product", "name sku unit")
       .populate("createdBy", "name email")
-      .sort({ createdAt: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit);
+      .populate("-items")
+      .select({ supplier: 1, warehouse: 1, purchaseNumber: 1, supplierInvoiceNumber: 1, status: 1, currency: 1, subtotal: 1, taxAmount: 1, totalAmount: 1, payments: 1, purchaseDate: 1, stockAdded: 1, ebm: 1, createdBy: 1, createdAt: 1, updatedAt: 1 })
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(limit)
+      .skip(skip);
 
     res.json({
       success: true,
@@ -678,6 +680,8 @@ exports.receivePurchase = async (req, res, next) => {
       console.error("EBM direct purchase pull/confirmation or stock reporting failed after receiving purchase:", ebmErr.message);
     }
 
+    emitDataChanged(companyId, "purchases", { affectsStock: true });
+    await cacheService.bumpCompanyStockCaches(companyId);
     res.json({
       success: true,
       message: "Purchase received and stock added",
@@ -1148,6 +1152,8 @@ exports.cancelPurchase = async (req, res, next) => {
       await sendPurchaseEmail(purchase, 'cancelled', companyId);
     }
 
+    emitDataChanged(companyId, "purchases", { affectsStock: true });
+    await cacheService.bumpCompanyStockCaches(companyId);
     res.json({
       success: true,
       message: "Purchase cancelled and stock reversed",

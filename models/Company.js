@@ -5,21 +5,12 @@
  * keep calling `Company.findById(...)`, `Company.find(...)`, etc. Returned
  * documents use the legacy snake_case field names (see utils/authMappers).
  *
- * A minimal Mongoose schema is still registered under the name 'Company' so
- * legacy `ref: 'Company'` populate() calls in unmigrated Mongo models do not
- * crash (they resolve against the historical Mongo collection).
  */
 
-const mongoose = require('mongoose');
 const { prisma } = require('../lib/prisma');
 const { makeCompatModel } = require('../utils/prismaCompat');
 const { generateObjectId, toIdString } = require('../utils/objectId');
 const { companyToApi, companyInputToPrisma } = require('../utils/authMappers');
-
-// Register a bare schema for legacy populate() compatibility only.
-if (!mongoose.models.Company) {
-  mongoose.model('Company', new mongoose.Schema({}, { strict: false, collection: 'companies' }));
-}
 
 const FIELD_MAP = {
   _id: { target: 'id', isId: true },

@@ -1,4 +1,3 @@
-const mongoose = require('mongoose');
 const JournalEntry = require('../models/JournalEntry');
 const cacheService = require('../services/cacheService');
 const { CHART_OF_ACCOUNTS, getAccount, DEFAULT_ACCOUNTS, canPostToAccount } = require('../constants/chartOfAccounts');
@@ -240,8 +239,8 @@ class JournalService {
       }
     }
 
-    // No session provided - attempt to start a session and run a transaction if supported
-    // If running under test environment (in-memory Mongo) or caller requested no transactions, avoid transactions
+    // Tests can explicitly request a non-transactional write; production writes
+    // use Prisma transactions so journal, tax, and bank records stay atomic.
     if (process.env.NODE_ENV === 'test' || options.forceNoTransaction) {
       try {
         const entry = await createFn(null);
@@ -253,47 +252,9 @@ class JournalService {
       }
     }
 
-    let sessionStarted = null;
-    try {
-      sessionStarted = await mongoose.startSession();
-      let resultEntry = null;
-
-      await sessionStarted.withTransaction(async (trxSession) => {
-        try {
-          resultEntry = await createFn(trxSession);
-        } catch (err) {
-          // If duplicate key error, attempt to find existing and return it (abort will be handled by withTransaction)
-          if (err && err.code === 11000 && sourceType && sourceId) {
-            const existing = await JournalEntry.findOne({ company: companyId, sourceType, sourceId }).session(trxSession);
-            if (existing) {
-              resultEntry = existing;
-              return;
-            }
-          }
-          throw err;
-        }
-      });
-
-      return coerceSavedEntry(resultEntry);
-    } catch (err) {
-      // If transactions not supported or any other error, fallback to non-transactional create
-      if (sessionStarted) sessionStarted.endSession();
-
-      try {
-        const entry = await createFn(null);
-        return coerceSavedEntry(entry);
-      } catch (err2) {
-        if (err2 && err2.code === 11000 && sourceType && sourceId) {
-          const existing = await JournalEntry.findOne({ company: companyId, sourceType, sourceId });
-          if (existing) return existing;
-        }
-        const enhanced = new Error(`JournalService.createEntry failed: ${err2.message}`);
-        enhanced.cause = err2;
-        throw enhanced;
-      }
-    } finally {
-      if (sessionStarted) sessionStarted.endSession();
-    }
+    const { runInPrismaTransaction } = require('./transactionService');
+    const resultEntry = await runInPrismaTransaction((tx) => createFn(tx));
+    return coerceSavedEntry(resultEntry);
   }
 
   /**
@@ -366,26 +327,8 @@ class JournalService {
       }
     }
 
-    let sessionStarted = null;
-    try {
-      sessionStarted = await mongoose.startSession();
-      let created = null;
-      await sessionStarted.withTransaction(async (trx) => {
-        created = await runWithSession(trx);
-      });
-      return created || [];
-    } catch (err) {
-      // Fallback to non-transactional creation if transactions unsupported
-      if (sessionStarted) sessionStarted.endSession();
-      try {
-        const created = await runWithSession(null);
-        return created;
-      } finally {
-        if (sessionStarted) sessionStarted.endSession();
-      }
-    } finally {
-      if (sessionStarted) sessionStarted.endSession();
-    }
+    const { runInPrismaTransaction } = require('./transactionService');
+    return runInPrismaTransaction((tx) => runWithSession(tx), options);
   }
 
   static createDebitLine(accountCode, amount, description = '', reference = '') {

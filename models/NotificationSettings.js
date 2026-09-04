@@ -31,6 +31,7 @@ const NotificationSettings = buildTenantModel({
   toApi: notificationSettingsToApi,
   translateCreate: notificationSettingsTranslateCreate,
   translateUpdate: notificationSettingsTranslateUpdate,
+  mutable: true,
 });
 
 /**

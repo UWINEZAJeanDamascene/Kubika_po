@@ -97,7 +97,7 @@ function quotationToApi(row) {
     publicRejectToken: row.customerAction?.publicRejectToken ?? null,
     publicTokenExpiresAt: row.customerAction?.publicTokenExpiresAt ?? null,
     lineCount,
-    lines: lines.length ? lines : Array.from({ length: lineCount }),
+    lines: lines.length ? lines : [],
     ...mapTimestamps(row),
   };
 }
@@ -200,6 +200,7 @@ function invoiceToApi(row) {
     createdBy: row.createdById ?? null,
     lines,
     items: lines,
+    lineCount: row._count?.lines != null ? Number(row._count.lines) : lines.length,
     ...mapTimestamps(row),
   };
 }
@@ -396,8 +397,8 @@ function salesOrderToApi(row) {
     notes: row.notes ?? null,
     createdBy: row.createdById ?? null,
     lineCount,
-    // Preserve .length for list UIs that only need a count (no product payload).
-    lines: lines.length ? lines : Array.from({ length: lineCount }),
+    // List projections expose the count without allocating placeholder line rows.
+    lines,
     ...mapTimestamps(row),
   };
 }
@@ -433,6 +434,7 @@ function purchaseOrderToApi(row) {
     (s, l) => s + (Number(l.lineTotal) || 0),
     0,
   ) || (linesSubtotal + linesTax);
+  const lineCount = row._count?.lines != null ? Number(row._count.lines) : lines.length;
   const headerSubtotal = qtyNum(row.subtotal);
   const headerTax = qtyNum(row.taxAmount);
   const headerTotal = qtyNum(row.totalAmount);
@@ -468,7 +470,7 @@ function purchaseOrderToApi(row) {
     approvedAt: row.approvedAt ?? null,
     createdBy: row.createdById ?? null,
     lines,
-    linesCount: lines.length,
+    linesCount: lineCount,
     ...mapTimestamps(row),
   };
 }
@@ -800,6 +802,7 @@ function purchaseToApi(row) {
   const subtotal = qtyNum(row.subtotal);
   const taxAmount = qtyNum(row.taxAmount);
   const totalAmount = qtyNum(row.totalAmount) || (subtotal + taxAmount);
+  const lineCount = row._count?.lines != null ? Number(row._count.lines) : lines.length;
   return {
     _id: row.id,
     company: row.companyId,
@@ -826,6 +829,7 @@ function purchaseToApi(row) {
     ebm: row.ebm ?? {},
     items: lines,
     lines,
+    lineCount,
     createdBy: row.createdById ?? null,
     ...mapTimestamps(row),
   };

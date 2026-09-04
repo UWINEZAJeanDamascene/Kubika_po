@@ -70,9 +70,20 @@ describe('Step 8 — postgresSequenceStore (integration)', () => {
   const companyId = '6a1682833035c524d960189e'; // from Phase 1 ETL
   const seqName = `_jest_step8_${Date.now()}`;
 
+  async function hasSeedCompany() {
+    if (!process.env.DATABASE_URL) return false;
+    try {
+      const { prisma } = require('../lib/prisma');
+      const count = await prisma.company.count({ where: { id: companyId } });
+      return count > 0;
+    } catch (_) {
+      return false;
+    }
+  }
+
   test('incrementSequence is atomic and monotonic', async () => {
-    if (!process.env.DATABASE_URL) {
-      console.warn('Skipping sequence integration — DATABASE_URL not set');
+    if (!process.env.DATABASE_URL || !(await hasSeedCompany())) {
+      console.warn('Skipping sequence integration — DATABASE_URL or seeded company not available');
       return;
     }
 
@@ -88,8 +99,8 @@ describe('Step 8 — postgresSequenceStore (integration)', () => {
   });
 
   test('allocateEbmSequence respects branch + type', async () => {
-    if (!process.env.DATABASE_URL) {
-      console.warn('Skipping EBM sequence integration — DATABASE_URL not set');
+    if (!process.env.DATABASE_URL || !(await hasSeedCompany())) {
+      console.warn('Skipping EBM sequence integration — DATABASE_URL or seeded company not available');
       return;
     }
 
@@ -107,8 +118,8 @@ describe('Step 8 — postgresSequenceStore (integration)', () => {
   });
 
   test('nextSequence returns padded year-scoped value', async () => {
-    if (!process.env.DATABASE_URL) {
-      console.warn('Skipping nextSequence integration — DATABASE_URL not set');
+    if (!process.env.DATABASE_URL || !(await hasSeedCompany())) {
+      console.warn('Skipping nextSequence integration — DATABASE_URL or seeded company not available');
       return;
     }
 

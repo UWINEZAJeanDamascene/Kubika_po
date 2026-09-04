@@ -1,4 +1,3 @@
-const mongoose = require('mongoose');
 const InventoryLayer = require('../models/InventoryLayer');
 const Product = require('../models/Product');
 const InventoryBatch = require('../models/InventoryBatch');

@@ -11,7 +11,9 @@
 
 const crypto = require('crypto');
 const { redisClient, isRedisConfigured } = require('../config/redis');
+const { getSentryPerformanceConfig } = require('../config/sentryPerformance');
 
+const APDEX_T_MS = getSentryPerformanceConfig().satisfaction_threshold_ms;
 const KEY_PREFIX = String(process.env.PERFORMANCE_METRICS_KEY_PREFIX || 'metrics:performance:v1').replace(/:+$/, '');
 const RETENTION_SECONDS = Math.max(300, Number(process.env.PERFORMANCE_METRICS_RETENTION_SECONDS || 7 * 24 * 60 * 60));
 const FLUSH_INTERVAL_MS = Math.max(50, Number(process.env.PERFORMANCE_METRICS_FLUSH_INTERVAL_MS || 250));
@@ -28,6 +30,11 @@ const CACHE_KEY = `${KEY_PREFIX}:cache`;
 const CACHE_TYPE_INDEX_KEY = `${KEY_PREFIX}:cache-type-index`;
 const CACHE_TYPE_KEY_PREFIX = `${KEY_PREFIX}:cache-type`;
 const EVENT_LOOP_SAMPLES_KEY = `${KEY_PREFIX}:event-loop-samples`;
+const CLIENT_METRIC_INDEX_KEY = `${KEY_PREFIX}:client-metric-index`;
+const CLIENT_METRIC_KEY_PREFIX = `${KEY_PREFIX}:client-metric`;
+const QUERY_POLICY_KEY = `${KEY_PREFIX}:query-policy`;
+const MAX_CLIENT_METRICS = Math.max(5, Number(process.env.PERFORMANCE_CLIENT_METRICS_MAX || 20));
+const MAX_CLIENT_SAMPLES = Math.max(20, Number(process.env.PERFORMANCE_CLIENT_METRICS_SAMPLES || 100));
 
 const health = {
   flushes: 0,
@@ -43,6 +50,8 @@ function createPending() {
     routes: new Map(),
     cache: { hits: 0, misses: 0, errors: 0, types: new Map() },
     eventLoopSamples: [],
+    clientMetrics: new Map(),
+    queryPolicy: { violations: 0, codes: new Map() },
   };
 }
 
@@ -158,6 +167,53 @@ function recordEventLoopSample(value) {
   scheduleFlush();
 }
 
+/**
+ * Record a bounded browser timing sample. Client metrics are intentionally
+ * anonymous at this layer: the health dashboard consumes fleet aggregates and
+ * the request path never waits for Redis.
+ */
+function recordQuerySafetyViolation(details = {}) {
+  if (!enabled()) return;
+  const code = String(details.code || 'QUERY_POLICY_VIOLATION').slice(0, 80);
+  pending.queryPolicy.violations += 1;
+  pending.queryPolicy.codes.set(code, (pending.queryPolicy.codes.get(code) || 0) + 1);
+  scheduleFlush();
+}
+
+function recordClientMetric(name, value, context = {}) {
+  if (!enabled()) return;
+  const metric = String(name || '').trim().toLowerCase().replace(/[^a-z0-9_.-]/g, '_');
+  const numericValue = Number(value);
+  if (!metric || !Number.isFinite(numericValue) || numericValue < 0) return;
+
+  let entry = pending.clientMetrics.get(metric);
+  if (!entry) {
+    if (pending.clientMetrics.size >= MAX_CLIENT_METRICS) return;
+    entry = {
+      name: metric,
+      unit: context.unit === 'score' ? 'score' : 'ms',
+      count: 0,
+      total: 0,
+      samples: [],
+    };
+    pending.clientMetrics.set(metric, entry);
+  }
+  entry.count += 1;
+  entry.total += numericValue;
+  if (entry.samples.length < MAX_CLIENT_SAMPLES) {
+    entry.samples.push({
+      timestamp: Date.now(),
+      value: Math.round(numericValue * 100) / 100,
+      route: typeof context.route === 'string' ? context.route.slice(0, 120) : undefined,
+    });
+  }
+  scheduleFlush();
+}
+
+function clientMetricKey(name) {
+  return `${CLIENT_METRIC_KEY_PREFIX}:${name}`;
+}
+
 function addCommand(pipeline, directCommands, method, args) {
   if (pipeline && typeof pipeline[method] === 'function') {
     pipeline[method](...args);
@@ -217,6 +273,8 @@ async function flush() {
     && batch.cache.misses === 0
     && batch.cache.errors === 0
     && batch.eventLoopSamples.length === 0
+    && batch.clientMetrics.size === 0
+    && batch.queryPolicy.violations === 0
   ) return true;
 
   flushPromise = (async () => {
@@ -255,6 +313,23 @@ async function flush() {
     if (batch.cache.types.size) addCommand(pipeline, directCommands, 'expire', [CACHE_TYPE_INDEX_KEY, RETENTION_SECONDS]);
 
     addSamplesCommands(pipeline, directCommands, EVENT_LOOP_SAMPLES_KEY, batch.eventLoopSamples, MAX_REQUEST_SAMPLES);
+
+    for (const entry of batch.clientMetrics.values()) {
+      const key = clientMetricKey(entry.name);
+      addCommand(pipeline, directCommands, 'sadd', [CLIENT_METRIC_INDEX_KEY, entry.name]);
+      addCommand(pipeline, directCommands, 'setex', [`${key}:unit`, RETENTION_SECONDS, entry.unit || 'ms']);
+      addCounterCommands(pipeline, directCommands, key, {
+        count: entry.count,
+        total_x100: Math.round(entry.total * 100),
+      });
+      addSamplesCommands(pipeline, directCommands, `${key}:samples`, entry.samples, MAX_CLIENT_SAMPLES);
+    }
+    if (batch.clientMetrics.size) addCommand(pipeline, directCommands, 'expire', [CLIENT_METRIC_INDEX_KEY, RETENTION_SECONDS]);
+
+    addCounterCommands(pipeline, directCommands, QUERY_POLICY_KEY, {
+      violations: batch.queryPolicy.violations,
+      ...Object.fromEntries(batch.queryPolicy.codes),
+    });
 
     if (pipeline && typeof pipeline.exec === 'function') await pipeline.exec();
     if (directCommands.length) await Promise.all(directCommands.map((command) => command()));
@@ -298,6 +373,20 @@ async function flush() {
       pending.cache.types.set(type, existing);
     }
     pending.eventLoopSamples = pending.eventLoopSamples.concat(retry.eventLoopSamples).slice(-MAX_BATCH_SAMPLES);
+    pending.queryPolicy.violations += retry.queryPolicy.violations;
+    for (const [code, count] of retry.queryPolicy.codes) {
+      pending.queryPolicy.codes.set(code, (pending.queryPolicy.codes.get(code) || 0) + count);
+    }
+    for (const [name, metric] of retry.clientMetrics) {
+      const existing = pending.clientMetrics.get(name);
+      if (!existing) {
+        pending.clientMetrics.set(name, metric);
+      } else {
+        existing.count += metric.count;
+        existing.total += metric.total;
+        existing.samples = existing.samples.concat(metric.samples).slice(-MAX_CLIENT_SAMPLES);
+      }
+    }
     return false;
   }).finally(() => {
     flushPromise = null;
@@ -360,8 +449,8 @@ async function getRequestMetrics() {
   const recent = samples.filter((sample) => now - toFiniteNumber(sample.timestamp) < 60 * 1000);
   const durations = samples.map((sample) => toFiniteNumber(sample.durationMs));
   const summary = summarizeDurations(durations);
-  const satisfied = samples.filter((sample) => sample.durationMs <= toFiniteNumber(process.env.APDEX_T_MS, 1000)).length;
-  const tolerating = samples.filter((sample) => sample.durationMs > toFiniteNumber(process.env.APDEX_T_MS, 1000) && sample.durationMs <= toFiniteNumber(process.env.APDEX_T_MS, 1000) * 4).length;
+  const satisfied = samples.filter((sample) => sample.durationMs <= APDEX_T_MS).length;
+  const tolerating = samples.filter((sample) => sample.durationMs > APDEX_T_MS && sample.durationMs <= APDEX_T_MS * 4).length;
   const apdex = samples.length ? Math.round(((satisfied + tolerating / 2) / samples.length) * 1000) / 1000 : null;
   return {
     total_requests: count,
@@ -375,7 +464,7 @@ async function getRequestMetrics() {
     p99_ms: summary.p99_ms,
     max_ms: summary.max_ms,
     apdex,
-    apdex_t_ms: toFiniteNumber(process.env.APDEX_T_MS, 1000),
+    apdex_t_ms: APDEX_T_MS,
     sample_window: samples.length,
     scope: 'redis-fleet',
   };
@@ -530,6 +619,82 @@ async function getEventLoopMetrics() {
   };
 }
 
+async function getClientMetrics() {
+  if (!enabled()) return null;
+  await flush();
+  const names = await readRedis('smembers', CLIENT_METRIC_INDEX_KEY);
+  if (!Array.isArray(names)) return null;
+  const boundedNames = names.slice(0, MAX_CLIENT_METRICS);
+  const rows = [];
+
+  try {
+    if (typeof redisClient.pipeline === 'function' && boundedNames.length) {
+      const pipeline = redisClient.pipeline();
+      for (const name of boundedNames) {
+        const key = clientMetricKey(name);
+        pipeline.hgetall(key);
+        pipeline.get(`${key}:unit`);
+        pipeline.lrange(`${key}:samples`, 0, MAX_CLIENT_SAMPLES - 1);
+      }
+      const values = await pipeline.exec();
+      for (let i = 0; i < boundedNames.length; i += 1) {
+        const stats = parseHash(unwrapPipelineResult(values[i * 3]));
+        const unit = unwrapPipelineResult(values[i * 3 + 1]) || 'ms';
+        const samples = parseSamples(unwrapPipelineResult(values[i * 3 + 2]));
+        const count = toFiniteNumber(stats.count);
+        const summary = summarizeDurations(samples.map((sample) => sample.value));
+        rows.push({
+          name: boundedNames[i],
+          unit: String(unit),
+          count,
+          avg: count ? Math.round(toFiniteNumber(stats.total_x100) / count) / 100 : 0,
+          p50: summary.p50_ms,
+          p95: summary.p95_ms,
+          p99: summary.p99_ms,
+          max: summary.max_ms,
+          sample_window: samples.length,
+        });
+      }
+    } else {
+      for (const name of boundedNames) {
+        const key = clientMetricKey(name);
+        const [rawStats, unit, rawSamples] = await Promise.all([
+          readRedis('hgetall', key),
+          readRedis('get', `${key}:unit`),
+          readRedis('lrange', `${key}:samples`, 0, MAX_CLIENT_SAMPLES - 1),
+        ]);
+        const stats = parseHash(rawStats);
+        const samples = parseSamples(rawSamples);
+        const count = toFiniteNumber(stats.count);
+        const summary = summarizeDurations(samples.map((sample) => sample.value));
+        rows.push({
+          name,
+          unit: String(unit || 'ms'),
+          count,
+          avg: count ? Math.round(toFiniteNumber(stats.total_x100) / count) / 100 : 0,
+          p50: summary.p50_ms,
+          p95: summary.p95_ms,
+          p99: summary.p99_ms,
+          max: summary.max_ms,
+          sample_window: samples.length,
+        });
+      }
+    }
+  } catch (error) {
+    health.readFailures += 1;
+    health.lastError = error.message || String(error);
+    return null;
+  }
+
+  rows.sort((a, b) => b.p95 - a.p95);
+  return {
+    metrics: rows,
+    tracked_metrics: names.length,
+    truncated: names.length > MAX_CLIENT_METRICS,
+    scope: 'redis-fleet',
+  };
+}
+
 function getStorageStatus() {
   return {
     backend: enabled() ? 'redis' : 'process-memory',
@@ -538,7 +703,11 @@ function getStorageStatus() {
     key_prefix: KEY_PREFIX,
     retention_seconds: RETENTION_SECONDS,
     flush_interval_ms: FLUSH_INTERVAL_MS,
-    pending_events: pending.requests.count + pending.routes.size + pending.cache.hits + pending.cache.misses + pending.cache.errors + pending.eventLoopSamples.length,
+    pending_events: pending.requests.count + pending.routes.size + pending.cache.hits + pending.cache.misses + pending.cache.errors + pending.eventLoopSamples.length + pending.clientMetrics.size + pending.queryPolicy.violations,
+    client_metrics: {
+      max_metrics: MAX_CLIENT_METRICS,
+      max_samples_per_metric: MAX_CLIENT_SAMPLES,
+    },
     health: { ...health },
   };
 }
@@ -548,10 +717,13 @@ module.exports = {
   recordRequest,
   recordCacheEvent,
   recordEventLoopSample,
+  recordClientMetric,
+  recordQuerySafetyViolation,
   flush,
   getRequestMetrics,
   getRouteMetrics,
   getCacheMetrics,
   getEventLoopMetrics,
+  getClientMetrics,
   getStorageStatus,
 };

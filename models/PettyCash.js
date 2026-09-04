@@ -112,11 +112,11 @@ PettyCashFloat.invalidateCacheForLedgerAccount = async function invalidateCacheF
 };
 
 PettyCashFloat.getCurrentBalance = async function getCurrentBalance(floatId) {
-  const rows = await dbClient().pettyCashTransaction.findMany({
+  const result = await dbClient().pettyCashTransaction.aggregate({
     where: { floatId: String(floatId) },
-    select: { amount: true },
+    _sum: { amount: true },
   });
-  return rows.reduce((sum, tx) => sum + Number(tx.amount || 0), 0);
+  return Number(result?._sum?.amount || 0);
 };
 
 const pettyCashExpenseBase = buildTenantModel({

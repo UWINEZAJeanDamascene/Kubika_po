@@ -5,12 +5,8 @@
  * keep calling `User.find(...)`, `User.findById(...)`, etc. while all user
  * data lives in PostgreSQL.
  *
- * A minimal Mongoose schema is still registered under the name 'User' so
- * legacy `ref: 'User'` populate() calls in unmigrated Mongo models do not
- * crash (they resolve against the historical Mongo collection).
  */
 
-const mongoose = require('mongoose');
 const { prisma } = require('../lib/prisma');
 const { makeCompatModel } = require('../utils/prismaCompat');
 const { generateObjectId, toIdString } = require('../utils/objectId');
@@ -28,17 +24,6 @@ const USER_ERRORS = {
   INVALID_OR_EXPIRED_TOKEN: 'INVALID_OR_EXPIRED_TOKEN',
   USER_ALREADY_MEMBER: 'USER_ALREADY_MEMBER'
 };
-
-// Register a bare schema for legacy populate() compatibility only.
-if (!mongoose.models.User) {
-  mongoose.model('User', new mongoose.Schema({
-    password: { type: String, select: false },
-    refresh_token: { type: String, select: false },
-    refresh_token_hash: { type: String, select: false },
-    twoFASecret: { type: String, select: false },
-    passwordResetToken: { type: String, select: false },
-  }, { strict: false, collection: 'users' }));
-}
 
 const FIELD_MAP = {
   _id: { target: 'id', isId: true },

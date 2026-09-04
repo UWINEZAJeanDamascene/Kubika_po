@@ -12,6 +12,7 @@ const emailService = require("../services/emailService");
 const { BankAccount } = require("../models/BankAccount");
 const { DEFAULT_ACCOUNTS } = require("../constants/chartOfAccounts");
 const EBMSalesService = require("../services/ebmSalesService");
+const { emitDataChanged } = require("../lib/realtimeEvents");
 const PDFDocument = require("pdfkit");
 const EBMCode = require("../models/EBMCode");
 const {
@@ -813,6 +814,22 @@ exports.approveCreditNote = async (req, res, next) => {
           company: companyId,
         }).populate("invoice client lines.product items.product createdBy");
       }
+    }
+
+    // This legacy approve path mutates Product.currentStock directly above
+    // (the reverseStock branch) whenever it runs, bypassing the /api/products
+    // and /api/stock/* route-level cache invalidation. bumpCompanyStockCaches
+    // is a no-op-cost safety call even when reverseStock was false.
+    try {
+      const cacheService = require('../services/cacheService');
+      if (reverseStock) {
+        await cacheService.bumpCompanyStockCaches(companyId);
+      }
+      if (journalEntry) {
+        await cacheService.invalidateByCompany(companyId, 'report');
+      }
+    } catch (cacheErr) {
+      console.error('Cache invalidation after credit note approve failed:', cacheErr);
     }
 
     res.json({ success: true, data: responseNote });
@@ -1712,6 +1729,8 @@ exports.confirmCreditNote = async (req, res, next) => {
     }
 
     console.log("DEBUG: Sending response with status:", responseNote.status);
+    emitDataChanged(companyId, "creditNotes", { affectsStock: true });
+    await require("../services/cacheService").bumpCompanyStockCaches(companyId);
     res.json({
       success: true,
       message: "Credit note confirmed successfully",

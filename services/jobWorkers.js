@@ -6,19 +6,21 @@
  */
 
 const { Worker } = require('bullmq');
+const { Prisma } = require('@prisma/client');
+const { dbClient } = require('../lib/prisma');
 const { redisClient, isRedisConfigured , createQueueConnection } = require('../config/redis');
 
 // BullMQ needs its own connection: it rejects a client with maxRetriesPerRequest
 // set, and its blocking reads would otherwise stall shared cache traffic.
 const queueConnection = createQueueConnection();
 const Invoice = require('../models/Invoice');
+const Purchase = require('../models/Purchase');
 const Product = require('../models/Product');
 const Company = require('../models/Company');
 const RecurringInvoice = require('../models/RecurringInvoice');
 const emailService = require('./emailService');
 
 const { JOB_TYPES, isQueueAvailable } = require('./jobQueue');
-const { aggregateWithTimeout } = require('../utils/mongoAggregation');
 
 // Store worker references
 const workers = {};
@@ -93,24 +95,21 @@ const nightlyAggregationProcessor = async (job) => {
  * Pre-compute Balance Sheet totals
  */
 async function precomputeBalanceSheet(companyId) {
-  const pipeline = [
-    { $match: { company: companyId } },
-    { $facet: {
-      totalInvoices: [{ $count: 'count' }],
-      totalRevenue: [{ $group: { _id: null, total: { $sum: '$grandTotal' } } }],
-      totalTax: [{ $group: { _id: null, total: { $sum: '$totalTax' } } }],
-      totalReceivables: [
-        { $match: { status: { $in: ['draft', 'confirmed', 'partial'] } } },
-        { $group: { _id: null, total: { $sum: '$balance' } } }
-      ]
-    }}
-  ];
-  
-  const results = await aggregateWithTimeout(Invoice, pipeline, 'report');
-  
-  // Store pre-computed data in cache or dedicated collection
-  // This can be used by reports instead of running full aggregation
-  return results[0];
+  const where = { companyId: String(companyId) };
+  const [count, sums, receivables] = await Promise.all([
+    dbClient().invoice.count({ where }),
+    dbClient().invoice.aggregate({ where, _sum: { totalAmount: true, taxAmount: true } }),
+    dbClient().invoice.aggregate({
+      where: { ...where, status: { in: ['draft', 'confirmed', 'partially_paid'] }, amountOutstanding: { gt: 0 } },
+      _sum: { amountOutstanding: true },
+    }),
+  ]);
+  return {
+    totalInvoices: [{ count }],
+    totalRevenue: [{ total: Number(sums._sum.totalAmount || 0) }],
+    totalTax: [{ total: Number(sums._sum.taxAmount || 0) }],
+    totalReceivables: [{ total: Number(receivables._sum.amountOutstanding || 0) }],
+  };
 }
 
 /**
@@ -120,44 +119,29 @@ async function precomputeProfitAndLoss(companyId) {
   const now = new Date();
   const yearStart = new Date(now.getFullYear(), 0, 1);
   
-  const pipeline = [
-    { 
-      $match: { 
-        company: companyId, 
-        status: 'paid',
-        paidDate: { $gte: yearStart, $lte: now }
-      } 
-    },
-    { $facet: {
-      revenue: [{ $group: { _id: null, total: { $sum: '$grandTotal' } } }],
-      tax: [{ $group: { _id: null, total: { $sum: '$totalTax' } } }],
-      discount: [{ $group: { _id: null, total: { $sum: '$totalDiscount' } } }]
-    }}
-  ];
-  
-  const results = await aggregateWithTimeout(Invoice, pipeline, 'report');
-  return results[0];
+  const result = await dbClient().invoice.aggregate({
+    where: { companyId: String(companyId), status: 'fully_paid', paidDate: { gte: yearStart, lte: now } },
+    _sum: { totalAmount: true, taxAmount: true, totalDiscount: true },
+  });
+  return {
+    revenue: [{ total: Number(result._sum.totalAmount || 0) }],
+    tax: [{ total: Number(result._sum.taxAmount || 0) }],
+    discount: [{ total: Number(result._sum.totalDiscount || 0) }],
+  };
 }
 
 /**
  * Pre-compute Inventory Valuation
  */
 async function precomputeInventoryValuation(companyId) {
-  const pipeline = [
-    { $match: { company: companyId, isArchived: false } },
-    { $project: { 
-      stockValue: { $multiply: ['$currentStock', '$averageCost'] }
-    }},
-    { $group: { 
-      _id: null, 
-      totalValue: { $sum: '$stockValue' },
-      totalProducts: { $sum: 1 },
-      totalStock: { $sum: '$currentStock' }
-    }}
-  ];
-  
-  const results = await aggregateWithTimeout(Product, pipeline, 'report');
-  return results[0] || { totalValue: 0, totalProducts: 0, totalStock: 0 };
+  const [result] = await dbClient().$queryRaw(Prisma.sql`
+    SELECT COALESCE(SUM("current_stock" * "average_cost"), 0) AS "totalValue",
+           COUNT(*)::int AS "totalProducts",
+           COALESCE(SUM("current_stock"), 0) AS "totalStock"
+    FROM "products"
+    WHERE "company_id" = ${String(companyId)} AND "is_archived" = false
+  `);
+  return result || { totalValue: 0, totalProducts: 0, totalStock: 0 };
 }
 
 /**
@@ -220,11 +204,14 @@ const monthlySummaryProcessor = async (job) => {
             company: company._id,
             createdAt: { $gte: monthStart }
           }),
-          totalRevenue: await aggregateWithTimeout(Invoice, [
-            { $match: { company: company._id, status: 'paid', paidDate: { $gte: monthStart } } },
-            { $group: { _id: null, total: { $sum: '$grandTotal' } } }
-          ], 'report'),
-          totalPurchases: await precomputeInventoryValuation(company._id)
+          totalRevenue: await dbClient().invoice.aggregate({
+            where: { companyId: String(company._id), status: 'fully_paid', paidDate: { gte: monthStart } },
+            _sum: { totalAmount: true },
+          }),
+          totalPurchases: Number((await Purchase.aggregate({
+            where: { companyId: String(company._id), purchaseDate: { gte: monthStart, lte: now } },
+            _sum: { totalAmount: true },
+          }))._sum.totalAmount || 0)
         }
       };
       

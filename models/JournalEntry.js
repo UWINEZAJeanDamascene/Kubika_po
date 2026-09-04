@@ -3,7 +3,6 @@
  * Lines in journal_entry_lines; API keeps embedded lines[] for compatibility.
  */
 
-const mongoose = require('mongoose');
 const { prisma, dbClient } = require('../lib/prisma');
 const { makeCompatModel, toId } = require('../utils/prismaCompat');
 const { decimalToNumber } = require('../utils/decimalHelpers');
@@ -41,10 +40,6 @@ const FIELD_MAP = {
 };
 
 const LINE_INCLUDE = { lines: { orderBy: { lineOrder: 'asc' } } };
-
-if (!mongoose.models.JournalEntry) {
-  mongoose.model('JournalEntry', new mongoose.Schema({}, { strict: false, collection: 'journalentries' }));
-}
 
 function JournalEntryDoc(data = {}) {
   Object.assign(this, data);

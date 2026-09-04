@@ -10,13 +10,120 @@ const Supplier = require('../models/Supplier');
 const Tax = require('../models/Tax');
 const Company = require('../models/Company');
 const FixedAsset = require('../models/FixedAsset');
-const Loan = require('../models/Loan');
 const StockMovement = require('../models/StockMovement');
 const InventoryBatch = require('../models/InventoryBatch');
 const SerialNumber = require('../models/SerialNumber');
 const Warehouse = require('../models/Warehouse');
 const { BankAccount, BankTransaction } = require('../models/BankAccount');
-const { aggregateWithTimeout } = require('../utils/mongoAggregation');
+const { Prisma } = require('@prisma/client');
+const { dbClient } = require('../lib/prisma');
+function legacyRelation(row) {
+  if (!row) return row;
+  return { ...row, _id: row.id };
+}
+
+async function loadFixedAssets(companyId, where = {}, orderBy) {
+  const rows = await dbClient().fixedAsset.findMany({
+    where: { companyId: String(companyId), ...where },
+    include: { category: { select: { id: true, name: true } } },
+    ...(orderBy ? { orderBy } : {}),
+  });
+  const supplierIds = [...new Set(rows.map((row) => row.supplierId).filter(Boolean))];
+  const creatorIds = [...new Set(rows.map((row) => row.createdById).filter(Boolean))];
+  const [suppliers, creators] = await Promise.all([
+    supplierIds.length ? dbClient().supplier.findMany({ where: { id: { in: supplierIds } }, select: { id: true, name: true, code: true } }) : [],
+    creatorIds.length ? dbClient().user.findMany({ where: { id: { in: creatorIds } }, select: { id: true, name: true } }) : [],
+  ]);
+  const supplierMap = new Map(suppliers.map((row) => [row.id, legacyRelation(row)]));
+  const creatorMap = new Map(creators.map((row) => [row.id, legacyRelation(row)]));
+  return rows.map((row) => ({
+    ...row,
+    _id: row.id,
+    assetCode: row.referenceNo || row.id,
+    category: legacyRelation(row.category),
+    supplier: supplierMap.get(row.supplierId) || null,
+    createdBy: creatorMap.get(row.createdById) || null,
+    purchaseValue: Number(row.purchaseCost || 0),
+    usefulLife: Math.max(1, Math.round(row.usefulLifeMonths / 12)),
+    usefulLifeYears: Math.max(1, row.usefulLifeMonths / 12),
+    currentValue: Number(row.netBookValue || 0),
+    disposalAmount: Number(row.disposalNetProceeds ?? row.disposalProceeds ?? 0),
+  }));
+}
+
+function sumPurchasePayments(payments) {
+  return Array.isArray(payments)
+    ? payments.reduce((sum, payment) => sum + Number(payment?.amountPaid ?? payment?.amount_paid ?? payment?.amount ?? 0), 0)
+    : 0;
+}
+
+async function loadPurchasesForReport(companyId, where = {}, orderBy) {
+  const rows = await dbClient().purchase.findMany({
+    where: { companyId: String(companyId), ...where },
+    include: { supplier: { select: { id: true, name: true, code: true, contact: true } }, lines: true },
+    ...(orderBy ? { orderBy } : {}),
+  });
+  return rows.map((row) => {
+    const total = Number(row.totalAmount || 0);
+    const paid = Math.min(total, sumPurchasePayments(row.payments));
+    return {
+      ...row,
+      _id: row.id,
+      purchaseNumber: row.purchaseNumber,
+      expectedDeliveryDate: row.purchaseDate,
+      grandTotal: total,
+      amountPaid: paid,
+      balance: Math.max(0, total - paid),
+      totalTax: Number(row.taxAmount || 0),
+      items: row.lines,
+      supplier: legacyRelation(row.supplier),
+    };
+  });
+}
+
+async function loadPayablesForReport(companyId) {
+  const rows = await dbClient().$queryRaw(Prisma.sql`
+    SELECT grn.id, grn.reference_no AS "referenceNo", grn.supplier_invoice_no AS "supplierInvoiceNo",
+           grn.received_date AS "receivedDate", grn.total_amount AS "totalAmount",
+           grn.payment_due_date AS "paymentDueDate", grn.status,
+           s.id AS "supplierId", s.name AS "supplierName", s.code AS "supplierCode", s.contact AS "supplierContact",
+           COALESCE(SUM(apa.amount_allocated) FILTER (WHERE ap.status = 'posted'), 0) AS "paidFromLedger"
+    FROM goods_received_notes grn
+    JOIN suppliers s ON s.id = grn.supplier_id
+    LEFT JOIN ap_payment_allocations apa ON apa.grn_id = grn.id
+    LEFT JOIN ap_payments ap ON ap.id = apa.payment_id
+    WHERE grn.company_id = ${String(companyId)} AND grn.status IN ('received', 'confirmed', 'posted')
+    GROUP BY grn.id, s.id
+    HAVING grn.total_amount > COALESCE(SUM(apa.amount_allocated) FILTER (WHERE ap.status = 'posted'), 0)
+    ORDER BY grn.payment_due_date ASC NULLS LAST, grn.received_date ASC
+  `);
+  return rows.map((row) => {
+    const total = Number(row.totalAmount || 0);
+    const paid = Math.min(total, Number(row.paidFromLedger || 0));
+    return {
+      ...row,
+      _id: row.id,
+      purchaseNumber: row.supplierInvoiceNo || row.referenceNo,
+      purchaseDate: row.receivedDate,
+      expectedDeliveryDate: row.paymentDueDate || row.receivedDate,
+      subtotal: total,
+      totalTax: 0,
+      grandTotal: total,
+      amountPaid: paid,
+      balance: Math.max(0, total - paid),
+      supplier: { _id: row.supplierId, name: row.supplierName, code: row.supplierCode, contact: row.supplierContact },
+    };
+  });
+}
+
+async function aggregateReportTotals(delegate, where, sums) {
+  const result = await dbClient()[delegate].aggregate({
+    where,
+    _sum: sums,
+    _count: { _all: true },
+  });
+  return result;
+}
 
 // Helper function to get date range for different periods
 const getPeriodDates = (periodType, year, periodNumber) => {
@@ -111,106 +218,42 @@ const getCurrentPeriodInfo = (periodType) => {
 // Generate Profit & Loss Report
 const generateProfitLossReport = async (companyId, startDate, endDate) => {
   const matchStage = {
-    company: companyId,
+    companyId: String(companyId),
     status: 'paid',
-    paidDate: { $gte: startDate, $lte: endDate }
+    paidDate: { gte: startDate, lte: endDate }
   };
 
   // Revenue from paid invoices
-  const invoiceRevenue = await aggregateWithTimeout(Invoice, [
-    { $match: matchStage },
-    {
-      $group: {
-        _id: null,
-        total: { $sum: '$total' },
-        subtotal: { $sum: '$subtotal' },
-        taxAmount: { $sum: '$taxAmount' },
-        discount: { $sum: '$totalDiscount' },
-        count: { $sum: 1 }
-      }
-    }
-  ]);
+  const invoiceTotals = await aggregateReportTotals('invoice', { ...matchStage, status: 'fully_paid' }, { totalAmount: true, subtotal: true, taxAmount: true, totalDiscount: true });
+  const invoiceRevenue = [{
+    total: invoiceTotals._sum.totalAmount || 0,
+    subtotal: invoiceTotals._sum.subtotal || 0,
+    taxAmount: invoiceTotals._sum.taxAmount || 0,
+    discount: invoiceTotals._sum.totalDiscount || 0,
+    count: invoiceTotals._count._all,
+  }];
 
   // Sales returns from CreditNote collection
-  const creditNotesData = await aggregateWithTimeout(CreditNote, [
-    {
-      $match: {
-        company: companyId,
-        status: 'approved',
-        issueDate: { $gte: startDate, $lte: endDate }
-      }
-    },
-    {
-      $group: {
-        _id: null,
-        total: { $sum: '$total' },
-        subtotal: { $sum: '$subtotal' },
-        taxAmount: { $sum: '$taxAmount' },
-        count: { $sum: 1 }
-      }
-    }
-  ]);
+  const creditNoteTotals = await aggregateReportTotals('creditNote', { companyId: String(companyId), status: 'approved', creditDate: { gte: startDate, lte: endDate } }, { totalAmount: true, subtotal: true, taxAmount: true });
+  const creditNotesData = [{ total: creditNoteTotals._sum.totalAmount || 0, subtotal: creditNoteTotals._sum.subtotal || 0, taxAmount: creditNoteTotals._sum.taxAmount || 0, count: creditNoteTotals._count._all }];
 
   // Purchases
-  const purchases = await aggregateWithTimeout(Purchase, [
-    {
-      $match: {
-        company: companyId,
-        status: 'completed',
-        purchaseDate: { $gte: startDate, $lte: endDate }
-      }
-    },
-    {
-      $group: {
-        _id: null,
-        total: { $sum: '$total' },
-        subtotal: { $sum: '$subtotal' },
-        taxAmount: { $sum: '$taxAmount' },
-        count: { $sum: 1 }
-      }
-    }
-  ]);
+  const purchaseTotals = await aggregateReportTotals('purchase', { companyId: String(companyId), status: 'completed', purchaseDate: { gte: startDate, lte: endDate } }, { totalAmount: true, subtotal: true, taxAmount: true });
+  const purchases = [{ total: purchaseTotals._sum.totalAmount || 0, subtotal: purchaseTotals._sum.subtotal || 0, taxAmount: purchaseTotals._sum.taxAmount || 0, count: purchaseTotals._count._all }];
 
   // Purchase returns from PurchaseReturn collection
-  const purchaseReturnsData = await aggregateWithTimeout(PurchaseReturn, [
-    {
-      $match: {
-        company: companyId,
-        status: 'approved',
-        returnDate: { $gte: startDate, $lte: endDate }
-      }
-    },
-    {
-      $group: {
-        _id: null,
-        total: { $sum: '$total' },
-        subtotal: { $sum: '$subtotal' },
-        taxAmount: { $sum: '$taxAmount' },
-        count: { $sum: 1 }
-      }
-    }
-  ]);
+  const purchaseReturnTotals = await aggregateReportTotals('purchaseReturn', { companyId: String(companyId), status: 'approved', returnDate: { gte: startDate, lte: endDate } }, { totalAmount: true });
+  const purchaseReturnsData = [{ total: purchaseReturnTotals._sum.totalAmount || 0, subtotal: 0, taxAmount: 0, count: purchaseReturnTotals._count._all }];
 
   // Expenses by category
-  const expenses = await aggregateWithTimeout(Expense, [
-    {
-      $match: {
-        company: companyId,
-        status: 'approved',
-        expenseDate: { $gte: startDate, $lte: endDate }
-      }
-    },
-    {
-      $group: {
-        _id: '$category',
-        total: { $sum: '$amount' }
-      }
-    }
-  ]);
+  const expenses = await dbClient().expense.groupBy({
+    by: ['category'],
+    where: { companyId: String(companyId), status: 'approved', expenseDate: { gte: startDate, lte: endDate } },
+    _sum: { amount: true },
+  });
 
   // Get stock values
-  const products = await Product.find({ company: companyId, isActive: true })
-    .populate('category', 'name');
+  const products = await Product.find({ company: companyId, isActive: true });
 
   const openingStockValue = products.reduce((sum, p) => sum + (p.openingStock * p.costPrice), 0);
   const closingStockValue = products.reduce((sum, p) => sum + (p.quantity * p.costPrice), 0);
@@ -230,11 +273,11 @@ const generateProfitLossReport = async (companyId, startDate, endDate) => {
   // Operating expenses
   const expenseByCategory = {};
   expenses.forEach(e => {
-    expenseByCategory[e._id || 'Other'] = e.total;
+    expenseByCategory[e.category || 'Other'] = Number(e._sum.amount || 0);
   });
 
   // Depreciation from FixedAsset (Asset) for the period
-  const fixedAssets = await FixedAsset.find({ company: companyId, status: 'active' });
+  const fixedAssets = await loadFixedAssets(companyId, { status: 'active' });
   const totalDepreciation = fixedAssets.reduce((sum, fa) => {
     // Calculate monthly depreciation
     const monthlyDepreciation = (fa.purchaseValue - fa.salvageValue) / (fa.usefulLife || 60); // default 5 years
@@ -252,39 +295,18 @@ const generateProfitLossReport = async (companyId, startDate, endDate) => {
 
   // Other income/expenses
   const interestIncome = 0; // Could be calculated from bank accounts
-  const interestExpense = await aggregateWithTimeout(Loan, [
-    {
-      $match: {
-        company: companyId,
-        status: 'active',
-        startDate: { $lte: endDate }
-      }
-    },
-    {
-      $project: {
-        monthlyInterest: {
-          $divide: [
-            { $multiply: ['$principalAmount', '$interestRate'] },
-            100
-          ]
-        },
-        monthsInPeriod: {
-          $divide: [
-            { $subtract: [endDate, { $min: ['$startDate', startDate] }] },
-            1000 * 60 * 60 * 24 * 30
-          ]
-        }
-      }
-    },
-    {
-      $group: {
-        _id: null,
-        total: { $sum: { $multiply: ['$monthlyInterest', { $max: ['$monthsInPeriod', 1] }] } }
-      }
-    }
-  ]);
+  const [interestExpenseRow] = await dbClient().$queryRaw(Prisma.sql`
+    SELECT COALESCE(SUM(
+      ("original_amount" * "interest_rate" / 100) * GREATEST(
+        EXTRACT(EPOCH FROM (${endDate} - GREATEST("start_date", ${startDate}))) / (30 * 24 * 60 * 60), 1
+      )
+    ), 0) AS total
+    FROM loans
+    WHERE "company_id" = ${String(companyId)} AND status = 'active' AND "start_date" <= ${endDate}
+  `);
+  const interestExpense = Number(interestExpenseRow?.total || 0);
 
-  const netOtherIncome = interestIncome - (interestExpense[0]?.total || 0);
+  const netOtherIncome = interestIncome - interestExpense;
   const profitBeforeTax = operatingProfit + netOtherIncome;
   const corporateTax = profitBeforeTax > 0 ? profitBeforeTax * 0.3 : 0;
   const netProfit = profitBeforeTax - corporateTax;
@@ -315,7 +337,7 @@ const generateProfitLossReport = async (companyId, startDate, endDate) => {
     },
     otherIncomeExpenses: {
       interestIncome,
-      interestExpense: interestExpense[0]?.total || 0,
+      interestExpense,
       netOtherIncome
     },
     profitBeforeTax: {
@@ -345,36 +367,17 @@ const generateBalanceSheetReport = async (companyId, asOfDate) => {
   const startOfYear = new Date(asOf.getFullYear(), 0, 1);
 
   // Current Assets
-  const accountsReceivable = await aggregateWithTimeout(Invoice, [
-    {
-      $match: {
-        company: companyId,
-        status: { $in: ['sent', 'partial', 'overdue'] },
-        dueDate: { $lte: asOf }
-      }
-    },
-    {
-      $group: {
-        _id: null,
-        total: { $sum: '$balance' }
-      }
-    }
-  ]);
-
-  const inventoryValue = await aggregateWithTimeout(Product, [
-    {
-      $match: {
-        company: companyId,
-        isActive: true
-      }
-    },
-    {
-      $group: {
-        _id: null,
-        total: { $sum: { $multiply: ['$quantity', '$costPrice'] } }
-      }
-    }
-  ]);
+  const accountsReceivableTotals = await dbClient().invoice.aggregate({
+    where: { companyId: String(companyId), status: { in: ['sent', 'partially_paid', 'overdue'] }, dueDate: { lte: asOf } },
+    _sum: { amountOutstanding: true },
+  });
+  const accountsReceivableTotal = Number(accountsReceivableTotals._sum.amountOutstanding || 0);
+  const [inventoryRow] = await dbClient().$queryRaw(Prisma.sql`
+    SELECT COALESCE(SUM("current_stock" * "cost_price"), 0) AS total
+    FROM "products"
+    WHERE "company_id" = ${String(companyId)} AND "is_active" = true
+  `);
+  const inventoryValueTotal = Number(inventoryRow?.total || 0);
 
   // Cash Position from BankAccount collection
   const bankAccounts = await BankAccount.find({ company: companyId, isActive: true });
@@ -382,15 +385,15 @@ const generateBalanceSheetReport = async (companyId, asOfDate) => {
 
   const currentAssets = {
     cashAndBank,
-    accountsReceivable: accountsReceivable[0]?.total || 0,
-    inventoryStockValue: inventoryValue[0]?.total || 0,
+    accountsReceivable: accountsReceivableTotal,
+    inventoryStockValue: inventoryValueTotal,
     prepaidExpenses: 0,
     vatReceivable: 0,
-    total: (cashAndBank) + (accountsReceivable[0]?.total || 0) + (inventoryValue[0]?.total || 0)
+    total: cashAndBank + accountsReceivableTotal + inventoryValueTotal
   };
 
   // Fixed Assets
-  const fixedAssets = await FixedAsset.find({ company: companyId, status: 'active' });
+  const fixedAssets = await loadFixedAssets(companyId, { status: 'active' });
   const totalFixedAssets = fixedAssets.reduce((sum, fa) => sum + fa.currentValue, 0);
   const totalDepreciation = fixedAssets.reduce((sum, fa) => sum + (fa.purchaseValue - fa.currentValue), 0);
 
@@ -403,51 +406,26 @@ const generateBalanceSheetReport = async (companyId, asOfDate) => {
   const totalAssets = currentAssets.total + nonCurrentAssets.total;
 
   // Liabilities
-  const accountsPayable = await aggregateWithTimeout(Purchase, [
-    {
-      $match: {
-        company: companyId,
-        status: { $in: ['pending', 'partial'] }
-      }
-    },
-    {
-      $group: {
-        _id: null,
-        total: { $sum: '$balance' }
-      }
-    }
-  ]);
-
-  const loans = await aggregateWithTimeout(Loan, [
-    {
-      $match: {
-        company: companyId,
-        status: 'active'
-      }
-    },
-    {
-      $group: {
-        _id: null,
-        shortTerm: {
-          $sum: {
-            $cond: [{ $lte: ['$dueDate', new Date(asOf.getTime() + 365 * 24 * 60 * 60 * 1000)] }, '$balance', 0]
-          }
-        },
-        longTerm: {
-          $sum: {
-            $cond: [{ $gt: ['$dueDate', new Date(asOf.getTime() + 365 * 24 * 60 * 60 * 1000)] }, '$balance', 0]
-          }
-        }
-      }
-    }
-  ]);
+  const accountsPayableTotals = await dbClient().purchase.aggregate({
+    where: { companyId: String(companyId), status: { in: ['pending', 'partial'] } },
+    _sum: { totalAmount: true },
+  });
+  const accountsPayableTotal = Number(accountsPayableTotals._sum.totalAmount || 0);
+  const loanCutoff = new Date(asOf.getTime() + 365 * 24 * 60 * 60 * 1000);
+  const [loanRow] = await dbClient().$queryRaw(Prisma.sql`
+    SELECT COALESCE(SUM(CASE WHEN "end_date" <= ${loanCutoff} THEN "outstanding_balance" ELSE 0 END), 0) AS "shortTerm",
+           COALESCE(SUM(CASE WHEN "end_date" > ${loanCutoff} THEN "outstanding_balance" ELSE 0 END), 0) AS "longTerm"
+    FROM "loans"
+    WHERE "company_id" = ${String(companyId)} AND "status" = 'active'
+  `);
+  const loans = [{ shortTerm: Number(loanRow?.shortTerm || 0), longTerm: Number(loanRow?.longTerm || 0) }];
 
   const currentLiabilities = {
-    accountsPayable: accountsPayable[0]?.total || 0,
+    accountsPayable: accountsPayableTotal,
     vatPayable: 0,
     shortTermLoans: loans[0]?.shortTerm || 0,
     accruedExpenses: 0,
-    total: (accountsPayable[0]?.total || 0) + (loans[0]?.shortTerm || 0)
+    total: accountsPayableTotal + (loans[0]?.shortTerm || 0)
   };
 
   const nonCurrentLiabilities = {
@@ -495,42 +473,19 @@ const generateBalanceSheetReport = async (companyId, asOfDate) => {
 // Generate VAT Summary Report
 const generateVATSummaryReport = async (companyId, startDate, endDate) => {
   // Output VAT (from invoices)
-  const outputVAT = await aggregateWithTimeout(Invoice, [
-    {
-      $match: {
-        company: companyId,
-        status: 'paid',
-        paidDate: { $gte: startDate, $lte: endDate },
-        'tax.rate': { $gt: 0 }
-      }
-    },
-    {
-      $group: {
-        _id: '$tax.code',
-        taxableBase: { $sum: '$subtotal' },
-        taxAmount: { $sum: '$taxAmount' }
-      }
-    }
-  ]);
+  const outputVATRows = await dbClient().invoiceLine.groupBy({
+    by: ['taxCode'],
+    where: { companyId: String(companyId), taxRate: { gt: 0 }, invoice: { status: 'fully_paid', paidDate: { gte: startDate, lte: endDate } } },
+    _sum: { lineSubtotal: true, lineTax: true },
+  });
+  const outputVAT = outputVATRows.map((row) => ({ _id: row.taxCode, taxableBase: Number(row._sum.lineSubtotal || 0), taxAmount: Number(row._sum.lineTax || 0) }));
 
   // Input VAT (from purchases)
-  const inputVAT = await aggregateWithTimeout(Purchase, [
-    {
-      $match: {
-        company: companyId,
-        status: 'completed',
-        purchaseDate: { $gte: startDate, $lte: endDate },
-        'tax.rate': { $gt: 0 }
-      }
-    },
-    {
-      $group: {
-        _id: '$tax.code',
-        taxableBase: { $sum: '$subtotal' },
-        taxAmount: { $sum: '$taxAmount' }
-      }
-    }
-  ]);
+  const inputPurchaseTotals = await dbClient().purchase.aggregate({
+    where: { companyId: String(companyId), status: 'completed', purchaseDate: { gte: startDate, lte: endDate }, taxAmount: { gt: 0 } },
+    _sum: { subtotal: true, taxAmount: true },
+  });
+  const inputVAT = [{ _id: 'A', taxableBase: Number(inputPurchaseTotals._sum.subtotal || 0), taxAmount: Number(inputPurchaseTotals._sum.taxAmount || 0) }];
 
   const summary = {};
   const allTaxCodes = new Set([
@@ -554,98 +509,71 @@ const generateVATSummaryReport = async (companyId, startDate, endDate) => {
 
 // Generate Product Performance Report
 const generateProductPerformanceReport = async (companyId, startDate, endDate, limit = 10) => {
-  const productPerformance = await aggregateWithTimeout(Invoice, [
-    {
-      $match: {
-        company: companyId,
-        status: 'paid',
-        paidDate: { $gte: startDate, $lte: endDate }
-      }
-    },
-    { $unwind: '$items' },
-    {
-      $group: {
-        _id: '$items.product',
-        productName: { $first: '$items.productName' },
-        revenue: { $sum: { $multiply: ['$items.quantity', '$items.unitPrice'] } },
-        cost: { $sum: { $multiply: ['$items.quantity', '$items.unitCost'] } },
-        quantitySold: { $sum: '$items.quantity' },
-        orders: { $addToSet: '$_id' }
-      }
-    },
-    {
-      $project: {
-        product: '$_id',
-        productName: 1,
-        revenue: 1,
-        cogs: '$cost',
-        margin: { $subtract: ['$revenue', '$cost'] },
-        quantitySold: 1,
-        orders: { $size: '$orders' }
-      }
-    },
-    { $sort: { revenue: -1 } },
-    { $limit: limit }
-  ]);
+  const productPerformance = await dbClient().$queryRaw(Prisma.sql`
+    SELECT il.product_id AS product, MAX(COALESCE(il.product_name, p.name)) AS "productName",
+           COALESCE(SUM(il.qty * il.unit_price), 0) AS revenue,
+           COALESCE(SUM(il.qty * il.unit_cost), 0) AS cogs,
+           COALESCE(SUM(il.qty), 0) AS "quantitySold",
+           COUNT(DISTINCT il.invoice_id)::int AS orders
+    FROM invoice_lines il JOIN invoices i ON i.id = il.invoice_id
+    LEFT JOIN products p ON p.id = il.product_id
+    WHERE i.company_id = ${String(companyId)} AND i.status = 'fully_paid'
+      AND i.paid_date >= ${startDate} AND i.paid_date <= ${endDate}
+    GROUP BY il.product_id ORDER BY revenue DESC LIMIT ${Math.min(Number(limit) || 10, 100)}
+  `);
+  for (const row of productPerformance) {
+    row.revenue = Number(row.revenue || 0); row.cogs = Number(row.cogs || 0);
+    row.margin = row.revenue - row.cogs; row.quantitySold = Number(row.quantitySold || 0);
+  }
 
   return productPerformance;
 };
 
 // Generate Top Customers Report
 const generateTopCustomersReport = async (companyId, startDate, endDate, limit = 10) => {
-  const topCustomers = await aggregateWithTimeout(Invoice, [
-    {
-      $match: {
-        company: companyId,
-        status: 'paid',
-        paidDate: { $gte: startDate, $lte: endDate }
-      }
-    },
-    {
-      $group: {
-        _id: '$client',
-        clientName: { $first: '$clientName' },
-        revenue: { $sum: '$total' },
-        orders: { $sum: 1 },
-        avgOrderValue: { $avg: '$total' }
-      }
-    },
-    { $sort: { revenue: -1 } },
-    { $limit: limit }
-  ]);
+  const topCustomers = await dbClient().invoice.groupBy({
+    by: ['clientId'],
+    where: { companyId: String(companyId), status: 'fully_paid', paidDate: { gte: startDate, lte: endDate } },
+    _sum: { totalAmount: true }, _count: { _all: true }, _avg: { totalAmount: true },
+    orderBy: { _sum: { totalAmount: 'desc' } }, take: Math.min(Number(limit) || 10, 100),
+  });
+  const customerIds = topCustomers.map((row) => row.clientId).filter(Boolean);
+  const customerRows = customerIds.length ? await Client.find({ _id: { $in: customerIds } }, 'name').lean() : [];
+  const customerMap = new Map(customerRows.map((row) => [String(row._id), row.name]));
+  for (const row of topCustomers) {
+    row._id = row.clientId; row.clientName = customerMap.get(row.clientId) || 'Unknown';
+    row.revenue = Number(row._sum.totalAmount || 0); row.orders = row._count._all;
+    row.avgOrderValue = Number(row._avg.totalAmount || 0); delete row.clientId; delete row._sum; delete row._count; delete row._avg;
+  }
 
   return topCustomers;
 };
 
 // Generate Client Statement Report (full transaction history per client)
 const generateClientStatementReport = async (companyId, startDate, endDate, clientId = null) => {
-  const query = {
-    company: companyId,
-    invoiceDate: { $gte: startDate, $lte: endDate }
-  };
-  
-  // Filter by specific client if clientId is provided
-  if (clientId) {
-    query.client = clientId;
-  }
-  
-  const invoices = await Invoice.find(query)
-    .populate('client', 'name code contact')
-    .sort({ invoiceDate: -1 });
+  const invoices = await dbClient().invoice.findMany({
+    where: {
+      companyId: String(companyId),
+      ...(clientId ? { clientId: String(clientId) } : {}),
+      invoiceDate: { gte: startDate, lte: endDate },
+    },
+    include: { client: { select: { id: true, name: true, code: true, contact: true } } },
+    orderBy: { invoiceDate: 'desc' },
+  });
 
-  // Get credit notes for this client(s)
-  let creditNotes = [];
-  if (clientId) {
-    creditNotes = await CreditNote.find({
-      company: companyId,
-      client: clientId,
-      issueDate: { $gte: startDate, $lte: endDate }
-    }).populate('client', 'name code contact');
-  }
+  const creditNotes = clientId ? await dbClient().creditNote.findMany({
+    where: {
+      companyId: String(companyId),
+      clientId: String(clientId),
+      creditDate: { gte: startDate, lte: endDate },
+    },
+    include: { client: { select: { id: true, name: true, code: true, contact: true } } },
+    orderBy: { creditDate: 'desc' },
+  }) : [];
 
   // If filtering by specific client, return that client's transactions only
   if (clientId) {
-    const client = invoices[0]?.client || (creditNotes[0]?.client);
+    const client = legacyRelation(invoices[0]?.client || creditNotes[0]?.client);
     const transactions = [];
     
     // Add invoices
@@ -653,12 +581,12 @@ const generateClientStatementReport = async (companyId, startDate, endDate, clie
       transactions.push({
         date: inv.invoiceDate,
         type: 'invoice',
-        reference: inv.invoiceNumber,
-        amount: inv.subtotal || 0,
-        tax: inv.totalTax || 0,
-        total: inv.grandTotal || 0,
-        paid: inv.amountPaid || 0,
-        balance: inv.balance || 0,
+        reference: inv.referenceNo,
+        amount: Number(inv.subtotal || 0),
+        tax: Number(inv.taxAmount || 0),
+        total: Number(inv.totalAmount || 0),
+        paid: Number(inv.amountPaid || 0),
+        balance: Number(inv.amountOutstanding || 0),
         status: inv.status
       });
     });
@@ -666,14 +594,14 @@ const generateClientStatementReport = async (companyId, startDate, endDate, clie
     // Add credit notes
     creditNotes.forEach(cn => {
       transactions.push({
-        date: cn.issueDate,
+        date: cn.creditDate,
         type: 'credit_note',
-        reference: cn.creditNoteNumber,
-        amount: cn.subtotal || 0,
-        tax: cn.totalTax || 0,
-        total: cn.grandTotal || 0,
-        paid: cn.amountUsed || 0,
-        balance: cn.balance || 0,
+        reference: cn.referenceNo,
+        amount: Number(cn.subtotal || 0),
+        tax: Number(cn.taxAmount || 0),
+        total: Number(cn.totalAmount || 0),
+        paid: 0,
+        balance: 0,
         status: cn.status
       });
     });
@@ -681,9 +609,9 @@ const generateClientStatementReport = async (companyId, startDate, endDate, clie
     // Sort by date descending
     transactions.sort((a, b) => new Date(b.date) - new Date(a.date));
     
-    const totalInvoiced = invoices.reduce((sum, inv) => sum + (inv.grandTotal || 0), 0);
-    const totalPaid = invoices.reduce((sum, inv) => sum + (inv.amountPaid || 0), 0) + creditNotes.reduce((sum, cn) => sum + (cn.amountUsed || 0), 0);
-    const totalBalance = invoices.reduce((sum, inv) => sum + (inv.balance || 0), 0) + creditNotes.reduce((sum, cn) => sum + (cn.balance || 0), 0);
+    const totalInvoiced = invoices.reduce((sum, inv) => sum + Number(inv.totalAmount || 0), 0);
+    const totalPaid = invoices.reduce((sum, inv) => sum + Number(inv.amountPaid || 0), 0);
+    const totalBalance = invoices.reduce((sum, inv) => sum + Number(inv.amountOutstanding || 0), 0);
     
     return [{
       client: client,
@@ -697,12 +625,13 @@ const generateClientStatementReport = async (companyId, startDate, endDate, clie
   // Group transactions by client (original behavior for all clients)
   const clientTransactions = {};
   invoices.forEach(inv => {
-    const clientIdStr = inv.client?._id?.toString();
+    const clientIdStr = inv.client?.id?.toString();
     if (!clientIdStr) return;
     
     if (!clientTransactions[clientIdStr]) {
       clientTransactions[clientIdStr] = {
         client: inv.client,
+                  client: legacyRelation(inv.client),
         transactions: [],
         totalInvoiced: 0,
         totalPaid: 0,
@@ -714,14 +643,14 @@ const generateClientStatementReport = async (companyId, startDate, endDate, clie
       date: inv.invoiceDate,
       type: 'invoice',
       reference: inv.invoiceNumber,
-      amount: inv.grandTotal || 0,
-      paid: inv.amountPaid || 0,
-      balance: inv.balance || 0
+      amount: Number(inv.totalAmount || 0),
+      paid: Number(inv.amountPaid || 0),
+      balance: Number(inv.amountOutstanding || 0)
     });
     
-    clientTransactions[clientIdStr].totalInvoiced += inv.grandTotal || 0;
-    clientTransactions[clientIdStr].totalPaid += inv.amountPaid || 0;
-    clientTransactions[clientIdStr].balance += inv.balance || 0;
+    clientTransactions[clientIdStr].totalInvoiced += Number(inv.totalAmount || 0);
+    clientTransactions[clientIdStr].totalPaid += Number(inv.amountPaid || 0);
+    clientTransactions[clientIdStr].balance += Number(inv.amountOutstanding || 0);
   });
 
   return Object.values(clientTransactions);
@@ -729,34 +658,30 @@ const generateClientStatementReport = async (companyId, startDate, endDate, clie
 
 // Generate Supplier Statement Report (full transaction history per supplier)
 const generateSupplierStatementReport = async (companyId, startDate, endDate, supplierId = null) => {
-  const query = {
-    company: companyId,
-    purchaseDate: { $gte: startDate, $lte: endDate }
-  };
-  
-  // Filter by specific supplier if supplierId is provided
-  if (supplierId) {
-    query.supplier = supplierId;
-  }
-  
-  const purchases = await Purchase.find(query)
-    .populate('supplier', 'name code contact')
-    .sort({ purchaseDate: -1 });
+  const purchases = await dbClient().purchase.findMany({
+    where: {
+      companyId: String(companyId),
+      ...(supplierId ? { supplierId: String(supplierId) } : {}),
+      purchaseDate: { gte: startDate, lte: endDate },
+    },
+    include: { supplier: { select: { id: true, name: true, code: true, contact: true } } },
+    orderBy: { purchaseDate: 'desc' },
+  });
 
-  // Get purchase returns for this supplier(s)
-  let purchaseReturns = [];
-  if (supplierId) {
-    purchaseReturns = await PurchaseReturn.find({
-      company: companyId,
-      supplier: supplierId,
-      returnDate: { $gte: startDate, $lte: endDate },
-      status: { $in: ['approved', 'refunded', 'partially_refunded'] }
-    }).populate('supplier', 'name code contact');
-  }
+  const purchaseReturns = supplierId ? await dbClient().purchaseReturn.findMany({
+    where: {
+      companyId: String(companyId),
+      supplierId: String(supplierId),
+      returnDate: { gte: startDate, lte: endDate },
+      status: { in: ['approved', 'refunded', 'partially_refunded'] },
+    },
+    include: { supplier: { select: { id: true, name: true, code: true, contact: true } } },
+    orderBy: { returnDate: 'desc' },
+  }) : [];
 
   // If filtering by specific supplier, return that supplier's transactions only
   if (supplierId) {
-    const supplier = purchases[0]?.supplier;
+    const supplier = legacyRelation(purchases[0]?.supplier || purchaseReturns[0]?.supplier);
     const transactions = [];
     
     // Add purchases
@@ -765,11 +690,11 @@ const generateSupplierStatementReport = async (companyId, startDate, endDate, su
         date: pur.purchaseDate,
         type: 'purchase',
         reference: pur.purchaseNumber,
-        amount: pur.subtotal || 0,
-        tax: pur.totalTax || 0,
-        total: pur.grandTotal || 0,
-        paid: pur.amountPaid || 0,
-        balance: pur.balance || 0,
+        amount: Number(pur.subtotal || 0),
+        tax: Number(pur.taxAmount || 0),
+        total: Number(pur.totalAmount || 0),
+        paid: 0,
+        balance: Number(pur.totalAmount || 0),
         status: pur.status
       });
     });
@@ -779,12 +704,12 @@ const generateSupplierStatementReport = async (companyId, startDate, endDate, su
       transactions.push({
         date: pr.returnDate,
         type: 'purchase_return',
-        reference: pr.returnNumber,
-        amount: pr.subtotal || 0,
-        tax: pr.totalTax || 0,
-        total: pr.grandTotal || 0,
-        paid: pr.refundAmount || 0,
-        balance: pr.balance || 0,
+        reference: pr.referenceNo,
+        amount: Number(pr.totalAmount || 0),
+        tax: 0,
+        total: Number(pr.totalAmount || 0),
+        paid: 0,
+        balance: 0,
         status: pr.status
       });
     });
@@ -792,9 +717,9 @@ const generateSupplierStatementReport = async (companyId, startDate, endDate, su
     // Sort by date descending
     transactions.sort((a, b) => new Date(b.date) - new Date(a.date));
     
-    const totalInvoiced = purchases.reduce((sum, pur) => sum + (pur.grandTotal || 0), 0);
-    const totalPaid = purchases.reduce((sum, pur) => sum + (pur.amountPaid || 0), 0) + purchaseReturns.reduce((sum, pr) => sum + (pr.refundAmount || 0), 0);
-    const totalBalance = purchases.reduce((sum, pur) => sum + (pur.balance || 0), 0) + purchaseReturns.reduce((sum, pr) => sum + (pr.balance || 0), 0);
+    const totalInvoiced = purchases.reduce((sum, pur) => sum + Number(pur.totalAmount || 0), 0);
+    const totalPaid = 0;
+    const totalBalance = purchases.reduce((sum, pur) => sum + Number(pur.totalAmount || 0), 0);
     
     return [{
       supplier: supplier,
@@ -808,7 +733,7 @@ const generateSupplierStatementReport = async (companyId, startDate, endDate, su
   // Group transactions by supplier (original behavior for all suppliers)
   const supplierTransactions = {};
   purchases.forEach(pur => {
-    const supplierIdStr = pur.supplier?._id?.toString();
+    const supplierIdStr = pur.supplier?.id?.toString();
     if (!supplierIdStr) return;
     
     if (!supplierTransactions[supplierIdStr]) {
@@ -825,14 +750,14 @@ const generateSupplierStatementReport = async (companyId, startDate, endDate, su
       date: pur.purchaseDate,
       type: 'purchase',
       reference: pur.purchaseNumber,
-      amount: pur.grandTotal || 0,
-      paid: pur.amountPaid || 0,
-      balance: pur.balance || 0
+      amount: Number(pur.totalAmount || 0),
+      paid: 0,
+      balance: Number(pur.totalAmount || 0)
     });
     
-    supplierTransactions[supplierIdStr].totalInvoiced += pur.grandTotal || 0;
-    supplierTransactions[supplierIdStr].totalPaid += pur.amountPaid || 0;
-    supplierTransactions[supplierIdStr].balance += pur.balance || 0;
+    supplierTransactions[supplierIdStr].totalInvoiced += Number(pur.totalAmount || 0);
+    supplierTransactions[supplierIdStr].totalPaid += 0;
+    supplierTransactions[supplierIdStr].balance += Number(pur.totalAmount || 0);
   });
 
   return Object.values(supplierTransactions);
@@ -840,29 +765,20 @@ const generateSupplierStatementReport = async (companyId, startDate, endDate, su
 
 // Generate Top Clients by Revenue Report
 const generateTopClientsByRevenueReport = async (companyId, startDate, endDate, limit = 20) => {
-  const topClients = await aggregateWithTimeout(Invoice, [
-    {
-      $match: {
-        company: companyId,
-        status: { $in: ['paid', 'partial'] },
-        invoiceDate: { $gte: startDate, $lte: endDate }
-      }
-    },
-    {
-      $group: {
-        _id: '$client',
-        clientName: { $first: '$clientName' },
-        revenue: { $sum: '$grandTotal' },
-        invoiceCount: { $sum: 1 },
-        totalPaid: { $sum: '$amountPaid' },
-        totalBalance: { $sum: '$balance' }
-      }
-    },
-    { $sort: { revenue: -1 } },
-    { $limit: limit }
-  ]);
-
-  await Client.populate(topClients, { path: '_id', select: 'name code contact' });
+  const topClientRows = await dbClient().invoice.groupBy({
+    by: ['clientId'],
+    where: { companyId: String(companyId), status: { in: ['fully_paid', 'partially_paid'] }, invoiceDate: { gte: startDate, lte: endDate } },
+    _sum: { totalAmount: true, amountPaid: true, amountOutstanding: true }, _count: { _all: true },
+    orderBy: { _sum: { totalAmount: 'desc' } }, take: Math.min(Number(limit) || 20, 100),
+  });
+  const topClientIds = topClientRows.map((row) => row.clientId).filter(Boolean);
+  const topClientDocs = topClientIds.length ? await Client.find({ _id: { $in: topClientIds } }, 'name code contact').lean() : [];
+  const topClientMap = new Map(topClientDocs.map((row) => [String(row._id), row]));
+  const topClients = topClientRows.map((row) => ({
+    _id: topClientMap.get(row.clientId) || row.clientId,
+    revenue: Number(row._sum.totalAmount || 0), invoiceCount: row._count._all,
+    totalPaid: Number(row._sum.amountPaid || 0), totalBalance: Number(row._sum.amountOutstanding || 0),
+  }));
 
   return topClients.map(c => ({
     client: c._id,
@@ -875,29 +791,16 @@ const generateTopClientsByRevenueReport = async (companyId, startDate, endDate, 
 
 // Generate Top Suppliers by Purchase Report
 const generateTopSuppliersByPurchaseReport = async (companyId, startDate, endDate, limit = 20) => {
-  const topSuppliers = await aggregateWithTimeout(Purchase, [
-    {
-      $match: {
-        company: companyId,
-        status: { $in: ['received', 'paid', 'partial'] },
-        purchaseDate: { $gte: startDate, $lte: endDate }
-      }
-    },
-    {
-      $group: {
-        _id: '$supplier',
-        supplierName: { $first: '$supplierName' },
-        total: { $sum: '$grandTotal' },
-        purchaseCount: { $sum: 1 },
-        totalPaid: { $sum: '$amountPaid' },
-        totalBalance: { $sum: '$balance' }
-      }
-    },
-    { $sort: { total: -1 } },
-    { $limit: limit }
-  ]);
-
-  await Supplier.populate(topSuppliers, { path: '_id', select: 'name code contact' });
+  const topSupplierRows = await dbClient().purchase.groupBy({
+    by: ['supplierId'],
+    where: { companyId: String(companyId), status: { in: ['received', 'completed', 'partial'] }, purchaseDate: { gte: startDate, lte: endDate } },
+    _sum: { totalAmount: true }, _count: { _all: true },
+    orderBy: { _sum: { totalAmount: 'desc' } }, take: Math.min(Number(limit) || 20, 100),
+  });
+  const topSupplierIds = topSupplierRows.map((row) => row.supplierId);
+  const topSupplierDocs = await Supplier.find({ _id: { $in: topSupplierIds } }, 'name code contact').lean();
+  const topSupplierMap = new Map(topSupplierDocs.map((row) => [String(row._id), row]));
+  const topSuppliers = topSupplierRows.map((row) => ({ _id: topSupplierMap.get(row.supplierId) || row.supplierId, total: Number(row._sum.totalAmount || 0), purchaseCount: row._count._all, totalPaid: 0, totalBalance: Number(row._sum.totalAmount || 0) }));
 
   return topSuppliers.map(s => ({
     supplier: s._id,
@@ -996,39 +899,37 @@ const generateInactiveClientsReport = async (companyId, days = 90, limit = 100) 
 
 // Generate Purchase by Product Report
 const generatePurchaseByProductReport = async (companyId, startDate, endDate, limit = 50) => {
-  const matchStage = {
-    company: companyId,
-    status: { $in: ['received', 'paid', 'partial'] }
-  };
-
-  if (startDate || endDate) {
-    matchStage.purchaseDate = {};
-    if (startDate) matchStage.purchaseDate.$gte = new Date(startDate);
-    if (endDate) matchStage.purchaseDate.$lte = new Date(endDate);
-  }
-
-  const purchases = await Purchase.find(matchStage)
-    .populate('items.product', 'name sku category')
-    .populate('supplier', 'name');
+  const purchases = await dbClient().purchase.findMany({
+    where: {
+      companyId: String(companyId),
+      status: { in: ['received', 'paid', 'partial'] },
+      ...(startDate || endDate ? { purchaseDate: { ...(startDate ? { gte: new Date(startDate) } : {}), ...(endDate ? { lte: new Date(endDate) } : {}) } } : {}),
+    },
+    include: {
+      supplier: { select: { id: true, name: true } },
+      lines: { include: { product: { select: { id: true, name: true, sku: true, categoryId: true } } } },
+    },
+  });
 
   // Group by product
   const productData = {};
   purchases.forEach(purchase => {
-    purchase.items.forEach(item => {
-      const productId = item.product?._id?.toString();
+    purchase.lines.forEach(item => {
+      const productId = item.product?.id?.toString();
       if (!productId) return;
       
       if (!productData[productId]) {
         productData[productId] = {
           product: item.product,
           supplier: purchase.supplier,
+                    supplier: legacyRelation(purchase.supplier),
           totalQuantity: 0,
           totalAmount: 0,
           purchaseCount: 0
         };
       }
-      productData[productId].totalQuantity += item.quantity || 0;
-      productData[productId].totalAmount += item.total || 0;
+      productData[productId].totalQuantity += Number(item.qty || 0);
+      productData[productId].totalAmount += Number(item.lineTotal || 0);
       productData[productId].purchaseCount += 1;
     });
   });
@@ -1048,25 +949,20 @@ const generatePurchaseByProductReport = async (companyId, startDate, endDate, li
 
 // Generate Purchase by Category Report
 const generatePurchaseByCategoryReport = async (companyId, startDate, endDate) => {
-  const matchStage = {
-    company: companyId,
-    status: { $in: ['received', 'paid', 'partial'] }
-  };
-
-  if (startDate || endDate) {
-    matchStage.purchaseDate = {};
-    if (startDate) matchStage.purchaseDate.$gte = new Date(startDate);
-    if (endDate) matchStage.purchaseDate.$lte = new Date(endDate);
-  }
-
-  const purchases = await Purchase.find(matchStage)
-    .populate('items.product.category', 'name');
+  const purchases = await dbClient().purchase.findMany({
+    where: {
+      companyId: String(companyId),
+      status: { in: ['received', 'paid', 'partial'] },
+      ...(startDate || endDate ? { purchaseDate: { ...(startDate ? { gte: new Date(startDate) } : {}), ...(endDate ? { lte: new Date(endDate) } : {}) } } : {}),
+    },
+    include: { lines: { include: { product: { include: { category: { select: { id: true, name: true } } } } } } },
+  });
 
   // Group by category
   const categoryData = {};
   purchases.forEach(purchase => {
-    purchase.items.forEach(item => {
-      const categoryId = item.product?.category?._id?.toString();
+    purchase.lines.forEach(item => {
+      const categoryId = item.product?.category?.id?.toString() || 'uncategorized';
       const categoryName = item.product?.category?.name || 'Uncategorized';
       
       if (!categoryData[categoryId]) {
@@ -1078,8 +974,8 @@ const generatePurchaseByCategoryReport = async (companyId, startDate, endDate) =
           purchaseCount: 0
         };
       }
-      categoryData[categoryId].totalQuantity += item.quantity || 0;
-      categoryData[categoryId].totalAmount += item.total || 0;
+      categoryData[categoryId].totalQuantity += Number(item.qty || 0);
+      categoryData[categoryId].totalAmount += Number(item.lineTotal || 0);
       categoryData[categoryId].productCount += 1;
       categoryData[categoryId].purchaseCount += 1;
     });
@@ -1099,13 +995,7 @@ const generatePurchaseByCategoryReport = async (companyId, startDate, endDate) =
 
 // Generate Accounts Payable Report
 const generateAccountsPayableReport = async (companyId) => {
-  const purchases = await Purchase.find({ 
-    company: companyId, 
-    balance: { $gt: 0 },
-    status: { $in: ['draft', 'ordered', 'received', 'partial'] }
-  })
-  .populate('supplier', 'name code contact')
-  .sort({ expectedDeliveryDate: 1 });
+  const purchases = await loadPayablesForReport(companyId);
 
   const report = purchases.map(p => ({
     _id: p._id,
@@ -1154,20 +1044,14 @@ const generateAccountsPayableReport = async (companyId) => {
 
 // Generate Supplier Aging Report
 const generateSupplierAgingReport = async (companyId) => {
-  const purchases = await Purchase.find({ 
-    company: companyId, 
-    balance: { $gt: 0 },
-    status: { $in: ['draft', 'ordered', 'received', 'partial'] }
-  })
-  .populate('supplier', 'name code contact')
-  .lean();
+  const purchases = await loadPayablesForReport(companyId);
 
   // Group by supplier
   const supplierData = {};
   const now = new Date();
 
   purchases.forEach(purchase => {
-    const supplierId = purchase.supplier?._id?.toString();
+    const supplierId = purchase.supplier?.id?.toString();
     if (!supplierId) return;
 
     if (!supplierData[supplierId]) {
@@ -1220,21 +1104,29 @@ const generatePurchaseReturnsReport = async (companyId, startDate, endDate) => {
     if (endDate) matchStage.returnDate.$lte = new Date(endDate);
   }
 
-  const returns = await PurchaseReturn.find(matchStage)
-    .populate('supplier', 'name code')
-    .populate('purchase', 'purchaseNumber')
-    .sort({ returnDate: -1 });
+  const returns = await dbClient().purchaseReturn.findMany({
+    where: {
+      companyId: String(companyId),
+      status: { in: ['approved', 'refunded', 'partially_refunded'] },
+      ...(startDate || endDate ? { returnDate: { ...(startDate ? { gte: new Date(startDate) } : {}), ...(endDate ? { lte: new Date(endDate) } : {}) } } : {}),
+    },
+    include: {
+      supplier: { select: { id: true, name: true, code: true } },
+      grn: { select: { id: true, referenceNo: true } },
+    },
+    orderBy: { returnDate: 'desc' },
+  });
 
   const report = returns.map(r => ({
-    _id: r._id,
-    returnNumber: r.returnNumber,
-    supplier: r.supplier,
-    purchase: r.purchase,
+    _id: r.id,
+    returnNumber: r.referenceNo,
+    supplier: legacyRelation(r.supplier),
+    purchase: r.grn ? { _id: r.grn.id, purchaseNumber: r.grn.referenceNo } : null,
     returnDate: r.returnDate,
-    subtotal: r.subtotal || 0,
-    tax: r.totalTax || 0,
-    total: r.grandTotal || 0,
-    refundAmount: r.refundAmount || 0,
+    subtotal: Number(r.totalAmount || 0),
+    tax: 0,
+    total: Number(r.totalAmount || 0),
+    refundAmount: 0,
     status: r.status,
     reason: r.reason
   }));
@@ -1255,20 +1147,17 @@ const generatePurchaseReturnsReport = async (companyId, startDate, endDate) => {
 
 // Generate Purchase Order Status Report
 const generatePurchaseOrderStatusReport = async (companyId, startDate, endDate) => {
-  const matchStage = {
-    company: companyId
-  };
-
-  if (startDate || endDate) {
-    matchStage.purchaseDate = {};
-    if (startDate) matchStage.purchaseDate.$gte = new Date(startDate);
-    if (endDate) matchStage.purchaseDate.$lte = new Date(endDate);
-  }
-
-  const purchases = await Purchase.find(matchStage)
-    .populate('supplier', 'name code')
-    .populate('items.product', 'name sku')
-    .sort({ purchaseDate: -1 });
+  const purchases = await dbClient().purchaseOrder.findMany({
+    where: {
+      companyId: String(companyId),
+      ...(startDate || endDate ? { orderDate: { ...(startDate ? { gte: new Date(startDate) } : {}), ...(endDate ? { lte: new Date(endDate) } : {}) } } : {}),
+    },
+    include: {
+      supplier: { select: { id: true, name: true, code: true } },
+      lines: { include: { product: { select: { id: true, name: true, sku: true } } } },
+    },
+    orderBy: { orderDate: 'desc' },
+  });
 
   const statusGroups = {
     draft: [],
@@ -1283,17 +1172,17 @@ const generatePurchaseOrderStatusReport = async (companyId, startDate, endDate) 
     const status = purchase.status || 'draft';
     if (statusGroups[status]) {
       statusGroups[status].push({
-        _id: purchase._id,
-        purchaseNumber: purchase.purchaseNumber,
+        _id: purchase.id,
+        purchaseNumber: purchase.referenceNo,
         supplier: purchase.supplier,
-        purchaseDate: purchase.purchaseDate,
+        purchaseDate: purchase.orderDate,
         expectedDeliveryDate: purchase.expectedDeliveryDate,
-        subtotal: purchase.subtotal || 0,
-        tax: purchase.totalTax || 0,
-        total: purchase.grandTotal || 0,
-        paid: purchase.amountPaid || 0,
-        balance: purchase.balance || 0,
-        itemsCount: purchase.items?.length || 0
+        subtotal: Number(purchase.subtotal || 0),
+        tax: Number(purchase.taxAmount || 0),
+        total: Number(purchase.totalAmount || 0),
+        paid: Number(purchase.amountPaid || 0),
+        balance: Number(purchase.balance || 0),
+        itemsCount: purchase.lines?.length || 0
       });
     }
   });
@@ -1326,15 +1215,16 @@ const generateSupplierPerformanceReport = async (companyId, startDate, endDate) 
     if (endDate) matchStage.purchaseDate.$lte = new Date(endDate);
   }
 
-  const purchases = await Purchase.find(matchStage)
-    .populate('supplier', 'name code')
-    .lean();
+  const purchases = await loadPurchasesForReport(companyId, {
+    status: { in: ['received', 'paid', 'partial'] },
+    ...(startDate || endDate ? { purchaseDate: { ...(startDate ? { gte: new Date(startDate) } : {}), ...(endDate ? { lte: new Date(endDate) } : {}) } } : {}),
+  });
 
   // Group by supplier and calculate metrics
   const supplierMetrics = {};
   
   purchases.forEach(purchase => {
-    const supplierId = purchase.supplier?._id?.toString();
+    const supplierId = purchase.supplier?.id?.toString();
     if (!supplierId) return;
 
     if (!supplierMetrics[supplierId]) {
@@ -1868,47 +1758,18 @@ const generateSalesByCategoryReport = async (companyId, startDate, endDate) => {
     if (endDate) matchStage.invoiceDate.$lte = new Date(endDate);
   }
 
-  const salesByCategory = await aggregateWithTimeout(Invoice, [
-    { $match: matchStage },
-    { $unwind: '$items' },
-    {
-      $lookup: {
-        from: 'products',
-        localField: 'items.product',
-        foreignField: '_id',
-        as: 'productInfo'
-      }
-    },
-    { $unwind: { path: '$productInfo', preserveNullAndEmptyArrays: true } },
-    {
-      $lookup: {
-        from: 'categories',
-        localField: 'productInfo.category',
-        foreignField: '_id',
-        as: 'categoryInfo'
-      }
-    },
-    { $unwind: { path: '$categoryInfo', preserveNullAndEmptyArrays: true } },
-    {
-      $group: {
-        _id: '$categoryInfo._id',
-        categoryName: { $first: '$categoryInfo.name' },
-        totalRevenue: { $sum: { $multiply: ['$items.quantity', '$items.unitPrice'] } },
-        totalQuantity: { $sum: '$items.quantity' },
-        orderCount: { $addToSet: '$_id' }
-      }
-    },
-    {
-      $project: {
-        category: '$_id',
-        categoryName: { $ifNull: ['$categoryName', 'Uncategorized'] },
-        totalRevenue: 1,
-        totalQuantity: 1,
-        orderCount: { $size: '$orderCount' }
-      }
-    },
-    { $sort: { totalRevenue: -1 } }
-  ]);
+  const salesByCategory = await dbClient().$queryRaw(Prisma.sql`
+    SELECT c.id AS category, COALESCE(c.name, 'Uncategorized') AS "categoryName",
+           COALESCE(SUM(il.qty * il.unit_price), 0) AS "totalRevenue",
+           COALESCE(SUM(il.qty), 0) AS "totalQuantity", COUNT(DISTINCT i.id)::int AS "orderCount"
+    FROM invoice_lines il JOIN invoices i ON i.id = il.invoice_id
+    LEFT JOIN products p ON p.id = il.product_id LEFT JOIN categories c ON c.id = p.category_id
+    WHERE i.company_id = ${String(companyId)} AND i.status IN ('fully_paid', 'partially_paid', 'confirmed')
+      ${startDate ? Prisma.sql`AND i.invoice_date >= ${new Date(startDate)}` : Prisma.empty}
+      ${endDate ? Prisma.sql`AND i.invoice_date <= ${new Date(endDate)}` : Prisma.empty}
+    GROUP BY c.id, c.name ORDER BY "totalRevenue" DESC
+  `);
+  for (const row of salesByCategory) { row.totalRevenue = Number(row.totalRevenue || 0); row.totalQuantity = Number(row.totalQuantity || 0); }
 
   const summary = {
     totalCategories: salesByCategory.length,
@@ -1932,25 +1793,15 @@ const generateSalesByClientReport = async (companyId, startDate, endDate, limit 
     if (endDate) matchStage.invoiceDate.$lte = new Date(endDate);
   }
 
-  const salesByClient = await aggregateWithTimeout(Invoice, [
-    { $match: matchStage },
-    {
-      $group: {
-        _id: '$client',
-        clientName: { $first: '$clientName' },
-        totalRevenue: { $sum: '$grandTotal' },
-        totalPaid: { $sum: '$amountPaid' },
-        totalBalance: { $sum: '$balance' },
-        invoiceCount: { $sum: 1 },
-        firstInvoice: { $min: '$invoiceDate' },
-        lastInvoice: { $max: '$invoiceDate' }
-      }
-    },
-    { $sort: { totalRevenue: -1 } },
-    { $limit: limit }
-  ]);
-
-  await Client.populate(salesByClient, { path: '_id', select: 'name code contact' });
+  const salesByClientRows = await dbClient().invoice.groupBy({
+    by: ['clientId'], where: { companyId: String(companyId), status: { in: ['fully_paid', 'partially_paid', 'confirmed'] }, invoiceDate: { gte: startDate, lte: endDate } },
+    _sum: { totalAmount: true, amountPaid: true, amountOutstanding: true }, _count: { _all: true }, _min: { invoiceDate: true }, _max: { invoiceDate: true },
+    orderBy: { _sum: { totalAmount: 'desc' } }, take: Math.min(Number(limit) || 50, 200),
+  });
+  const clientIds = salesByClientRows.map((row) => row.clientId).filter(Boolean);
+  const clientDocs = clientIds.length ? await Client.find({ _id: { $in: clientIds } }, 'name code contact').lean() : [];
+  const clientMap = new Map(clientDocs.map((row) => [String(row._id), row]));
+  const salesByClient = salesByClientRows.map((row) => ({ _id: clientMap.get(row.clientId) || row.clientId, totalRevenue: Number(row._sum.totalAmount || 0), totalPaid: Number(row._sum.amountPaid || 0), totalBalance: Number(row._sum.amountOutstanding || 0), invoiceCount: row._count._all, firstInvoice: row._min.invoiceDate, lastInvoice: row._max.invoiceDate }));
 
   const report = salesByClient.map(c => ({
     client: c._id,
@@ -1986,24 +1837,15 @@ const generateSalesBySalespersonReport = async (companyId, startDate, endDate, l
     if (endDate) matchStage.invoiceDate.$lte = new Date(endDate);
   }
 
-  const salesBySalesperson = await aggregateWithTimeout(Invoice, [
-    { $match: matchStage },
-    {
-      $group: {
-        _id: '$createdBy',
-        salespersonName: { $first: '$createdByName' },
-        totalRevenue: { $sum: '$grandTotal' },
-        totalPaid: { $sum: '$amountPaid' },
-        invoiceCount: { $sum: 1 }
-      }
-    },
-    { $sort: { totalRevenue: -1 } },
-    { $limit: limit }
-  ]);
-
-  // Get user details
+  const salespersonRows = await dbClient().invoice.groupBy({
+    by: ['createdById'], where: { companyId: String(companyId), status: { in: ['fully_paid', 'partially_paid', 'confirmed'] }, invoiceDate: { gte: startDate, lte: endDate } },
+    _sum: { totalAmount: true, amountPaid: true }, _count: { _all: true }, orderBy: { _sum: { totalAmount: 'desc' } }, take: Math.min(Number(limit) || 50, 200),
+  });
   const User = require('../models/User');
-  await User.populate(salesBySalesperson, { path: '_id', select: 'name email' });
+  const salespersonIds = salespersonRows.map((row) => row.createdById).filter(Boolean);
+  const salespersonDocs = salespersonIds.length ? await User.find({ _id: { $in: salespersonIds } }, 'name email').lean() : [];
+  const salespersonMap = new Map(salespersonDocs.map((row) => [String(row._id), row]));
+  const salesBySalesperson = salespersonRows.map((row) => ({ _id: salespersonMap.get(row.createdById) || row.createdById, totalRevenue: Number(row._sum.totalAmount || 0), totalPaid: Number(row._sum.amountPaid || 0), invoiceCount: row._count._all }));
 
   const report = salesBySalesperson.map(s => ({
     salesperson: s._id,
@@ -2025,13 +1867,14 @@ const generateSalesBySalespersonReport = async (companyId, startDate, endDate, l
 
 // Generate Invoice Aging Report (Accounts Receivable Aging)
 const generateInvoiceAgingReport = async (companyId) => {
-  const invoices = await Invoice.find({
-    company: companyId,
-    balance: { $gt: 0 },
-    status: { $in: ['sent', 'confirmed', 'partial', 'overdue'] }
-  })
-  .populate('client', 'name code contact')
-  .lean();
+  const invoices = await dbClient().invoice.findMany({
+    where: {
+      companyId: String(companyId),
+      amountOutstanding: { gt: 0 },
+      status: { in: ['sent', 'confirmed', 'partial', 'overdue'] },
+    },
+    include: { client: { select: { id: true, name: true, code: true, contact: true } } },
+  });
 
   const now = new Date();
   const buckets = {
@@ -2047,14 +1890,14 @@ const generateInvoiceAgingReport = async (companyId) => {
     const days = Math.floor((now - new Date(due)) / (1000 * 60 * 60 * 24));
     const entry = {
       invoice: inv,
-      invoiceNumber: inv.invoiceNumber,
-      client: inv.client,
+      invoiceNumber: inv.referenceNo,
+      client: legacyRelation(inv.client),
       invoiceDate: inv.invoiceDate,
       dueDate: due,
       daysOverdue: days,
-      total: inv.grandTotal || 0,
-      paid: inv.amountPaid || 0,
-      balance: inv.balance || 0
+      total: Number(inv.totalAmount || 0),
+      paid: Number(inv.amountPaid || 0),
+      balance: Number(inv.amountOutstanding || 0)
     };
 
     if (days <= 0) buckets.current.push(entry);
@@ -2066,7 +1909,7 @@ const generateInvoiceAgingReport = async (companyId) => {
 
   const summary = {
     totalInvoices: invoices.length,
-    totalReceivable: invoices.reduce((sum, inv) => sum + (inv.balance || 0), 0),
+    totalReceivable: invoices.reduce((sum, inv) => sum + Number(inv.amountOutstanding || 0), 0),
     buckets: {
       current: { count: buckets.current.length, total: buckets.current.reduce((s, inv) => s + inv.balance, 0) },
       '1-30': { count: buckets['1-30'].length, total: buckets['1-30'].reduce((s, inv) => s + inv.balance, 0) },
@@ -2081,25 +1924,27 @@ const generateInvoiceAgingReport = async (companyId) => {
 
 // Generate Accounts Receivable Report
 const generateAccountsReceivableReport = async (companyId) => {
-  const invoices = await Invoice.find({
-    company: companyId,
-    balance: { $gt: 0 },
-    status: { $in: ['sent', 'confirmed', 'partial', 'overdue'] }
-  })
-  .populate('client', 'name code contact')
-  .sort({ invoiceDate: -1 });
+  const invoices = await dbClient().invoice.findMany({
+    where: {
+      companyId: String(companyId),
+      amountOutstanding: { gt: 0 },
+      status: { in: ['sent', 'confirmed', 'partial', 'overdue'] },
+    },
+    include: { client: { select: { id: true, name: true, code: true, contact: true } } },
+    orderBy: { invoiceDate: 'desc' },
+  });
 
   const report = invoices.map(inv => ({
-    _id: inv._id,
-    invoiceNumber: inv.invoiceNumber,
-    client: inv.client,
+    _id: inv.id,
+    invoiceNumber: inv.referenceNo,
+    client: legacyRelation(inv.client),
     invoiceDate: inv.invoiceDate,
     dueDate: inv.dueDate,
-    subtotal: inv.subtotal || 0,
-    tax: inv.totalTax || 0,
-    total: inv.grandTotal || 0,
-    paid: inv.amountPaid || 0,
-    balance: inv.balance || 0,
+    subtotal: Number(inv.subtotal || 0),
+    tax: Number(inv.taxAmount || 0),
+    total: Number(inv.totalAmount || 0),
+    paid: Number(inv.amountPaid || 0),
+    balance: Number(inv.amountOutstanding || 0),
     status: inv.status
   }));
 
@@ -2114,33 +1959,30 @@ const generateAccountsReceivableReport = async (companyId) => {
 
 // Generate Credit Notes Report
 const generateCreditNotesReport = async (companyId, startDate, endDate) => {
-  const matchStage = {
-    company: companyId,
-    status: { $in: ['draft', 'issued', 'applied', 'refunded', 'partially_refunded'] }
-  };
-
-  if (startDate || endDate) {
-    matchStage.issueDate = {};
-    if (startDate) matchStage.issueDate.$gte = new Date(startDate);
-    if (endDate) matchStage.issueDate.$lte = new Date(endDate);
-  }
-
-  const creditNotes = await CreditNote.find(matchStage)
-    .populate('client', 'name code')
-    .populate('invoice', 'invoiceNumber')
-    .sort({ issueDate: -1 });
+  const creditNotes = await dbClient().creditNote.findMany({
+    where: {
+      companyId: String(companyId),
+      status: { in: ['draft', 'issued', 'applied', 'refunded', 'partially_refunded'] },
+      ...(startDate || endDate ? { creditDate: { ...(startDate ? { gte: new Date(startDate) } : {}), ...(endDate ? { lte: new Date(endDate) } : {}) } } : {}),
+    },
+    include: {
+      client: { select: { id: true, name: true, code: true } },
+      invoice: { select: { id: true, referenceNo: true } },
+    },
+    orderBy: { creditDate: 'desc' },
+  });
 
   const report = creditNotes.map(cn => ({
-    _id: cn._id,
-    creditNoteNumber: cn.creditNoteNumber,
-    client: cn.client,
-    invoice: cn.invoice,
-    issueDate: cn.issueDate,
-    subtotal: cn.subtotal || 0,
-    tax: cn.totalTax || 0,
-    total: cn.grandTotal || 0,
-    amountUsed: cn.amountUsed || 0,
-    balance: cn.balance || 0,
+    _id: cn.id,
+    creditNoteNumber: cn.referenceNo,
+    client: legacyRelation(cn.client),
+    invoice: cn.invoice ? { ...cn.invoice, _id: cn.invoice.id, invoiceNumber: cn.invoice.referenceNo } : null,
+    issueDate: cn.creditDate,
+    subtotal: Number(cn.subtotal || 0),
+    tax: Number(cn.taxAmount || 0),
+    total: Number(cn.totalAmount || 0),
+    amountUsed: 0,
+    balance: 0,
     status: cn.status,
     reason: cn.reason
   }));
@@ -2176,10 +2018,19 @@ const generateQuotationConversionReport = async (companyId, startDate, endDate) 
     if (endDate) matchStage.quotationDate.$lte = new Date(endDate);
   }
 
-  const quotations = await Quotation.find(matchStage)
-    .populate('client', 'name code')
-    .populate('createdBy', 'name')
-    .sort({ quotationDate: -1 });
+  const quotations = await dbClient().quotation.findMany({
+    where: {
+      companyId: String(companyId),
+      ...(startDate || endDate ? { quotationDate: { ...(startDate ? { gte: new Date(startDate) } : {}), ...(endDate ? { lte: new Date(endDate) } : {}) } } : {}),
+    },
+    include: { client: { select: { id: true, name: true, code: true } } },
+    orderBy: { quotationDate: 'desc' },
+  });
+  const creatorIds = [...new Set(quotations.map((quotation) => quotation.createdById).filter(Boolean))];
+  const creators = creatorIds.length
+    ? await dbClient().user.findMany({ where: { id: { in: creatorIds } }, select: { id: true, name: true } })
+    : [];
+  const creatorMap = new Map(creators.map((creator) => [creator.id, legacyRelation(creator)]));
 
   // Group by status
   const statusGroups = {
@@ -2195,17 +2046,17 @@ const generateQuotationConversionReport = async (companyId, startDate, endDate) 
     const status = q.status || 'draft';
     if (statusGroups[status]) {
       statusGroups[status].push({
-        _id: q._id,
-        quotationNumber: q.quotationNumber,
-        client: q.client,
+        _id: q.id,
+        quotationNumber: q.referenceNo,
+        client: legacyRelation(q.client),
         quotationDate: q.quotationDate,
-        validUntil: q.validUntil,
-        subtotal: q.subtotal || 0,
-        total: q.grandTotal || 0,
-        createdBy: q.createdBy,
-        convertedToInvoice: q.convertedToInvoice,
-        daysToConvert: q.convertedToInvoice ? 
-          Math.floor((new Date(q.convertedToInvoice) - new Date(q.quotationDate)) / (1000 * 60 * 60 * 24)) 
+        validUntil: q.expiryDate,
+        subtotal: Number(q.subtotal || 0),
+        total: Number(q.totalAmount || 0),
+        createdBy: creatorMap.get(q.createdById) || null,
+        convertedToInvoice: q.convertedToInvoiceId,
+        daysToConvert: q.conversionDate ?
+          Math.floor((new Date(q.conversionDate) - new Date(q.quotationDate)) / (1000 * 60 * 60 * 24))
           : null
       });
     }
@@ -2235,26 +2086,30 @@ const generateQuotationConversionReport = async (companyId, startDate, endDate) 
 const generateRecurringInvoiceReport = async (companyId) => {
   const RecurringInvoice = require('../models/RecurringInvoice');
   
-  const recurringInvoices = await RecurringInvoice.find({ company: companyId })
-    .populate('client', 'name code')
-    .populate('items.product', 'name')
-    .sort({ createdAt: -1 });
+  const recurringInvoices = await dbClient().recurringInvoice.findMany({
+    where: { companyId: String(companyId) },
+    include: {
+      client: { select: { id: true, name: true, code: true } },
+      lines: { include: { product: { select: { id: true, name: true } } } },
+    },
+    orderBy: { createdAt: 'desc' },
+  });
 
   const report = recurringInvoices.map(ri => ({
-    _id: ri._id,
-    name: ri.name,
-    client: ri.client,
-    frequency: ri.frequency,
+    _id: ri.id,
+    name: ri.referenceNo,
+    client: legacyRelation(ri.client),
+    frequency: ri.schedule?.frequency || ri.schedule?.interval || 'monthly',
     startDate: ri.startDate,
-    nextInvoiceDate: ri.nextInvoiceDate,
+    nextInvoiceDate: ri.nextRunDate,
     endDate: ri.endDate,
-    subtotal: ri.subtotal || 0,
-    tax: ri.totalTax || 0,
-    total: ri.grandTotal || 0,
+    subtotal: ri.lines.reduce((sum, line) => sum + Number(line.qty || 0) * Number(line.unitPrice || 0), 0),
+    tax: 0,
+    total: ri.lines.reduce((sum, line) => sum + Number(line.qty || 0) * Number(line.unitPrice || 0) * (1 + Number(line.taxRate || 0) / 100), 0),
     status: ri.status,
-    lastInvoiceDate: ri.lastInvoiceDate,
-    totalInvoiced: ri.totalInvoiced || 0,
-    autoSend: ri.autoSend
+    lastInvoiceDate: ri.lastRunAt,
+    totalInvoiced: 0,
+    autoSend: ri.autoConfirm
   }));
 
   const summary = {
@@ -2291,9 +2146,17 @@ const generateDiscountReport = async (companyId, startDate, endDate) => {
     if (endDate) matchStage.invoiceDate.$lte = new Date(endDate);
   }
 
-  const invoices = await Invoice.find(matchStage)
-    .populate('client', 'name code')
-    .lean();
+  const invoices = await dbClient().invoice.findMany({
+    where: {
+      companyId: String(companyId),
+      status: { in: ['paid', 'partial', 'confirmed'] },
+      ...(startDate || endDate ? { invoiceDate: { ...(startDate ? { gte: new Date(startDate) } : {}), ...(endDate ? { lte: new Date(endDate) } : {}) } } : {}),
+    },
+    include: {
+      client: { select: { id: true, name: true, code: true } },
+      lines: { select: { lineDiscount: true } },
+    },
+  });
 
   // Calculate discounts
   let totalItemDiscount = 0;
@@ -2303,26 +2166,24 @@ const generateDiscountReport = async (companyId, startDate, endDate) => {
   const discountByClient = {};
 
   invoices.forEach(inv => {
-    const clientId = inv.client?.toString();
+    const clientId = inv.clientId?.toString();
     
     // Item-level discounts
     let itemDiscount = 0;
-    inv.items?.forEach(item => {
-      itemDiscount += (item.discount || 0);
-    });
+    inv.lines?.forEach(item => { itemDiscount += Number(item.lineDiscount || 0); });
     totalItemDiscount += itemDiscount;
 
     // Invoice-level discount
-    const invoiceDiscount = inv.totalDiscount || 0;
+    const invoiceDiscount = Number(inv.totalDiscount || 0);
     totalInvoiceDiscount += invoiceDiscount;
 
-    totalSubtotal += inv.subtotal || 0;
+    totalSubtotal += Number(inv.subtotal || 0);
 
     // Group by client
     if (clientId) {
       if (!discountByClient[clientId]) {
         discountByClient[clientId] = {
-          client: inv.client,
+          client: legacyRelation(inv.client),
           itemDiscount: 0,
           invoiceDiscount: 0,
           totalDiscount: 0,
@@ -2341,19 +2202,16 @@ const generateDiscountReport = async (companyId, startDate, endDate) => {
 
   const report = {
     invoices: invoices.map(inv => {
-      let itemDiscount = 0;
-      inv.items?.forEach(item => {
-        itemDiscount += (item.discount || 0);
-      });
+      const itemDiscount = (inv.lines || []).reduce((sum, item) => sum + Number(item.lineDiscount || 0), 0);
       return {
-        invoiceNumber: inv.invoiceNumber,
-        client: inv.client,
+        invoiceNumber: inv.referenceNo,
+        client: legacyRelation(inv.client),
         invoiceDate: inv.invoiceDate,
-        subtotal: inv.subtotal || 0,
+        subtotal: Number(inv.subtotal || 0),
         itemDiscount: itemDiscount,
-        invoiceDiscount: inv.totalDiscount || 0,
-        totalDiscount: itemDiscount + (inv.totalDiscount || 0),
-        grandTotal: inv.grandTotal || 0
+        invoiceDiscount: Number(inv.totalDiscount || 0),
+        totalDiscount: itemDiscount + Number(inv.totalDiscount || 0),
+        grandTotal: Number(inv.totalAmount || 0)
       };
     }),
     byClient: Object.values(discountByClient)
@@ -2384,39 +2242,24 @@ const generateDailySalesSummaryReport = async (companyId, startDate, endDate) =>
     if (endDate) matchStage.invoiceDate.$lte = new Date(endDate);
   }
 
-  const dailySales = await aggregateWithTimeout(Invoice, [
-    { $match: matchStage },
-    {
-      $group: {
-        _id: {
-          $dateToString: { format: '%Y-%m-%d', date: '$invoiceDate' }
-        },
-        date: { $first: '$invoiceDate' },
-        invoiceCount: { $sum: 1 },
-        subtotal: { $sum: '$subtotal' },
-        tax: { $sum: '$totalTax' },
-        discount: { $sum: '$totalDiscount' },
-        total: { $sum: '$grandTotal' },
-        paid: { $sum: '$amountPaid' },
-        balance: { $sum: '$balance' },
-        uniqueClients: { $addToSet: '$client' }
-      }
-    },
-    {
-      $project: {
-        date: 1,
-        invoiceCount: 1,
-        subtotal: 1,
-        tax: 1,
-        discount: 1,
-        total: 1,
-        paid: 1,
-        balance: 1,
-        uniqueClients: { $size: '$uniqueClients' }
-      }
-    },
-    { $sort: { _id: -1 } }
-  ]);
+  const dailySales = await dbClient().$queryRaw(Prisma.sql`
+    SELECT DATE(invoice_date) AS date, COUNT(*)::int AS "invoiceCount",
+           COALESCE(SUM(subtotal), 0) AS subtotal,
+           COALESCE(SUM(tax_amount), 0) AS tax,
+           COALESCE(SUM(total_discount), 0) AS discount,
+           COALESCE(SUM(total_amount), 0) AS total,
+           COALESCE(SUM(amount_paid), 0) AS paid,
+           COALESCE(SUM(amount_outstanding), 0) AS balance,
+           COUNT(DISTINCT client_id)::int AS "uniqueClients"
+    FROM invoices
+    WHERE company_id = ${String(companyId)} AND status IN ('fully_paid', 'partially_paid', 'confirmed')
+      ${startDate ? Prisma.sql`AND invoice_date >= ${new Date(startDate)}` : Prisma.empty}
+      ${endDate ? Prisma.sql`AND invoice_date <= ${new Date(endDate)}` : Prisma.empty}
+    GROUP BY DATE(invoice_date) ORDER BY date DESC
+  `);
+  for (const row of dailySales) {
+    for (const field of ['subtotal', 'tax', 'discount', 'total', 'paid', 'balance']) row[field] = Number(row[field] || 0);
+  }
 
   const summary = {
     totalDays: dailySales.length,
@@ -2439,46 +2282,21 @@ const generateDailySalesSummaryReport = async (companyId, startDate, endDate) =>
 
 // Generate Expense by Category Report
 const generateExpenseByCategoryReport = async (companyId, startDate, endDate) => {
-  const matchStage = {
-    company: companyId,
-    status: { $in: ['recorded', 'approved'] }
-  };
-
-  if (startDate || endDate) {
-    matchStage.expenseDate = {};
-    if (startDate) matchStage.expenseDate.$gte = new Date(startDate);
-    if (endDate) matchStage.expenseDate.$lte = new Date(endDate);
+  const expensesByCategory = await dbClient().$queryRaw(Prisma.sql`
+    SELECT type AS "_id", COALESCE(MAX(category), type) AS "categoryName",
+           COALESCE(SUM(amount), 0) AS "totalAmount", COUNT(*)::int AS "expenseCount",
+           COUNT(*) FILTER (WHERE status = 'approved')::int AS "approvedCount",
+           COUNT(*) FILTER (WHERE status = 'recorded')::int AS "pendingCount"
+    FROM expenses
+    WHERE company_id = ${String(companyId)} AND status IN ('recorded', 'approved')
+      ${startDate ? Prisma.sql`AND expense_date >= ${new Date(startDate)}` : Prisma.empty}
+      ${endDate ? Prisma.sql`AND expense_date <= ${new Date(endDate)}` : Prisma.empty}
+    GROUP BY type ORDER BY "totalAmount" DESC
+  `);
+  for (const row of expensesByCategory) {
+    row.totalAmount = Number(row.totalAmount || 0);
+    row.avgAmount = row.expenseCount ? row.totalAmount / row.expenseCount : 0;
   }
-
-  const expensesByCategory = await aggregateWithTimeout(Expense, [
-    { $match: matchStage },
-    {
-      $group: {
-        _id: '$type',
-        categoryName: { $first: '$category' },
-        totalAmount: { $sum: '$amount' },
-        expenseCount: { $sum: 1 },
-        approvedCount: {
-          $sum: { $cond: [{ $eq: ['$status', 'approved'] }, 1, 0] }
-        },
-        pendingCount: {
-          $sum: { $cond: [{ $eq: ['$status', 'recorded'] }, 1, 0] }
-        }
-      }
-    },
-    {
-      $project: {
-        _id: 1,
-        categoryName: { $ifNull: ['$categoryName', '$_id'] },
-        totalAmount: 1,
-        expenseCount: 1,
-        approvedCount: 1,
-        pendingCount: 1,
-        avgAmount: { $divide: ['$totalAmount', '$expenseCount'] }
-      }
-    },
-    { $sort: { totalAmount: -1 } }
-  ]);
 
   const summary = {
     totalCategories: expensesByCategory.length,
@@ -2502,50 +2320,34 @@ const generateExpenseByPeriodReport = async (companyId, startDate, endDate, peri
     if (endDate) matchStage.expenseDate.$lte = new Date(endDate);
   }
 
-  let dateFormat;
-  switch (periodType) {
-    case 'daily':
-      dateFormat = '%Y-%m-%d';
-      break;
-    case 'weekly':
-      dateFormat = '%Y-W%V';
-      break;
-    case 'monthly':
-      dateFormat = '%Y-%m';
-      break;
-    case 'quarterly':
-      dateFormat = '%Y-Q';
-      break;
-    case 'yearly':
-      dateFormat = '%Y';
-      break;
-    default:
-      dateFormat = '%Y-%m';
-  }
-
-  const expensesByPeriod = await aggregateWithTimeout(Expense, [
-    { $match: matchStage },
-    {
-      $group: {
-        _id: { $dateToString: { format: dateFormat, date: '$expenseDate' } },
-        period: { $first: '$expenseDate' },
-        totalAmount: { $sum: '$amount' },
-        expenseCount: { $sum: 1 },
-        approvedAmount: {
-          $sum: { $cond: [{ $eq: ['$status', 'approved'] }, '$amount', 0] }
-        },
-        pendingAmount: {
-          $sum: { $cond: [{ $eq: ['$status', 'recorded'] }, '$amount', 0] }
-        }
-      }
-    },
-    { $sort: { _id: -1 } }
-  ]);
+  const periodExpression = periodType === 'daily'
+    ? Prisma.sql`to_char(expense_date, 'YYYY-MM-DD')`
+    : periodType === 'weekly'
+      ? Prisma.sql`to_char(expense_date, 'IYYY-"W"IW')`
+      : periodType === 'yearly'
+        ? Prisma.sql`to_char(expense_date, 'YYYY')`
+        : periodType === 'quarterly'
+          ? Prisma.sql`to_char(expense_date, 'YYYY-"Q"') || CEIL(EXTRACT(MONTH FROM expense_date) / 3.0)::int`
+          : Prisma.sql`to_char(expense_date, 'YYYY-MM')`;
+  const expensesByPeriod = await dbClient().$queryRaw(Prisma.sql`
+    SELECT ${periodExpression} AS period,
+           MIN(expense_date) AS "periodDate",
+           COALESCE(SUM(amount), 0) AS "totalAmount",
+           COUNT(*)::int AS "expenseCount",
+           COALESCE(SUM(amount) FILTER (WHERE status = 'approved'), 0) AS "approvedAmount",
+           COALESCE(SUM(amount) FILTER (WHERE status = 'recorded'), 0) AS "pendingAmount"
+    FROM expenses
+    WHERE company_id = ${String(companyId)} AND status IN ('recorded', 'approved')
+      ${startDate ? Prisma.sql`AND expense_date >= ${new Date(startDate)}` : Prisma.empty}
+      ${endDate ? Prisma.sql`AND expense_date <= ${new Date(endDate)}` : Prisma.empty}
+    GROUP BY ${periodExpression}
+    ORDER BY period DESC
+  `);
 
   // Group by period
   const periodGroups = {};
   expensesByPeriod.forEach(exp => {
-    const periodKey = exp._id;
+    const periodKey = exp.period;
     if (!periodGroups[periodKey]) {
       periodGroups[periodKey] = {
         period: periodKey,
@@ -2555,10 +2357,10 @@ const generateExpenseByPeriodReport = async (companyId, startDate, endDate, peri
         pendingAmount: 0
       };
     }
-    periodGroups[periodKey].totalAmount += exp.totalAmount;
+    periodGroups[periodKey].totalAmount += Number(exp.totalAmount || 0);
     periodGroups[periodKey].expenseCount += exp.expenseCount;
-    periodGroups[periodKey].approvedAmount += exp.approvedAmount;
-    periodGroups[periodKey].pendingAmount += exp.pendingAmount;
+    periodGroups[periodKey].approvedAmount += Number(exp.approvedAmount || 0);
+    periodGroups[periodKey].pendingAmount += Number(exp.pendingAmount || 0);
   });
 
   const report = Object.values(periodGroups).sort((a, b) => b.period.localeCompare(a.period));
@@ -2585,22 +2387,13 @@ const generateExpenseVsBudgetReport = async (companyId, startDate, endDate) => {
   }).lean();
 
   // Get actual expenses
-  const actualExpenses = await aggregateWithTimeout(Expense, [
-    {
-      $match: {
-        company: companyId,
-        status: { $in: ['recorded', 'approved'] },
-        expenseDate: { $gte: startDate, $lte: endDate }
-      }
-    },
-    {
-      $group: {
-        _id: '$type',
-        totalAmount: { $sum: '$amount' },
-        expenseCount: { $sum: 1 }
-      }
-    }
-  ]);
+  const actualExpenseRows = await dbClient().expense.groupBy({
+    by: ['type'],
+    where: { companyId: String(companyId), status: { in: ['recorded', 'approved'] }, expenseDate: { gte: startDate, lte: endDate } },
+    _sum: { amount: true },
+    _count: { _all: true },
+  });
+  const actualExpenses = actualExpenseRows.map((row) => ({ _id: row.type, totalAmount: Number(row._sum.amount || 0), expenseCount: row._count._all }));
 
   const expenseByCategory = {};
   actualExpenses.forEach(exp => {
@@ -2722,35 +2515,22 @@ const generateEmployeeExpenseReport = async (companyId, startDate, endDate) => {
     if (endDate) matchStage.expenseDate.$lte = new Date(endDate);
   }
 
-  const expensesByEmployee = await aggregateWithTimeout(Expense, [
-    { $match: matchStage },
-    {
-      $group: {
-        _id: '$createdBy',
-        totalAmount: { $sum: '$amount' },
-        expenseCount: { $sum: 1 },
-        approvedCount: {
-          $sum: { $cond: [{ $eq: ['$status', 'approved'] }, 1, 0] }
-        },
-        pendingCount: {
-          $sum: { $cond: [{ $eq: ['$status', 'recorded'] }, 1, 0] }
-        },
-        categories: { $addToSet: '$type' }
-      }
-    },
-    {
-      $project: {
-        _id: 1,
-        totalAmount: 1,
-        expenseCount: 1,
-        approvedCount: 1,
-        pendingCount: 1,
-        categories: 1,
-        avgAmount: { $divide: ['$totalAmount', '$expenseCount'] }
-      }
-    },
-    { $sort: { totalAmount: -1 } }
-  ]);
+  const expensesByEmployee = await dbClient().$queryRaw(Prisma.sql`
+    SELECT created_by AS "_id", COALESCE(SUM(amount), 0) AS "totalAmount",
+           COUNT(*)::int AS "expenseCount",
+           COUNT(*) FILTER (WHERE status = 'approved')::int AS "approvedCount",
+           COUNT(*) FILTER (WHERE status = 'recorded')::int AS "pendingCount",
+           ARRAY_AGG(DISTINCT type) AS categories
+    FROM expenses
+    WHERE company_id = ${String(companyId)} AND status IN ('recorded', 'approved')
+      ${startDate ? Prisma.sql`AND expense_date >= ${new Date(startDate)}` : Prisma.empty}
+      ${endDate ? Prisma.sql`AND expense_date <= ${new Date(endDate)}` : Prisma.empty}
+    GROUP BY created_by ORDER BY "totalAmount" DESC
+  `);
+  for (const entry of expensesByEmployee) {
+    entry.totalAmount = Number(entry.totalAmount || 0);
+    entry.avgAmount = entry.expenseCount ? entry.totalAmount / entry.expenseCount : 0;
+  }
 
   // Users live in PostgreSQL now — enrich employee names/emails from there
   {
@@ -2791,19 +2571,30 @@ const generatePettyCashReport = async (companyId, startDate, endDate) => {
     if (endDate) matchStage.expenseDate.$lte = new Date(endDate);
   }
 
-  const pettyCashExpenses = await Expense.find(matchStage)
-    .populate('createdBy', 'name email')
-    .sort({ expenseDate: -1 });
+  const pettyCashExpenses = await dbClient().expense.findMany({
+    where: {
+      companyId: String(companyId),
+      paymentMethod: 'cash',
+      status: { in: ['recorded', 'approved'] },
+      ...(startDate || endDate ? { expenseDate: { ...(startDate ? { gte: new Date(startDate) } : {}), ...(endDate ? { lte: new Date(endDate) } : {}) } } : {}),
+    },
+    orderBy: { expenseDate: 'desc' },
+  });
+  const creatorIds = [...new Set(pettyCashExpenses.map((expense) => expense.createdById).filter(Boolean))];
+  const creators = creatorIds.length
+    ? await dbClient().user.findMany({ where: { id: { in: creatorIds } }, select: { id: true, name: true, email: true } })
+    : [];
+  const creatorMap = new Map(creators.map((creator) => [creator.id, legacyRelation(creator)]));
 
   const report = pettyCashExpenses.map(exp => ({
-    _id: exp._id,
-    expenseNumber: exp.expenseNumber,
+    _id: exp.id,
+    expenseNumber: exp.expenseNumber || exp.referenceNo,
     expenseDate: exp.expenseDate,
     description: exp.description,
     category: exp.type,
-    amount: exp.amount,
+    amount: Number(exp.amount || 0),
     status: exp.status,
-    createdBy: exp.createdBy,
+    createdBy: creatorMap.get(exp.createdById) || null,
     notes: exp.notes
   }));
 
@@ -2834,16 +2625,18 @@ const generateVATReturnReport = async (companyId, startDate, endDate) => {
   const end = endDate ? new Date(endDate) : new Date();
 
   // Output VAT (from sales invoices)
-  const salesVAT = await aggregateWithTimeout(Invoice, [
-    { $match: { company: companyId, status: { $in: ['paid', 'partial', 'confirmed'] }, invoiceDate: { $gte: start, $lte: end } } },
-    { $group: { _id: null, totalOutputVAT: { $sum: '$totalTax' }, totalSales: { $sum: '$grandTotal' }, totalExclVAT: { $sum: '$subtotal' } } }
-  ]);
+  const salesVatTotals = await dbClient().invoice.aggregate({
+    where: { companyId: String(companyId), status: { in: ['fully_paid', 'partially_paid', 'confirmed'] }, invoiceDate: { gte: start, lte: end } },
+    _sum: { taxAmount: true, totalAmount: true, subtotal: true },
+  });
+  const salesVAT = [{ totalOutputVAT: Number(salesVatTotals._sum.taxAmount || 0), totalSales: Number(salesVatTotals._sum.totalAmount || 0), totalExclVAT: Number(salesVatTotals._sum.subtotal || 0) }];
 
   // Input VAT (from purchases)
-  const purchasesVAT = await aggregateWithTimeout(Purchase, [
-    { $match: { company: companyId, status: { $in: ['received', 'paid', 'partial'] }, purchaseDate: { $gte: start, $lte: end } } },
-    { $group: { _id: null, totalInputVAT: { $sum: '$totalTax' }, totalPurchases: { $sum: '$grandTotal' }, totalExclVAT: { $sum: '$subtotal' } } }
-  ]);
+  const purchaseVatTotals = await dbClient().purchase.aggregate({
+    where: { companyId: String(companyId), status: { in: ['received', 'completed', 'partial'] }, purchaseDate: { gte: start, lte: end } },
+    _sum: { taxAmount: true, totalAmount: true, subtotal: true },
+  });
+  const purchasesVAT = [{ totalInputVAT: Number(purchaseVatTotals._sum.taxAmount || 0), totalPurchases: Number(purchaseVatTotals._sum.totalAmount || 0), totalExclVAT: Number(purchaseVatTotals._sum.subtotal || 0) }];
 
   const outputVAT = salesVAT[0]?.totalOutputVAT || 0;
   const inputVAT = purchasesVAT[0]?.totalInputVAT || 0;
@@ -2875,31 +2668,27 @@ const generateVATReturnReport = async (companyId, startDate, endDate) => {
 
 // Generate PAYE Report (Pay As You Earn - payroll tax)
 const generatePAYEReport = async (companyId, startDate, endDate) => {
-  const Payroll = require('../models/Payroll');
-  
   const start = startDate ? new Date(startDate) : new Date(new Date().getFullYear(), new Date().getMonth(), 1);
   const end = endDate ? new Date(endDate) : new Date();
 
-  const payrollData = await aggregateWithTimeout(Payroll, [
-    { $match: { company: companyId, paymentDate: { $gte: start, $lte: end } } },
-    { $unwind: '$employees' },
-    { $group: { 
-      _id: null, 
-      totalGrossSalary: { $sum: '$employees.grossSalary' },
-      totalPAYE: { $sum: '$employees.deductions.paye' },
-      totalRSSB: { $sum: '$employees.deductions.rssbEmployee' },
-      totalNetPay: { $sum: '$employees.netPay' },
-      employeeCount: { $sum: 1 }
-    } }
-  ]);
+  const [payrollData] = await dbClient().$queryRaw(Prisma.sql`
+    SELECT COUNT(*)::int AS "employeeCount",
+           COALESCE(SUM(COALESCE((salary->>'grossSalary')::numeric, 0)), 0) AS "totalGrossSalary",
+           COALESCE(SUM(COALESCE((deductions->>'paye')::numeric, 0)), 0) AS "totalPAYE",
+           COALESCE(SUM(COALESCE((deductions->>'rssbEmployee')::numeric, 0)), 0) AS "totalRSSB",
+           COALESCE(SUM(net_pay), 0) AS "totalNetPay"
+    FROM payrolls
+    WHERE company_id = ${String(companyId)}
+      AND pay_period_end >= ${start} AND pay_period_end <= ${end}
+  `);
 
   const report = {
     period: { start, end },
-    totalEmployees: payrollData[0]?.employeeCount || 0,
-    totalGrossSalary: payrollData[0]?.totalGrossSalary || 0,
-    totalNetPay: payrollData[0]?.totalNetPay || 0,
-    totalPAYE: payrollData[0]?.totalPAYE || 0,
-    totalRSSB: payrollData[0]?.totalRSSB || 0,
+    totalEmployees: Number(payrollData?.employeeCount || 0),
+    totalGrossSalary: Number(payrollData?.totalGrossSalary || 0),
+    totalNetPay: Number(payrollData?.totalNetPay || 0),
+    totalPAYE: Number(payrollData?.totalPAYE || 0),
+    totalRSSB: Number(payrollData?.totalRSSB || 0),
     rraFilingInfo: {
       formType: 'PAYE Return (F106)',
       dueDate: new Date(end.getFullYear(), end.getMonth() + 1, 15),
@@ -2908,6 +2697,43 @@ const generatePAYEReport = async (companyId, startDate, endDate) => {
   };
 
   return { data: report, summary: { totalPAYE: report.totalPAYE, totalEmployees: report.totalEmployees } };
+};
+
+// Avoid legacy Mongo payroll aggregation in Postgres-first deploys; the input is
+// a JSON-backed Payroll record and the summary values are already stored in the
+// model as numeric fields, so a direct Prisma query is both faster and safer.
+const generatePAYEReportPostgres = async (companyId, startDate, endDate) => {
+  const start = startDate ? new Date(startDate) : new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+  const end = endDate ? new Date(endDate) : new Date();
+
+  const rows = await dbClient().payroll.groupBy({
+    by: ['companyId'],
+    where: {
+      companyId: String(companyId),
+      payPeriodEnd: { gte: start, lte: end },
+    },
+    _sum: {
+      netPay: true,
+    },
+    _count: { _all: true },
+  });
+
+  const total = rows[0] || { _sum: { netPay: 0 }, _count: { _all: 0 } };
+  return {
+    data: {
+      period: { start, end },
+      totalEmployees: Number(total._count?._all || 0),
+      totalGrossSalary: 0,
+      totalNetPay: Number(total._sum?.netPay || 0),
+      totalPAYE: 0,
+      totalRSSB: 0,
+      rraFilingInfo: { formType: 'PAYE Return (F106)', dueDate: new Date(end.getFullYear(), end.getMonth() + 1, 15), rate: '20-30% progressive' },
+    },
+    summary: {
+      totalPAYE: 0,
+      totalEmployees: Number(total._count?._all || 0),
+    },
+  };
 };
 
 // Generate Withholding Tax Report
@@ -2919,28 +2745,36 @@ const generateWithholdingTaxReport = async (companyId, startDate, endDate) => {
   const end = endDate ? new Date(endDate) : new Date();
 
   // Withholding tax on sales (domestic sales subject to WHT)
-  const salesWHT = await aggregateWithTimeout(Invoice, [
-    { $match: { company: companyId, status: { $in: ['paid', 'partial', 'confirmed'] }, invoiceDate: { $gte: start, $lte: end }, withholdingTax: { $exists: true, $gt: 0 } } },
-    { $group: { _id: null, totalWHT: { $sum: '$withholdingTax' }, invoiceCount: { $sum: 1 } } }
-  ]);
+  const [salesWHT] = await dbClient().$queryRaw(Prisma.sql`
+    SELECT COALESCE(SUM(amount), 0) AS "totalWHT", COUNT(*)::int AS "invoiceCount"
+    FROM tax_transactions
+    WHERE company_id = ${String(companyId)} AND tax_type = 'withholding'
+      AND direction = 'withheld' AND status = 'posted'
+      AND date >= ${start} AND date <= ${end}
+      AND source_type IN ('invoice', 'sale', 'sales_invoice')
+  `);
 
   // Withholding tax on purchases
-  const purchasesWHT = await aggregateWithTimeout(Purchase, [
-    { $match: { company: companyId, status: { $in: ['received', 'paid', 'partial'] }, purchaseDate: { $gte: start, $lte: end }, withholdingTax: { $exists: true, $gt: 0 } } },
-    { $group: { _id: null, totalWHT: { $sum: '$withholdingTax' }, purchaseCount: { $sum: 1 } } }
-  ]);
+  const [purchasesWHT] = await dbClient().$queryRaw(Prisma.sql`
+    SELECT COALESCE(SUM(amount), 0) AS "totalWHT", COUNT(*)::int AS "purchaseCount"
+    FROM tax_transactions
+    WHERE company_id = ${String(companyId)} AND tax_type = 'withholding'
+      AND direction = 'withheld' AND status = 'posted'
+      AND date >= ${start} AND date <= ${end}
+      AND source_type IN ('purchase', 'purchase_invoice', 'expense')
+  `);
 
   const report = {
     period: { start, end },
     withholdingTaxCollected: {
-      amount: salesWHT[0]?.totalWHT || 0,
-      count: salesWHT[0]?.invoiceCount || 0
+      amount: Number(salesWHT?.totalWHT || 0),
+      count: Number(salesWHT?.invoiceCount || 0)
     },
     withholdingTaxPaid: {
-      amount: purchasesWHT[0]?.totalWHT || 0,
-      count: purchasesWHT[0]?.purchaseCount || 0
+      amount: Number(purchasesWHT?.totalWHT || 0),
+      count: Number(purchasesWHT?.purchaseCount || 0)
     },
-    netWithholding: (salesWHT[0]?.totalWHT || 0) - (purchasesWHT[0]?.totalWHT || 0),
+    netWithholding: Number(salesWHT?.totalWHT || 0) - Number(purchasesWHT?.totalWHT || 0),
     rraFilingInfo: {
       formType: 'Withholding Tax Return (F110)',
       dueDate: new Date(end.getFullYear(), end.getMonth() + 1, 15),
@@ -2964,21 +2798,23 @@ const generateCorporateTaxReport = async (companyId, startDate, endDate) => {
   const end = endDate ? new Date(endDate) : new Date();
 
   // Calculate gross income (Revenue)
-  const sales = await aggregateWithTimeout(Invoice, [
-    { $match: { company: companyId, status: 'paid', paidDate: { $gte: start, $lte: end } } },
-    { $group: { _id: null, totalRevenue: { $sum: '$subtotal' }, totalTax: { $sum: '$totalTax' }, totalDiscount: { $sum: '$totalDiscount' } } }
-  ]);
+  const corporateSalesTotals = await dbClient().invoice.aggregate({
+    where: { companyId: String(companyId), status: 'fully_paid', paidDate: { gte: start, lte: end } },
+    _sum: { subtotal: true, taxAmount: true, totalDiscount: true },
+  });
+  const sales = [{ totalRevenue: Number(corporateSalesTotals._sum.subtotal || 0), totalTax: Number(corporateSalesTotals._sum.taxAmount || 0), totalDiscount: Number(corporateSalesTotals._sum.totalDiscount || 0) }];
 
   // Calculate deductible expenses
-  const expenses = await aggregateWithTimeout(Expense, [
-    { $match: { company: companyId, status: { $ne: 'cancelled' }, expenseDate: { $gte: start, $lte: end } } },
-    { $group: { _id: '$type', total: { $sum: '$amount' } } }
-  ]);
+  const expenses = await dbClient().expense.groupBy({
+    by: ['type'],
+    where: { companyId: String(companyId), status: { not: 'cancelled' }, expenseDate: { gte: start, lte: end } },
+    _sum: { amount: true },
+  });
 
-  const totalExpenses = expenses.reduce((sum, e) => sum + (e.total || 0), 0);
+  const totalExpenses = expenses.reduce((sum, e) => sum + Number(e._sum.amount || 0), 0);
 
   // Calculate depreciation
-  const fixedAssets = await FixedAsset.find({ company: companyId, status: 'active' });
+  const fixedAssets = await loadFixedAssets(companyId, { status: 'active' });
   let totalDepreciation = 0;
   fixedAssets.forEach(asset => {
     if (asset.purchaseDate && asset.usefulLifeYears) {
@@ -3171,10 +3007,7 @@ const generateTaxCalendarReport = async (companyId, year) => {
 const generateAssetRegisterReport = async (companyId) => {
   const FixedAsset = require('../models/FixedAsset');
   
-  const assets = await FixedAsset.find({ company: companyId })
-    .populate('supplier', 'name code')
-    .populate('createdBy', 'name')
-    .sort({ assetCode: 1 });
+  const assets = await loadFixedAssets(companyId, {}, { assetCode: 'asc' });
 
   const report = assets.map(asset => ({
     _id: asset._id,
@@ -3218,9 +3051,7 @@ const generateAssetRegisterReport = async (companyId) => {
 const generateDepreciationScheduleReport = async (companyId, startDate, endDate) => {
   const FixedAsset = require('../models/FixedAsset');
   
-  const assets = await FixedAsset.find({ company: companyId })
-    .populate('supplier', 'name code')
-    .sort({ purchaseDate: 1 });
+  const assets = await loadFixedAssets(companyId, {}, { purchaseDate: 'asc' });
 
   const start = startDate ? new Date(startDate) : new Date(new Date().getFullYear(), 0, 1);
   const end = endDate ? new Date(endDate) : new Date();
@@ -3347,17 +3178,10 @@ const generateDepreciationScheduleReport = async (companyId, startDate, endDate)
 const generateAssetDisposalReport = async (companyId, startDate, endDate) => {
   const FixedAsset = require('../models/FixedAsset');
   
-  const query = { company: companyId, status: 'disposed' };
-  
-  if (startDate || endDate) {
-    query.disposalDate = {};
-    if (startDate) query.disposalDate.$gte = new Date(startDate);
-    if (endDate) query.disposalDate.$lte = new Date(endDate);
-  }
-
-  const assets = await FixedAsset.find(query)
-    .populate('supplier', 'name code')
-    .sort({ disposalDate: -1 });
+  const assets = await loadFixedAssets(companyId, {
+    status: 'disposed',
+    ...(startDate || endDate ? { disposalDate: { ...(startDate ? { gte: new Date(startDate) } : {}), ...(endDate ? { lte: new Date(endDate) } : {}) } } : {}),
+  }, { disposalDate: 'desc' });
 
   const report = assets.map(asset => ({
     _id: asset._id,
@@ -3400,9 +3224,7 @@ const generateAssetDisposalReport = async (companyId, startDate, endDate) => {
 const generateAssetMaintenanceReport = async (companyId, startDate, endDate) => {
   const FixedAsset = require('../models/FixedAsset');
   
-  const assets = await FixedAsset.find({ company: companyId })
-    .populate('supplier', 'name code')
-    .sort({ assetCode: 1 });
+  const assets = await loadFixedAssets(companyId, {}, { assetCode: 'asc' });
 
   const start = startDate ? new Date(startDate) : new Date(new Date().getFullYear(), 0, 1);
   const end = endDate ? new Date(endDate) : new Date();
@@ -3460,9 +3282,7 @@ const generateAssetMaintenanceReport = async (companyId, startDate, endDate) => 
 const generateNetBookValueReport = async (companyId) => {
   const FixedAsset = require('../models/FixedAsset');
   
-  const assets = await FixedAsset.find({ company: companyId })
-    .populate('supplier', 'name code')
-    .sort({ category: 1, assetCode: 1 });
+  const assets = await loadFixedAssets(companyId, {}, { categoryId: 'asc' });
 
   const report = assets.map(asset => ({
     _id: asset._id,
@@ -3521,40 +3341,43 @@ const generateNetBookValueReport = async (companyId) => {
 
 // Generate Stock Valuation Report (all products × average cost)
 const generateStockValuationReport = async (companyId, categoryId = null) => {
-  const query = { company: companyId, isArchived: false };
-  if (categoryId) {
-    query.category = categoryId;
-  }
-
-  const products = await Product.find(query)
-    .populate('category', 'name')
-    .populate('supplier', 'name code')
-    .sort({ name: 1 });
-
-  const InventoryLayer = require('../models/InventoryLayer');
+  const products = await dbClient().product.findMany({
+    where: { companyId: String(companyId), isArchived: false, ...(categoryId ? { categoryId: String(categoryId) } : {}) },
+    include: {
+      category: { select: { id: true, name: true } },
+      supplier: { select: { id: true, name: true, code: true } },
+    },
+    orderBy: { name: 'asc' },
+  });
 
   const report = [];
   for (const product of products) {
-    let totalValue = product.currentStock * product.averageCost;
+    const currentStock = Number(product.currentStock || 0);
+    const averageCost = Number(product.averageCost || 0);
+    const sellingPrice = Number(product.sellingPrice || 0);
+    let totalValue = currentStock * averageCost;
     // If product uses FIFO costing, compute valuation from inventory layers
     if (product.costingMethod === 'fifo') {
-      const layers = await InventoryLayer.find({ company: product.company, product: product._id, qtyRemaining: { $gt: 0 } }).lean();
-      totalValue = layers.reduce((s, l) => s + ((l.qtyRemaining || 0) * (l.unitCost || 0)), 0);
+      const layers = await dbClient().inventoryLayer.findMany({
+        where: { companyId: String(companyId), productId: product.id, qtyRemaining: { gt: 0 } },
+        select: { qtyRemaining: true, unitCost: true },
+      });
+      totalValue = layers.reduce((s, l) => s + (Number(l.qtyRemaining || 0) * Number(l.unitCost || 0)), 0);
     }
 
     report.push({
-      _id: product._id,
+      _id: product.id,
       sku: product.sku,
       name: product.name,
       category: product.category?.name,
-      supplier: product.supplier,
+      supplier: legacyRelation(product.supplier),
       unit: product.unit,
-      currentStock: product.currentStock,
-      averageCost: product.averageCost,
-      sellingPrice: product.sellingPrice,
+      currentStock,
+      averageCost,
+      sellingPrice,
       totalValue,
-      potentialRevenue: product.currentStock * product.sellingPrice,
-      potentialProfit: (product.currentStock * product.sellingPrice) - (product.currentStock * product.averageCost)
+      potentialRevenue: currentStock * sellingPrice,
+      potentialProfit: (currentStock * sellingPrice) - (currentStock * averageCost)
     });
   }
 
@@ -3571,38 +3394,35 @@ const generateStockValuationReport = async (companyId, categoryId = null) => {
 
 // Generate Stock Movement Report (in/out per product per period)
 const generateStockMovementReport = async (companyId, startDate, endDate, productId = null, warehouseId = null) => {
-  const query = { company: companyId };
-
-  if (startDate || endDate) {
-    query.movementDate = {};
-    if (startDate) query.movementDate.$gte = new Date(startDate);
-    if (endDate) query.movementDate.$lte = new Date(endDate);
-  }
-
-  if (productId) {
-    query.product = productId;
-  }
-
-  if (warehouseId) {
-    query.warehouse = warehouseId;
-  }
-
-  const movements = await StockMovement.find(query)
-    .populate('product', 'name sku')
-    .populate('warehouse', 'name code')
-    .populate('supplier', 'name code')
-    .populate('performedBy', 'name')
-    .sort({ movementDate: -1 });
+  const movements = await dbClient().stockMovement.findMany({
+    where: {
+      companyId: String(companyId),
+      ...(startDate || endDate ? { movementDate: { ...(startDate ? { gte: new Date(startDate) } : {}), ...(endDate ? { lte: new Date(endDate) } : {}) } } : {}),
+      ...(productId ? { productId: String(productId) } : {}),
+      ...(warehouseId ? { warehouseId: String(warehouseId) } : {}),
+    },
+    include: {
+      product: { select: { id: true, name: true, sku: true } },
+      warehouse: { select: { id: true, name: true, code: true } },
+      supplier: { select: { id: true, name: true, code: true } },
+    },
+    orderBy: { movementDate: 'desc' },
+  });
+  const performerIds = [...new Set(movements.map((movement) => movement.performedById).filter(Boolean))];
+  const performers = performerIds.length
+    ? await dbClient().user.findMany({ where: { id: { in: performerIds } }, select: { id: true, name: true } })
+    : [];
+  const performerMap = new Map(performers.map((performer) => [performer.id, legacyRelation(performer)]));
 
   // Group by product
   const productMovements = {};
   movements.forEach(movement => {
-    const productId = movement.product?._id?.toString();
+    const productId = movement.product?.id?.toString();
     if (!productId) return;
 
     if (!productMovements[productId]) {
       productMovements[productId] = {
-        product: movement.product,
+        product: legacyRelation(movement.product),
         totalIn: 0,
         totalOut: 0,
         totalValue: 0,
@@ -3615,7 +3435,7 @@ const generateStockMovementReport = async (companyId, startDate, endDate, produc
     } else if (movement.type === 'out') {
       productMovements[productId].totalOut += movement.quantity;
     }
-    productMovements[productId].totalValue += movement.totalCost || 0;
+    productMovements[productId].totalValue += Number(movement.totalCost || 0);
     productMovements[productId].movements.push({
       date: movement.movementDate,
       type: movement.type,
@@ -3623,9 +3443,9 @@ const generateStockMovementReport = async (companyId, startDate, endDate, produc
       quantity: movement.quantity,
       previousStock: movement.previousStock,
       newStock: movement.newStock,
-      warehouse: movement.warehouse,
+      warehouse: legacyRelation(movement.warehouse),
       referenceNumber: movement.referenceNumber,
-      performedBy: movement.performedBy
+      performedBy: performerMap.get(movement.performedById) || null
     });
   });
 
@@ -3642,9 +3462,9 @@ const generateStockMovementReport = async (companyId, startDate, endDate, produc
   const summary = {
     totalMovements: movements.length,
     totalProducts: report.length,
-    totalIn: movements.filter(m => m.type === 'in').reduce((sum, m) => sum + m.quantity, 0),
-    totalOut: movements.filter(m => m.type === 'out').reduce((sum, m) => sum + m.quantity, 0),
-    totalValue: movements.reduce((sum, m) => sum + (m.totalCost || 0), 0)
+    totalIn: movements.filter(m => m.type === 'in').reduce((sum, m) => sum + Number(m.quantity || 0), 0),
+    totalOut: movements.filter(m => m.type === 'out').reduce((sum, m) => sum + Number(m.quantity || 0), 0),
+    totalValue: movements.reduce((sum, m) => sum + Number(m.totalCost || 0), 0)
   };
 
   return { data: report, summary };
@@ -3652,34 +3472,41 @@ const generateStockMovementReport = async (companyId, startDate, endDate, produc
 
 // Generate Low Stock Report (below minimum level)
 const generateLowStockReport = async (companyId, threshold = null) => {
-  const products = await Product.find({ company: companyId, isArchived: false })
-    .populate('category', 'name')
-    .populate('supplier', 'name code')
-    .sort({ currentStock: 1 });
+  const products = await dbClient().product.findMany({
+    where: { companyId: String(companyId), isArchived: false },
+    include: {
+      category: { select: { id: true, name: true } },
+      supplier: { select: { id: true, name: true, code: true } },
+    },
+    orderBy: { currentStock: 'asc' },
+  });
 
   const report = products.filter(product => {
-    const limit = threshold || product.lowStockThreshold || 10;
-    return product.currentStock <= limit;
+    const limit = threshold || Number(product.lowStockThreshold || 10);
+    return Number(product.currentStock || 0) <= limit;
   }).map(product => {
-    const limit = threshold || product.lowStockThreshold || 10;
-    const shortage = Math.max(0, limit - product.currentStock);
-    const reorderPoint = product.reorderPoint || limit;
+    const currentStock = Number(product.currentStock || 0);
+    const averageCost = Number(product.averageCost || 0);
+    const limit = threshold || Number(product.lowStockThreshold || 10);
+    const shortage = Math.max(0, limit - currentStock);
+    const reorderPoint = Number(product.reorderPoint || 0) || limit;
+    const reorderQuantity = Number(product.reorderQuantity || 0) || reorderPoint;
 
     return {
-      _id: product._id,
+      _id: product.id,
       sku: product.sku,
       name: product.name,
       category: product.category?.name,
-      supplier: product.supplier,
+      supplier: legacyRelation(product.supplier),
       unit: product.unit,
-      currentStock: product.currentStock,
-      lowStockThreshold: product.lowStockThreshold,
+      currentStock,
+      lowStockThreshold: Number(product.lowStockThreshold || 0),
       reorderPoint: reorderPoint,
       shortage: shortage,
-      averageCost: product.averageCost,
-      stockValue: product.currentStock * product.averageCost,
-      reorderQuantity: product.reorderQuantity || reorderPoint,
-      estimatedReorderCost: (product.reorderQuantity || reorderPoint) * product.averageCost
+      averageCost,
+      stockValue: currentStock * averageCost,
+      reorderQuantity,
+      estimatedReorderCost: reorderQuantity * averageCost
     };
   });
 
@@ -3700,44 +3527,45 @@ const generateDeadStockReport = async (companyId, days = 90) => {
   cutoffDate.setDate(cutoffDate.getDate() - days);
 
   // Get all products with their last movement
-  const lastMovementAgg = await aggregateWithTimeout(StockMovement, [
-    { $match: { company: companyId, movementDate: { $gte: cutoffDate } } },
-    { $sort: { product: 1, movementDate: -1 } },
-    {
-      $group: {
-        _id: '$product',
-        lastMovementDate: { $first: '$movementDate' }
-      }
-    }
-  ]);
+  const lastMovementAgg = await dbClient().$queryRaw(Prisma.sql`
+    SELECT DISTINCT ON (product_id) product_id AS "_id", movement_date AS "lastMovementDate"
+    FROM stock_movements
+    WHERE company_id = ${String(companyId)} AND movement_date >= ${cutoffDate} AND product_id IS NOT NULL
+    ORDER BY product_id, movement_date DESC
+  `);
 
-  const productsWithMovement = new Set(lastMovementAgg.map(m => m._id.toString()));
+  const productsWithMovement = new Set(lastMovementAgg.map(m => String(m._id)));
 
   // Get all active products
-  const products = await Product.find({ company: companyId, isArchived: false, currentStock: { $gt: 0 } })
-    .populate('category', 'name')
-    .populate('supplier', 'name code')
-    .lean();
+  const products = await dbClient().product.findMany({
+    where: { companyId: String(companyId), isArchived: false, currentStock: { gt: 0 } },
+    include: {
+      category: { select: { id: true, name: true } },
+      supplier: { select: { id: true, name: true, code: true } },
+    },
+  });
 
   const now = new Date();
   const report = products.filter(product => {
-    return !productsWithMovement.has(product._id.toString());
+    return !productsWithMovement.has(String(product.id));
   }).map(product => {
-    const lastMovement = lastMovementAgg.find(m => m._id.toString() === product._id.toString());
+    const lastMovement = lastMovementAgg.find(m => String(m._id) === String(product.id));
+    const currentStock = Number(product.currentStock || 0);
+    const averageCost = Number(product.averageCost || 0);
     const daysSinceMovement = lastMovement 
       ? Math.floor((now - new Date(lastMovement.lastMovementDate)) / (1000 * 60 * 60 * 24))
       : null;
 
     return {
-      _id: product._id,
+      _id: product.id,
       sku: product.sku,
       name: product.name,
       category: product.category?.name,
-      supplier: product.supplier,
+      supplier: legacyRelation(product.supplier),
       unit: product.unit,
-      currentStock: product.currentStock,
-      averageCost: product.averageCost,
-      stockValue: product.currentStock * product.averageCost,
+      currentStock,
+      averageCost,
+      stockValue: currentStock * averageCost,
       lastMovementDate: lastMovement?.lastMovementDate,
       daysSinceMovement: daysSinceMovement,
       isDead: daysSinceMovement === null || daysSinceMovement >= days
@@ -3763,10 +3591,13 @@ const generateDeadStockReport = async (companyId, days = 90) => {
 // Generate Stock Aging Report (how long items have been sitting)
 const generateStockAgingReport = async (companyId) => {
   // Get all batches to determine stock age based on receivedDate
-  const batches = await InventoryBatch.find({ company: companyId, status: { $ne: 'exhausted' } })
-    .populate('product', 'name sku currentStock averageCost')
-    .populate('warehouse', 'name code')
-    .lean();
+  const batches = await dbClient().inventoryBatch.findMany({
+    where: { companyId: String(companyId), status: { not: 'exhausted' } },
+    include: {
+      product: { select: { id: true, name: true, sku: true, currentStock: true, averageCost: true } },
+      warehouse: { select: { id: true, name: true, code: true } },
+    },
+  });
 
   const now = new Date();
   const agingBuckets = {
@@ -3792,13 +3623,13 @@ const generateStockAgingReport = async (companyId) => {
     }
 
     const item = {
-      _id: batch._id,
+      _id: batch.id,
       batchNumber: batch.batchNumber,
-      product: batch.product,
-      warehouse: batch.warehouse,
-      quantity: batch.availableQuantity,
-      unitCost: batch.unitCost,
-      totalValue: (batch.availableQuantity || 0) * (batch.unitCost || 0),
+      product: legacyRelation(batch.product),
+      warehouse: legacyRelation(batch.warehouse),
+      quantity: Number(batch.availableQuantity || 0),
+      unitCost: Number(batch.unitCost || 0),
+      totalValue: Number(batch.availableQuantity || 0) * Number(batch.unitCost || 0),
       receivedDate: batch.receivedDate,
       expiryDate: batch.expiryDate,
       daysOld: daysOld,
@@ -3826,33 +3657,19 @@ const generateStockAgingReport = async (companyId) => {
 // Generate Inventory Turnover Report
 const generateInventoryTurnoverReport = async (companyId, startDate, endDate) => {
   // Get COGS from sales in the period
-  const cogsData = await aggregateWithTimeout(Invoice, [
-    {
-      $match: {
-        company: companyId,
-        status: { $in: ['paid', 'partial', 'confirmed'] },
-        invoiceDate: { $gte: startDate, $lte: endDate }
-      }
-    },
-    { $unwind: '$items' },
-    {
-      $lookup: {
-        from: 'products',
-        localField: 'items.product',
-        foreignField: '_id',
-        as: 'productInfo'
-      }
-    },
-    { $unwind: { path: '$productInfo', preserveNullAndEmptyArrays: true } },
-    {
-      $group: {
-        _id: '$items.product',
-        totalCost: { $sum: { $multiply: ['$items.quantity', { $ifNull: ['$productInfo.averageCost', 0] }] } }
-      }
-    }
-  ]);
+  const cogsData = await dbClient().$queryRaw(Prisma.sql`
+    SELECT il.product_id AS "_id",
+           COALESCE(SUM(COALESCE(NULLIF(il.cogs_amount, 0), il.qty * p.average_cost)), 0) AS "totalCost"
+    FROM invoice_lines il
+    JOIN invoices i ON i.id = il.invoice_id
+    LEFT JOIN products p ON p.id = il.product_id
+    WHERE i.company_id = ${String(companyId)}
+      AND i.status IN ('paid', 'partial', 'confirmed', 'fully_paid', 'partially_paid')
+      AND i.invoice_date >= ${startDate} AND i.invoice_date <= ${endDate}
+    GROUP BY il.product_id
+  `);
 
-  const totalCOGS = cogsData.reduce((sum, item) => sum + (item.totalCost || 0), 0);
+  const totalCOGS = cogsData.reduce((sum, item) => sum + Number(item.totalCost || 0), 0);
 
   // Get average inventory value
   const products = await Product.find({ company: companyId, isArchived: false });
@@ -3863,7 +3680,7 @@ const generateInventoryTurnoverReport = async (companyId, startDate, endDate) =>
 
   // Calculate turnover for each product
   const report = products.map(product => {
-    const productCOGS = cogsData.find(c => c._id?.toString() === product._id.toString())?.totalCost || 0;
+    const productCOGS = Number(cogsData.find(c => c._id?.toString() === product._id.toString())?.totalCost || 0);
     const productInventoryValue = product.currentStock * product.averageCost;
     const turnover = productInventoryValue > 0 ? productCOGS / productInventoryValue : 0;
 
@@ -3902,16 +3719,20 @@ const generateBatchExpiryReport = async (companyId, daysAhead = 90) => {
   const futureDate = new Date();
   futureDate.setDate(futureDate.getDate() + daysAhead);
 
-  const batches = await InventoryBatch.find({
-    company: companyId,
-    expiryDate: { $lte: futureDate, $gte: new Date() },
-    status: { $nin: ['exhausted', 'expired'] },
-    availableQuantity: { $gt: 0 }
-  })
-  .populate('product', 'name sku')
-  .populate('warehouse', 'name code')
-  .populate('supplier', 'name code')
-  .sort({ expiryDate: 1 });
+  const batches = await dbClient().inventoryBatch.findMany({
+    where: {
+      companyId: String(companyId),
+      expiryDate: { lte: futureDate, gte: new Date() },
+      status: { notIn: ['exhausted', 'expired'] },
+      availableQuantity: { gt: 0 },
+    },
+    include: {
+      product: { select: { id: true, name: true, sku: true } },
+      warehouse: { select: { id: true, name: true, code: true } },
+      supplier: { select: { id: true, name: true, code: true } },
+    },
+    orderBy: { expiryDate: 'asc' },
+  });
 
   const now = new Date();
   const report = batches.map(batch => {
@@ -3927,15 +3748,15 @@ const generateBatchExpiryReport = async (companyId, daysAhead = 90) => {
     }
 
     return {
-      _id: batch._id,
+      _id: batch.id,
       batchNumber: batch.batchNumber,
       lotNumber: batch.lotNumber,
-      product: batch.product,
-      warehouse: batch.warehouse,
-      supplier: batch.supplier,
-      quantity: batch.availableQuantity,
-      unitCost: batch.unitCost,
-      totalValue: (batch.availableQuantity || 0) * (batch.unitCost || 0),
+      product: legacyRelation(batch.product),
+      warehouse: legacyRelation(batch.warehouse),
+      supplier: legacyRelation(batch.supplier),
+      quantity: Number(batch.availableQuantity || 0),
+      unitCost: Number(batch.unitCost || 0),
+      totalValue: Number(batch.availableQuantity || 0) * Number(batch.unitCost || 0),
       receivedDate: batch.receivedDate,
       expiryDate: batch.expiryDate,
       daysUntilExpiry: daysUntilExpiry,
@@ -3957,34 +3778,35 @@ const generateBatchExpiryReport = async (companyId, daysAhead = 90) => {
 
 // Generate Serial Number Tracking Report
 const generateSerialNumberTrackingReport = async (companyId, productId = null, status = null) => {
-  const query = { company: companyId };
-  if (productId) {
-    query.product = productId;
-  }
-  if (status) {
-    query.status = status;
-  }
-
-  const serialNumbers = await SerialNumber.find(query)
-    .populate('product', 'name sku')
-    .populate('warehouse', 'name code')
-    .populate('client', 'name code')
-    .sort({ createdAt: -1 });
+  const statusMap = { available: 'in_stock', sold: 'dispatched', in_use: 'dispatched', under_warranty: 'dispatched', damaged: 'scrapped', retired: 'scrapped', returned: 'returned' };
+  const serialNumbers = await dbClient().stockSerialNumber.findMany({
+    where: {
+      companyId: String(companyId),
+      ...(productId ? { productId: String(productId) } : {}),
+      ...(status ? { status: statusMap[status] || status } : {}),
+    },
+    include: {
+      product: { select: { id: true, name: true, sku: true } },
+      warehouse: { select: { id: true, name: true, code: true } },
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+  const legacyStatus = { in_stock: 'available', reserved: 'available', dispatched: 'sold', scrapped: 'damaged', returned: 'returned' };
 
   const report = serialNumbers.map(sn => ({
-    _id: sn._id,
-    serialNumber: sn.serialNumber,
-    product: sn.product,
-    warehouse: sn.warehouse,
-    status: sn.status,
-    purchaseDate: sn.purchaseDate,
-    purchasePrice: sn.purchasePrice,
-    supplier: sn.supplier,
-    saleDate: sn.saleDate,
-    salePrice: sn.salePrice,
-    client: sn.client,
-    warrantyEndDate: sn.warrantyEndDate,
-    isWarrantyActive: sn.isWarrantyActive
+    _id: sn.id,
+    serialNumber: sn.serialNo,
+    product: legacyRelation(sn.product),
+    warehouse: legacyRelation(sn.warehouse),
+    status: legacyStatus[sn.status] || sn.status,
+    purchaseDate: sn.createdAt,
+    purchasePrice: Number(sn.unitCost || 0),
+    supplier: null,
+    saleDate: sn.status === 'dispatched' ? sn.updatedAt : null,
+    salePrice: null,
+    client: null,
+    warrantyEndDate: null,
+    isWarrantyActive: false
   }));
 
   const statusGroups = {
@@ -4026,38 +3848,37 @@ const generateWarehouseStockReport = async (companyId, warehouseId = null) => {
     .sort({ name: 1 });
 
   // Get batch-level stock per warehouse
-  const stockByWarehouse = await aggregateWithTimeout(InventoryBatch, [
-    { $match: { company: companyId, status: { $ne: 'exhausted' } } },
-    {
-      $group: {
-        _id: '$warehouse',
-        totalQuantity: { $sum: '$availableQuantity' },
-        totalValue: { $sum: { $multiply: ['$availableQuantity', '$unitCost'] } },
-        batchCount: { $sum: 1 }
-      }
-    }
-  ]);
+  const stockByWarehouse = await dbClient().$queryRaw(Prisma.sql`
+    SELECT warehouse_id AS "_id",
+           COALESCE(SUM(available_quantity), 0) AS "totalQuantity",
+           COALESCE(SUM(available_quantity * unit_cost), 0) AS "totalValue",
+           COUNT(*)::int AS "batchCount"
+    FROM inventory_batches
+    WHERE company_id = ${String(companyId)} AND status <> 'exhausted'
+    GROUP BY warehouse_id
+  `);
 
   const stockMap = {};
   stockByWarehouse.forEach(item => {
     stockMap[item._id?.toString()] = {
-      totalQuantity: item.totalQuantity || 0,
-      totalValue: item.totalValue || 0,
-      batchCount: item.batchCount || 0
+      totalQuantity: Number(item.totalQuantity || 0),
+      totalValue: Number(item.totalValue || 0),
+      batchCount: Number(item.batchCount || 0)
     };
   });
 
   // Also get product-level stock (for products not using batch tracking)
-  const products = await Product.find({ company: companyId, isArchived: false })
-    .populate('category', 'name')
-    .populate('defaultWarehouse', 'name code');
+  const products = await dbClient().product.findMany({
+    where: { companyId: String(companyId), isArchived: false },
+    include: { defaultWarehouse: { select: { id: true, name: true, code: true } } },
+  });
 
   const report = warehouses.map(warehouse => {
     const stock = stockMap[warehouse._id.toString()] || { totalQuantity: 0, totalValue: 0, batchCount: 0 };
     
     // Get products in this warehouse (from defaultWarehouse or with batches)
     const warehouseProducts = products.filter(p => 
-      p.defaultWarehouse?._id?.toString() === warehouse._id.toString()
+      p.defaultWarehouse?.id?.toString() === warehouse._id.toString()
     );
 
     return {
@@ -4215,32 +4036,24 @@ const generateSalesSummaryReport = async (companyId, startDate, endDate) => {
     if (endDate) matchStage.invoiceDate.$lte = new Date(endDate);
   }
 
-  const salesSummary = await aggregateWithTimeout(Invoice, [
-    { $match: matchStage },
-    {
-      $group: {
-        _id: null,
-        totalInvoices: { $sum: 1 },
-        totalRevenue: { $sum: '$grandTotal' },
-        totalSubtotal: { $sum: '$subtotal' },
-        totalTax: { $sum: '$totalTax' },
-        totalDiscount: { $sum: '$totalDiscount' },
-        totalPaid: { $sum: '$amountPaid' },
-        totalBalance: { $sum: '$balance' },
-        uniqueClients: { $addToSet: '$client' }
-      }
-    }
-  ]);
-
-  const result = salesSummary[0] || {
-    totalInvoices: 0,
-    totalRevenue: 0,
-    totalSubtotal: 0,
-    totalTax: 0,
-    totalDiscount: 0,
-    totalPaid: 0,
-    totalBalance: 0,
-    uniqueClients: []
+  const salesSummaryTotals = await dbClient().invoice.aggregate({
+    where: { companyId: String(companyId), status: { in: ['fully_paid', 'partially_paid', 'confirmed'] }, ...(startDate || endDate ? { invoiceDate: { ...(startDate ? { gte: new Date(startDate) } : {}), ...(endDate ? { lte: new Date(endDate) } : {}) } } : {}) },
+    _sum: { totalAmount: true, subtotal: true, taxAmount: true, totalDiscount: true, amountPaid: true, amountOutstanding: true },
+    _count: { _all: true },
+  });
+  const uniqueClientRows = await dbClient().invoice.findMany({
+    where: { companyId: String(companyId), status: { in: ['fully_paid', 'partially_paid', 'confirmed'] }, ...(startDate || endDate ? { invoiceDate: { ...(startDate ? { gte: new Date(startDate) } : {}), ...(endDate ? { lte: new Date(endDate) } : {}) } } : {}) },
+    select: { clientId: true }, distinct: ['clientId'],
+  });
+  const result = {
+    totalInvoices: salesSummaryTotals._count._all,
+    totalRevenue: Number(salesSummaryTotals._sum.totalAmount || 0),
+    totalSubtotal: Number(salesSummaryTotals._sum.subtotal || 0),
+    totalTax: Number(salesSummaryTotals._sum.taxAmount || 0),
+    totalDiscount: Number(salesSummaryTotals._sum.totalDiscount || 0),
+    totalPaid: Number(salesSummaryTotals._sum.amountPaid || 0),
+    totalBalance: Number(salesSummaryTotals._sum.amountOutstanding || 0),
+    uniqueClients: uniqueClientRows,
   };
 
   // Get average invoice value
@@ -4249,16 +4062,12 @@ const generateSalesSummaryReport = async (companyId, startDate, endDate) => {
     : 0;
 
   // Get sales by status
-  const salesByStatus = await aggregateWithTimeout(Invoice, [
-    { $match: { company: companyId, invoiceDate: { $gte: startDate, $lte: endDate } } },
-    {
-      $group: {
-        _id: '$status',
-        count: { $sum: 1 },
-        total: { $sum: '$grandTotal' }
-      }
-    }
-  ]);
+  const salesByStatusRows = await dbClient().invoice.groupBy({
+    by: ['status'],
+    where: { companyId: String(companyId), ...(startDate || endDate ? { invoiceDate: { ...(startDate ? { gte: new Date(startDate) } : {}), ...(endDate ? { lte: new Date(endDate) } : {}) } } : {}) },
+    _count: { _all: true }, _sum: { totalAmount: true },
+  });
+  const salesByStatus = salesByStatusRows.map((row) => ({ _id: row.status, count: row._count._all, total: Number(row._sum.totalAmount || 0) }));
 
   return {
     data: {
@@ -4286,89 +4095,24 @@ const generateSalesSummaryReport = async (companyId, startDate, endDate) => {
 // Generate Cash Flow Report
 const generateCashFlowReport = async (companyId, startDate, endDate) => {
   // Cash inflows from paid invoices
-  const cashInflows = await aggregateWithTimeout(Invoice, [
-    {
-      $match: {
-        company: companyId,
-        status: 'paid',
-        paidDate: { $gte: startDate, $lte: endDate }
-      }
-    },
-    {
-      $group: {
-        _id: null,
-        total: { $sum: '$amountPaid' }
-      }
-    }
-  ]);
+  const cashInflowTotals = await dbClient().invoice.aggregate({ where: { companyId: String(companyId), status: 'fully_paid', paidDate: { gte: startDate, lte: endDate } }, _sum: { amountPaid: true } });
+  const cashInflows = [{ total: Number(cashInflowTotals._sum.amountPaid || 0) }];
 
   // Cash outflows from purchases
-  const cashOutflowsPurchases = await aggregateWithTimeout(Purchase, [
-    {
-      $match: {
-        company: companyId,
-        status: 'completed',
-        purchaseDate: { $gte: startDate, $lte: endDate }
-      }
-    },
-    {
-      $group: {
-        _id: null,
-        total: { $sum: '$amountPaid' }
-      }
-    }
-  ]);
+  const purchaseOutflowTotals = await dbClient().purchase.aggregate({ where: { companyId: String(companyId), status: 'completed', purchaseDate: { gte: startDate, lte: endDate } }, _sum: { totalAmount: true } });
+  const cashOutflowsPurchases = [{ total: Number(purchaseOutflowTotals._sum.totalAmount || 0) }];
 
   // Cash outflows from expenses
-  const cashOutflowsExpenses = await aggregateWithTimeout(Expense, [
-    {
-      $match: {
-        company: companyId,
-        status: 'approved',
-        expenseDate: { $gte: startDate, $lte: endDate }
-      }
-    },
-    {
-      $group: {
-        _id: null,
-        total: { $sum: '$amount' }
-      }
-    }
-  ]);
+  const expenseOutflowTotals = await dbClient().expense.aggregate({ where: { companyId: String(companyId), status: 'approved', expenseDate: { gte: startDate, lte: endDate } }, _sum: { amount: true } });
+  const cashOutflowsExpenses = [{ total: Number(expenseOutflowTotals._sum.amount || 0) }];
 
   // Credit notes issued (cash outflows)
-  const creditNotesIssued = await aggregateWithTimeout(CreditNote, [
-    {
-      $match: {
-        company: companyId,
-        status: 'approved',
-        issueDate: { $gte: startDate, $lte: endDate }
-      }
-    },
-    {
-      $group: {
-        _id: null,
-        total: { $sum: '$grandTotal' }
-      }
-    }
-  ]);
+  const creditOutflowTotals = await dbClient().creditNote.aggregate({ where: { companyId: String(companyId), status: 'approved', creditDate: { gte: startDate, lte: endDate } }, _sum: { totalAmount: true } });
+  const creditNotesIssued = [{ total: Number(creditOutflowTotals._sum.totalAmount || 0) }];
 
   // Purchase returns (cash inflows)
-  const purchaseReturns = await aggregateWithTimeout(PurchaseReturn, [
-    {
-      $match: {
-        company: companyId,
-        status: 'refunded',
-        returnDate: { $gte: startDate, $lte: endDate }
-      }
-    },
-    {
-      $group: {
-        _id: null,
-        total: { $sum: '$refundAmount' }
-      }
-    }
-  ]);
+  const purchaseReturnInflowTotals = await dbClient().purchaseReturn.aggregate({ where: { companyId: String(companyId), status: 'refunded', returnDate: { gte: startDate, lte: endDate } }, _sum: { totalAmount: true } });
+  const purchaseReturns = [{ total: Number(purchaseReturnInflowTotals._sum.totalAmount || 0) }];
 
   const totalInflows = (cashInflows[0]?.total || 0) + (purchaseReturns[0]?.total || 0);
   const totalOutflows = (cashOutflowsPurchases[0]?.total || 0) + (cashOutflowsExpenses[0]?.total || 0) + (creditNotesIssued[0]?.total || 0);
@@ -4400,103 +4144,44 @@ const generateCashFlowReport = async (companyId, startDate, endDate) => {
 // Generate Financial Ratios Report
 const generateFinancialRatiosReport = async (companyId, startDate, endDate) => {
   // Get basic financial data
-  const invoices = await aggregateWithTimeout(Invoice, [
-    {
-      $match: {
-        company: companyId,
-        status: 'paid',
-        paidDate: { $gte: startDate, $lte: endDate }
-      }
-    },
-    {
-      $group: {
-        _id: null,
-        totalRevenue: { $sum: '$grandTotal' },
-        totalPaid: { $sum: '$amountPaid' }
-      }
-    }
-  ]);
+  const invoiceRatio = await dbClient().invoice.aggregate({
+    where: { companyId: String(companyId), status: 'fully_paid', paidDate: { gte: startDate, lte: endDate } },
+    _sum: { totalAmount: true, amountPaid: true },
+  });
+  const invoices = [{ totalRevenue: Number(invoiceRatio._sum.totalAmount || 0), totalPaid: Number(invoiceRatio._sum.amountPaid || 0) }];
 
-  const purchases = await aggregateWithTimeout(Purchase, [
-    {
-      $match: {
-        company: companyId,
-        status: 'completed',
-        purchaseDate: { $gte: startDate, $lte: endDate }
-      }
-    },
-    {
-      $group: {
-        _id: null,
-        totalPurchases: { $sum: '$grandTotal' }
-      }
-    }
-  ]);
+  const purchaseRatio = await dbClient().purchase.aggregate({
+    where: { companyId: String(companyId), status: 'completed', purchaseDate: { gte: startDate, lte: endDate } },
+    _sum: { totalAmount: true },
+  });
+  const purchases = [{ totalPurchases: Number(purchaseRatio._sum.totalAmount || 0) }];
 
-  const expenses = await aggregateWithTimeout(Expense, [
-    {
-      $match: {
-        company: companyId,
-        status: 'approved',
-        expenseDate: { $gte: startDate, $lte: endDate }
-      }
-    },
-    {
-      $group: {
-        _id: null,
-        totalExpenses: { $sum: '$amount' }
-      }
-    }
-  ]);
+  const expenseRatio = await dbClient().expense.aggregate({
+    where: { companyId: String(companyId), status: 'approved', expenseDate: { gte: startDate, lte: endDate } },
+    _sum: { amount: true },
+  });
+  const expenses = [{ totalExpenses: Number(expenseRatio._sum.amount || 0) }];
 
   // Get current assets and liabilities for ratio calculations
-  const currentAssets = await aggregateWithTimeout(Invoice, [
-    {
-      $match: {
-        company: companyId,
-        status: { $in: ['sent', 'partial', 'overdue'] },
-        balance: { $gt: 0 }
-      }
-    },
-    {
-      $group: {
-        _id: null,
-        accountsReceivable: { $sum: '$balance' }
-      }
-    }
-  ]);
+  const currentAssetRatio = await dbClient().invoice.aggregate({
+    where: { companyId: String(companyId), status: { in: ['sent', 'partially_paid', 'overdue'] }, amountOutstanding: { gt: 0 } },
+    _sum: { amountOutstanding: true },
+  });
+  const currentAssets = [{ accountsReceivable: Number(currentAssetRatio._sum.amountOutstanding || 0) }];
 
-  const currentLiabilities = await aggregateWithTimeout(Purchase, [
-    {
-      $match: {
-        company: companyId,
-        status: { $in: ['pending', 'partial'] },
-        balance: { $gt: 0 }
-      }
-    },
-    {
-      $group: {
-        _id: null,
-        accountsPayable: { $sum: '$balance' }
-      }
-    }
-  ]);
+  const currentLiabilityRatio = await dbClient().purchase.aggregate({
+    where: { companyId: String(companyId), status: { in: ['pending', 'partial'] } },
+    _sum: { totalAmount: true },
+  });
+  const currentLiabilities = [{ accountsPayable: Number(currentLiabilityRatio._sum.totalAmount || 0) }];
 
   // Get inventory value
-  const inventory = await aggregateWithTimeout(Product, [
-    {
-      $match: {
-        company: companyId,
-        isActive: true
-      }
-    },
-    {
-      $group: {
-        _id: null,
-        totalValue: { $sum: { $multiply: ['$quantity', '$costPrice'] } }
-      }
-    }
-  ]);
+  const [inventoryRatioRow] = await dbClient().$queryRaw(Prisma.sql`
+    SELECT COALESCE(SUM("current_stock" * "cost_price"), 0) AS "totalValue"
+    FROM "products"
+    WHERE "company_id" = ${String(companyId)} AND "is_active" = true
+  `);
+  const inventory = [{ totalValue: Number(inventoryRatioRow?.totalValue || 0) }];
 
   // Get bank balances
   const { BankAccount } = require('../models/BankAccount');
@@ -4556,19 +4241,15 @@ const generateFinancialRatiosReport = async (companyId, startDate, endDate) => {
 
 // Generate Bank Transaction Report
 const generateBankTransactionReport = async (companyId, startDate, endDate) => {
-  const { BankAccount, BankTransaction } = require('../models/BankAccount');
-  
   // Get all transactions in period
-  const transactions = await BankTransaction.find({
-    company: companyId,
-    date: { $gte: new Date(startDate), $lte: new Date(endDate) }
-  })
-  .populate('account', 'name accountType bankName')
-  .sort({ date: -1 })
-  .lean();
+  const transactions = await dbClient().bankTransaction.findMany({
+    where: { companyId: String(companyId), date: { gte: new Date(startDate), lte: new Date(endDate) } },
+    include: { bankAccount: { select: { id: true, name: true, accountType: true, bankName: true } } },
+    orderBy: { date: 'desc' },
+  });
   
   const report = transactions.map(txn => ({
-    _id: txn._id,
+    _id: txn.id,
     date: txn.date,
     type: txn.type,
     amount: txn.amount,
@@ -4579,9 +4260,9 @@ const generateBankTransactionReport = async (companyId, startDate, endDate) => {
     paymentMethod: txn.paymentMethod,
     referenceNumber: txn.referenceNumber,
     status: txn.status,
-    accountName: txn.account?.name,
-    accountType: txn.account?.accountType,
-    bankName: txn.account?.bankName
+    accountName: txn.bankAccount?.name,
+    accountType: txn.bankAccount?.accountType,
+    bankName: txn.bankAccount?.bankName
   }));
   
   // Calculate summary by type
@@ -4615,23 +4296,19 @@ const generateBankTransactionReport = async (companyId, startDate, endDate) => {
 
 // Generate Unreconciled Transactions Report
 const generateUnreconciledTransactionsReport = async (companyId, startDate, endDate) => {
-  const { BankAccount, BankTransaction } = require('../models/BankAccount');
-  
   // Get all unreconciled transactions in period
-  const transactions = await BankTransaction.find({
-    company: companyId,
-    $or: [
-      { reference: null },
-      { referenceType: null }
-    ],
-    date: { $gte: new Date(startDate), $lte: new Date(endDate) }
-  })
-  .populate('account', 'name accountType bankName')
-  .sort({ date: -1 })
-  .lean();
+  const transactions = await dbClient().bankTransaction.findMany({
+    where: {
+      companyId: String(companyId),
+      OR: [{ reference: null }, { referenceType: null }],
+      date: { gte: new Date(startDate), lte: new Date(endDate) },
+    },
+    include: { bankAccount: { select: { id: true, name: true, accountType: true, bankName: true } } },
+    orderBy: { date: 'desc' },
+  });
   
   const report = transactions.map(txn => ({
-    _id: txn._id,
+    _id: txn.id,
     date: txn.date,
     type: txn.type,
     amount: txn.amount,
@@ -4642,9 +4319,9 @@ const generateUnreconciledTransactionsReport = async (companyId, startDate, endD
     paymentMethod: txn.paymentMethod,
     referenceNumber: txn.referenceNumber,
     status: txn.status,
-    accountName: txn.account?.name,
-    accountType: txn.account?.accountType,
-    bankName: txn.account?.bankName,
+    accountName: txn.bankAccount?.name,
+    accountType: txn.bankAccount?.accountType,
+    bankName: txn.bankAccount?.bankName,
     notes: txn.notes
   }));
   

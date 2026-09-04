@@ -13,6 +13,8 @@
 const { prisma } = require('../lib/prisma');
 const { getMaxTimeMS } = require('./mongoAggregation');
 const { getActiveTx } = require('../lib/txContext');
+const { getReadContext } = require('../lib/readContext');
+const { assertReadLimit, QuerySafetyError } = require('./querySafety');
 
 /**
  * Run `fn` against a transaction client carrying a LOCAL statement timeout.
@@ -84,4 +86,36 @@ async function executeWithTimeout(sql, params = [], kind = 'report') {
   return withTimeoutTx(getMaxTimeMS(kind), (tx) => tx.$executeRawUnsafe(sql, ...params));
 }
 
-module.exports = { queryWithTimeout, executeWithTimeout };
+/**
+ * Bounded raw-list query for migrated endpoints. Aggregate queries may opt out
+ * of the tenant-text check with `expect: 'aggregate'`, but list queries must
+ * declare a tenant id and include an explicit LIMIT in SQL.
+ */
+async function queryBoundedRows(sql, params = [], options = {}) {
+  const context = options.context || getReadContext();
+  const tenantId = options.tenantId;
+  const expect = options.expect || 'list';
+  const source = String(sql || '');
+  if (expect !== 'aggregate' && options.allowGlobal !== true) {
+    if (!tenantId) {
+      throw new QuerySafetyError('tenantId is required for a bounded raw list query', 'TENANT_SCOPE_REQUIRED', 500);
+    }
+    if (!/(company[_\s]*id|tenant[_\s]*id)/i.test(source)) {
+      throw new QuerySafetyError('bounded raw list query must include a tenant predicate', 'TENANT_SCOPE_REQUIRED', 500);
+    }
+  }
+
+  const maxRows = Math.max(1, Number(options.maxRows || context.maxRows));
+  if (options.limit !== undefined) assertReadLimit(options.limit, context, { name: 'limit', maxRows });
+  if (expect !== 'aggregate' && !/\blimit\b/i.test(source)) {
+    throw new QuerySafetyError('bounded raw list query must include LIMIT', 'QUERY_LIMIT_REQUIRED', 500);
+  }
+  const rows = await queryWithTimeout(sql, params, options.kind || 'report');
+  if (expect === 'aggregate' || !Array.isArray(rows)) return rows;
+  if (rows.length > maxRows) {
+    throw new QuerySafetyError(`raw list query returned more than ${maxRows} rows`, 'QUERY_LIMIT_EXCEEDED', 413);
+  }
+  return rows;
+}
+
+module.exports = { queryWithTimeout, executeWithTimeout, queryBoundedRows };

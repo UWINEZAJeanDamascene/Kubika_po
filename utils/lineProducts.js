@@ -41,7 +41,12 @@ function lineProductId(line) {
 async function loadLineProducts(Product, lines, companyId) {
   const ids = [...new Set((lines || []).map(lineProductId).filter(Boolean))];
   if (!ids.length) return new Map();
-  const rows = await Product.find({ _id: { $in: ids }, company: companyId });
+  const chunks = [];
+  for (let index = 0; index < ids.length; index += 100) chunks.push(ids.slice(index, index + 100));
+  const rows = (await Promise.all(chunks.map((chunk) => Product.find({ _id: { $in: chunk }, company: companyId })
+    .select('_id name sku unit isActive isStockable costingMethod currentStock averageCost')
+    .limit(chunk.length)
+    .lean()))).flat();
   return new Map((rows || []).map((p) => [String(p._id), p]));
 }
 

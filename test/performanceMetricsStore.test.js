@@ -115,4 +115,33 @@ describe('performanceMetricsStore', () => {
       aggregated_across_instances: true,
     }));
   });
+
+  test('flushes bounded browser timing metrics with percentile data', async () => {
+    store.recordClientMetric('application_shell_ready', 120, { route: '/dashboard' });
+    store.recordClientMetric('application_shell_ready', 180, { route: '/dashboard' });
+    store.recordClientMetric('cumulative_layout_shift', 0.12, { unit: 'score', route: '/dashboard' });
+    await store.flush();
+
+    const metrics = await store.getClientMetrics();
+
+    expect(metrics).toEqual(expect.objectContaining({
+      scope: 'redis-fleet',
+      tracked_metrics: 2,
+    }));
+    expect(metrics.metrics).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        name: 'application_shell_ready',
+        unit: 'ms',
+        count: 2,
+        avg: 150,
+        p95: 180,
+      }),
+      expect.objectContaining({
+        name: 'cumulative_layout_shift',
+        unit: 'score',
+        count: 1,
+        avg: 0.12,
+      }),
+    ]));
+  });
 });

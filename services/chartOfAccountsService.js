@@ -1,7 +1,5 @@
-const mongoose = require('mongoose');
 const ChartOfAccount = require('../models/ChartOfAccount');
-const JournalEntry = require('../models/JournalEntry');
-const { aggregateWithTimeout } = require('../utils/mongoAggregation');
+const { dbClient } = require('../lib/prisma');
 
 /**
  * Chart of Accounts Service
@@ -25,35 +23,26 @@ class ChartOfAccountsService {
 
     if (!account) throw new Error('ACCOUNT_NOT_FOUND');
 
-    // Aggregate using embedded lines
-    const result = await aggregateWithTimeout(JournalEntry, [
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
+    const result = await dbClient().journalEntryLine.aggregate({
+      where: {
+        companyId: String(companyId),
+        accountCode: account.code,
+        journalEntry: {
           status: 'posted',
           date: {
-            $gte: new Date(dateFrom),
-            $lte: new Date(dateTo)
-          }
-        }
+            gte: new Date(dateFrom),
+            lte: new Date(dateTo),
+          },
+        },
       },
-      { $unwind: '$lines' },
-      {
-        $match: {
-          'lines.accountCode': account.code
-        }
+      _sum: {
+        debit: true,
+        credit: true,
       },
-      {
-        $group: {
-          _id: '$lines.accountCode',
-          total_dr: { $sum: '$lines.debit' },
-          total_cr: { $sum: '$lines.credit' }
-        }
-      }
-    ]);
+    });
 
-    const dr = result[0]?.total_dr || 0;
-    const cr = result[0]?.total_cr || 0;
+    const dr = Number(result._sum.debit || 0);
+    const cr = Number(result._sum.credit || 0);
 
     // Apply normal balance direction
     // For debit-normal accounts (Assets, Expenses, COGS): balance = dr - cr
@@ -218,6 +207,17 @@ class ChartOfAccountsService {
     }
 
     return account;
+  }
+
+  /** Load multiple account codes in one tenant-scoped query. */
+  static async getAccountsByCodes(companyId, codes = []) {
+    const uniqueCodes = [...new Set((codes || []).map((code) => String(code || '').trim()).filter(Boolean))];
+    if (!uniqueCodes.length) return [];
+    return ChartOfAccount.find({ company: companyId, code: { $in: uniqueCodes } })
+      .select('_id code name type normal_balance')
+      .sort({ code: 1 })
+      .limit(uniqueCodes.length)
+      .lean();
   }
 }
 

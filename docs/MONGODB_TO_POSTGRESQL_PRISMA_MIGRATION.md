@@ -108,12 +108,7 @@ All routes are registered in `server.js` on shared `apiRouter`, mounted at **`/a
 
 See [Appendix B](#appendix-b--route-inventory-must-stay-unchanged) for the full list.
 
-**Important:** Two dashboard routers coexist:
-
-- `routes/dashboard.routes.js` — Phase 3 executive/inventory/sales/purchase/finance dashboards
-- `routes/dashboardRoutes.js` — legacy stats
-
-Both must continue to work during and after migration.
+**Important:** `routes/dashboardRoutes.js` now owns both the Phase 3 executive/inventory/sales/purchase/finance/ratios/period-comparison widgets and the legacy stats/activity/chart endpoints — the two files were consolidated into one explicitly-ordered router (Performance Phase 4) after traffic verification showed both path sets were live. All existing paths and handlers are unchanged.
 
 ### 2.5 MongoDB-specific patterns in use
 
@@ -1596,7 +1591,7 @@ Mount prefix: **`/api`** and **`/api/v1`** (both identical).
 | `/sales-invoices` | `routes/invoiceRoutes.js` |
 | `/purchases` | `routes/purchaseRoutes.js` |
 | `/pos` | `routes/posRoutes.js` |
-| `/dashboard` | `routes/dashboard.routes.js` + `routes/dashboardRoutes.js` |
+| `/dashboard` | `routes/dashboardRoutes.js` |
 | `/reports/*` | multiple report route files |
 | `/journal-entries` | `routes/journalRoutes.js` |
 | `/ebm` | `routes/ebmRoutes.js` |

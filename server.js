@@ -28,12 +28,12 @@ try {
   // ignore if not supported on older Node versions
 }
 
-const connectDB = require('./config/database');
 const errorHandler = require('./middleware/errorHandler');
+const { readContextMiddleware } = require('./lib/readContext');
 
-// Redis caching layer
-const { redisClient } = require('./config/redis');
+// Redis-backed caching, rate limiting, and Phase 0 telemetry.
 const { createRateLimiters } = require('./middleware/redisRateLimiter');
+const phase0RateLimiters = createRateLimiters();
 const { sessionMiddleware } = require('./middleware/cacheMiddleware');
 
 // Import centralized configuration (now dotenv has been loaded)
@@ -68,10 +68,8 @@ async function initializeServer() {
   // this process is running, avoiding cold-start latency on user requests.
   startPrismaKeepAlive();
 
-  // Connect to MongoDB (still used by not-yet-migrated domains).
-  // When MONGODB_URI is unset, MongoDB is disabled and Mongo-backed routes
-  // fail fast; only the PostgreSQL-backed domains are served.
-  await connectDB();
+  // PostgreSQL is already connected and warmed above. Do not open a second
+  // connection through the legacy database module during API boot.
 
   // Pricing packages are customer-facing reference data. Initialize the
   // default catalog automatically on PostgreSQL, without replacing administrator edits.
@@ -195,6 +193,10 @@ async function initializeServer() {
 
   app = express();
 
+  // Every request gets an explicit HTTP read context. Large reads must opt into
+  // a worker/export context instead of escaping the policy through a query arg.
+  app.use(readContextMiddleware);
+
   // Normalize accidental double slashes from deployed API base URLs with a trailing slash.
   app.use((req, res, next) => {
     const [pathname, query = ''] = req.url.split('?');
@@ -232,6 +234,9 @@ async function initializeServer() {
   // Performance metrics only — see healthController.performanceMetrics.
   app.get('/api/performance', cors(), healthController.performanceMetrics);
   app.get('/api/performance/readiness', cors(), healthController.performanceReadiness);
+  // Browser timing is anonymous, bounded, best-effort telemetry. It is rate
+  // limited so it cannot become an ingestion or memory-amplification vector.
+  app.post('/api/performance/client', cors(), express.json({ limit: '8kb' }), phase0RateLimiters.api, healthController.clientPerformance);
 
   // CORS - must run BEFORE rate limiters so that rate-limited responses
   // (429) include proper CORS headers instead of failing the browser fetch.
@@ -338,7 +343,10 @@ async function initializeServer() {
   apiRouter.use('/reports/monthly', require('./routes/monthlyReportsRoutes'));
   apiRouter.use('/reports/annual', require('./routes/annualReportsRoutes'));
   apiRouter.use('/reports', require('./routes/reportRoutes'));
-  apiRouter.use('/dashboard', require('./routes/dashboard.routes'));
+  // Consolidated: dashboard.routes.js and dashboardRoutes.js used to be
+  // mounted separately at the same base path; both path sets are live
+  // traffic (see routes/dashboardRoutes.js header), so they were merged
+  // into one explicitly-ordered router instead of relying on mount order.
   apiRouter.use('/dashboard', require('./routes/dashboardRoutes'));
   apiRouter.use('/currencies', require('./routes/currencyRoutes'));
   apiRouter.use('/exchange-rates', require('./routes/exchangeRateRoutes'));

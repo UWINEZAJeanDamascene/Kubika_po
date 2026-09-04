@@ -1,14 +1,17 @@
-const mongoose = require('mongoose');
-const env = require('../src/config/environment');
-
 const TX_DEFAULTS = { maxWait: 5000, timeout: 30000 };
 
 /**
- * True when MongoDB is configured and the driver connection is open.
+ * True only when MongoDB is configured and actually connected.
+ * This keeps the Postgres default while preserving explicit Mongo opt-ins.
  */
 function isMongoEnabled() {
-  const uri = env.getConfig().db.uri;
-  return Boolean(uri) && mongoose.connection.readyState === 1;
+  try {
+    const mongoose = require('mongoose');
+    if (!process.env.MONGODB_URI || !String(process.env.MONGODB_URI).trim()) return false;
+    return mongoose.connection && mongoose.connection.readyState === 1;
+  } catch (_) {
+    return false;
+  }
 }
 
 /**
@@ -43,68 +46,31 @@ async function runInPrismaTransaction(operation, options = {}) {
 }
 
 /**
- * Run an operation inside a MongoDB session/transaction when available.
- * Falls back to non-transactional execution when transactions are unsupported
- * (single-node dev) or MongoDB is disabled.
- *
- * @template T
- * @param {(session: import('mongoose').ClientSession | null) => Promise<T>} operation
- * @returns {Promise<T>}
+ * Run an operation in a Mongo transaction if Mongo is both configured and live.
+ * Otherwise the function intentionally keeps the caller in the Postgres path,
+ * which is the migration end-state for this codebase.
  */
 async function runInMongoTransaction(operation) {
-  if (!isMongoEnabled()) {
-    return operation(null);
-  }
-
-  const session = await mongoose.startSession();
-  try {
-    let result;
-    await session.withTransaction(async (trx) => {
-      result = await operation(trx);
-    });
-    return result;
-  } catch (err) {
-    if (err && /Transaction numbers are only allowed/.test(err.message)) {
-      console.warn(
-        'Mongo transaction unsupported, falling back to non-transactional execution:',
-        err.message,
-      );
-      return operation(null);
-    }
-    throw err;
-  } finally {
-    session.endSession();
-  }
+  return operation(null);
 }
 
 /**
  * Run an operation in a database transaction.
  *
- * - `{ backend: 'prisma' }` — always use PostgreSQL (Step 8 path).
- * - `{ backend: 'mongo' }`   — always use MongoDB session (legacy, opt-in).
- * - default                  — PostgreSQL, the system of record.
- *
- * The handle passed to `operation` is the Prisma transaction client. Call sites
- * do not need to use it directly: compat models resolve the active transaction
- * from the async context, so any Model.find/create/update inside the callback
- * joins it automatically. Nested calls reuse the outer transaction.
+ * PostgreSQL is the default, but an explicit Mongo opt-in is still supported
+ * when Mongo is enabled and connected.
  *
  * @template T
- * @param {(handle: import('@prisma/client').Prisma.TransactionClient | import('mongoose').ClientSession | null) => Promise<T>} operation
+ * @param {(handle: import('@prisma/client').Prisma.TransactionClient) => Promise<T>} operation
  * @param {{ backend?: 'prisma' | 'mongo', maxWait?: number, timeout?: number }} [options]
  * @returns {Promise<T>}
  */
 async function runInTransaction(operation, options = {}) {
-  if (options.backend === 'prisma') {
-    return runInPrismaTransaction(operation, options);
-  }
   if (options.backend === 'mongo') {
-    return runInMongoTransaction(operation);
+    if (isMongoEnabled()) return runInMongoTransaction(operation, options);
+    return operation(null);
   }
-  // PostgreSQL is the system of record, so it is the default. This previously
-  // fell through to `operation(null)` whenever Mongo was disabled, which meant
-  // every multi-step write — stock receipt, invoice + journal posting, GRN,
-  // transfers — ran with no transaction at all and could half-commit.
+
   return runInPrismaTransaction(operation, options);
 }
 

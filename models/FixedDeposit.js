@@ -1,122 +1,57 @@
-const mongoose = require("mongoose");
+'use strict';
 
-const fixedDepositSchema = new mongoose.Schema(
-  {
-    company: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "Company",
-      required: true,
-      index: true,
-    },
-    bankAccount: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "BankAccount",
-      default: null,
-    },
-    depositReference: {
-      type: String,
-      required: true,
-      trim: true,
-    },
-    bankName: {
-      type: String,
-      required: true,
-      trim: true,
-    },
-    principalAmount: {
-      type: mongoose.Schema.Types.Decimal128,
-      required: true,
-      get: function (value) {
-        return value ? parseFloat(value.toString()) : 0;
-      },
-    },
-    interestRate: {
-      type: Number,
-      required: true,
-      min: 0,
-    },
-    startDate: {
-      type: Date,
-      required: true,
-    },
-    maturityDate: {
-      type: Date,
-      required: true,
-    },
-    interestPaymentFrequency: {
-      type: String,
-      enum: ["monthly", "at_maturity"],
-      default: "at_maturity",
-    },
-    linkedAssetAccount: {
-      type: String,
-      default: "1105",
-      trim: true,
-    },
-    linkedIncomeAccount: {
-      type: String,
-      default: "4300",
-      trim: true,
-    },
-    linkedAccrualAccount: {
-      type: String,
-      default: "1350",
-      trim: true,
-    },
-    autoRollover: {
-      type: Boolean,
-      default: false,
-    },
-    status: {
-      type: String,
-      enum: ["active", "matured", "closed", "rolled_over"],
-      default: "active",
-    },
-    totalInterestAccrued: {
-      type: mongoose.Schema.Types.Decimal128,
-      default: 0,
-      get: function (value) {
-        return value ? parseFloat(value.toString()) : 0;
-      },
-    },
-    totalInterestReceived: {
-      type: mongoose.Schema.Types.Decimal128,
-      default: 0,
-      get: function (value) {
-        return value ? parseFloat(value.toString()) : 0;
-      },
-    },
-    notes: {
-      type: String,
-      trim: true,
-      default: null,
-    },
-    createdBy: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: "User",
-    },
-  },
-  {
-    timestamps: true,
+const { buildTenantModel } = require('../utils/masterDataCommon');
+const { generateObjectId, toIdString } = require('../utils/objectId');
+const { decimalToNumber } = require('../utils/decimalHelpers');
+
+const sourceToTarget = {
+  company: 'companyId', bankAccount: 'bankAccountId', depositReference: 'depositReference', bankName: 'bankName',
+  principalAmount: 'principalAmount', interestRate: 'interestRate', startDate: 'startDate', maturityDate: 'maturityDate',
+  interestPaymentFrequency: 'interestPaymentFrequency', linkedAssetAccount: 'linkedAssetAccount', linkedIncomeAccount: 'linkedIncomeAccount',
+  linkedAccrualAccount: 'linkedAccrualAccount', autoRollover: 'autoRollover', status: 'status', totalInterestAccrued: 'totalInterestAccrued',
+  totalInterestReceived: 'totalInterestReceived', notes: 'notes', createdBy: 'createdBy',
+};
+const FIELD_MAP = { _id: { target: 'id', isId: true }, id: { target: 'id', isId: true } };
+for (const [source, target] of Object.entries(sourceToTarget)) FIELD_MAP[source] = { target, isId: /Id$/.test(target) };
+
+function toApi(row) {
+  if (!row) return null;
+  const result = { _id: row.id };
+  for (const [source, target] of Object.entries(sourceToTarget)) result[source] = row[target];
+  result.principalAmount = decimalToNumber(row.principalAmount, 0);
+  result.totalInterestAccrued = decimalToNumber(row.totalInterestAccrued, 0);
+  result.totalInterestReceived = decimalToNumber(row.totalInterestReceived, 0);
+  result.createdAt = row.createdAt;
+  result.updatedAt = row.updatedAt;
+  return result;
+}
+
+function translateCreate(data = {}) {
+  const result = { id: toIdString(data._id || data.id) || generateObjectId() };
+  for (const [source, target] of Object.entries(sourceToTarget)) {
+    if (data[source] !== undefined) result[target] = /Id$/.test(target) ? (data[source] ? toIdString(data[source]) : null) : data[source];
   }
-);
+  return result;
+}
 
-fixedDepositSchema.index({ company: 1, status: 1 });
-fixedDepositSchema.index({ company: 1, maturityDate: 1 });
+function translateUpdate(update = {}) {
+  const source = update.$set ? { ...update, ...update.$set } : { ...update };
+  delete source.$set;
+  delete source.$unset;
+  const result = {};
+  for (const [sourceKey, target] of Object.entries(sourceToTarget)) {
+    if (source[sourceKey] !== undefined) result[target] = /Id$/.test(target) ? (source[sourceKey] ? toIdString(source[sourceKey]) : null) : source[sourceKey];
+  }
+  return result;
+}
 
-fixedDepositSchema.set("toJSON", {
-  transform: function (doc, ret) {
-    if (ret.principalAmount && ret.principalAmount.$numberDecimal) {
-      ret.principalAmount = parseFloat(ret.principalAmount.$numberDecimal);
-    }
-    if (ret.totalInterestAccrued && ret.totalInterestAccrued.$numberDecimal) {
-      ret.totalInterestAccrued = parseFloat(ret.totalInterestAccrued.$numberDecimal);
-    }
-    if (ret.totalInterestReceived && ret.totalInterestReceived.$numberDecimal) {
-      ret.totalInterestReceived = parseFloat(ret.totalInterestReceived.$numberDecimal);
-    }
-    return ret;
-  },
+module.exports = buildTenantModel({
+  name: 'FixedDeposit',
+  collection: 'fixed_deposits',
+  delegateName: 'fixedDeposit',
+  fieldMap: FIELD_MAP,
+  toApi,
+  translateCreate,
+  translateUpdate,
+  mutable: true,
 });
-
-module.exports = mongoose.model("FixedDeposit", fixedDepositSchema);

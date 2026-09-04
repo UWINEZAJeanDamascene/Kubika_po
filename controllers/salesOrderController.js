@@ -7,6 +7,55 @@ const Company = require('../models/Company');
 const emailService = require('../services/emailService');
 const EBMProductService = require('../services/ebmProductService');
 
+const normalizeId = (value) => {
+  if (!value) return null;
+  if (typeof value === 'string' || typeof value === 'number') return String(value);
+  return String(value._id || value.id || value);
+};
+
+async function hydrateSalesOrderRelations(docOrDocs) {
+  const docs = Array.isArray(docOrDocs) ? docOrDocs : [docOrDocs];
+  const valid = docs.filter(Boolean);
+  if (!valid.length) return docOrDocs;
+
+  const clientIds = [...new Set(valid.map((doc) => normalizeId(doc.client)).filter(Boolean))];
+  const userIds = [...new Set(valid.map((doc) => normalizeId(doc.createdBy)).filter(Boolean))];
+  const quotationIds = [...new Set(valid.map((doc) => normalizeId(doc.quotation)).filter(Boolean))];
+  const productIds = [...new Set(valid.flatMap((doc) => (doc.lines || []).map((line) => normalizeId(line.product)).filter(Boolean)))];
+  const warehouseIds = [...new Set(valid.flatMap((doc) => (doc.lines || []).map((line) => normalizeId(line.warehouse)).filter(Boolean)))];
+
+  const [clients, users, quotations, products, warehouses] = await Promise.all([
+    clientIds.length ? Client.find({ _id: { $in: clientIds } }, 'name code tin address phone email').lean() : [],
+    userIds.length ? require('../models/User').find({ _id: { $in: userIds } }, 'name email').lean() : [],
+    quotationIds.length ? require('../models/Quotation').find({ _id: { $in: quotationIds } }, 'referenceNo').lean() : [],
+    productIds.length ? Product.find({ _id: { $in: productIds } }, 'name sku unit taxRate taxCode trackingType isStockable').lean() : [],
+    warehouseIds.length ? Warehouse.find({ _id: { $in: warehouseIds } }, 'name code').lean() : [],
+  ]);
+
+  const clientMap = new Map(clients.map((client) => [normalizeId(client._id), client]));
+  const userMap = new Map(users.map((user) => [normalizeId(user._id), user]));
+  const quotationMap = new Map(quotations.map((quotation) => [normalizeId(quotation._id), quotation]));
+  const productMap = new Map(products.map((product) => [normalizeId(product._id), product]));
+  const warehouseMap = new Map(warehouses.map((warehouse) => [normalizeId(warehouse._id), warehouse]));
+
+  for (const doc of valid) {
+    const clientId = normalizeId(doc.client);
+    if (clientId && clientMap.has(clientId)) doc.client = clientMap.get(clientId);
+    const createdById = normalizeId(doc.createdBy);
+    if (createdById && userMap.has(createdById)) doc.createdBy = userMap.get(createdById);
+    const quotationId = normalizeId(doc.quotation);
+    if (quotationId && quotationMap.has(quotationId)) doc.quotation = quotationMap.get(quotationId);
+    for (const line of doc.lines || []) {
+      const productId = normalizeId(line.product);
+      if (productId && productMap.has(productId)) line.product = productMap.get(productId);
+      const warehouseId = normalizeId(line.warehouse);
+      if (warehouseId && warehouseMap.has(warehouseId)) line.warehouse = warehouseMap.get(warehouseId);
+    }
+  }
+
+  return Array.isArray(docOrDocs) ? valid : valid[0];
+}
+
 const sendSOEmail = async (so, action, companyId) => {
   try {
     const config = require('../src/config/environment').getConfig();
@@ -18,8 +67,10 @@ const sendSOEmail = async (so, action, companyId) => {
     const company = await Company.findById(companyId);
     const client = await Client.findById(so.client);
     
-    // Populate product data for email
-    const soWithProducts = await SalesOrder.findById(so._id).populate('lines.product', 'name');
+    const soWithProducts = await SalesOrder.findById(so._id)
+      .select({ client: 1, lines: 1, referenceNo: 1, status: 1 })
+      .lean();
+    await hydrateSalesOrderRelations(soWithProducts);
     
     if (client?.contact?.email || client?.email) {
       await emailService.sendSalesOrderEmail(soWithProducts, company, client, action);
@@ -109,19 +160,19 @@ exports.getSalesOrders = async (req, res, next) => {
     // List path: headers + client + line count only (no product rows).
     const [salesOrders, totalCount] = await Promise.all([
       SalesOrder.find(filter)
+        .select({ client: 1, createdBy: 1, referenceNo: 1, status: 1, orderDate: 1, expectedDate: 1, fulfillmentStatus: 1, createdAt: 1 })
         .populate('-lines')
-        .populate('client', 'name code tin')
-        .populate('createdBy', 'name email')
-        .sort({ createdAt: -1 })
+        .sort({ createdAt: -1, _id: -1 })
         .skip(skip)
         .limit(limitNum)
         .lean(),
       SalesOrder.countDocuments(filter)
     ]);
+    const hydratedSalesOrders = await hydrateSalesOrderRelations(salesOrders);
     
     res.status(200).json({
       success: true,
-      count: salesOrders.length,
+      count: hydratedSalesOrders.length,
       total: totalCount,
       page: pageNum,
       pages: Math.ceil(totalCount / limitNum),
@@ -131,7 +182,7 @@ exports.getSalesOrders = async (req, res, next) => {
         total: totalCount,
         pages: Math.ceil(totalCount / limitNum),
       },
-      data: salesOrders
+      data: hydratedSalesOrders
     });
   } catch (error) {
     next(error);
@@ -146,12 +197,11 @@ exports.getSalesOrder = async (req, res, next) => {
     const companyId = req.user.company._id;
     
     const salesOrder = await SalesOrder.findOne({ _id: req.params.id, company: companyId })
-      .populate('client', 'name code tin address phone email')
-      .populate('lines.product', 'name sku unit taxRate taxCode trackingType isStockable')
-      .populate('createdBy', 'name email')
-      .populate('quotation', 'referenceNo');
+      .select({ client: 1, lines: 1, createdBy: 1, quotation: 1, referenceNo: 1, status: 1, orderDate: 1, expectedDate: 1, fulfillmentStatus: 1 })
+      .lean();
+    const hydratedSalesOrder = await hydrateSalesOrderRelations(salesOrder);
     
-    if (!salesOrder) {
+    if (!hydratedSalesOrder) {
       return res.status(404).json({
         success: false,
         error: ERR_SALES_ORDER_NOT_FOUND,
@@ -161,7 +211,7 @@ exports.getSalesOrder = async (req, res, next) => {
     
     res.status(200).json({
       success: true,
-      data: salesOrder
+      data: hydratedSalesOrder
     });
   } catch (error) {
     next(error);
@@ -251,7 +301,7 @@ exports.createSalesOrder = async (req, res, next) => {
       clientTin: clientDoc.tin
     });
     
-    await salesOrder.populate('client lines.product createdBy');
+    await hydrateSalesOrderRelations(salesOrder);
     
     // Send email notification if requested (creates as confirmed)
     const sendEmailOnCreate = req.body.sendEmail || false;
@@ -340,7 +390,7 @@ exports.updateSalesOrder = async (req, res, next) => {
     if (exchangeRate) salesOrder.exchangeRate = exchangeRate;
     
     await salesOrder.save();
-    await salesOrder.populate('client lines.product createdBy');
+    await hydrateSalesOrderRelations(salesOrder);
     
     res.status(200).json({
       success: true,
@@ -397,8 +447,8 @@ exports.confirmSalesOrder = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
 
-    const salesOrder = await SalesOrder.findOne({ _id: req.params.id, company: companyId })
-      .populate('lines.product');
+    const salesOrder = await SalesOrder.findOne({ _id: req.params.id, company: companyId });
+    await hydrateSalesOrderRelations(salesOrder);
 
     if (!salesOrder) {
       return res.status(404).json({
@@ -482,7 +532,8 @@ exports.confirmSalesOrder = async (req, res, next) => {
 
     await salesOrder.save();
 
-    const finalSO = await SalesOrder.findById(salesOrder._id).populate('lines.product');
+    const finalSO = await SalesOrder.findById(salesOrder._id);
+    await hydrateSalesOrderRelations(finalSO);
 
     const sendEmailOnConfirm = req.body.sendEmail || false;
     if (sendEmailOnConfirm) {
@@ -509,8 +560,8 @@ exports.cancelSalesOrder = async (req, res, next) => {
     const companyId = req.user.company._id;
     const { reason } = req.body;
     
-    const salesOrder = await SalesOrder.findOne({ _id: req.params.id, company: companyId })
-      .populate('lines.product');
+    const salesOrder = await SalesOrder.findOne({ _id: req.params.id, company: companyId });
+    await hydrateSalesOrderRelations(salesOrder);
     
     if (!salesOrder) {
       return res.status(404).json({
@@ -579,9 +630,10 @@ exports.getClientSalesOrders = async (req, res, next) => {
       client: req.params.clientId, 
       company: companyId 
     })
-      .populate('lines.product', 'name sku')
-      .populate('createdBy', 'name email')
-      .sort({ createdAt: -1 });
+      .select({ client: 1, lines: 1, createdBy: 1, referenceNo: 1, status: 1, orderDate: 1, createdAt: 1 })
+      .sort({ createdAt: -1 })
+      .lean();
+    await hydrateSalesOrderRelations(salesOrders);
     
     res.status(200).json({
       success: true,
@@ -604,10 +656,10 @@ exports.getReadyForPicking = async (req, res, next) => {
       company: companyId,
       status: 'confirmed'
     })
-      .populate('client', 'name code')
-      .populate('lines.product', 'name sku')
-      .populate('lines.warehouse', 'name code')
-      .sort({ expectedDate: 1, createdAt: -1 });
+      .select({ client: 1, lines: 1, referenceNo: 1, status: 1, expectedDate: 1, createdAt: 1 })
+      .sort({ expectedDate: 1, createdAt: -1 })
+      .lean();
+    await hydrateSalesOrderRelations(salesOrders);
     
     res.status(200).json({
       success: true,
@@ -630,10 +682,10 @@ exports.getReadyForPacking = async (req, res, next) => {
       company: companyId,
       status: 'picking'
     })
-      .populate('client', 'name code')
-      .populate('lines.product', 'name sku')
-      .populate('createdBy', 'name email')
-      .sort({ expectedDate: 1, createdAt: -1 });
+      .select({ client: 1, lines: 1, createdBy: 1, referenceNo: 1, status: 1, expectedDate: 1, createdAt: 1 })
+      .sort({ expectedDate: 1, createdAt: -1 })
+      .lean();
+    await hydrateSalesOrderRelations(salesOrders);
     
     res.status(200).json({
       success: true,
@@ -656,9 +708,10 @@ exports.getReadyForDelivery = async (req, res, next) => {
       company: companyId,
       status: 'packed'
     })
-      .populate('client', 'name code')
-      .populate('lines.product', 'name sku')
-      .sort({ packedDate: -1 });
+      .select({ client: 1, lines: 1, referenceNo: 1, status: 1, packedDate: 1, createdAt: 1 })
+      .sort({ packedDate: -1 })
+      .lean();
+    await hydrateSalesOrderRelations(salesOrders);
     
     res.status(200).json({
       success: true,
@@ -682,9 +735,10 @@ exports.getBackorders = async (req, res, next) => {
       isBackorder: true,
       status: { $nin: ['closed', 'cancelled'] }
     })
-      .populate('client', 'name code')
-      .populate('lines.product', 'name sku')
-      .sort({ createdAt: -1 });
+      .select({ client: 1, lines: 1, referenceNo: 1, status: 1, isBackorder: 1, createdAt: 1 })
+      .sort({ createdAt: -1 })
+      .lean();
+    await hydrateSalesOrderRelations(salesOrders);
     
     res.status(200).json({
       success: true,
@@ -704,8 +758,7 @@ exports.getWorkflowStatus = async (req, res, next) => {
     const companyId = req.user.company._id;
     
     const salesOrder = await SalesOrder.findOne({ _id: req.params.id, company: companyId })
-      .populate('-lines')
-      .select('status');
+      .select({ status: 1 });
     
     if (!salesOrder) {
       return res.status(404).json({

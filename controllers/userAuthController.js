@@ -9,6 +9,8 @@ const { prisma } = require('../lib/prisma');
 const { generateObjectId } = require('../utils/objectId');
 const passwordUtils = require('../utils/passwordUtils');
 const sessionService = require('../services/sessionService');
+const env = require('../src/config/environment');
+const config = env.getConfig();
 
 // Generate JWT Token
 const generateToken = (id, companyId, role) => {
@@ -83,6 +85,16 @@ exports.login = async (req, res, next) => {
 
     const result = await UserService.login(email, password, req.body.companyId);
 
+    // Keep cookie-based clients aligned with the new access token too. The
+    // bearer token remains the primary frontend contract, but an old cookie
+    // must never survive a successful login and win on the next request.
+    res.cookie('token', result.access_token, {
+      httpOnly: true,
+      secure: config.server.env === 'production',
+      sameSite: 'lax',
+      maxAge: config.session.ttl * 1000,
+    });
+
     res.json({
       success: true,
       token: result.access_token,
@@ -129,6 +141,13 @@ exports.refresh = async (req, res, next) => {
     }
 
     const result = await UserService.refresh(refresh_token);
+
+    res.cookie('token', result.access_token, {
+      httpOnly: true,
+      secure: config.server.env === 'production',
+      sameSite: 'lax',
+      maxAge: config.session.ttl * 1000,
+    });
 
     res.json({
       success: true,

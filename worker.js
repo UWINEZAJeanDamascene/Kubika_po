@@ -140,7 +140,14 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('unhandledRejection', (error) => console.error('[worker] Unhandled rejection:', error));
 
-startWorker().catch((error) => {
+const { runReadContext } = require('./lib/readContext');
+
+runReadContext({
+  kind: 'job',
+  allowLargeRead: true,
+  maxRows: Number(process.env.WORKER_MAX_READ_ROWS || 10000),
+  purpose: 'background-worker',
+}, () => startWorker()).catch((error) => {
   console.error('[worker] Failed to start:', error);
   process.exit(1);
 });

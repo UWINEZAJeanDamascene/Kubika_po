@@ -1,10 +1,10 @@
-const mongoose = require("mongoose");
 const { parsePagination, paginationMeta } = require("../utils/pagination");
 const StockTransfer = require("../models/StockTransfer");
 const StockTransferLine = require("../models/StockTransferLine");
 const stockTransferService = require("../services/stockTransferService");
 const StockLevel = require("../models/StockLevel");
 const EBMStockService = require("../services/ebmStockService");
+const { emitDataChanged } = require("../lib/realtimeEvents");
 const crypto = require("crypto");
 
 function transferSignature(action, req, notes = "") {
@@ -128,8 +128,8 @@ exports.list = async (req, res, next) => {
     const { page, limit, skip } = parsePagination(req.query);
     const total = await StockTransfer.countDocuments(q);
     const transfers = await StockTransfer.find(q)
-      .populate("items")
-      .sort({ transferDate: -1 })
+      .populate("-items")
+      .sort({ transferDate: -1, _id: -1 })
       .skip(skip)
       .limit(limit);
     res.json({
@@ -191,7 +191,8 @@ exports.getStockTransfers = async (req, res, next) => {
       .populate("createdBy", "name")
       .populate("confirmedBy", "name")
       .populate("receivedBy", "name")
-      .sort({ createdAt: -1 })
+      .populate("-items")
+      .sort({ createdAt: -1, _id: -1 })
       .skip(skip)
       .limit(limit);
 
@@ -356,12 +357,8 @@ exports.createStockTransfer = async (req, res, next) => {
     // Create line records and attach to transfer
     const createdLineIds = [];
     for (const item of items) {
-      const qty = mongoose.Types.Decimal128.fromString(
-        String(item.quantity || item.qty || 0),
-      );
-      const unitCost = item.unitCost
-        ? mongoose.Types.Decimal128.fromString(String(item.unitCost))
-        : null;
+      const qty = Number(item.quantity || item.qty || 0);
+      const unitCost = item.unitCost != null ? Number(item.unitCost) : null;
       const line = await StockTransferLine.create({
         company: companyId,
         transfer: transfer._id,
@@ -748,6 +745,7 @@ exports.approveStockTransfer = async (req, res, next) => {
         console.error("EBM branch transfer submission failed after approval:", ebmErr.message);
       });
 
+    emitDataChanged(companyId, "transfers", { affectsStock: true });
     res.json({
       success: true,
       message: "Stock transfer approved and journal/movements recorded",
@@ -1058,6 +1056,7 @@ exports.cancelStockTransfer = async (req, res, next) => {
     transfer.notes = `${transfer.notes || ""}\nCancellation reason: ${reason || "Not specified"}`;
     await transfer.save();
 
+    emitDataChanged(companyId, "transfers", { affectsStock: true });
     res.json({
       success: true,
       message: "Stock transfer cancelled",

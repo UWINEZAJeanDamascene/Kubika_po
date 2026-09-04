@@ -1,12 +1,26 @@
-const mongoose = require("mongoose");
 const TaxRate = require("../models/TaxRate");
-const JournalEntry = require("../models/JournalEntry");
+const { dbClient } = require('../lib/prisma');
 const JournalService = require("./journalService");
 const TaxAutomationService = require("./taxAutomationService");
 const SequenceService = require("./sequenceService");
 const PeriodService = require("./periodService");
 const { BankAccount } = require("../models/BankAccount");
-const { aggregateWithTimeout } = require("../utils/mongoAggregation");
+
+async function journalAmount(companyId, periodStart, periodEnd, accountCodes, amountField, sourceTypes = null) {
+  const where = {
+    companyId: String(companyId),
+    accountCode: { in: accountCodes },
+    [amountField]: { gt: 0 },
+    journalEntry: {
+      status: 'posted',
+      reversed: false,
+      date: { gte: new Date(periodStart), lte: new Date(periodEnd) },
+      ...(sourceTypes ? { sourceType: { in: sourceTypes } } : {}),
+    },
+  };
+  const result = await dbClient().journalEntryLine.aggregate({ where, _sum: { [amountField]: true } });
+  return Number(result._sum[amountField] || 0);
+}
 
 class TaxService {
   // ── TAX RATE MANAGEMENT ─────────────────────────────────────────────
@@ -118,86 +132,21 @@ class TaxService {
     companyId,
     { periodStart, periodEnd, taxCode },
   ) {
-    const dateFilter = {
-      $gte: new Date(periodStart),
-      $lte: new Date(periodEnd),
-    };
-
-    const matchBase = {
-      company: new mongoose.Types.ObjectId(companyId),
-      status: "posted",
-      reversed: { $ne: true },
-      date: dateFilter,
-    };
-
     // ── VAT SECTION ────────────────────────────────────────────────
     const vatOutputCodes = ["2220"];
     const vatInputCodes = ["2210"];
 
     // Output VAT — sum of credit lines on VAT Output accounts
-    const outputVatResult = await aggregateWithTimeout(JournalEntry, [
-      { $match: matchBase },
-      { $unwind: "$lines" },
-      {
-        $match: {
-          "lines.accountCode": { $in: vatOutputCodes },
-          "lines.credit": { $gt: 0 },
-        },
-      },
-      { $group: { _id: null, total: { $sum: "$lines.credit" } } },
-    ]);
+    const outputVat = await journalAmount(companyId, periodStart, periodEnd, vatOutputCodes, 'credit');
 
     // Output VAT reversed — sum of debit lines on VAT Output accounts (credit notes)
-    const outputVatReversedResult = await aggregateWithTimeout(JournalEntry, [
-      { $match: matchBase },
-      { $unwind: "$lines" },
-      {
-        $match: {
-          "lines.accountCode": { $in: vatOutputCodes },
-          "lines.debit": { $gt: 0 },
-        },
-      },
-      { $group: { _id: null, total: { $sum: "$lines.debit" } } },
-    ]);
+    const outputVatReversed = await journalAmount(companyId, periodStart, periodEnd, vatOutputCodes, 'debit');
 
     // Input VAT — sum of debit lines on VAT Input accounts
-    const inputVatResult = await aggregateWithTimeout(JournalEntry, [
-      { $match: matchBase },
-      { $unwind: "$lines" },
-      {
-        $match: {
-          "lines.accountCode": { $in: vatInputCodes },
-          "lines.debit": { $gt: 0 },
-        },
-      },
-      { $group: { _id: null, total: { $sum: "$lines.debit" } } },
-    ]);
+    const inputVat = await journalAmount(companyId, periodStart, periodEnd, vatInputCodes, 'debit');
 
     // Input VAT reversed — sum of credit lines on VAT Input accounts (purchase returns)
-    const inputVatReversedResult = await aggregateWithTimeout(JournalEntry, [
-      { $match: matchBase },
-      { $unwind: "$lines" },
-      {
-        $match: {
-          "lines.accountCode": { $in: vatInputCodes },
-          "lines.credit": { $gt: 0 },
-        },
-      },
-      { $group: { _id: null, total: { $sum: "$lines.credit" } } },
-    ]);
-
-    const outputVat = outputVatResult[0]?.total
-      ? Number(outputVatResult[0].total.toString())
-      : 0;
-    const outputVatReversed = outputVatReversedResult[0]?.total
-      ? Number(outputVatReversedResult[0].total.toString())
-      : 0;
-    const inputVat = inputVatResult[0]?.total
-      ? Number(inputVatResult[0].total.toString())
-      : 0;
-    const inputVatReversed = inputVatReversedResult[0]?.total
-      ? Number(inputVatReversedResult[0].total.toString())
-      : 0;
+    const inputVatReversed = await journalAmount(companyId, periodStart, periodEnd, vatInputCodes, 'credit');
 
     const netOutputVat = outputVat - outputVatReversed;
     const netInputVat = inputVat - inputVatReversed;
@@ -207,84 +156,20 @@ class TaxService {
     const payePayableCodes = ["2230"];
 
     // PAYE withheld — sum of credit lines on PAYE accounts
-    const payeWithheldResult = await aggregateWithTimeout(JournalEntry, [
-      { $match: matchBase },
-      { $unwind: "$lines" },
-      {
-        $match: {
-          "lines.accountCode": { $in: payePayableCodes },
-          "lines.credit": { $gt: 0 },
-        },
-      },
-      { $group: { _id: null, total: { $sum: "$lines.credit" } } },
-    ]);
+    const payeWithheld = await journalAmount(companyId, periodStart, periodEnd, payePayableCodes, 'credit');
 
     // PAYE remitted — sum of debit lines on PAYE accounts (settlements)
-    const payeRemittedResult = await aggregateWithTimeout(JournalEntry, [
-      {
-        $match: {
-          ...matchBase,
-          sourceType: { $in: ["paye_settlement", "payroll_tax"] },
-        },
-      },
-      { $unwind: "$lines" },
-      {
-        $match: {
-          "lines.accountCode": { $in: payePayableCodes },
-          "lines.debit": { $gt: 0 },
-        },
-      },
-      { $group: { _id: null, total: { $sum: "$lines.debit" } } },
-    ]);
-
-    const payeWithheld = payeWithheldResult[0]?.total
-      ? Number(payeWithheldResult[0].total.toString())
-      : 0;
-    const payeRemitted = payeRemittedResult[0]?.total
-      ? Number(payeRemittedResult[0].total.toString())
-      : 0;
+    const payeRemitted = await journalAmount(companyId, periodStart, periodEnd, payePayableCodes, 'debit', ["paye_settlement", "payroll_tax"]);
     const payeOutstanding = payeWithheld - payeRemitted;
 
     // ── RSSB SECTION ───────────────────────────────────────────────
     const rssbPayableCodes = ["2240"];
 
     // RSSB contributions — sum of credit lines on RSSB accounts
-    const rssbContributedResult = await aggregateWithTimeout(JournalEntry, [
-      { $match: matchBase },
-      { $unwind: "$lines" },
-      {
-        $match: {
-          "lines.accountCode": { $in: rssbPayableCodes },
-          "lines.credit": { $gt: 0 },
-        },
-      },
-      { $group: { _id: null, total: { $sum: "$lines.credit" } } },
-    ]);
+    const rssbContributed = await journalAmount(companyId, periodStart, periodEnd, rssbPayableCodes, 'credit');
 
     // RSSB remitted — sum of debit lines on RSSB accounts (settlements)
-    const rssbRemittedResult = await aggregateWithTimeout(JournalEntry, [
-      {
-        $match: {
-          ...matchBase,
-          sourceType: { $in: ["rssb_settlement", "payroll_tax"] },
-        },
-      },
-      { $unwind: "$lines" },
-      {
-        $match: {
-          "lines.accountCode": { $in: rssbPayableCodes },
-          "lines.debit": { $gt: 0 },
-        },
-      },
-      { $group: { _id: null, total: { $sum: "$lines.debit" } } },
-    ]);
-
-    const rssbContributed = rssbContributedResult[0]?.total
-      ? Number(rssbContributedResult[0].total.toString())
-      : 0;
-    const rssbRemitted = rssbRemittedResult[0]?.total
-      ? Number(rssbRemittedResult[0].total.toString())
-      : 0;
+    const rssbRemitted = await journalAmount(companyId, periodStart, periodEnd, rssbPayableCodes, 'debit', ["rssb_settlement", "payroll_tax"]);
     const rssbOutstanding = rssbContributed - rssbRemitted;
 
     return {

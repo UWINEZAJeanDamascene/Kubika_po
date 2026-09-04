@@ -10,6 +10,7 @@ const JournalService = require('../services/journalService');
 const transactionService = require('../services/transactionService');
 const PurchaseOrder = require('../models/PurchaseOrder');
 const emailService = require('../services/emailService');
+const cacheService = require('../services/cacheService');
 const DEFAULT_ACCOUNTS = require('../constants/chartOfAccounts').DEFAULT_ACCOUNTS;
 const { parsePagination, paginationMeta } = require('../utils/pagination');
 
@@ -328,7 +329,19 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
 
   try {
     const result = await transactionService.runInTransaction(async (trx) => await doConfirm(trx));
-    
+
+    // Confirming a purchase return reduces Product.currentStock directly
+    // (not through /api/products or /api/stock/*), so the route-level cache
+    // invalidation middleware on those routes never fires for it. Without
+    // this, the browse stock/product caches would keep serving the
+    // pre-return quantity for up to their TTL.
+    try {
+      await cacheService.bumpCompanyStockCaches(companyId);
+      await cacheService.invalidateByCompany(companyId, 'report');
+    } catch (cacheErr) {
+      console.error('Cache invalidation after purchase return confirm failed:', cacheErr);
+    }
+
     // Send email notification
     if (req.body.sendEmail) {
       const confirmedPR = await PurchaseReturn.findById(result._id).populate('grn');

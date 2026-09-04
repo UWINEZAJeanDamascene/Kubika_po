@@ -27,7 +27,7 @@ exports.createSession = async (req, res) => {
 exports.listSessions = async (req, res) => {
   try {
     const sessions = await service.listSessions(companyId(req), req.query);
-    res.json({ success: true, data: sessions });
+    res.json({ success: true, ...sessions });
   } catch (error) {
     sendError(res, error);
   }
@@ -83,8 +83,8 @@ exports.addTransaction = async (req, res) => {
 
 exports.listTransactions = async (req, res) => {
   try {
-    const transactions = await service.listStatementTransactions(companyId(req), req.params.id, req.query.matchStatus);
-    res.json({ success: true, data: transactions });
+    const transactions = await service.listStatementTransactions(companyId(req), req.params.id, req.query);
+    res.json({ success: true, data: transactions.data, pagination: transactions.pagination });
   } catch (error) {
     sendError(res, error);
   }
@@ -101,8 +101,8 @@ exports.deleteTransaction = async (req, res) => {
 
 exports.listBookTransactions = async (req, res) => {
   try {
-    const transactions = await service.listBookTransactions(companyId(req), req.params.id, req.query.matchStatus);
-    res.json({ success: true, data: transactions });
+    const transactions = await service.listBookTransactions(companyId(req), req.params.id, req.query);
+    res.json({ success: true, data: transactions.data, pagination: transactions.pagination });
   } catch (error) {
     sendError(res, error);
   }

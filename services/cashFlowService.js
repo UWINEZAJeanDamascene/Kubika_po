@@ -1,6 +1,5 @@
-const mongoose = require("mongoose");
-const JournalEntry = require("../models/JournalEntry");
-const { aggregateWithTimeout } = require("../utils/mongoAggregation");
+const { Prisma } = require('@prisma/client');
+const { dbClient } = require('../lib/prisma');
 const Company = require("../models/Company");
 const {
   CASH_FLOW_CLASSIFICATION,
@@ -146,11 +145,11 @@ class CashFlowService {
 
       const [bankAccts, pettyCash] = await Promise.all([
         BankAccount.find({
-          company: new mongoose.Types.ObjectId(companyId),
+          company: String(companyId),
           isActive: true,
         }).lean(),
         PettyCashFloat.find({
-          company: new mongoose.Types.ObjectId(companyId),
+          company: String(companyId),
           isActive: true,
         }).lean(),
       ]);
@@ -179,41 +178,22 @@ class CashFlowService {
       ...CashFlowService.NON_CASH_SOURCE_TYPES,
     ];
 
-    const rawMovements = await aggregateWithTimeout(
-      JournalEntry,
-      [
-        {
-          $match: {
-            company: new mongoose.Types.ObjectId(companyId),
-            status: "posted",
-            reversed: { $ne: true },
-            date: {
-              $gte: new Date(dateFrom),
-              $lte: new Date(dateTo),
-            },
-            // Exclude internal transfers at query time
-            sourceType: { $nin: allExcluded },
-          },
-        },
-        { $unwind: "$lines" },
-        {
-          // Only keep lines that touch cash/bank accounts
-          $match: {
-            "lines.accountCode": { $in: cashAccountCodes },
-          },
-        },
-        {
-          // Group by sourceType only — merges entries that hit multiple cash accounts
-          $group: {
-            _id: "$sourceType",
-            total_dr: { $sum: "$lines.debit" },
-            total_cr: { $sum: "$lines.credit" },
-            entry_count: { $sum: 1 },
-          },
-        },
-      ],
-      "report",
-    );
+    const rawMovements = await dbClient().$queryRaw(Prisma.sql`
+      SELECT je.source_type AS "sourceType",
+             COALESCE(SUM(jel.debit), 0) AS total_dr,
+             COALESCE(SUM(jel.credit), 0) AS total_cr,
+             COUNT(*)::int AS entry_count
+      FROM journal_entry_lines jel
+      JOIN journal_entries je ON je.id = jel.journal_entry_id
+      WHERE je.company_id = ${String(companyId)}
+        AND je.status = 'posted'
+        AND je.reversed = false
+        AND je.date >= ${new Date(dateFrom)}
+        AND je.date <= ${new Date(dateTo)}
+        AND jel.account_code IN (${Prisma.join(cashAccountCodes)})
+        AND (je.source_type IS NULL OR je.source_type NOT IN (${Prisma.join(allExcluded)}))
+      GROUP BY je.source_type
+    `);
 
     // ── Step 3: Classify into sections ──────────────────────────────
     const sections = {
@@ -227,7 +207,7 @@ class CashFlowService {
     const ZERO_TOLERANCE = 0.005;
 
     for (const row of rawMovements) {
-      const sourceType = row._id;
+      const sourceType = row.sourceType;
 
       const section = CashFlowService._classifySourceType(sourceType);
       if (section === "excluded") continue; // internal / non-cash — skip
@@ -369,33 +349,18 @@ class CashFlowService {
   ) {
     if (!cashAccountCodes.length) return 0;
 
-    const result = await aggregateWithTimeout(
-      JournalEntry,
-      [
-        {
-          $match: {
-            company: new mongoose.Types.ObjectId(companyId),
-            status: "posted",
-            reversed: { $ne: true },
-            date: { $gte: dateFrom, $lte: dateTo },
-          },
-        },
-        { $unwind: "$lines" },
-        {
-          $match: {
-            "lines.accountCode": { $in: cashAccountCodes },
-          },
-        },
-        {
-          $group: {
-            _id: null,
-            total_dr: { $sum: "$lines.debit" },
-            total_cr: { $sum: "$lines.credit" },
-          },
-        },
-      ],
-      "report",
-    );
+    const result = await dbClient().$queryRaw(Prisma.sql`
+      SELECT COALESCE(SUM(jel.debit), 0) AS total_dr,
+             COALESCE(SUM(jel.credit), 0) AS total_cr
+      FROM journal_entry_lines jel
+      JOIN journal_entries je ON je.id = jel.journal_entry_id
+      WHERE je.company_id = ${String(companyId)}
+        AND je.status = 'posted'
+        AND je.reversed = false
+        AND je.date >= ${dateFrom}
+        AND je.date <= ${dateTo}
+        AND jel.account_code IN (${Prisma.join(cashAccountCodes)})
+    `);
 
     // Asset account: balance = DR − CR (debit-normal)
     const dr = parseFloat(result[0]?.total_dr?.toString() || "0");

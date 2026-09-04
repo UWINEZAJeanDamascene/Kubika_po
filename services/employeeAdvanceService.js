@@ -1,9 +1,9 @@
-const mongoose = require('mongoose');
 const EmployeeAdvance = require('../models/EmployeeAdvance');
 const JournalService = require('./journalService');
 const SequenceService = require('./sequenceService');
 const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
 const { BankAccount } = require('../models/BankAccount');
+const { dbClient } = require('../lib/prisma');
 
 class EmployeeAdvanceService {
   static async getNextReference(companyId) {
@@ -251,25 +251,20 @@ class EmployeeAdvanceService {
   }
 
   static async getEmployeeBalance(companyId, employeeId) {
-    const result = await EmployeeAdvance.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          employee: new mongoose.Types.ObjectId(employeeId),
-          status: { $in: ['issued', 'partially_repaid'] }
-        }
+    const result = await dbClient().employeeAdvance.aggregate({
+      where: {
+        companyId: String(companyId),
+        employeeId: String(employeeId),
+        status: { in: ['issued', 'partially_repaid'] },
       },
-      {
-        $group: {
-          _id: null,
-          totalIssued: { $sum: '$amount' },
-          totalRepaid: { $sum: '$amountRepaid' },
-          totalBalance: { $sum: '$balance' }
-        }
-      }
-    ]);
+      _sum: { amount: true, amountRepaid: true, balance: true },
+    });
 
-    return result[0] || { totalIssued: 0, totalRepaid: 0, totalBalance: 0 };
+    return {
+      totalIssued: Number(result._sum?.amount || 0),
+      totalRepaid: Number(result._sum?.amountRepaid || 0),
+      totalBalance: Number(result._sum?.balance || 0),
+    };
   }
 
   static async delete(companyId, advanceId) {

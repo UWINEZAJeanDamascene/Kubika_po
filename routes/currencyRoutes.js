@@ -13,7 +13,7 @@ const { cacheMiddleware, cacheInvalidationMiddleware } = require('../middleware/
 // filter) and this route is public, so it is marked global: without that the
 // cache would be skipped for lack of a resolvable tenant.
 const cacheCurrencies = cacheMiddleware({ type: 'currency', ttl: 3600, global: true });
-const invalidateCurrencies = cacheInvalidationMiddleware({ type: 'currency', invalidateAll: true });
+const invalidateCurrencies = cacheInvalidationMiddleware({ type: 'currency', invalidateAll: true, global: true });
 
 // @route   GET /api/currencies
 // @desc    List currencies (active by default)

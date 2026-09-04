@@ -8,6 +8,75 @@ const Warehouse = require('../models/Warehouse');
 const ERR_SALES_ORDER_NOT_FOUND = 'ERR_SALES_ORDER_NOT_FOUND';
 const ERR_INVALID_STATUS_TRANSITION = 'ERR_INVALID_STATUS_TRANSITION';
 
+const normalizeId = (value) => {
+  if (!value) return null;
+  if (typeof value === 'string' || typeof value === 'number') return String(value);
+  return String(value._id || value.id || value);
+};
+
+async function hydrateSalesOrderRelations(docOrDocs) {
+  const docs = Array.isArray(docOrDocs) ? docOrDocs : [docOrDocs];
+  const valid = docs.filter(Boolean);
+  if (!valid.length) return docOrDocs;
+
+  const clientIds = [...new Set(valid.map((doc) => normalizeId(doc.client)).filter(Boolean))];
+  const productIds = [...new Set(valid.flatMap((doc) => (doc.lines || []).map((line) => normalizeId(line.product)).filter(Boolean)))];
+  const createdByIds = [...new Set(valid.map((doc) => normalizeId(doc.createdBy)).filter(Boolean))];
+  const quotationIds = [...new Set(valid.map((doc) => normalizeId(doc.quotation)).filter(Boolean))];
+  const deliveryNoteIds = [...new Set(valid.flatMap((doc) => (doc.deliveryNotes || []).map((id) => normalizeId(id)).filter(Boolean)))];
+  const invoiceIds = [...new Set(valid.flatMap((doc) => (doc.invoices || []).map((id) => normalizeId(id)).filter(Boolean)))];
+  const warehouseIds = [...new Set(valid.flatMap((doc) => (doc.lines || []).map((line) => normalizeId(line.warehouse)).filter(Boolean)))];
+
+  const [clients, products, users, quotations, deliveryNotes, invoices, warehouses] = await Promise.all([
+    clientIds.length ? Client.find({ _id: { $in: clientIds } }, 'name code tin address phone email').lean() : [],
+    productIds.length ? Product.find({ _id: { $in: productIds } }, 'name sku unit taxRate taxCode trackingType isStockable').lean() : [],
+    createdByIds.length ? require('../models/User').find({ _id: { $in: createdByIds } }, 'name email').lean() : [],
+    quotationIds.length ? require('../models/Quotation').find({ _id: { $in: quotationIds } }, 'referenceNo').lean() : [],
+    deliveryNoteIds.length ? require('../models/DeliveryNote').find({ _id: { $in: deliveryNoteIds } }, 'referenceNo status deliveryDate').lean() : [],
+    invoiceIds.length ? require('../models/Invoice').find({ _id: { $in: invoiceIds } }, 'referenceNo status totalAmount').lean() : [],
+    warehouseIds.length ? require('../models/Warehouse').find({ _id: { $in: warehouseIds } }, 'name code').lean() : [],
+  ]);
+
+  const clientMap = new Map(clients.map((c) => [normalizeId(c._id), c]));
+  const productMap = new Map(products.map((p) => [normalizeId(p._id), p]));
+  const userMap = new Map(users.map((u) => [normalizeId(u._id), u]));
+  const quotationMap = new Map(quotations.map((q) => [normalizeId(q._id), q]));
+  const deliveryNoteMap = new Map(deliveryNotes.map((dn) => [normalizeId(dn._id), dn]));
+  const invoiceMap = new Map(invoices.map((inv) => [normalizeId(inv._id), inv]));
+  const warehouseMap = new Map(warehouses.map((warehouse) => [normalizeId(warehouse._id), warehouse]));
+
+  for (const doc of valid) {
+    const clientId = normalizeId(doc.client);
+    if (clientId && clientMap.has(clientId)) doc.client = clientMap.get(clientId);
+    const createdById = normalizeId(doc.createdBy);
+    if (createdById && userMap.has(createdById)) doc.createdBy = userMap.get(createdById);
+    const quotationId = normalizeId(doc.quotation);
+    if (quotationId && quotationMap.has(quotationId)) doc.quotation = quotationMap.get(quotationId);
+    for (const line of doc.lines || []) {
+      const pid = normalizeId(line.product);
+      if (pid && productMap.has(pid)) line.product = productMap.get(pid);
+      if (line.warehouse) {
+        const wid = normalizeId(line.warehouse);
+        if (wid && warehouseMap.has(wid)) line.warehouse = warehouseMap.get(wid);
+      }
+    }
+    if (Array.isArray(doc.deliveryNotes)) {
+      doc.deliveryNotes = doc.deliveryNotes.map((dn) => {
+        const id = normalizeId(dn);
+        return id && deliveryNoteMap.has(id) ? deliveryNoteMap.get(id) : dn;
+      });
+    }
+    if (Array.isArray(doc.invoices)) {
+      doc.invoices = doc.invoices.map((inv) => {
+        const id = normalizeId(inv);
+        return id && invoiceMap.has(id) ? invoiceMap.get(id) : inv;
+      });
+    }
+  }
+
+  return Array.isArray(docOrDocs) ? valid : valid[0];
+}
+
 // @desc    Get all sales orders
 // @route   GET /api/sales-orders
 // @access  Private
@@ -40,23 +109,23 @@ exports.getSalesOrders = async (req, res, next) => {
     
     const [salesOrders, totalCount] = await Promise.all([
       SalesOrder.find(filter)
-        .populate('client', 'name code tin')
-        .populate('lines.product', 'name sku')
-        .populate('createdBy', 'name email')
+        .select({ client: 1, lines: 1, createdBy: 1, referenceNo: 1, status: 1, orderDate: 1, expectedDate: 1, createdAt: 1 })
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(parseInt(limit))
         .lean(),
       SalesOrder.countDocuments(filter)
     ]);
-    
+
+    const hydratedSalesOrders = await hydrateSalesOrderRelations(salesOrders);
+
     res.status(200).json({
       success: true,
-      count: salesOrders.length,
+      count: hydratedSalesOrders.length,
       total: totalCount,
       page: parseInt(page),
       pages: Math.ceil(totalCount / parseInt(limit)),
-      data: salesOrders
+      data: hydratedSalesOrders
     });
   } catch (error) {
     next(error);
@@ -71,29 +140,22 @@ exports.getSalesOrder = async (req, res, next) => {
     const companyId = req.user.company._id;
     
     const salesOrder = await SalesOrder.findOne({ _id: req.params.id, company: companyId })
-      .populate('client', 'name code tin address phone email')
-      .populate('lines.product', 'name sku unit taxRate taxCode trackingType isStockable')
-      .populate('lines.warehouse', 'name code')
-      .populate('createdBy', 'name email')
-      .populate('confirmedBy', 'name email')
-      .populate('packedBy', 'name email')
-      .populate('deliveredBy', 'name email')
-      .populate('invoicedBy', 'name email')
-      .populate('quotation', 'referenceNo')
-      .populate('deliveryNotes', 'referenceNo status deliveryDate')
-      .populate('invoices', 'referenceNo status totalAmount');
-    
-    if (!salesOrder) {
+      .select({ client: 1, lines: 1, createdBy: 1, confirmedBy: 1, packedBy: 1, deliveredBy: 1, invoicedBy: 1, quotation: 1, deliveryNotes: 1, invoices: 1, referenceNo: 1, status: 1 })
+      .lean();
+
+    const hydratedSalesOrder = await hydrateSalesOrderRelations(salesOrder);
+
+    if (!hydratedSalesOrder) {
       return res.status(404).json({
         success: false,
         error: ERR_SALES_ORDER_NOT_FOUND,
         message: 'Sales order not found'
       });
     }
-    
+
     res.status(200).json({
       success: true,
-      data: salesOrder
+      data: hydratedSalesOrder
     });
   } catch (error) {
     next(error);
@@ -178,12 +240,12 @@ exports.createSalesOrder = async (req, res, next) => {
       clientTin: clientDoc.tin
     });
     
-    await salesOrder.populate('client lines.product createdBy');
+    const hydratedCreatedSalesOrder = await hydrateSalesOrderRelations(salesOrder);
     
     res.status(201).json({
       success: true,
       message: 'Sales order created successfully',
-      data: salesOrder
+      data: hydratedCreatedSalesOrder
     });
   } catch (error) {
     next(error);
@@ -256,12 +318,12 @@ exports.updateSalesOrder = async (req, res, next) => {
     if (currencyCode) salesOrder.currencyCode = currencyCode;
     
     await salesOrder.save();
-    await salesOrder.populate('client lines.product createdBy');
+    const hydratedUpdatedSalesOrder = await hydrateSalesOrderRelations(salesOrder);
     
     res.status(200).json({
       success: true,
       message: 'Sales order updated successfully',
-      data: salesOrder
+      data: hydratedUpdatedSalesOrder
     });
   } catch (error) {
     next(error);
@@ -313,8 +375,8 @@ exports.confirmSalesOrder = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     
-    const salesOrder = await SalesOrder.findOne({ _id: req.params.id, company: companyId })
-      .populate('lines.product');
+    const salesOrder = await SalesOrder.findOne({ _id: req.params.id, company: companyId });
+    await hydrateSalesOrderRelations(salesOrder);
     
     if (!salesOrder) {
       return res.status(404).json({
@@ -410,8 +472,8 @@ exports.cancelSalesOrder = async (req, res, next) => {
     const companyId = req.user.company._id;
     const { reason } = req.body;
     
-    const salesOrder = await SalesOrder.findOne({ _id: req.params.id, company: companyId })
-      .populate('lines.product');
+    const salesOrder = await SalesOrder.findOne({ _id: req.params.id, company: companyId });
+    await hydrateSalesOrderRelations(salesOrder);
     
     if (!salesOrder) {
       return res.status(404).json({
@@ -473,10 +535,8 @@ exports.getClientSalesOrders = async (req, res, next) => {
     const salesOrders = await SalesOrder.find({ 
       client: req.params.clientId, 
       company: companyId 
-    })
-      .populate('lines.product', 'name sku')
-      .populate('createdBy', 'name email')
-      .sort({ createdAt: -1 });
+    }).select({ lines: 1, createdBy: 1 }).sort({ createdAt: -1 }).lean();
+    const hydratedSalesOrders = await hydrateSalesOrderRelations(salesOrders);
     
     res.status(200).json({
       success: true,
@@ -498,11 +558,8 @@ exports.getReadyForPicking = async (req, res, next) => {
     const salesOrders = await SalesOrder.find({ 
       company: companyId,
       status: 'confirmed'
-    })
-      .populate('client', 'name code')
-      .populate('lines.product', 'name sku')
-      .populate('lines.warehouse', 'name code')
-      .sort({ expectedDate: 1, createdAt: -1 });
+    }).select({ client: 1, lines: 1 }).sort({ expectedDate: 1, createdAt: -1 }).lean();
+    const hydratedSalesOrders = await hydrateSalesOrderRelations(salesOrders);
     
     res.status(200).json({
       success: true,
@@ -524,11 +581,8 @@ exports.getReadyForPacking = async (req, res, next) => {
     const salesOrders = await SalesOrder.find({ 
       company: companyId,
       status: 'picking'
-    })
-      .populate('client', 'name code')
-      .populate('lines.product', 'name sku')
-      .populate('createdBy', 'name email')
-      .sort({ expectedDate: 1, createdAt: -1 });
+    }).select({ client: 1, lines: 1, createdBy: 1 }).sort({ expectedDate: 1, createdAt: -1 }).lean();
+    const hydratedSalesOrders = await hydrateSalesOrderRelations(salesOrders);
     
     res.status(200).json({
       success: true,
@@ -550,10 +604,8 @@ exports.getReadyForDelivery = async (req, res, next) => {
     const salesOrders = await SalesOrder.find({ 
       company: companyId,
       status: 'packed'
-    })
-      .populate('client', 'name code')
-      .populate('lines.product', 'name sku')
-      .sort({ packedDate: -1 });
+    }).select({ client: 1, lines: 1, packedDate: 1 }).sort({ packedDate: -1 }).lean();
+    const hydratedSalesOrders = await hydrateSalesOrderRelations(salesOrders);
     
     res.status(200).json({
       success: true,
@@ -576,10 +628,8 @@ exports.getBackorders = async (req, res, next) => {
       company: companyId,
       isBackorder: true,
       status: { $nin: ['closed', 'cancelled'] }
-    })
-      .populate('client', 'name code')
-      .populate('lines.product', 'name sku')
-      .sort({ createdAt: -1 });
+    }).select({ client: 1, lines: 1, createdAt: 1 }).sort({ createdAt: -1 }).lean();
+    const hydratedSalesOrders = await hydrateSalesOrderRelations(salesOrders);
     
     res.status(200).json({
       success: true,

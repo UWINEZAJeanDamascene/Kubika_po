@@ -1,4 +1,3 @@
-const mongoose = require('mongoose');
 const Product = require('../models/Product');
 const PurchaseOrder = require('../models/PurchaseOrder');
 const Purchase = require('../models/Purchase');
@@ -6,6 +5,8 @@ const Supplier = require('../models/Supplier');
 const StockLevel = require('../models/StockLevel');
 const StockMovement = require('../models/StockMovement');
 const SystemSettings = require('../models/SystemSettings');
+const { Prisma } = require('@prisma/client');
+const { dbClient } = require('../lib/prisma');
 const {
   notifyAutoPurchaseOrderCreated,
   notifyAutoDirectPurchaseCreated
@@ -23,8 +24,7 @@ function toNumber(value) {
 }
 
 function toObjectId(value) {
-  if (!value) return null;
-  return value instanceof mongoose.Types.ObjectId ? value : new mongoose.Types.ObjectId(String(value));
+  return value ? String(value) : null;
 }
 
 function shouldCheckMovement(movement) {
@@ -69,28 +69,20 @@ class AutoPurchaseOrderService {
     const companyObjectId = toObjectId(companyId);
     const productObjectId = toObjectId(productId);
 
-    const totals = await StockLevel.aggregate([
-      {
-        $match: {
-          company_id: companyObjectId,
-          product_id: productObjectId
-        }
-      },
-      {
-        $group: {
-          _id: '$product_id',
-          qty_on_hand: { $sum: '$qty_on_hand' }
-        }
-      }
-    ]);
+    const totals = await dbClient().stockLevel.groupBy({
+      by: ['productId'],
+      where: { companyId: companyObjectId, productId: productObjectId },
+      _sum: { qtyOnHand: true },
+    });
 
     if (totals.length > 0) {
-      return toNumber(totals[0].qty_on_hand);
+      return toNumber(totals[0]._sum?.qtyOnHand);
     }
 
-    const product = await Product.findOne({ _id: productObjectId, company: companyObjectId })
-      .select('currentStock')
-      .lean();
+    const product = await dbClient().product.findFirst({
+      where: { id: productObjectId, companyId: companyObjectId },
+      select: { currentStock: true },
+    });
     return toNumber(product?.currentStock);
   }
 
@@ -126,32 +118,19 @@ class AutoPurchaseOrderService {
 
   static async getSalesVelocity(companyId, productId, lookbackDays) {
     const since = new Date(Date.now() - (Number(lookbackDays) || 90) * 24 * 60 * 60 * 1000);
-    const rows = await StockMovement.aggregate([
-      {
-        $match: {
-          $and: [
-            { $or: [{ company: companyId }, { company_id: companyId }] },
-            { $or: [{ product: productId }, { product_id: productId }] },
-            { type: 'out' },
-            { reason: { $in: ['sale', 'dispatch'] } },
-            { movementDate: { $gte: since } }
-          ]
-        }
-      },
-      {
-        $group: {
-          _id: null,
-          quantity: { $sum: { $toDouble: { $ifNull: ['$quantity', 0] } } },
-          daysWithSales: { $addToSet: { $dateToString: { format: '%Y-%m-%d', date: '$movementDate' } } }
-        }
-      }
-    ]);
-    const totalSold = toNumber(rows[0]?.quantity);
+    const [row] = await dbClient().$queryRaw(Prisma.sql`
+      SELECT COALESCE(SUM(quantity), 0) AS quantity,
+             COUNT(DISTINCT DATE(movement_date))::int AS "salesDays"
+      FROM stock_movements
+      WHERE company_id = ${toObjectId(companyId)} AND product_id = ${toObjectId(productId)}
+        AND type = 'out' AND reason IN ('sale', 'dispatch') AND movement_date >= ${since}
+    `);
+    const totalSold = toNumber(row?.quantity);
     const observedDays = Math.max(1, Math.ceil((Date.now() - since.getTime()) / (24 * 60 * 60 * 1000)));
     return {
       totalSold,
       averageDailyDemand: totalSold / observedDays,
-      salesDays: rows[0]?.daysWithSales?.length || 0,
+      salesDays: Number(row?.salesDays || 0),
       lookbackDays: observedDays
     };
   }
@@ -240,10 +219,10 @@ class AutoPurchaseOrderService {
   }
 
   static async createDirectPurchase({ companyId, product, supplier, reorderQty, unitCost, performedBy, settings, plan }) {
-    const quantity = mongoose.Types.Decimal128.fromString(String(reorderQty));
-    const cost = mongoose.Types.Decimal128.fromString(String(unitCost));
     const subtotal = reorderQty * unitCost;
-    const total = mongoose.Types.Decimal128.fromString(String(subtotal));
+    const quantity = Number(reorderQty) || 0;
+    const cost = Number(unitCost) || 0;
+    const total = Number(subtotal) || 0;
     const purchase = await Purchase.create({
       company: companyId,
       supplier: supplier._id,

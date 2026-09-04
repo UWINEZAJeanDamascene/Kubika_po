@@ -148,6 +148,7 @@ const cacheMiddleware = (options = {}) => {
     skipCache = null,
     closedPeriodPersistent = false,
     varyByUser = false,
+    stampedeProtection = type === 'report',
     // Set for genuinely tenant-independent data (public/platform-wide). Without
     // it, a request with no resolvable tenant is served uncached rather than
     // risking a shared cache entry.
@@ -184,7 +185,7 @@ const cacheMiddleware = (options = {}) => {
         const params = {
           path: req.path,
           query: req.query,
-          companyId,
+          ...(isGlobal ? { scope: 'global' } : { companyId }),
           ...(varyByUser ? { userId: req.user?._id || req.user?.id || null } : {}),
         };
         cacheKey = cacheService.generateKey(type, params);
@@ -200,6 +201,17 @@ const cacheMiddleware = (options = {}) => {
           ...cachedResponse,
           fromCache: true,
         });
+      }
+
+      const requestFlight = stampedeProtection
+        ? await cacheService.beginRequestFlight(cacheKey)
+        : null;
+      if (requestFlight && !requestFlight.acquired) {
+        if (requestFlight.cached !== undefined && requestFlight.cached !== null) {
+          return res.status(200).json({ ...requestFlight.cached, fromCache: true });
+        }
+        // The owner failed or Redis lock support is unavailable. Recompute
+        // rather than blocking the request indefinitely.
       }
 
       let cacheTtl = ttl === null || ttl === undefined
@@ -222,7 +234,9 @@ const cacheMiddleware = (options = {}) => {
             console.error('Cache set error:', error);
           });
         }
-        return originalJson(data);
+        const result = originalJson(data);
+        if (requestFlight?.release) requestFlight.release().catch(() => {});
+        return result;
       };
 
       next();
@@ -250,6 +264,7 @@ const cacheInvalidationMiddleware = (options = {}) => {
     invalidateByCompany = true,
     types = null,
     invalidateDashboards = false,
+    global: isGlobal = false,
   } = options;
 
   return async (req, res, next) => {
@@ -267,7 +282,7 @@ const cacheInvalidationMiddleware = (options = {}) => {
       if (res.statusCode >= 200 && res.statusCode < 300) {
         try {
           const targetTypes = Array.isArray(types) && types.length ? types : [type];
-          if (invalidateAll) {
+          if (invalidateAll && isGlobal) {
             await Promise.all(targetTypes.map((targetType) => cacheService.invalidateType(targetType)));
           } else if (keyGenerator) {
             const key = keyGenerator(req, data);
@@ -422,4 +437,7 @@ module.exports = {
   cacheInvalidationMiddleware,
   sessionMiddleware,
   cacheControl,
+  reportDateRange,
+  isClosedPeriodReport,
+  resolveCompanyId,
 };

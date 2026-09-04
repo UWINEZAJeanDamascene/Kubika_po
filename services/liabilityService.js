@@ -1,4 +1,3 @@
-const mongoose = require('mongoose');
 const Liability = require('../models/Liability');
 const JournalEntry = require('../models/JournalEntry');
 const ChartOfAccount = require('../models/ChartOfAccount');

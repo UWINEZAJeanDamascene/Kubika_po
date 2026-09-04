@@ -1,14 +1,11 @@
-const mongoose = require("mongoose");
 const { parse } = require("csv-parse/sync");
+const { dbClient } = require("../lib/prisma");
+const { parseBoundedPage } = require("../utils/querySafety");
 const BankReconciliationSession = require("../models/BankReconciliationSession");
 const BankStatementTransaction = require("../models/BankStatementTransaction");
 const { BankAccount, BankTransaction, BankReconciliationMatch } = require("../models/BankAccount");
 const JournalEntry = require("../models/JournalEntry");
 const journalAgg = require("./journalAggregationService");
-
-function objectId(value) {
-  return value instanceof mongoose.Types.ObjectId ? value : new mongoose.Types.ObjectId(value);
-}
 
 function toNumber(value) {
   if (value == null) return 0;
@@ -24,6 +21,30 @@ function round(value) {
 
 function getCompanyId(reqOrId) {
   return reqOrId?.company?._id || reqOrId?.companyId || reqOrId;
+}
+
+const RECON_MAX_PAGE_SIZE = 100;
+const RECON_MAX_BATCH_ROWS = Math.max(RECON_MAX_PAGE_SIZE, Number(process.env.RECONCILIATION_MAX_BATCH_ROWS || 5000));
+
+function pageMeta(page, limit, total) {
+  return { page, limit, total, pages: total ? Math.ceil(total / limit) : 0 };
+}
+
+async function fetchAllPages(loadPage, purpose) {
+  const rows = [];
+  let page = 1;
+  let total = null;
+  while (rows.length < RECON_MAX_BATCH_ROWS) {
+    const result = await loadPage({ page, limit: RECON_MAX_PAGE_SIZE });
+    rows.push(...result.rows);
+    total = result.pagination.total;
+    if (rows.length >= total || result.rows.length < RECON_MAX_PAGE_SIZE) return rows;
+    page += 1;
+  }
+  throw Object.assign(new Error(`${purpose} exceeds the ${RECON_MAX_BATCH_ROWS}-row batch limit`), {
+    code: 'READ_BATCH_EXCEEDED',
+    statusCode: 413,
+  });
 }
 
 async function getScopedBankAccount(companyId, bankAccountId) {
@@ -107,7 +128,16 @@ async function listSessions(companyId, filters = {}) {
   const query = { companyId };
   if (filters.bankAccountId) query.bankAccountId = filters.bankAccountId;
   if (filters.status) query.status = filters.status;
-  return BankReconciliationSession.find(query).populate("bankAccountId", "name bankName accountNumber").sort({ periodEnd: -1 });
+  const { page, limit, skip } = parseBoundedPage(filters, { defaultLimit: 50, maxLimit: RECON_MAX_PAGE_SIZE });
+  const [rows, total] = await Promise.all([
+    BankReconciliationSession.find(query)
+      .populate("bankAccountId", "name bankName accountNumber")
+      .sort({ periodEnd: -1, _id: -1 })
+      .skip(skip)
+      .limit(limit),
+    BankReconciliationSession.countDocuments(query),
+  ]);
+  return { data: rows, pagination: pageMeta(page, limit, total) };
 }
 
 async function getSession(companyId, sessionId) {
@@ -120,11 +150,17 @@ async function getSession(companyId, sessionId) {
   return session;
 }
 
-async function listStatementTransactions(companyId, sessionId, matchStatus) {
+async function listStatementTransactions(companyId, sessionId, filters = {}) {
   const session = await getSession(companyId, sessionId);
   const query = { companyId, reconciliationSessionId: session._id };
+  const matchStatus = typeof filters === 'string' ? filters : filters.matchStatus;
   if (matchStatus) query.matchStatus = matchStatus;
-  return BankStatementTransaction.find(query).sort({ date: 1, _id: 1 });
+  const { page, limit, skip } = parseBoundedPage(typeof filters === 'string' ? {} : filters, { defaultLimit: 100, maxLimit: RECON_MAX_PAGE_SIZE });
+  const [rows, total] = await Promise.all([
+    BankStatementTransaction.find(query).sort({ date: 1, _id: 1 }).skip(skip).limit(limit),
+    BankStatementTransaction.countDocuments(query),
+  ]);
+  return { data: rows, rows, pagination: pageMeta(page, limit, total) };
 }
 
 async function addStatementTransaction(companyId, sessionId, data, importSource = "manual") {
@@ -200,8 +236,9 @@ async function deleteStatementTransaction(companyId, sessionId, transactionId) {
   await refreshSummary(companyId, sessionId);
 }
 
-async function listBookTransactions(companyId, sessionId, matchStatus) {
+async function listBookTransactions(companyId, sessionId, filters = {}) {
   const session = await getSession(companyId, sessionId);
+  const matchStatus = typeof filters === 'string' ? filters : filters.matchStatus;
   const query = {
     $and: [
       { $or: [{ companyId }, { company: companyId }] },
@@ -211,7 +248,12 @@ async function listBookTransactions(companyId, sessionId, matchStatus) {
   };
   if (matchStatus === "matched") query.reconciliationStatus = "reconciled";
   if (matchStatus === "unmatched") query.reconciliationStatus = { $ne: "reconciled" };
-  return BankTransaction.find(query).sort({ date: 1, _id: 1 });
+  const { page, limit, skip } = parseBoundedPage(typeof filters === 'string' ? {} : filters, { defaultLimit: 100, maxLimit: RECON_MAX_PAGE_SIZE });
+  const [rows, total] = await Promise.all([
+    BankTransaction.find(query).sort({ date: 1, _id: 1 }).skip(skip).limit(limit),
+    BankTransaction.countDocuments(query),
+  ]);
+  return { data: rows, rows, pagination: pageMeta(page, limit, total) };
 }
 
 async function createMatch(companyId, userId, sessionId, data, matchType = "manual") {
@@ -256,7 +298,7 @@ async function createMatch(companyId, userId, sessionId, data, matchType = "manu
     matchedBy: userId,
     matchType,
     amount: statementAmount,
-    matchedAmount: mongoose.Types.Decimal128.fromString(String(statementAmount)),
+    matchedAmount: statementAmount,
   });
   bookTx.reconciliationStatus = "reconciled";
   bookTx.reconciledSessionId = session._id;
@@ -268,8 +310,16 @@ async function createMatch(companyId, userId, sessionId, data, matchType = "manu
 }
 
 async function autoMatch(companyId, userId, sessionId, toleranceDays = 2) {
-  const books = await listBookTransactions(companyId, sessionId, "unmatched");
-  const statements = await listStatementTransactions(companyId, sessionId, "unmatched");
+  const [books, statements] = await Promise.all([
+    fetchAllPages(
+      (page) => listBookTransactions(companyId, sessionId, { ...page, matchStatus: "unmatched" }),
+      'book reconciliation auto-match',
+    ),
+    fetchAllPages(
+      (page) => listStatementTransactions(companyId, sessionId, { ...page, matchStatus: "unmatched" }),
+      'statement reconciliation auto-match',
+    ),
+  ]);
   const matches = [];
   for (const book of books) {
     const candidates = statements.filter((statement) => {
@@ -305,16 +355,49 @@ async function deleteMatch(companyId, matchId) {
 
 async function calculateSummary(companyId, sessionId) {
   const session = await getSession(companyId, sessionId);
-  const [bookTransactions, statementTransactions] = await Promise.all([
-    listBookTransactions(companyId, sessionId),
-    listStatementTransactions(companyId, sessionId),
+  const company = String(companyId);
+  const bankAccountId = String(session.bankAccountId);
+  const date = { gte: session.periodStart, lte: session.periodEnd };
+  const [bookGroups, statementGroups] = await Promise.all([
+    dbClient().bankTransaction.groupBy({
+      by: ['reconciliationStatus', 'type'],
+      where: { companyId: company, bankAccountId, date },
+      _sum: { amount: true },
+      _count: { _all: true },
+    }),
+    dbClient().bankStatementTransaction.groupBy({
+      by: ['matchStatus'],
+      where: { companyId: company, bankAccountId, reconciliationSessionId: String(sessionId) },
+      _sum: { debit: true, credit: true },
+      _count: { _all: true },
+    }),
   ]);
-  const unmatchedBook = bookTransactions.filter((tx) => tx.reconciliationStatus !== "reconciled");
-  const unmatchedStatements = statementTransactions.filter((tx) => tx.matchStatus !== "matched");
-  const outstandingDeposits = round(unmatchedBook.filter((tx) => tx.type === "debit" || tx.type === "deposit" || tx.type === "transfer_in").reduce((sum, tx) => sum + toNumber(tx.amount), 0));
-  const outstandingChecks = round(unmatchedBook.filter((tx) => tx.type === "credit" || tx.type === "withdrawal" || tx.type === "transfer_out").reduce((sum, tx) => sum + toNumber(tx.amount), 0));
-  const unrecordedBankCredits = round(unmatchedStatements.reduce((sum, tx) => sum + toNumber(tx.credit), 0));
-  const unrecordedBankCharges = round(unmatchedStatements.reduce((sum, tx) => sum + toNumber(tx.debit), 0));
+
+  let outstandingDeposits = 0;
+  let outstandingChecks = 0;
+  let bookTransactionCount = 0;
+  for (const group of bookGroups) {
+    bookTransactionCount += Number(group._count?._all || 0);
+    if (group.reconciliationStatus === 'reconciled') continue;
+    const amount = toNumber(group._sum?.amount);
+    if (['debit', 'deposit', 'transfer_in'].includes(String(group.type).toLowerCase())) outstandingDeposits += amount;
+    if (['credit', 'withdrawal', 'transfer_out'].includes(String(group.type).toLowerCase())) outstandingChecks += amount;
+  }
+
+  let unrecordedBankCredits = 0;
+  let unrecordedBankCharges = 0;
+  let statementTransactionCount = 0;
+  for (const group of statementGroups) {
+    statementTransactionCount += Number(group._count?._all || 0);
+    if (group.matchStatus === 'matched') continue;
+    unrecordedBankCredits += toNumber(group._sum?.credit);
+    unrecordedBankCharges += toNumber(group._sum?.debit);
+  }
+
+  outstandingDeposits = round(outstandingDeposits);
+  outstandingChecks = round(outstandingChecks);
+  unrecordedBankCredits = round(unrecordedBankCredits);
+  unrecordedBankCharges = round(unrecordedBankCharges);
   const adjustedBookBalance = round(toNumber(session.closingBookBalance) + unrecordedBankCredits - unrecordedBankCharges);
   const adjustedBankBalance = round(toNumber(session.closingStatementBalance) + outstandingDeposits - outstandingChecks);
   const difference = round(adjustedBookBalance - adjustedBankBalance);
@@ -330,8 +413,8 @@ async function calculateSummary(companyId, sessionId) {
     isBalanced: Math.abs(difference) < 0.01,
     difference,
     unrecordedBankItems: round(unrecordedBankCredits - unrecordedBankCharges),
-    bookTransactions,
-    statementTransactions,
+    bookTransactionCount,
+    statementTransactionCount,
   };
 }
 

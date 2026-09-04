@@ -13,6 +13,8 @@ const {
   reportUnboundedRead,
 } = require('../utils/prismaCompat');
 const { getCompanyId } = require('../utils/prismaTenant');
+const { getReadContext, runReadContext } = require('../lib/readContext');
+const { assertReadLimit, guardResultRows, recordQuerySafetyViolation } = require('../utils/querySafety');
 const { buildTenantModel, STANDARD_TENANT_FIELD_MAP } = require('../utils/masterDataCommon');
 const {
   productToApi,
@@ -197,8 +199,13 @@ function buildExprWhere(expr) {
 // $expr low-stock comparison), so it resolves the ambient transaction itself
 // via dbClient() — otherwise a read inside runInTransaction would miss rows the
 // same transaction just wrote.
-async function productCustomFind(filter, opts, { many = false } = {}) {
+async function productCustomFind(filter, opts, { many = false, readContext = getReadContext(), maxRows } = {}) {
   const { $expr, $or, $text, ...rest } = filter;
+  const readMaxRows = Math.max(1, Number(maxRows || readContext.maxRows || QUERY_MAX_ROWS));
+  const requestedLimit = opts.limit != null ? Number(opts.limit) : null;
+  if (requestedLimit != null && requestedLimit > 0) {
+    assertReadLimit(requestedLimit, readContext, { name: 'limit', maxRows: readMaxRows });
+  }
   const where = applyTenant(translateFilter(rest, FULL_FIELD_MAP), opts);
   if (where === IMPOSSIBLE) return many ? [] : null;
 
@@ -239,11 +246,9 @@ async function productCustomFind(filter, opts, { many = false } = {}) {
     // low_stock_threshold) — to get the matching, sorted, paginated ID page.
     // Then let Prisma's own client load + shape those rows (correct camelCase
     // fields, relations, decimals) exactly like every other query path.
-    const requestedLimit = opts.limit != null ? Number(opts.limit) : 50;
-    const explicitLimit = Math.max(
-      1,
-      Math.min(QUERY_MAX_ROWS, Number.isFinite(requestedLimit) && requestedLimit > 0 ? requestedLimit : 50),
-    );
+    const explicitLimit = Number.isFinite(requestedLimit) && requestedLimit > 0
+      ? requestedLimit
+      : null;
     const explicitSkip = Math.max(0, Number(opts.skip) || 0);
 
     const sortField = translateSort(opts.sort, FULL_FIELD_MAP);
@@ -267,9 +272,21 @@ async function productCustomFind(filter, opts, { many = false } = {}) {
       SELECT p.id FROM products p
       WHERE ${whereSql}
       ORDER BY p.${Prisma.raw(`"${safeOrderColumn}"`)} ${Prisma.raw(safeSortOrder)}
-      LIMIT ${explicitLimit} OFFSET ${explicitSkip}
+      LIMIT ${explicitLimit || readMaxRows + 1} OFFSET ${explicitSkip}
     `;
-    const pageIds = idRows.map((r) => r.id);
+    const pageIds = guardResultRows(idRows.map((r) => r.id), {
+      context: readContext,
+      maxRows: readMaxRows,
+      name: 'Product.customFind',
+      report: (rowCount, limit) => {
+        reportUnboundedRead(rowCount);
+        recordQuerySafetyViolation({
+          code: 'UNBOUNDED_READ',
+          operation: 'Product.customFind',
+          purpose: `${readContext.purpose}:max=${limit}`,
+        });
+      },
+    });
     if (pageIds.length === 0) return many ? [] : null;
 
     const rows = await dbClient().product.findMany({
@@ -283,9 +300,8 @@ async function productCustomFind(filter, opts, { many = false } = {}) {
     return many ? ordered : (ordered[0] || null);
   }
 
-  const requestedLimit = opts.limit != null ? Number(opts.limit) : null;
   const explicitLimit = Number.isFinite(requestedLimit) && requestedLimit > 0
-    ? Math.min(QUERY_MAX_ROWS, requestedLimit)
+    ? requestedLimit
     : null;
   const baseQuery = {
     where,
@@ -293,13 +309,22 @@ async function productCustomFind(filter, opts, { many = false } = {}) {
     skip: Math.max(0, Number(opts.skip) || 0) || undefined,
     ...productQueryShape(opts),
   };
-  let rows = await dbClient().product.findMany({
-    ...baseQuery,
-    take: explicitLimit || QUERY_MAX_ROWS + 1,
-  });
-  if (!explicitLimit && rows.length > QUERY_MAX_ROWS) {
+  const effectiveMaxRows = Math.max(1, Number(readContext.maxRows || QUERY_MAX_ROWS));
+  let rows = await runReadContext(
+    { ...readContext, internalProbe: !explicitLimit },
+    () => dbClient().product.findMany({
+      ...baseQuery,
+      take: explicitLimit || effectiveMaxRows + 1,
+    }),
+  );
+  if (!explicitLimit && rows.length > effectiveMaxRows) {
     reportUnboundedRead(rows.length);
-    rows = rows.slice(0, QUERY_MAX_ROWS);
+    recordQuerySafetyViolation({
+      code: 'UNBOUNDED_READ',
+      operation: 'Product.customFind',
+      purpose: `${readContext.purpose}:max=${effectiveMaxRows}`,
+    });
+    rows = rows.slice(0, effectiveMaxRows);
   }
 
   return many ? rows : (rows[0] || null);

@@ -3,12 +3,86 @@ const SalesOrder = require('../models/SalesOrder');
 const Product = require('../models/Product');
 const Warehouse = require('../models/Warehouse');
 const InventoryBatch = require('../models/InventoryBatch');
+const { emitDataChanged } = require('../lib/realtimeEvents');
 
 // Error codes
 const ERR_PICKPACK_NOT_FOUND = 'ERR_PICKPACK_NOT_FOUND';
 const ERR_INVALID_STATUS = 'ERR_INVALID_STATUS';
 const ERR_SALES_ORDER_NOT_FOUND = 'ERR_SALES_ORDER_NOT_FOUND';
 const ERR_INSUFFICIENT_STOCK = 'ERR_INSUFFICIENT_STOCK';
+
+const normalizeId = (value) => {
+  if (!value) return null;
+  if (typeof value === 'string' || typeof value === 'number') return String(value);
+  return String(value._id || value.id || value);
+};
+
+async function hydratePickPackRelations(docOrDocs) {
+  const items = Array.isArray(docOrDocs) ? docOrDocs : [docOrDocs];
+  const valid = items.filter(Boolean);
+  if (!valid.length) return docOrDocs;
+
+  const salesOrderIds = [...new Set(valid.map((item) => normalizeId(item.salesOrder)).filter(Boolean))];
+  const clientIds = [...new Set(valid.map((item) => normalizeId(item.client)).filter(Boolean))];
+  const warehouseIds = [...new Set(valid.map((item) => normalizeId(item.warehouse)).filter(Boolean))];
+  const assignedToIds = [...new Set(valid.map((item) => normalizeId(item.assignedTo)).filter(Boolean))];
+  const createdByIds = [...new Set(valid.map((item) => normalizeId(item.createdBy)).filter(Boolean))];
+  const productIds = [...new Set(valid.flatMap((item) => (item.lines || []).map((line) => normalizeId(line.product)).filter(Boolean)))];
+  const batchIds = [...new Set(valid.flatMap((item) => (item.lines || []).map((line) => normalizeId(line.batchId)).filter(Boolean)))];
+
+  const [salesOrders, clients, warehouses, assignedUsers, createdUsers, products, batches] = await Promise.all([
+    salesOrderIds.length ? SalesOrder.find({ _id: { $in: salesOrderIds } }, 'referenceNo status client lines deliveryAddress shippingMethod').lean() : [],
+    clientIds.length ? require('../models/Client').find({ _id: { $in: clientIds } }, 'name code address phone email').lean() : [],
+    warehouseIds.length ? require('../models/Warehouse').find({ _id: { $in: warehouseIds } }, 'name code address').lean() : [],
+    assignedToIds.length ? require('../models/User').find({ _id: { $in: assignedToIds } }, 'name email').lean() : [],
+    createdByIds.length ? require('../models/User').find({ _id: { $in: createdByIds } }, 'name email').lean() : [],
+    productIds.length ? Product.find({ _id: { $in: productIds } }, 'name sku unit barcode location').lean() : [],
+    batchIds.length ? InventoryBatch.find({ _id: { $in: batchIds } }, 'batchNo expiryDate').lean() : [],
+  ]);
+
+  const salesOrderMap = new Map(salesOrders.map((so) => [normalizeId(so._id), so]));
+  const clientMap = new Map(clients.map((c) => [normalizeId(c._id), c]));
+  const warehouseMap = new Map(warehouses.map((w) => [normalizeId(w._id), w]));
+  const assignedUserMap = new Map(assignedUsers.map((u) => [normalizeId(u._id), u]));
+  const createdUserMap = new Map(createdUsers.map((u) => [normalizeId(u._id), u]));
+  const productMap = new Map(products.map((p) => [normalizeId(p._id), p]));
+  const batchMap = new Map(batches.map((batch) => [normalizeId(batch._id), batch]));
+
+  for (const doc of valid) {
+    const salesOrderId = normalizeId(doc.salesOrder);
+    if (salesOrderId && salesOrderMap.has(salesOrderId)) doc.salesOrder = salesOrderMap.get(salesOrderId);
+    const clientId = normalizeId(doc.client);
+    if (clientId && clientMap.has(clientId)) doc.client = clientMap.get(clientId);
+    const warehouseId = normalizeId(doc.warehouse);
+    if (warehouseId && warehouseMap.has(warehouseId)) doc.warehouse = warehouseMap.get(warehouseId);
+    const assignedId = normalizeId(doc.assignedTo);
+    if (assignedId && assignedUserMap.has(assignedId)) doc.assignedTo = assignedUserMap.get(assignedId);
+    const createdById = normalizeId(doc.createdBy);
+    if (createdById && createdUserMap.has(createdById)) doc.createdBy = createdUserMap.get(createdById);
+    for (const line of doc.lines || []) {
+      const pid = normalizeId(line.product);
+      if (pid && productMap.has(pid)) line.product = productMap.get(pid);
+      if (line.warehouse) {
+        const wid = normalizeId(line.warehouse);
+        if (wid && warehouseMap.has(wid)) line.warehouse = warehouseMap.get(wid);
+      }
+      if (line.batchId) {
+        const batchId = normalizeId(line.batchId);
+        if (batchId && batchMap.has(batchId)) line.batchId = batchMap.get(batchId);
+      }
+      if (line.pickedBy) {
+        const pickedById = normalizeId(line.pickedBy);
+        if (pickedById && createdUserMap.has(pickedById)) line.pickedBy = createdUserMap.get(pickedById);
+      }
+      if (line.packedBy) {
+        const packedById = normalizeId(line.packedBy);
+        if (packedById && createdUserMap.has(packedById)) line.packedBy = createdUserMap.get(packedById);
+      }
+    }
+  }
+
+  return Array.isArray(docOrDocs) ? valid : valid[0];
+}
 
 // @desc    Get all pick & pack tasks
 // @route   GET /api/pick-packs
@@ -31,25 +105,23 @@ exports.getPickPacks = async (req, res, next) => {
     
     const [pickPacks, totalCount] = await Promise.all([
       PickPack.find(filter)
-        .populate('salesOrder', 'referenceNo status')
-        .populate('client', 'name code')
-        .populate('warehouse', 'name code')
-        .populate('assignedTo', 'name email')
-        .populate('lines.product', 'name sku')
+        .select({ salesOrder: 1, client: 1, warehouse: 1, assignedTo: 1, lines: 1, createdAt: 1, priority: 1, status: 1 })
         .sort({ priority: -1, createdAt: -1 })
         .skip(skip)
         .limit(parseInt(limit))
         .lean(),
       PickPack.countDocuments(filter)
     ]);
-    
+
+    const hydratedPickPacks = await hydratePickPackRelations(pickPacks);
+
     res.status(200).json({
       success: true,
-      count: pickPacks.length,
+      count: hydratedPickPacks.length,
       total: totalCount,
       page: parseInt(page),
       pages: Math.ceil(totalCount / parseInt(limit)),
-      data: pickPacks
+      data: hydratedPickPacks
     });
   } catch (error) {
     next(error);
@@ -64,29 +136,22 @@ exports.getPickPack = async (req, res, next) => {
     const companyId = req.user.company._id;
     
     const pickPack = await PickPack.findOne({ _id: req.params.id, company: companyId })
-      .populate('salesOrder', 'referenceNo status client lines deliveryAddress shippingMethod')
-      .populate('salesOrder.client', 'name code address phone')
-      .populate('client', 'name code address phone')
-      .populate('warehouse', 'name code address')
-      .populate('assignedTo', 'name email')
-      .populate('createdBy', 'name email')
-      .populate('lines.product', 'name sku unit barcode location')
-      .populate('lines.warehouse', 'name code')
-      .populate('lines.batchId', 'batchNo expiryDate')
-      .populate('lines.pickedBy', 'name')
-      .populate('lines.packedBy', 'name');
-    
-    if (!pickPack) {
+      .select({ salesOrder: 1, client: 1, warehouse: 1, assignedTo: 1, createdBy: 1, lines: 1, status: 1, priority: 1, notes: 1 })
+      .lean();
+
+    const hydratedPickPack = await hydratePickPackRelations(pickPack);
+
+    if (!hydratedPickPack) {
       return res.status(404).json({
         success: false,
         error: ERR_PICKPACK_NOT_FOUND,
         message: 'Pick & Pack task not found'
       });
     }
-    
+
     res.status(200).json({
       success: true,
-      data: pickPack
+      data: hydratedPickPack
     });
   } catch (error) {
     next(error);
@@ -103,8 +168,22 @@ exports.createPickPack = async (req, res, next) => {
     
     // Get sales order
     const salesOrder = await SalesOrder.findOne({ _id: salesOrderId, company: companyId })
-      .populate('lines.product')
-      .populate('client');
+      .select({ client: 1, lines: 1, status: 1, company: 1, referenceNo: 1 })
+      .lean();
+
+    if (salesOrder?.client) {
+      const clientDoc = await require('../models/Client').findById(salesOrder.client, 'name code address phone email').lean();
+      salesOrder.client = clientDoc;
+    }
+    if (Array.isArray(salesOrder?.lines)) {
+      const productIds = [...new Set(salesOrder.lines.map((line) => normalizeId(line.product)).filter(Boolean))];
+      const productRows = productIds.length ? await Product.find({ _id: { $in: productIds } }, 'name sku unit isStockable').lean() : [];
+      const productMap = new Map(productRows.map((product) => [normalizeId(product._id), product]));
+      salesOrder.lines = salesOrder.lines.map((line) => ({
+        ...line,
+        product: productMap.get(normalizeId(line.product)) || line.product,
+      }));
+    }
     
     if (!salesOrder) {
       return res.status(404).json({
@@ -190,7 +269,7 @@ exports.createPickPack = async (req, res, next) => {
     salesOrder.pickPackId = pickPack._id;
     await salesOrder.save();
 
-    await pickPack.populate('salesOrder client warehouse lines.product');
+    const hydratedPickPack = await hydratePickPackRelations(pickPack);
     
     res.status(201).json({
       success: true,
@@ -232,7 +311,7 @@ exports.assignPickPack = async (req, res, next) => {
     pickPack.assignedAt = new Date();
     await pickPack.save();
     
-    await pickPack.populate('assignedTo', 'name email');
+    const hydratedPickPack = await hydratePickPackRelations(pickPack);
     
     res.status(200).json({
       success: true,
@@ -269,10 +348,12 @@ exports.startPicking = async (req, res, next) => {
       });
     }
     
-    pickPack.status = 'picking';
-    pickPack.pickingStartedAt = new Date();
-    await pickPack.save();
+    const model = await PickPack.findOne({ _id: req.params.id, company: companyId });
+    model.status = 'picking';
+    model.pickingStartedAt = new Date();
+    await model.save();
     
+    emitDataChanged(companyId, 'pickPacks');
     res.status(200).json({
       success: true,
       message: 'Picking started',
@@ -291,8 +372,8 @@ exports.pickItems = async (req, res, next) => {
     const companyId = req.user.company._id;
     const { lineId, qtyPicked, serialNumbers, batchId, notes } = req.body;
     
-    const pickPack = await PickPack.findOne({ _id: req.params.id, company: companyId })
-      .populate('lines.product');
+    const pickPack = await PickPack.findOne({ _id: req.params.id, company: companyId }).select({ lines: 1, status: 1 }).lean();
+    const hydratedPickPack = await hydratePickPackRelations(pickPack);
     
     if (!pickPack) {
       return res.status(404).json({
@@ -302,7 +383,7 @@ exports.pickItems = async (req, res, next) => {
       });
     }
     
-    if (!['picking', 'draft'].includes(pickPack.status)) {
+    if (!['picking', 'draft'].includes(hydratedPickPack.status)) {
       return res.status(400).json({
         success: false,
         error: ERR_INVALID_STATUS,
@@ -515,11 +596,8 @@ exports.completePacking = async (req, res, next) => {
     const companyId = req.user.company._id;
     const { packageCount, packageType, totalWeight, trackingNumber } = req.body;
     
-    const pickPack = await PickPack.findOne({ _id: req.params.id, company: companyId })
-      .populate('salesOrder')
-      .populate('client')
-      .populate('warehouse')
-      .populate('lines.product');
+    const pickPack = await PickPack.findOne({ _id: req.params.id, company: companyId }).select({ salesOrder: 1, client: 1, warehouse: 1, lines: 1, status: 1, notes: 1 }).lean();
+    const hydratedPickPack = await hydratePickPackRelations(pickPack);
     
     if (!pickPack) {
       return res.status(404).json({
@@ -538,7 +616,7 @@ exports.completePacking = async (req, res, next) => {
     }
     
     // Check if all lines are packed
-    const notFullyPacked = pickPack.lines.filter(line => line.qtyPacked < line.qtyToPick);
+    const notFullyPacked = hydratedPickPack.lines.filter(line => line.qtyPacked < line.qtyToPick);
     if (notFullyPacked.length > 0) {
       return res.status(400).json({
         success: false,
@@ -733,12 +811,8 @@ exports.getMyTasks = async (req, res, next) => {
       company: companyId,
       assignedTo: userId,
       status: { $nin: ['cancelled', 'ready_for_delivery'] }
-    })
-      .populate('salesOrder', 'referenceNo')
-      .populate('client', 'name code')
-      .populate('warehouse', 'name code')
-      .populate('lines.product', 'name sku')
-      .sort({ priority: -1, createdAt: -1 });
+    }).select({ salesOrder: 1, client: 1, warehouse: 1, lines: 1, priority: 1, createdAt: 1 }).sort({ priority: -1, createdAt: -1 }).lean();
+    const hydratedPickPacks = await hydratePickPackRelations(pickPacks);
     
     res.status(200).json({
       success: true,
@@ -760,12 +834,8 @@ exports.getPendingPick = async (req, res, next) => {
     const pickPacks = await PickPack.find({
       company: companyId,
       status: { $in: ['draft', 'picking'] }
-    })
-      .populate('salesOrder', 'referenceNo expectedDate')
-      .populate('client', 'name code')
-      .populate('warehouse', 'name code')
-      .populate('assignedTo', 'name email')
-      .sort({ priority: -1, 'salesOrder.expectedDate': 1 });
+    }).select({ salesOrder: 1, client: 1, warehouse: 1, assignedTo: 1, priority: 1 }).sort({ priority: -1 }).lean();
+    const hydratedPickPacks = await hydratePickPackRelations(pickPacks);
     
     res.status(200).json({
       success: true,
@@ -787,12 +857,8 @@ exports.getPendingPack = async (req, res, next) => {
     const pickPacks = await PickPack.find({
       company: companyId,
       status: { $in: ['picked', 'packed'] }
-    })
-      .populate('salesOrder', 'referenceNo expectedDate')
-      .populate('client', 'name code')
-      .populate('warehouse', 'name code')
-      .populate('assignedTo', 'name email')
-      .sort({ priority: -1, 'salesOrder.expectedDate': 1 });
+    }).select({ salesOrder: 1, client: 1, warehouse: 1, assignedTo: 1, priority: 1 }).sort({ priority: -1 }).lean();
+    const hydratedPickPacks = await hydratePickPackRelations(pickPacks);
     
     res.status(200).json({
       success: true,
@@ -837,6 +903,7 @@ exports.cancelPickPack = async (req, res, next) => {
     
     await pickPack.save();
     
+    emitDataChanged(companyId, 'pickPacks');
     res.status(200).json({
       success: true,
       message: 'Pick & Pack task cancelled successfully',

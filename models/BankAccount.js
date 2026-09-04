@@ -4,10 +4,9 @@
  * BankReconciliation (legacy export pattern preserved).
  */
 
-const mongoose = require('mongoose');
 const { prisma, dbClient } = require('../lib/prisma');
 const { makeCompatModel } = require('../utils/prismaCompat');
-const { STANDARD_TENANT_FIELD_MAP, registerBareSchema } = require('../utils/masterDataCommon');
+const { STANDARD_TENANT_FIELD_MAP } = require('../utils/masterDataCommon');
 const {
   setBankTransactionRef,
   attachBankAccountStatics,
@@ -108,12 +107,6 @@ const BANK_RECONCILIATION_FIELD_MAP = {
   startedBy: { target: 'startedById', isId: true },
   completedBy: { target: 'completedById', isId: true },
 };
-
-registerBareSchema('BankAccount', 'bankaccounts');
-registerBareSchema('BankTransaction', 'banktransactions');
-registerBareSchema('BankStatementLine', 'bankstatementlines');
-registerBareSchema('BankReconciliationMatch', 'bankreconciliationmatches');
-registerBareSchema('BankReconciliation', 'bankreconciliations');
 
 function wrapStatementLineDoc(apiDoc) {
   if (!apiDoc || apiDoc.__mutable) return apiDoc;
@@ -256,19 +249,6 @@ const BankReconciliation = makeCompatModel({
 });
 
 attachBankAccountStatics(BankAccount);
-
-if (!mongoose.models.BankTransaction) {
-  mongoose.model('BankTransaction', new mongoose.Schema({}, { strict: false, collection: 'banktransactions' }));
-}
-if (!mongoose.models.BankStatementLine) {
-  mongoose.model('BankStatementLine', new mongoose.Schema({}, { strict: false, collection: 'bankstatementlines' }));
-}
-if (!mongoose.models.BankReconciliationMatch) {
-  mongoose.model('BankReconciliationMatch', new mongoose.Schema({}, { strict: false, collection: 'bankreconciliationmatches' }));
-}
-if (!mongoose.models.BankReconciliation) {
-  mongoose.model('BankReconciliation', new mongoose.Schema({}, { strict: false, collection: 'bankreconciliations' }));
-}
 
 module.exports = BankAccount;
 module.exports.BankAccount = BankAccount;

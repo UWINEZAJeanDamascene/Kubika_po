@@ -5,6 +5,7 @@ const { parsePagination, paginationMeta } = require('../utils/pagination');
 const emailService = require('../services/emailService');
 const Company = require('../models/Company');
 const Supplier = require('../models/Supplier');
+const { emitDataChanged } = require('../lib/realtimeEvents');
 
 const sendPOEmail = async (po, action, companyId) => {
   try {
@@ -85,6 +86,7 @@ exports.approvePurchaseOrder = async (req, res, next) => {
     po.approvedBy = userId;
     po.approvedAt = new Date();
     await po.save();
+    emitDataChanged(companyId, 'purchaseOrders');
 
     // Send email notification for approved PO
     const sendEmailOnApprove = req.body.sendEmail || false;
@@ -196,6 +198,7 @@ exports.cancelPurchaseOrder = async (req, res, next) => {
       sendPOEmail(po, 'cancelled', companyId);
     }
 
+    emitDataChanged(companyId, 'purchaseOrders');
     res.json({ success: true, data: po });
   } catch (err) { next(err); }
 };
@@ -219,8 +222,10 @@ exports.getPurchaseOrders = async (req, res, next) => {
     const total = await PurchaseOrder.countDocuments(q);
     const list = await PurchaseOrder.find(q)
       .populate('supplier', 'name code contact email')
-      .populate('lines.product', 'name sku unit')
-      .sort({ orderDate: -1 })
+      .populate('warehouse', 'name code')
+      .populate('-lines')
+      .select({ supplier: 1, warehouse: 1, referenceNo: 1, orderDate: 1, expectedDeliveryDate: 1, status: 1, source: 1, currencyCode: 1, exchangeRate: 1, subtotal: 1, taxAmount: 1, totalAmount: 1, amountPaid: 1, balance: 1, paymentStatus: 1, freight: 1, ebm: 1, notes: 1, approvedBy: 1, approvedAt: 1, createdBy: 1, createdAt: 1, updatedAt: 1 })
+      .sort({ orderDate: -1, _id: -1 })
       .skip(skip)
       .limit(limit);
 
@@ -228,6 +233,7 @@ exports.getPurchaseOrders = async (req, res, next) => {
     const data = list.map(po => {
       const obj = po.toObject ? po.toObject() : { ...po };
       const lines = Array.isArray(obj.lines) ? obj.lines : [];
+      const lineCount = Number(obj._count?.lines || obj.linesCount || lines.length);
       // Backfill: compute totals on the fly if they're zero but lines exist
       if (lines.length > 0 && (!obj.totalAmount || Number(obj.totalAmount) === 0)) {
         let subtotal = 0;
@@ -247,7 +253,7 @@ exports.getPurchaseOrders = async (req, res, next) => {
           obj.balance = Math.max(0, obj.totalAmount - (Number(obj.amountPaid) || 0));
         }
       }
-      obj.linesCount = obj.linesCount ?? lines.length;
+      obj.linesCount = lineCount;
       return obj;
     });
 

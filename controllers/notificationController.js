@@ -4,7 +4,7 @@ const smsService = require('../services/smsService');
 const emailService = require('../services/emailService');
 const Invoice = require('../models/Invoice');
 const Company = require('../models/Company');
-const { isMongoConnected } = require('../utils/mongoConnection');
+const { parseBoundedPage } = require('../utils/querySafety');
 
 function getRequestUserId(req) {
   return req.user?._id || req.user?.id;
@@ -21,19 +21,6 @@ function sendMissingContext(res) {
   });
 }
 
-function mongoUnavailableResponse(res, page = 1, limit = 20) {
-  return res.json({
-    success: true,
-    data: [],
-    pagination: {
-      page: parseInt(page, 10),
-      limit: parseInt(limit, 10),
-      total: 0,
-      pages: 0,
-    },
-    unreadCount: 0,
-  });
-}
 
 // @desc    Get all notifications for user
 // @route   GET /api/notifications
@@ -42,7 +29,8 @@ exports.getNotifications = async (req, res, next) => {
   try {
     const companyId = getRequestCompanyId(req);
     const userId = getRequestUserId(req);
-    const { page = 1, limit = 20, unreadOnly } = req.query;
+    const { page, limit } = parseBoundedPage(req.query, { defaultLimit: 20, maxLimit: 100 });
+    const { unreadOnly } = req.query;
 
     if (!userId) {
       return sendMissingContext(res);
@@ -53,8 +41,8 @@ exports.getNotifications = async (req, res, next) => {
         success: true,
         data: [],
         pagination: {
-          page: parseInt(page),
-          limit: parseInt(limit),
+          page,
+          limit,
           total: 0,
           pages: 0
         },
@@ -62,10 +50,6 @@ exports.getNotifications = async (req, res, next) => {
       });
     }
 
-    if (!isMongoConnected()) {
-      return mongoUnavailableResponse(res, page, limit);
-    }
-    
     const query = {
       company: companyId,
       user: userId
@@ -76,9 +60,9 @@ exports.getNotifications = async (req, res, next) => {
     }
     
     const notifications = await Notification.find(query)
-      .sort({ createdAt: -1 })
-      .limit(parseInt(limit))
-      .skip((parseInt(page) - 1) * parseInt(limit));
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(limit)
+      .skip((page - 1) * limit);
     
     const total = await Notification.countDocuments(query);
     const unreadCount = await Notification.countDocuments({
@@ -91,10 +75,10 @@ exports.getNotifications = async (req, res, next) => {
       success: true,
       data: notifications,
       pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
+        page,
+        limit,
         total,
-        pages: Math.ceil(total / parseInt(limit))
+        pages: Math.ceil(total / limit)
       },
       unreadCount
     });
@@ -122,10 +106,6 @@ exports.getUnreadCount = async (req, res, next) => {
       });
     }
 
-    if (!isMongoConnected()) {
-      return res.json({ success: true, count: 0 });
-    }
-    
     const count = await Notification.countDocuments({
       company: companyId,
       user: userId,
@@ -146,19 +126,13 @@ exports.getUnreadCount = async (req, res, next) => {
 // @access  Private
 exports.markAsRead = async (req, res, next) => {
   try {
+    const companyId = getRequestCompanyId(req);
     const userId = getRequestUserId(req);
-    if (!userId) {
+    if (!companyId || !userId) {
       return sendMissingContext(res);
     }
 
-    if (!isMongoConnected()) {
-      return res.status(503).json({
-        success: false,
-        message: 'Notifications are temporarily unavailable',
-      });
-    }
-
-    const notification = await Notification.findById(req.params.id);
+    const notification = await Notification.findOne({ _id: req.params.id, company: companyId, user: userId });
     
     if (!notification) {
       return res.status(404).json({
@@ -200,10 +174,6 @@ exports.markAllAsRead = async (req, res, next) => {
       return sendMissingContext(res);
     }
 
-    if (!isMongoConnected()) {
-      return res.json({ success: true, message: 'All notifications marked as read' });
-    }
-    
     await Notification.updateMany(
       { company: companyId, user: userId, isRead: false },
       { isRead: true, readAt: new Date() }
@@ -223,19 +193,13 @@ exports.markAllAsRead = async (req, res, next) => {
 // @access  Private
 exports.deleteNotification = async (req, res, next) => {
   try {
+    const companyId = getRequestCompanyId(req);
     const userId = getRequestUserId(req);
-    if (!userId) {
+    if (!companyId || !userId) {
       return sendMissingContext(res);
     }
 
-    if (!isMongoConnected()) {
-      return res.status(503).json({
-        success: false,
-        message: 'Notifications are temporarily unavailable',
-      });
-    }
-
-    const notification = await Notification.findById(req.params.id);
+    const notification = await Notification.findOne({ _id: req.params.id, company: companyId, user: userId });
     
     if (!notification) {
       return res.status(404).json({
@@ -275,27 +239,6 @@ exports.getSettings = async (req, res, next) => {
       return sendMissingContext(res);
     }
 
-    if (!isMongoConnected()) {
-      return res.json({
-        success: true,
-        data: {
-          emailNotifications: {
-            enabled: true,
-            invoiceDelivery: false,
-            paymentReminders: true,
-            lowStockAlerts: true,
-            dailySummary: false,
-            weeklySummary: true,
-          },
-          smsNotifications: {
-            enabled: false,
-            criticalOnly: true,
-            adminPhones: [],
-          },
-        },
-      });
-    }
-    
     let settings = await NotificationSettings.findOne({ company: companyId });
     
     if (!settings) {
@@ -336,13 +279,6 @@ exports.updateSettings = async (req, res, next) => {
 
     if (!companyId) {
       return sendMissingContext(res);
-    }
-
-    if (!isMongoConnected()) {
-      return res.status(503).json({
-        success: false,
-        message: 'Notification settings are temporarily unavailable',
-      });
     }
 
     const {

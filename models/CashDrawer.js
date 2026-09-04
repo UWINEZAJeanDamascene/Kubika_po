@@ -1,33 +1,51 @@
-const mongoose = require('mongoose');
-const ebmSubmissionSchema = require('./schemas/ebmSubmissionSchema');
+'use strict';
 
-const cashTransactionSchema = new mongoose.Schema({
-  type: { type: String, enum: ['sale', 'refund', 'cash_in', 'cash_out'], required: true },
-  amount: { type: Number, required: true, min: 0 },
-  paymentMethod: { type: String, enum: ['cash', 'card', 'mobile_money', 'other'], default: 'cash' },
-  reference: String,
-  notes: String,
-  recordedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-  timestamp: { type: Date, default: Date.now },
-  ebm: { type: ebmSubmissionSchema, default: () => ({}) }
+const { buildTenantModel } = require('../utils/masterDataCommon');
+const { generateObjectId, toIdString } = require('../utils/objectId');
+const { decimalToNumber } = require('../utils/decimalHelpers');
+
+const map = { company: 'companyId', drawerId: 'drawerId', status: 'status', openedBy: 'openedBy', openedAt: 'openedAt', closedBy: 'closedBy', closedAt: 'closedAt', openingBalance: 'openingBalance', closingBalance: 'closingBalance', transactions: 'transactions', notes: 'notes' };
+const FIELD_MAP = { _id: { target: 'id', isId: true }, id: { target: 'id', isId: true } };
+for (const [source, target] of Object.entries(map)) FIELD_MAP[source] = { target, isId: /By$/.test(target) || target === 'companyId' };
+
+function toApi(row) {
+  if (!row) return null;
+  const result = { _id: row.id };
+  for (const [source, target] of Object.entries(map)) result[source] = row[target];
+  result.openingBalance = decimalToNumber(row.openingBalance, 0);
+  result.closingBalance = decimalToNumber(row.closingBalance, 0);
+  result.transactions = row.transactions || [];
+  result.createdAt = row.createdAt;
+  result.updatedAt = row.updatedAt;
+  return result;
+}
+
+function translateCreate(data = {}) {
+  const result = { id: toIdString(data._id || data.id) || generateObjectId() };
+  for (const [source, target] of Object.entries(map)) {
+    if (data[source] !== undefined) result[target] = /By$/.test(target) || target === 'companyId' ? (data[source] ? toIdString(data[source]) : null) : data[source];
+  }
+  return result;
+}
+
+function translateUpdate(update = {}) {
+  const sourceData = update.$set ? { ...update, ...update.$set } : { ...update };
+  delete sourceData.$set;
+  delete sourceData.$unset;
+  const result = {};
+  for (const [source, target] of Object.entries(map)) {
+    if (sourceData[source] !== undefined) result[target] = /By$/.test(target) || target === 'companyId' ? (sourceData[source] ? toIdString(sourceData[source]) : null) : sourceData[source];
+  }
+  return result;
+}
+
+module.exports = buildTenantModel({
+  name: 'CashDrawer',
+  collection: 'cash_drawers',
+  delegateName: 'cashDrawer',
+  fieldMap: FIELD_MAP,
+  toApi,
+  translateCreate,
+  translateUpdate,
+  mutable: true,
 });
-
-const cashDrawerSchema = new mongoose.Schema({
-  company: { type: mongoose.Schema.Types.ObjectId, ref: 'Company', required: true },
-  drawerId: { type: String, required: true },
-  status: { type: String, enum: ['open', 'closed'], default: 'closed' },
-  openedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-  openedAt: Date,
-  closedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-  closedAt: Date,
-  openingBalance: { type: Number, default: 0 },
-  closingBalance: { type: Number, default: 0 },
-  transactions: [cashTransactionSchema],
-  notes: String
-}, {
-  timestamps: true
-});
-
-cashDrawerSchema.index({ company: 1, drawerId: 1 }, { unique: true });
-
-module.exports = mongoose.model('CashDrawer', cashDrawerSchema);

@@ -11,6 +11,7 @@ const { runInTransaction } = require('../services/transactionService');
 const EBMStockService = require('../services/ebmStockService');
 const OpeningStockService = require('../services/openingStockService');
 const inventoryService = require('../services/inventoryService');
+const { parseBoundedPage } = require('../utils/querySafety');
 
 const STOCK_LEVEL_SORT_COLUMNS = {
   productName: 'p.name',
@@ -37,7 +38,7 @@ async function getActiveWarehouseOptions(companyId) {
   const warehouses = await Warehouse.find({ company: companyId, isActive: true })
     .select('name _id')
     .sort({ isDefault: -1, name: 1 })
-    .limit(1000)
+    .limit(100)
     .lean();
   const options = warehouses.map((warehouse) => ({
     _id: warehouse._id,
@@ -53,9 +54,8 @@ async function getActiveWarehouseOptions(companyId) {
 exports.getStockMovements = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
+    const { page, limit } = parseBoundedPage(req.query, { defaultLimit: 20, maxLimit: 100 });
     const {
-      page = 1,
-      limit = 20,
       type,
       reason,
       productId,
@@ -102,7 +102,7 @@ exports.getStockMovements = async (req, res, next) => {
     // classic case for keyset pagination — but page/limit keeps working
     // unchanged for every existing caller.
     if (wantsCursor(req.query)) {
-      const pageSize = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 100);
+      const pageSize = limit;
       const cursorQuery = { ...query, ...cursorFilter(req.query.cursor, 'desc') };
 
       // limit + 1 probes for a further page without counting the whole table —
@@ -123,8 +123,8 @@ exports.getStockMovements = async (req, res, next) => {
       .select(STOCK_MOVEMENT_LIST_SELECT)
       .populate('product', 'name sku unit')
       .populate('warehouse', 'name code')
-      .sort({ movementDate: -1 })
-      .limit(limit * 1)
+      .sort({ movementDate: -1, _id: -1 })
+      .limit(limit)
       .skip((page - 1) * limit);
 
     res.json({
@@ -487,14 +487,14 @@ exports.getProductStockMovements = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const { productId } = req.params;
-    const { page = 1, limit = 20 } = req.query;
+    const { page, limit } = parseBoundedPage(req.query, { defaultLimit: 20, maxLimit: 100 });
 
     const total = await StockMovement.countDocuments({ product: productId, company: companyId });
     const movements = await StockMovement.find({ product: productId, company: companyId })
       .populate('supplier', 'name code')
       .populate('performedBy', 'name email')
-      .sort({ movementDate: -1 })
-      .limit(limit * 1)
+      .sort({ movementDate: -1, _id: -1 })
+      .limit(limit)
       .skip((page - 1) * limit);
 
     res.json({
@@ -515,47 +515,48 @@ exports.getProductStockMovements = async (req, res, next) => {
 // @access  Private
 exports.getStockSummary = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
-    const products = await Product.find({ isArchived: false, company: companyId })
-      .populate('category', 'name');
+    const companyId = String(req.user.company._id);
+    const [summaryRows, categoryRows] = await Promise.all([
+      dbClient().$queryRaw`
+        SELECT
+          COUNT(*)::int AS "totalProducts",
+          COALESCE(SUM(p.current_stock * p.average_cost), 0)::double precision AS "totalStockValue",
+          COUNT(*) FILTER (WHERE p.current_stock > 0 AND p.current_stock <= p.low_stock_threshold)::int AS "lowStockProducts",
+          COUNT(*) FILTER (WHERE p.current_stock = 0)::int AS "outOfStockProducts"
+        FROM products p
+        WHERE p.company_id = ${companyId} AND p.is_archived = false
+      `,
+      dbClient().$queryRaw`
+        SELECT
+          COALESCE(c.name, 'Uncategorized') AS category,
+          COUNT(*)::int AS count,
+          COALESCE(SUM(p.current_stock * p.average_cost), 0)::double precision AS "totalValue",
+          COALESCE(SUM(p.current_stock), 0)::double precision AS "totalQuantity"
+        FROM products p
+        LEFT JOIN categories c
+          ON c.id = p.category_id AND c.company_id = p.company_id
+        WHERE p.company_id = ${companyId} AND p.is_archived = false
+        GROUP BY COALESCE(c.name, 'Uncategorized')
+        ORDER BY "totalValue" DESC, category ASC
+      `,
+    ]);
 
-    const totalProducts = products.length;
-    const totalStockValue = products.reduce(
-      (sum, product) => sum + (product.currentStock * product.averageCost),
-      0
-    );
-    const lowStockProducts = products.filter(
-      product => product.currentStock <= product.lowStockThreshold
-    ).length;
-    const outOfStockProducts = products.filter(
-      product => product.currentStock === 0
-    ).length;
-
-    // Stock by category
-    const stockByCategory = products.reduce((acc, product) => {
-      const categoryName = product.category?.name || 'Uncategorized';
-      if (!acc[categoryName]) {
-        acc[categoryName] = {
-          count: 0,
-          totalValue: 0,
-          totalQuantity: 0
-        };
-      }
-      acc[categoryName].count += 1;
-      acc[categoryName].totalValue += product.currentStock * product.averageCost;
-      acc[categoryName].totalQuantity += product.currentStock;
-      return acc;
-    }, {});
+    const summary = summaryRows[0] || {};
+    const stockByCategory = Object.fromEntries(categoryRows.map((row) => [String(row.category), {
+      count: Number(row.count || 0),
+      totalValue: Number(row.totalValue || 0),
+      totalQuantity: Number(row.totalQuantity || 0),
+    }]));
 
     res.json({
       success: true,
       data: {
-        totalProducts,
-        totalStockValue,
-        lowStockProducts,
-        outOfStockProducts,
-        stockByCategory
-      }
+        totalProducts: Number(summary.totalProducts || 0),
+        totalStockValue: Number(summary.totalStockValue || 0),
+        lowStockProducts: Number(summary.lowStockProducts || 0),
+        outOfStockProducts: Number(summary.outOfStockProducts || 0),
+        stockByCategory,
+      },
     });
   } catch (error) {
     next(error);

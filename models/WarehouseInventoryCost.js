@@ -1,27 +1,69 @@
-const mongoose = require('mongoose');
+'use strict';
 
-const warehouseInventoryCostSchema = new mongoose.Schema({
-  company: { type: mongoose.Schema.Types.ObjectId, ref: 'Company', required: true },
-  warehouse: { type: mongoose.Schema.Types.ObjectId, ref: 'Warehouse', required: true },
-  product: { type: mongoose.Schema.Types.ObjectId, ref: 'Product', required: true },
-  totalQty: { type: mongoose.Schema.Types.Decimal128, default: mongoose.Types.Decimal128.fromString('0') },
-  totalValue: { type: mongoose.Schema.Types.Decimal128, default: mongoose.Types.Decimal128.fromString('0') }
-}, { timestamps: true });
+const { buildTenantModel } = require('../utils/masterDataCommon');
+const { generateObjectId, toIdString } = require('../utils/objectId');
+const { decimalToNumber } = require('../utils/decimalHelpers');
 
-warehouseInventoryCostSchema.index({ company: 1, warehouse: 1, product: 1 }, { unique: true });
-
-warehouseInventoryCostSchema.methods.getAvgCost = function() {
-  const qty = Number(this.totalQty ? this.totalQty.toString() : 0);
-  const val = Number(this.totalValue ? this.totalValue.toString() : 0);
-  return qty > 0 ? val / qty : 0;
+const FIELD_MAP = {
+  _id: { target: 'id', isId: true },
+  company: { target: 'companyId', isId: true },
+  warehouse: { target: 'warehouseId', isId: true },
+  product: { target: 'productId', isId: true },
+  totalQty: { target: 'totalQty' },
+  totalValue: { target: 'totalValue' },
 };
 
-warehouseInventoryCostSchema.set('toJSON', {
-  transform: (doc, ret) => {
-    if (ret.totalQty && ret.totalQty.toString) ret.totalQty = parseFloat(ret.totalQty.toString());
-    if (ret.totalValue && ret.totalValue.toString) ret.totalValue = ret.totalValue.toString();
-    return ret;
-  }
-});
+function toApi(row) {
+  if (!row) return null;
+  return {
+    _id: row.id,
+    company: row.companyId,
+    warehouse: row.warehouseId,
+    product: row.productId,
+    totalQty: decimalToNumber(row.totalQty, 0),
+    totalValue: decimalToNumber(row.totalValue, 0),
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
 
-module.exports = mongoose.model('WarehouseInventoryCost', warehouseInventoryCostSchema);
+function translateCreate(data = {}) {
+  return {
+    id: toIdString(data._id || data.id) || generateObjectId(),
+    companyId: toIdString(data.company),
+    warehouseId: toIdString(data.warehouse),
+    productId: toIdString(data.product),
+    totalQty: data.totalQty ?? 0,
+    totalValue: data.totalValue ?? 0,
+  };
+}
+
+function translateUpdate(update = {}) {
+  const source = update.$set ? { ...update, ...update.$set } : { ...update };
+  delete source.$set;
+  delete source.$inc;
+  delete source.$unset;
+  const data = {};
+  for (const [sourceKey, target] of [['company', 'companyId'], ['warehouse', 'warehouseId'], ['product', 'productId'], ['totalQty', 'totalQty'], ['totalValue', 'totalValue']]) {
+    if (source[sourceKey] !== undefined) data[target] = ['companyId', 'warehouseId', 'productId'].includes(target) ? toIdString(source[sourceKey]) : source[sourceKey];
+  }
+  return data;
+}
+
+module.exports = buildTenantModel({
+  name: 'WarehouseInventoryCost',
+  collection: 'warehouse_inventory_costs',
+  delegateName: 'warehouseInventoryCost',
+  fieldMap: FIELD_MAP,
+  toApi,
+  translateCreate,
+  translateUpdate,
+  mutable: true,
+  instanceMethods: {
+    getAvgCost() {
+      const qty = Number(this.totalQty || 0);
+      const value = Number(this.totalValue || 0);
+      return qty > 0 ? value / qty : 0;
+    },
+  },
+});

@@ -39,6 +39,16 @@ const AuditLog = require('../models/AuditLog');
 const AccountingPeriod = require('../models/AccountingPeriod');
 const Notification = require('../models/Notification');
 const SalesOrder = require('../models/SalesOrder');
+const { dbClient } = require('../lib/prisma');
+
+const AI_MAX_LIST_ROWS = Math.min(500, Math.max(20, Number(process.env.AI_MAX_LIST_ROWS || 100)));
+const AI_MAX_SUMMARY_ROWS = Math.max(AI_MAX_LIST_ROWS, Number(process.env.AI_MAX_SUMMARY_ROWS || 5000));
+
+function safeAiLimit(value, fallback = 20) {
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) return Math.min(fallback, AI_MAX_LIST_ROWS);
+  return Math.min(parsed, AI_MAX_LIST_ROWS);
+}
 
 const MODULE_CATALOG = [
   { group: 'Command', modules: ['Dashboards', 'Inventory dashboard', 'Sales dashboard', 'Purchase dashboard', 'Finance dashboard'], tools: ['get_dashboard_metrics'] },
@@ -116,6 +126,18 @@ function dateFilter(start, end) {
   return Object.keys(q).length ? q : undefined;
 }
 
+function addDatePredicates(clauses, params, column, start, end) {
+  const range = dateFilter(start, end);
+  if (range?.$gte) {
+    params.push(range.$gte);
+    clauses.push(`${column} >= $${params.length}`);
+  }
+  if (range?.$lte) {
+    params.push(range.$lte);
+    clauses.push(`${column} <= $${params.length}`);
+  }
+}
+
 async function getCompanyInfo(companyId) {
   const company = await Company.findById(companyId).lean();
   if (!company) return { error: 'Company not found' };
@@ -137,7 +159,8 @@ async function getProducts(companyId, opts = {}) {
   if (search) q.name = { $regex: search, $options: 'i' };
   if (lowStock) q.$expr = { $lte: ['$currentStock', '$lowStockThreshold'] };
   if (outOfStock) q.currentStock = 0;
-  const products = await Product.find(q).lean().limit(Number(limit));
+  const boundedLimit = safeAiLimit(limit, 50);
+  const products = await Product.find(q).lean().limit(boundedLimit);
   const totalValue = products.reduce((s, p) => s + ((p.currentStock || 0) * (p.averageCost || 0)), 0);
   return {
     count: products.length, totalValue,
@@ -157,14 +180,23 @@ async function getInvoices(companyId, opts = {}) {
   if (status) q.status = status;
   const df = dateFilter(startDate, endDate);
   if (df) q.invoiceDate = df;
-  const invoices = await Invoice.find(q).sort({ invoiceDate: -1 }).limit(Number(limit)).populate('client', 'name').lean();
-  const stats = await Invoice.aggregate([
-    { $match: { company: companyId._id || companyId } },
-    { $group: { _id: '$status', count: { $sum: 1 }, total: { $sum: '$total' } } },
-  ]);
+  const boundedLimit = safeAiLimit(limit);
+  const invoices = await Invoice.find(q).sort({ invoiceDate: -1 }).limit(boundedLimit).populate('client', 'name').lean();
+  const stats = await dbClient().invoice.groupBy({
+    by: ['status'],
+    where: { companyId: String(companyId), ...(df ? { invoiceDate: df } : {}) },
+    _count: { _all: true },
+    _sum: { totalAmount: true },
+  });
   return {
     count: invoices.length,
-    stats: stats.reduce((a, s) => { a[s._id] = { count: s.count, total: s.total }; return a; }, {}),
+    stats: stats.reduce((acc, entry) => {
+      acc[entry.status] = {
+        count: Number(entry._count?._all || 0),
+        total: Number(entry._sum?.totalAmount || 0),
+      };
+      return acc;
+    }, {}),
     invoices: invoices.map(i => ({
       id: i._id.toString(), invoiceNumber: i.invoiceNumber,
       customerName: i.client?.name || i.customerName || 'Unknown',
@@ -181,7 +213,7 @@ async function getPurchases(companyId, opts = {}) {
   if (status) q.status = status;
   const df = dateFilter(startDate, endDate);
   if (df) q.createdAt = df;
-  const purchases = await Purchase.find(q).sort({ createdAt: -1 }).limit(Number(limit)).lean();
+  const purchases = await Purchase.find(q).sort({ createdAt: -1 }).limit(safeAiLimit(limit)).lean();
   return {
     count: purchases.length,
     purchases: purchases.map(p => ({
@@ -196,13 +228,14 @@ async function getClients(companyId, opts = {}) {
   const { limit = 50, search = '' } = opts;
   const q = { company: companyId };
   if (search) q.name = { $regex: search, $options: 'i' };
-  const clients = await Client.find(q).limit(Number(limit)).lean();
-  const outstanding = await Invoice.aggregate([
-    { $match: { company: companyId._id || companyId, status: { $in: ['confirmed', 'partial'] } } },
-    { $group: { _id: null, total: { $sum: { $subtract: ['$total', '$amountPaid'] } } } },
-  ]);
+  const boundedLimit = safeAiLimit(limit, 50);
+  const clients = await Client.find(q).limit(boundedLimit).lean();
+  const outstanding = await dbClient().invoice.aggregate({
+    where: { companyId: String(companyId), status: { in: ['confirmed', 'partial'] } },
+    _sum: { amountOutstanding: true },
+  });
   return {
-    count: clients.length, totalOutstanding: outstanding[0]?.total || 0,
+    count: clients.length, totalOutstanding: Number(outstanding._sum?.amountOutstanding || 0),
     clients: clients.map(c => ({
       id: c._id.toString(), name: c.name, type: c.type || 'Individual',
       phone: c.phone, email: c.email, isActive: c.isActive !== false,
@@ -216,15 +249,17 @@ async function getExpenses(companyId, opts = {}) {
   if (type) q.type = type;
   const df = dateFilter(startDate, endDate);
   if (df) q.expenseDate = df;
-  const expenses = await Expense.find(q).sort({ expenseDate: -1 }).limit(Number(limit)).lean();
-  const byType = await Expense.aggregate([
-    { $match: { company: companyId._id || companyId } },
-    { $group: { _id: '$type', total: { $sum: '$amount' } } },
-    { $sort: { total: -1 } },
-  ]);
+  const boundedLimit = safeAiLimit(limit);
+  const expenses = await Expense.find(q).sort({ expenseDate: -1 }).limit(boundedLimit).lean();
+  const byType = await dbClient().expense.groupBy({
+    by: ['type'],
+    where: { companyId: String(companyId), ...(df ? { expenseDate: df } : {}) },
+    _sum: { amount: true },
+    orderBy: { _sum: { amount: 'desc' } },
+  });
   return {
     count: expenses.length,
-    byType: byType.map(e => ({ type: e._id || 'Other', total: e.total })),
+    byType: byType.map((entry) => ({ type: entry.type || 'Other', total: Number(entry._sum?.amount || 0) })),
     expenses: expenses.map(e => ({
       id: e._id.toString(), type: e.type, amount: e.amount || 0,
       status: e.status, date: e.expenseDate ? new Date(e.expenseDate).toISOString().slice(0, 10) : null,
@@ -233,81 +268,125 @@ async function getExpenses(companyId, opts = {}) {
 }
 
 async function getStockSummary(companyId) {
-  const products = await Product.find({ company: companyId }).lean();
-  const totalValue = products.reduce((s, p) => s + ((p.currentStock || 0) * (p.averageCost || 0)), 0);
+  const [row] = await dbClient().$queryRaw`
+    SELECT
+      COUNT(*)::int AS "totalProducts",
+      COALESCE(SUM(current_stock * average_cost), 0)::double precision AS "totalStockValue",
+      COUNT(*) FILTER (WHERE current_stock = 0)::int AS "outOfStockCount",
+      COUNT(*) FILTER (WHERE current_stock > 0 AND current_stock <= low_stock_threshold)::int AS "lowStockCount"
+    FROM products
+    WHERE company_id = ${String(companyId)} AND is_archived = false
+  `;
   return {
-    totalProducts: products.length, totalStockValue: totalValue,
-    outOfStockCount: products.filter(p => (p.currentStock || 0) === 0).length,
-    lowStockCount: products.filter(p => (p.currentStock || 0) > 0 && (p.currentStock || 0) <= (p.lowStockThreshold || 0)).length,
+    totalProducts: Number(row?.totalProducts || 0),
+    totalStockValue: Number(row?.totalStockValue || 0),
+    outOfStockCount: Number(row?.outOfStockCount || 0),
+    lowStockCount: Number(row?.lowStockCount || 0),
   };
 }
 
 async function getSalesSummary(companyId, opts = {}) {
   const { period = 'month', startDate, endDate } = opts;
-  const q = { company: companyId, status: { $in: ['confirmed', 'partial', 'paid'] } };
-  const df = dateFilter(startDate, endDate);
-  if (df) q.invoiceDate = df;
-  const invoices = await Invoice.find(q).lean();
-  const totalRevenue = invoices.reduce((s, i) => s + (i.total || 0), 0);
-  const totalPaid = invoices.reduce((s, i) => s + (i.amountPaid || 0), 0);
-
-  const grouped = {};
-  invoices.forEach(i => {
-    const d = i.invoiceDate ? new Date(i.invoiceDate) : new Date();
-    let key;
-    if (period === 'day') key = d.toISOString().slice(0, 10);
-    else if (period === 'week') { const w = new Date(d); w.setDate(w.getDate() - w.getDay()); key = w.toISOString().slice(0, 10); }
-    else if (period === 'year') key = `${d.getFullYear()}`;
-    else key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-    if (!grouped[key]) grouped[key] = { revenue: 0, count: 0 };
-    grouped[key].revenue += (i.total || 0); grouped[key].count += 1;
-  });
-
-  const timeline = Object.entries(grouped).map(([k, v]) => ({ period: k, ...v })).sort((a, b) => a.period.localeCompare(b.period));
-
-  const productRevenue = {};
-  invoices.forEach(i => {
-    (i.items || []).forEach(item => {
-      const name = item.productName || item.name || 'Unknown';
-      productRevenue[name] = (productRevenue[name] || 0) + (item.lineTotal || item.lineSubtotal || 0);
-    });
-  });
-  const topProducts = Object.entries(productRevenue).map(([name, revenue]) => ({ name, revenue })).sort((a, b) => b.revenue - a.revenue).slice(0, 10);
-
-  return { totalInvoices: invoices.length, totalRevenue, totalPaid, totalOutstanding: totalRevenue - totalPaid, collectionRate: totalRevenue ? (totalPaid / totalRevenue) * 100 : 0, timeline, topProducts };
+  const periodBucket = ['day', 'week', 'month', 'quarter', 'year'].includes(period) ? period : 'month';
+  const bucketFormat = periodBucket === 'quarter' ? 'YYYY-"Q"Q' : periodBucket === 'year' ? 'YYYY' : periodBucket === 'month' ? 'YYYY-MM' : 'YYYY-MM-DD';
+  const bucketExpression = periodBucket === 'week'
+    ? "date_trunc('week', i.invoice_date)"
+    : `date_trunc('${periodBucket}', i.invoice_date)`;
+  const clauses = ['i.company_id = $1', "i.status IN ('confirmed', 'partial', 'paid')"];
+  const params = [String(companyId)];
+  addDatePredicates(clauses, params, 'i.invoice_date', startDate, endDate);
+  const whereSql = clauses.join(' AND ');
+  const [totals, timelineRows, productRows] = await Promise.all([
+    dbClient().invoice.aggregate({
+      where: {
+        companyId: String(companyId),
+        status: { in: ['confirmed', 'partial', 'paid'] },
+        ...(dateFilter(startDate, endDate) ? { invoiceDate: dateFilter(startDate, endDate) } : {}),
+      },
+      _count: { _all: true },
+      _sum: { totalAmount: true, amountPaid: true, amountOutstanding: true },
+    }),
+    dbClient().$queryRawUnsafe(`
+      SELECT to_char(${bucketExpression}, $${params.length + 1}) AS period,
+             COALESCE(SUM(i.total_amount), 0)::double precision AS revenue,
+             COUNT(*)::int AS count
+      FROM invoices i
+      WHERE ${whereSql}
+      GROUP BY ${bucketExpression}
+      ORDER BY ${bucketExpression} ASC
+      LIMIT 100`, ...params, bucketFormat),
+    dbClient().$queryRawUnsafe(`
+      SELECT COALESCE(il.product_name, 'Unknown') AS name,
+             COALESCE(SUM(il.line_total), 0)::double precision AS revenue
+      FROM invoice_lines il
+      JOIN invoices i ON i.id = il.invoice_id
+      WHERE ${whereSql}
+      GROUP BY COALESCE(il.product_name, 'Unknown')
+      ORDER BY revenue DESC, name ASC
+      LIMIT 10`, ...params),
+  ]);
+  const totalRevenue = Number(totals._sum?.totalAmount || 0);
+  const totalPaid = Number(totals._sum?.amountPaid || 0);
+  return {
+    totalInvoices: Number(totals._count?._all || 0),
+    totalRevenue,
+    totalPaid,
+    totalOutstanding: Number(totals._sum?.amountOutstanding ?? (totalRevenue - totalPaid)),
+    collectionRate: totalRevenue ? (totalPaid / totalRevenue) * 100 : 0,
+    timeline: timelineRows.map((row) => ({ period: row.period, revenue: Number(row.revenue || 0), count: Number(row.count || 0) })),
+    topProducts: productRows.map((row) => ({ name: row.name, revenue: Number(row.revenue || 0) })),
+  };
 }
 
 async function getReceivablesAging(companyId) {
-  const invoices = await Invoice.find({ company: companyId, status: { $in: ['confirmed', 'partial'] } }).populate('client', 'name').lean();
-  const now = new Date();
+  const baseWhere = "i.company_id = $1 AND i.status IN ('confirmed', 'partial') AND i.amount_outstanding > 0";
+  const bucketRows = await dbClient().$queryRawUnsafe(`
+    SELECT
+      CASE
+        WHEN COALESCE(i.due_date, i.invoice_date)::date >= CURRENT_DATE THEN 'current'
+        WHEN CURRENT_DATE - COALESCE(i.due_date, i.invoice_date)::date <= 30 THEN 'days1_30'
+        WHEN CURRENT_DATE - COALESCE(i.due_date, i.invoice_date)::date <= 60 THEN 'days31_60'
+        WHEN CURRENT_DATE - COALESCE(i.due_date, i.invoice_date)::date <= 90 THEN 'days61_90'
+        ELSE 'over90'
+      END AS bucket,
+      COALESCE(SUM(i.amount_outstanding), 0)::double precision AS total
+    FROM invoices i
+    WHERE ${baseWhere}
+    GROUP BY bucket
+  `, String(companyId));
+  const debtorRows = await dbClient().$queryRawUnsafe(`
+    SELECT COALESCE(c.name, i.customer_name, 'Unknown') AS name,
+           COALESCE(SUM(i.amount_outstanding), 0)::double precision AS total,
+           MAX(GREATEST(0, CURRENT_DATE - COALESCE(i.due_date, i.invoice_date)::date))::int AS oldest
+    FROM invoices i
+    LEFT JOIN clients c ON c.id = i.client_id AND c.company_id = i.company_id
+    WHERE ${baseWhere}
+    GROUP BY COALESCE(c.name, i.customer_name, 'Unknown')
+    ORDER BY total DESC, name ASC
+    LIMIT 10
+  `, String(companyId));
   const buckets = { current: 0, days1_30: 0, days31_60: 0, days61_90: 0, over90: 0 };
-  const clientAging = {};
-
-  invoices.forEach(i => {
-    const due = i.dueDate ? new Date(i.dueDate) : new Date(i.invoiceDate);
-    const diff = Math.floor((now - due) / (1000 * 60 * 60 * 24));
-    const outstanding = (i.total || 0) - (i.amountPaid || 0);
-    if (diff <= 0) buckets.current += outstanding;
-    else if (diff <= 30) buckets.days1_30 += outstanding;
-    else if (diff <= 60) buckets.days31_60 += outstanding;
-    else if (diff <= 90) buckets.days61_90 += outstanding;
-    else buckets.over90 += outstanding;
-
-    const cname = i.client?.name || i.customerName || 'Unknown';
-    if (!clientAging[cname]) clientAging[cname] = { total: 0, oldest: 0 };
-    clientAging[cname].total += outstanding;
-    clientAging[cname].oldest = Math.max(clientAging[cname].oldest, diff);
-  });
-
-  const topDebtors = Object.entries(clientAging).map(([name, data]) => ({ name, ...data })).sort((a, b) => b.total - a.total).slice(0, 10);
-  return { totalOutstanding: Object.values(buckets).reduce((a, b) => a + b, 0), buckets, topDebtors };
+  for (const row of bucketRows) if (Object.prototype.hasOwnProperty.call(buckets, row.bucket)) buckets[row.bucket] = Number(row.total || 0);
+  return {
+    totalOutstanding: Object.values(buckets).reduce((sum, value) => sum + value, 0),
+    buckets,
+    topDebtors: debtorRows.map((row) => ({ name: row.name, total: Number(row.total || 0), oldest: Number(row.oldest || 0) })),
+  };
 }
 
 async function getBankAccounts(companyId) {
-  const accounts = await BankAccount.find({ company: companyId }).lean();
-  const totalBalance = accounts.reduce((s, a) => s + (a.currentBalance || a.cachedBalance || 0), 0);
+  const [accounts, totals] = await Promise.all([
+    BankAccount.find({ company: companyId }).limit(AI_MAX_LIST_ROWS).lean(),
+    dbClient().bankAccount.aggregate({
+      where: { companyId: String(companyId) },
+      _count: { _all: true },
+      _sum: { cachedBalance: true },
+    }),
+  ]);
   return {
-    count: accounts.length, totalBalance,
+    count: Number(totals._count?._all || 0),
+    totalBalance: Number(totals._sum?.cachedBalance || 0),
+    truncated: Number(totals._count?._all || 0) > accounts.length,
     accounts: accounts.map(a => ({
       id: a._id.toString(), name: a.name, type: a.accountType,
       balance: a.currentBalance || a.cachedBalance || 0,
@@ -315,30 +394,52 @@ async function getBankAccounts(companyId) {
   };
 }
 
-async function getFixedAssets(companyId) {
-  const assets = await FixedAsset.find({ company: companyId }).lean();
-  const totalCost = assets.reduce((s, a) => s + (a.cost || 0), 0);
-  const totalDep = assets.reduce((s, a) => s + (a.accumulatedDepreciation || 0), 0);
+async function getFixedAssets(companyId, opts = {}) {
+  const limit = safeAiLimit(opts.limit, AI_MAX_LIST_ROWS);
+  const [assets, totals] = await Promise.all([
+    FixedAsset.find({ company: companyId }).sort({ createdAt: -1, _id: -1 }).limit(limit).lean(),
+    dbClient().fixedAsset.aggregate({
+      where: { companyId: String(companyId) },
+      _count: { _all: true },
+      _sum: { purchaseCost: true, accumulatedDepreciation: true, netBookValue: true },
+    }),
+  ]);
   return {
-    count: assets.length, totalCost, totalDepreciation: totalDep, netBookValue: totalCost - totalDep,
+    count: Number(totals._count?._all || 0),
+    totalCost: Number(totals._sum?.purchaseCost || 0),
+    totalDepreciation: Number(totals._sum?.accumulatedDepreciation || 0),
+    netBookValue: Number(totals._sum?.netBookValue || 0),
+    truncated: Number(totals._count?._all || 0) > assets.length,
     assets: assets.map(a => ({
-      id: a._id.toString(), name: a.name, cost: a.cost || 0,
-      netBookValue: (a.cost || 0) - (a.accumulatedDepreciation || 0),
+      id: a._id.toString(), name: a.name, cost: a.cost || a.purchaseCost || 0,
+      netBookValue: a.netBookValue ?? ((a.cost || a.purchaseCost || 0) - (a.accumulatedDepreciation || 0)),
       status: a.status,
     })),
   };
 }
 
-async function getLoans(companyId) {
-  const loans = await Loan.find({ company: companyId }).lean();
-  const totalOutstanding = loans.reduce((s, l) => s + (l.outstandingBalance || 0), 0);
-  return { count: loans.length, totalOutstanding, loans: loans.map(l => ({ id: l._id.toString(), name: l.name, outstandingBalance: l.outstandingBalance || 0, status: l.status })) };
+async function getLoans(companyId, opts = {}) {
+  const limit = safeAiLimit(opts.limit, AI_MAX_LIST_ROWS);
+  const [loans, totals] = await Promise.all([
+    Loan.find({ company: companyId }).sort({ createdAt: -1, _id: -1 }).limit(limit).lean(),
+    dbClient().loan.aggregate({
+      where: { companyId: String(companyId) },
+      _count: { _all: true },
+      _sum: { outstandingBalance: true },
+    }),
+  ]);
+  return {
+    count: Number(totals._count?._all || 0),
+    totalOutstanding: Number(totals._sum?.outstandingBalance || 0),
+    truncated: Number(totals._count?._all || 0) > loans.length,
+    loans: loans.map(l => ({ id: l._id.toString(), name: l.name, outstandingBalance: l.outstandingBalance || 0, status: l.status })),
+  };
 }
 
 async function getDashboardMetrics(companyId) {
-  const [company, products, invoices, purchases, expenses, clients, lowStock] = await Promise.all([
+  const [company, stockSummary, invoices, purchases, expenses, clients, lowStock] = await Promise.all([
     Company.findById(companyId).lean(),
-    Product.find({ company: companyId }).lean(),
+    getStockSummary(companyId),
     Invoice.find({ company: companyId }).sort({ createdAt: -1 }).limit(5).lean(),
     Purchase.find({ company: companyId }).sort({ createdAt: -1 }).limit(5).lean(),
     Expense.find({ company: companyId }).sort({ createdAt: -1 }).limit(5).lean().catch(() => []),
@@ -346,71 +447,65 @@ async function getDashboardMetrics(companyId) {
     Product.find({ company: companyId, $expr: { $lte: ['$currentStock', '$lowStockThreshold'] } }).lean().limit(20),
   ]);
 
-  const totalStockValue = products.reduce((s, p) => s + ((p.currentStock || 0) * (p.averageCost || 0)), 0);
   const pendingInvoices = await Invoice.countDocuments({ company: companyId, status: { $in: ['confirmed', 'partial'] } }).catch(() => 0);
 
   const yearStart = new Date(); yearStart.setMonth(0, 1); yearStart.setHours(0, 0, 0, 0);
-  const monthlyRevenue = await Invoice.aggregate([
-    { $match: { company: companyId._id || companyId, status: { $in: ['confirmed', 'partial', 'paid'] }, invoiceDate: { $gte: yearStart } } },
-    { $group: { _id: { $month: '$invoiceDate' }, revenue: { $sum: '$total' }, count: { $sum: 1 } } },
-    { $sort: { _id: 1 } },
-  ]);
+  const monthlyRevenue = await getSalesSummary(companyId, { period: 'month', startDate: yearStart.toISOString() });
 
   return {
     company: { name: company?.name, currency: company?.settings?.currency || 'FRW' },
-    products: { total: products.length, totalValue: totalStockValue, outOfStock: products.filter(p => (p.currentStock || 0) === 0).length, lowStock: lowStock.length },
-    sales: { pendingInvoices, monthlyRevenue: monthlyRevenue.map(m => ({ month: m._id, revenue: m.revenue, count: m.count })) },
+    products: { total: stockSummary.totalProducts, totalValue: stockSummary.totalStockValue, outOfStock: stockSummary.outOfStockCount, lowStock: stockSummary.lowStockCount || lowStock.length },
+    sales: { pendingInvoices, monthlyRevenue: monthlyRevenue.timeline.map((point) => ({ month: point.period, revenue: point.revenue, count: point.count })) },
     clients: { total: clients },
   };
 }
 
 async function generateChartData(companyId, opts = {}) {
   const { chartType = 'line', dataType = 'revenue', period = 'month', startDate, endDate, limit = 12 } = opts;
+  const boundedLimit = safeAiLimit(limit, 12);
   let labels = [], datasets = [];
 
   if (dataType === 'revenue') {
-    const q = { company: companyId, status: { $in: ['confirmed', 'partial', 'paid'] } };
-    const df = dateFilter(startDate, endDate);
-    if (df) q.invoiceDate = df;
-    const invoices = await Invoice.find(q).lean();
-    const grouped = {};
-    invoices.forEach(i => {
-      const d = i.invoiceDate ? new Date(i.invoiceDate) : new Date();
-      let key = period === 'day' ? d.toISOString().slice(0, 10)
-        : period === 'year' ? `${d.getFullYear()}`
-        : `${d.toLocaleString('en', { month: 'short' })} ${d.getFullYear()}`;
-      if (!grouped[key]) grouped[key] = 0;
-      grouped[key] += (i.total || 0);
-    });
-    const sorted = Object.entries(grouped).sort((a, b) => a[0].localeCompare(b[0])).slice(-Number(limit));
-    labels = sorted.map(([k]) => k);
-    datasets = [{ label: 'Revenue', data: sorted.map(([, v]) => v), color: '#6366f1' }];
+    const summary = await getSalesSummary(companyId, { period, startDate, endDate });
+    const points = summary.timeline.slice(-boundedLimit);
+    labels = points.map((point) => point.period);
+    datasets = [{ label: 'Revenue', data: points.map((point) => point.revenue), color: '#6366f1' }];
   }
 
   if (dataType === 'expenses') {
-    const q = { company: companyId };
-    const df = dateFilter(startDate, endDate);
-    if (df) q.expenseDate = df;
-    const expenses = await Expense.find(q).lean();
-    const grouped = {};
-    expenses.forEach(e => { const t = e.type || 'Other'; grouped[t] = (grouped[t] || 0) + (e.amount || 0); });
-    labels = Object.keys(grouped);
-    datasets = [{ label: 'Expenses', data: Object.values(grouped), color: '#ef4444' }];
+    const clauses = ['company_id = $1'];
+    const params = [String(companyId)];
+    addDatePredicates(clauses, params, 'expense_date', startDate, endDate);
+    const rows = await dbClient().$queryRawUnsafe(`
+      SELECT COALESCE(type, 'Other') AS name,
+             COALESCE(SUM(amount), 0)::double precision AS value
+      FROM expenses
+      WHERE ${clauses.join(' AND ')}
+      GROUP BY COALESCE(type, 'Other')
+      ORDER BY value DESC, name ASC
+      LIMIT ${boundedLimit}`, ...params);
+    labels = rows.map((row) => row.name);
+    datasets = [{ label: 'Expenses', data: rows.map((row) => Number(row.value || 0)), color: '#ef4444' }];
   }
 
   if (dataType === 'stock') {
-    const products = await Product.find({ company: companyId }).sort({ currentStock: -1 }).limit(Number(limit)).lean();
-    labels = products.map(p => p.name);
-    datasets = [{ label: 'Stock Qty', data: products.map(p => p.currentStock || 0), color: '#10b981' }];
+    const products = await Product.find({ company: companyId }).sort({ currentStock: -1, _id: -1 }).limit(boundedLimit).lean();
+    labels = products.map((p) => p.name);
+    datasets = [{ label: 'Stock Qty', data: products.map((p) => Number(p.currentStock || 0)), color: '#10b981' }];
   }
 
   if (dataType === 'product_revenue') {
-    const invoices = await Invoice.find({ company: companyId, status: { $in: ['confirmed', 'partial', 'paid'] } }).lean();
-    const prodRev = {};
-    invoices.forEach(i => { (i.items || []).forEach(item => { const n = item.productName || item.name || 'Unknown'; prodRev[n] = (prodRev[n] || 0) + (item.total || item.lineTotal || 0); }); });
-    const sorted = Object.entries(prodRev).sort((a, b) => b[1] - a[1]).slice(0, Number(limit));
-    labels = sorted.map(([k]) => k);
-    datasets = [{ label: 'Revenue', data: sorted.map(([, v]) => v), color: '#f59e0b' }];
+    const rows = await dbClient().$queryRawUnsafe(`
+      SELECT COALESCE(il.product_name, 'Unknown') AS name,
+             COALESCE(SUM(il.line_total), 0)::double precision AS revenue
+      FROM invoice_lines il
+      JOIN invoices i ON i.id = il.invoice_id
+      WHERE i.company_id = $1 AND i.status IN ('confirmed', 'partial', 'paid')
+      GROUP BY COALESCE(il.product_name, 'Unknown')
+      ORDER BY revenue DESC, name ASC
+      LIMIT ${boundedLimit}`, String(companyId));
+    labels = rows.map((row) => row.name);
+    datasets = [{ label: 'Revenue', data: rows.map((row) => Number(row.revenue || 0)), color: '#f59e0b' }];
   }
 
   return { chartType, dataType, labels, datasets, title: `${dataType.replace('_', ' ')} ${chartType}`, currency: 'FRW' };
@@ -418,23 +513,26 @@ async function generateChartData(companyId, opts = {}) {
 
 async function getProfitLossSummary(companyId, opts = {}) {
   const { startDate, endDate } = opts;
-  const df = dateFilter(startDate, endDate);
-  const iq = { company: companyId, status: { $in: ['confirmed', 'partial', 'paid'] } };
-  const eq = { company: companyId };
-  if (df) { iq.invoiceDate = df; eq.expenseDate = df; }
-
-  const [invoices, expenses] = await Promise.all([
-    Invoice.find(iq).lean(),
-    Expense.find(eq).lean(),
+  const invoiceWhere = {
+    companyId: String(companyId),
+    status: { in: ['confirmed', 'partial', 'paid'] },
+    ...(dateFilter(startDate, endDate) ? { invoiceDate: dateFilter(startDate, endDate) } : {}),
+  };
+  const expenseWhere = {
+    companyId: String(companyId),
+    ...(dateFilter(startDate, endDate) ? { expenseDate: dateFilter(startDate, endDate) } : {}),
+  };
+  const [invoiceTotals, expenseTotals, lineTotals] = await Promise.all([
+    dbClient().invoice.aggregate({ where: invoiceWhere, _sum: { totalAmount: true }, _count: { _all: true } }),
+    dbClient().expense.aggregate({ where: expenseWhere, _sum: { amount: true } }),
+    dbClient().invoiceLine.aggregate({
+      where: { companyId: String(companyId), invoice: invoiceWhere },
+      _sum: { cogsAmount: true },
+    }),
   ]);
-
-  const revenue = invoices.reduce((s, i) => s + (i.total || 0), 0);
-  const totalExpenses = expenses.reduce((s, e) => s + (e.amount || 0), 0);
-
-  let cogs = 0;
-  invoices.forEach(i => { (i.items || []).forEach(item => { cogs += Number(item.qty || item.quantity || 0) * Number(item.unitCost || item.cogsAmount || 0); }); });
-  if (!cogs) cogs = Math.max(0, revenue * 0.6);
-
+  const revenue = Number(invoiceTotals._sum?.totalAmount || 0);
+  const totalExpenses = Number(expenseTotals._sum?.amount || 0);
+  const cogs = Number(lineTotals._sum?.cogsAmount || 0) || Math.max(0, revenue * 0.6);
   const grossProfit = revenue - cogs;
   const operatingProfit = grossProfit - totalExpenses;
   const tax = Math.max(0, operatingProfit * 0.3);
@@ -443,6 +541,7 @@ async function getProfitLossSummary(companyId, opts = {}) {
   return {
     revenue, cogs, grossProfit, operatingExpenses: totalExpenses, operatingProfit,
     tax, netProfit, isProfit: netProfit >= 0, currency: 'FRW',
+    totalInvoices: Number(invoiceTotals._count?._all || 0),
   };
 }
 
@@ -451,14 +550,18 @@ async function getCategories(companyId, opts = {}) {
   const { search = '', limit = 50 } = opts;
   const q = { company: companyId };
   if (search) q.name = { $regex: search, $options: 'i' };
-  const categories = await Category.find(q).limit(Number(limit)).lean();
+  const categories = await Category.find(q).limit(safeAiLimit(limit, 50)).lean();
   return { count: categories.length, categories: categories.map(c => ({ id: c._id, name: c.name, description: c.description })) };
 }
 
 async function getWarehouses(companyId, opts = {}) {
   opts = opts || {};
-  const warehouses = await Warehouse.find({ company: companyId }).lean();
-  return { count: warehouses.length, warehouses: warehouses.map(w => ({ id: w._id, name: w.name, location: w.location, capacity: w.capacity })) };
+  const limit = safeAiLimit(opts.limit, 50);
+  const [warehouses, total] = await Promise.all([
+    Warehouse.find({ company: companyId }).sort({ name: 1, _id: 1 }).limit(limit).lean(),
+    Warehouse.countDocuments({ company: companyId }),
+  ]);
+  return { count: total, truncated: total > warehouses.length, warehouses: warehouses.map(w => ({ id: w._id, name: w.name, location: w.location, capacity: w.capacity })) };
 }
 
 async function getStockMovements(companyId, opts = {}) {
@@ -469,7 +572,7 @@ async function getStockMovements(companyId, opts = {}) {
   if (df) q.date = df;
   const movements = await StockMovement.find(q)
     .sort({ date: -1 })
-    .limit(Number(limit))
+    .limit(safeAiLimit(limit))
     .populate('product', 'name sku')
     .populate('warehouse', 'name')
     .lean();
@@ -495,7 +598,7 @@ async function getStockTransfers(companyId, opts = {}) {
   if (status) q.status = status;
   const transfers = await StockTransfer.find(q)
     .sort({ createdAt: -1 })
-    .limit(Number(limit))
+    .limit(safeAiLimit(limit))
     .populate('fromWarehouse', 'name')
     .populate('toWarehouse', 'name')
     .lean();
@@ -519,7 +622,7 @@ async function getSuppliers(companyId, opts = {}) {
   const { search = '', limit = 50 } = opts;
   const q = { company: companyId };
   if (search) q.name = { $regex: search, $options: 'i' };
-  const suppliers = await Supplier.find(q).limit(Number(limit)).lean();
+  const suppliers = await Supplier.find(q).limit(safeAiLimit(limit, 50)).lean();
   return { count: suppliers.length, suppliers: suppliers.map(s => ({ id: s._id, name: s.name, email: s.email, phone: s.phone, balance: s.balance })) };
 }
 
@@ -532,7 +635,7 @@ async function getPurchaseOrders(companyId, opts = {}) {
   if (df) q.orderDate = df;
   const orders = await PurchaseOrder.find(q)
     .sort({ orderDate: -1 })
-    .limit(Number(limit))
+    .limit(safeAiLimit(limit))
     .populate('supplier', 'name')
     .lean();
   return {
@@ -562,7 +665,7 @@ async function getGoodsReceivedNotes(companyId, opts = {}) {
   if (df) q.date = df;
   const grns = await GoodsReceivedNote.find(q)
     .sort({ date: -1 })
-    .limit(Number(limit))
+    .limit(safeAiLimit(limit))
     .populate('purchaseOrder', 'purchaseNumber')
     .populate('warehouse', 'name')
     .populate('supplier', 'name')
@@ -599,7 +702,7 @@ async function getCreditNotes(companyId, opts = {}) {
   if (df) q.date = df;
   const notes = await CreditNote.find(q)
     .sort({ date: -1 })
-    .limit(Number(limit))
+    .limit(safeAiLimit(limit))
     .populate('invoice', 'invoiceNumber')
     .lean();
   return {
@@ -623,7 +726,7 @@ async function getDeliveryNotes(companyId, opts = {}) {
   if (df) q.date = df;
   const notes = await DeliveryNote.find(q)
     .sort({ date: -1 })
-    .limit(Number(limit))
+    .limit(safeAiLimit(limit))
     .populate('salesOrder', 'orderNumber')
     .lean();
   return {
@@ -648,7 +751,7 @@ async function getQuotations(companyId, opts = {}) {
   if (df) q.quotationDate = df;
   const quotations = await Quotation.find(q)
     .sort({ quotationDate: -1 })
-    .limit(Number(limit))
+    .limit(safeAiLimit(limit))
     .populate('client', 'name')
     .populate('salesperson', 'name email')
     .lean();
@@ -676,7 +779,7 @@ async function getSalesOrders(companyId, opts = {}) {
   if (df) q.orderDate = df;
   const orders = await SalesOrder.find(q)
     .sort({ orderDate: -1 })
-    .limit(Number(limit))
+    .limit(safeAiLimit(limit))
     .populate('client', 'name')
     .lean();
   return {
@@ -700,7 +803,7 @@ async function getARReceipts(companyId, opts = {}) {
   if (df) q.receiptDate = df;
   const receipts = await ARReceipt.find(q)
     .sort({ receiptDate: -1 })
-    .limit(Number(limit))
+    .limit(safeAiLimit(limit))
     .populate('client', 'name')
     .populate('bankAccount', 'accountName bankName')
     .lean();
@@ -726,7 +829,7 @@ async function getAPPayments(companyId, opts = {}) {
   if (df) q.paymentDate = df;
   const payments = await APPayment.find(q)
     .sort({ paymentDate: -1 })
-    .limit(Number(limit))
+    .limit(safeAiLimit(limit))
     .populate('supplier', 'name')
     .populate('bankAccount', 'accountName bankName')
     .lean();
@@ -750,7 +853,7 @@ async function getChartOfAccounts(companyId, opts = {}) {
   const q = { company: companyId };
   if (type) q.accountType = type;
   if (search) q.name = { $regex: search, $options: 'i' };
-  const accounts = await ChartOfAccount.find(q).limit(Number(limit)).lean();
+  const accounts = await ChartOfAccount.find(q).limit(safeAiLimit(limit, 50)).lean();
   return { count: accounts.length, accounts: accounts.map(a => ({ id: a._id, code: a.code, name: a.name, type: a.accountType, balance: a.balance })) };
 }
 
@@ -760,7 +863,7 @@ async function getJournalEntries(companyId, opts = {}) {
   const q = { company: companyId };
   const df = dateFilter(startDate, endDate);
   if (df) q.date = df;
-  const entries = await JournalEntry.find(q).sort({ date: -1 }).limit(Number(limit)).lean();
+  const entries = await JournalEntry.find(q).sort({ date: -1, _id: -1 }).limit(safeAiLimit(limit)).lean();
   return { count: entries.length, entries };
 }
 
@@ -769,7 +872,7 @@ async function getBudgets(companyId, opts = {}) {
   const { limit = 20, fiscalYear = '' } = opts;
   const q = { company: companyId };
   if (fiscalYear) q.fiscalYear = fiscalYear;
-  const budgets = await Budget.find(q).sort({ createdAt: -1 }).limit(Number(limit)).lean();
+  const budgets = await Budget.find(q).sort({ createdAt: -1, _id: -1 }).limit(safeAiLimit(limit)).lean();
   return { count: budgets.length, budgets };
 }
 
@@ -778,7 +881,7 @@ async function getDepartments(companyId, opts = {}) {
   const { search = '', limit = 50 } = opts;
   const q = { company: companyId };
   if (search) q.name = { $regex: search, $options: 'i' };
-  const departments = await Department.find(q).limit(Number(limit)).lean();
+  const departments = await Department.find(q).limit(safeAiLimit(limit, 50)).lean();
   return { count: departments.length, departments: departments.map(d => ({ id: d._id, name: d.name, manager: d.manager, budget: d.budget })) };
 }
 
@@ -788,7 +891,7 @@ async function getCompanyUsers(companyId, opts = {}) {
   const { prisma } = require('../lib/prisma');
   const users = await prisma.user.findMany({
     where: { companyId: String(companyId), ...(role ? { role } : {}) },
-    take: Number(limit),
+    take: safeAiLimit(limit, 50),
     select: { id: true, name: true, email: true, role: true, isActive: true },
   });
   return {
@@ -802,7 +905,7 @@ async function getNotifications(companyId, opts = {}) {
   const { limit = 20, unreadOnly = false } = opts;
   const q = { company: companyId };
   if (unreadOnly) q.read = false;
-  const notifications = await Notification.find(q).sort({ createdAt: -1 }).limit(Number(limit)).lean();
+  const notifications = await Notification.find(q).sort({ createdAt: -1, _id: -1 }).limit(safeAiLimit(limit)).lean();
   return { count: notifications.length, notifications: notifications.map(n => ({ id: n._id, title: n.title, message: n.message, read: n.read, type: n.type, createdAt: n.createdAt })) };
 }
 
@@ -813,35 +916,51 @@ async function getAuditLogs(companyId, opts = {}) {
   if (action) q.action = action;
   const df = dateFilter(startDate, endDate);
   if (df) q.timestamp = df;
-  const logs = await AuditLog.find(q).sort({ timestamp: -1 }).limit(Number(limit)).lean();
+  const logs = await AuditLog.find(q).sort({ timestamp: -1, _id: -1 }).limit(safeAiLimit(limit)).lean();
   return { count: logs.length, logs: logs.map(l => ({ id: l._id, user: l.userName || l.userEmail, action: l.action, entity: l.entityType, details: l.details, timestamp: l.timestamp })) };
 }
 
 async function getBalanceSheet(companyId, opts = {}) {
   opts = opts || {};
   const { asOfDate } = opts;
-  const q = { company: companyId };
-  const accounts = await ChartOfAccount.find(q).lean();
-  const assets = accounts.filter(a => (a.accountType || '').toLowerCase().includes('asset')).reduce((s, a) => s + (a.balance || 0), 0);
-  const liabilities = accounts.filter(a => (a.accountType || '').toLowerCase().includes('liabilit')).reduce((s, a) => s + (a.balance || 0), 0);
-  const equity = accounts.filter(a => (a.accountType || '').toLowerCase().includes('equity') || (a.accountType || '').toLowerCase().includes('capital')).reduce((s, a) => s + (a.balance || 0), 0);
+  const params = [String(companyId)];
+  const dateClause = asOfDate ? 'AND je.date <= $2' : '';
+  if (asOfDate) params.push(new Date(asOfDate));
+  const [row] = await dbClient().$queryRawUnsafe(`
+    SELECT
+      COALESCE(SUM(CASE WHEN LOWER(coa.type::text) LIKE '%asset%' THEN jel.debit - jel.credit ELSE 0 END), 0)::double precision AS assets,
+      COALESCE(SUM(CASE WHEN LOWER(coa.type::text) LIKE '%liabilit%' THEN jel.credit - jel.debit ELSE 0 END), 0)::double precision AS liabilities,
+      COALESCE(SUM(CASE WHEN LOWER(coa.type::text) LIKE '%equity%' OR LOWER(coa.type::text) LIKE '%capital%' THEN jel.credit - jel.debit ELSE 0 END), 0)::double precision AS equity
+    FROM journal_entry_lines jel
+    JOIN journal_entries je ON je.id = jel.journal_entry_id
+    LEFT JOIN chart_of_accounts coa ON coa.company_id = jel.company_id AND coa.code = jel.account_code
+    WHERE jel.company_id = $1 AND je.status = 'posted' ${dateClause}
+  `, ...params);
+  const assets = Number(row?.assets || 0);
+  const liabilities = Number(row?.liabilities || 0);
+  const equity = Number(row?.equity || 0);
   return { asOfDate: asOfDate || new Date().toISOString().slice(0, 10), totalAssets: assets, totalLiabilities: liabilities, totalEquity: equity, balanced: Math.abs(assets - liabilities - equity) < 0.01, currency: 'FRW' };
 }
 
 async function getCashFlowSummary(companyId, opts = {}) {
   opts = opts || {};
   const { startDate, endDate } = opts;
-  const df = dateFilter(startDate, endDate);
-  const bq = { company: companyId };
-  const jq = { company: companyId };
-  if (df) { jq.date = df; }
-  const [bankAccounts, journalEntries] = await Promise.all([
-    BankAccount.find(bq).lean(),
-    JournalEntry.find(jq).lean(),
+  const date = {};
+  if (dateFilter(startDate, endDate)?.$gte) date.gte = dateFilter(startDate, endDate).$gte;
+  if (dateFilter(startDate, endDate)?.$lte) date.lte = dateFilter(startDate, endDate).$lte;
+  const [bankTotals, journalTotals] = await Promise.all([
+    dbClient().bankAccount.aggregate({
+      where: { companyId: String(companyId) },
+      _sum: { cachedBalance: true },
+    }),
+    dbClient().journalEntry.aggregate({
+      where: { companyId: String(companyId), status: 'posted', ...(Object.keys(date).length ? { date } : {}) },
+      _sum: { totalDebit: true, totalCredit: true },
+    }),
   ]);
-  const bankBalance = bankAccounts.reduce((s, b) => s + (b.currentBalance || 0), 0);
-  const cashIn = journalEntries.filter(j => (j.narration || '').toLowerCase().includes('receipt') || (j.type || '').toLowerCase().includes('income')).reduce((s, j) => s + (j.amount || 0), 0);
-  const cashOut = journalEntries.filter(j => (j.narration || '').toLowerCase().includes('payment') || (j.type || '').toLowerCase().includes('expense')).reduce((s, j) => s + (j.amount || 0), 0);
+  const bankBalance = Number(bankTotals._sum?.cachedBalance || 0);
+  const cashIn = Number(journalTotals._sum?.totalDebit || 0);
+  const cashOut = Number(journalTotals._sum?.totalCredit || 0);
   return { bankBalance, cashIn, cashOut, netCashFlow: cashIn - cashOut, period: { startDate, endDate }, currency: 'FRW' };
 }
 
@@ -1260,8 +1379,8 @@ async function executeTool(companyId, toolName, args = {}) {
     case 'get_bank_accounts': return getBankAccounts(companyId);
     case 'get_chart_of_accounts': return getChartOfAccounts(companyId, args);
     case 'get_journal_entries': return getJournalEntries(companyId, args);
-    case 'get_fixed_assets': return getFixedAssets(companyId);
-    case 'get_loans': return getLoans(companyId);
+    case 'get_fixed_assets': return getFixedAssets(companyId, args);
+    case 'get_loans': return getLoans(companyId, args);
     case 'get_ap_payments': return getAPPayments(companyId, args);
     case 'get_budgets': return getBudgets(companyId, args);
     // Reports

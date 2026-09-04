@@ -15,6 +15,8 @@ const {
   getAccount,
   canPostToAccount,
 } = require("../constants/chartOfAccounts");
+const { dbClient } = require("../lib/prisma");
+const { parseBoundedPage } = require("../utils/querySafety");
 const mongoose = require("mongoose");
 
 // Helper: map petty cash category to default GL account code
@@ -91,16 +93,13 @@ async function getCurrentBalance(floatId) {
     return float.cachedBalance;
   }
 
-  // Compute from transactions
-  const transactions = await PettyCashTransaction.find({ float: floatId }).sort(
-    { transactionDate: 1, createdAt: 1 },
-  );
-
-  // Sum all transaction amounts (opening transaction already includes the opening balance)
-  let balance = 0;
-  for (const tx of transactions) {
-    balance += tx.amount;
-  }
+  // Compute with a database aggregate. The previous implementation loaded the
+  // complete transaction history into the API process for every balance read.
+  const result = await dbClient().pettyCashTransaction.aggregate({
+    where: { floatId: String(floatId) },
+    _sum: { amount: true },
+  });
+  const balance = Number(result?._sum?.amount || 0);
 
   // Update cache
   float.cachedBalance = balance;
@@ -109,6 +108,17 @@ async function getCurrentBalance(floatId) {
   await float.save();
 
   return balance;
+}
+
+async function getBalancesByFloatIds(companyId, floatIds = []) {
+  const ids = [...new Set((floatIds || []).map((id) => String(id)).filter(Boolean))];
+  if (!ids.length) return new Map();
+  const rows = await dbClient().pettyCashTransaction.groupBy({
+    by: ['floatId'],
+    where: { companyId: String(companyId), floatId: { in: ids } },
+    _sum: { amount: true },
+  });
+  return new Map(rows.map((row) => [String(row.floatId), Number(row._sum?.amount || 0)]));
 }
 
 // Helper to invalidate cache
@@ -147,33 +157,33 @@ exports.getFloats = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const { isActive } = req.query;
+    const { page, limit, skip } = parseBoundedPage(req.query, { defaultLimit: 50, maxLimit: 100 });
 
     const query = { company: companyId };
     if (isActive !== undefined) {
       query.isActive = isActive === "true";
     }
 
-    const floats = await PettyCashFloat.find(query)
-      .populate("custodian", "name email")
-      .sort({ createdAt: -1 });
-
-    // Calculate current balance for each float
-    const floatsWithBalance = await Promise.all(
-      floats.map(async (float) => {
-        // Calculate balance from transactions
-        const transactions = await PettyCashTransaction.find({ float: float._id });
-        const currentBalance = transactions.reduce((sum, tx) => sum + (tx.amount || 0), 0);
-
-        return {
-          ...float.toObject(),
-          currentBalance,
-        };
-      }),
-    );
+    const [floats, total] = await Promise.all([
+      PettyCashFloat.find(query)
+        .populate("custodian", "name email")
+        .sort({ createdAt: -1, _id: -1 })
+        .skip(skip)
+        .limit(limit),
+      PettyCashFloat.countDocuments(query),
+    ]);
+    const balances = await getBalancesByFloatIds(companyId, floats.map((float) => float._id));
+    const floatsWithBalance = floats.map((float) => ({
+      ...float.toObject(),
+      currentBalance: balances.get(String(float._id)) || 0,
+    }));
 
     res.json({
       success: true,
       count: floatsWithBalance.length,
+      total,
+      pages: Math.ceil(total / limit),
+      pagination: { page, limit, total, pages: Math.ceil(total / limit) },
       data: floatsWithBalance,
     });
   } catch (error) {
@@ -354,14 +364,13 @@ exports.deleteFloat = async (req, res, next) => {
 exports.getExpenses = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
+    const { page, limit, skip } = parseBoundedPage(req.query, { defaultLimit: 50, maxLimit: 100 });
     const {
       floatId,
       status,
       category,
       startDate,
       endDate,
-      page = 1,
-      limit = 50,
     } = req.query;
 
     const query = { company: companyId };
@@ -379,9 +388,9 @@ exports.getExpenses = async (req, res, next) => {
     const expenses = await PettyCashExpense.find(query)
       .populate("float", "name")
       .populate("approvedBy", "name email")
-      .sort({ date: -1 })
-      .skip((page - 1) * limit)
-      .limit(parseInt(limit));
+      .sort({ date: -1, _id: -1 })
+      .skip(skip)
+      .limit(limit);
 
     const total = await PettyCashExpense.countDocuments(query);
 
@@ -698,13 +707,12 @@ exports.deleteExpense = async (req, res, next) => {
 exports.getReplenishments = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
+    const { page, limit, skip } = parseBoundedPage(req.query, { defaultLimit: 50, maxLimit: 100 });
     const {
       floatId,
       status,
       startDate,
       endDate,
-      page = 1,
-      limit = 50,
     } = req.query;
 
     const query = { company: companyId };
@@ -723,9 +731,9 @@ exports.getReplenishments = async (req, res, next) => {
       .populate("requestedBy", "name email")
       .populate("approvedBy", "name email")
       .populate("completedBy", "name email")
-      .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(parseInt(limit));
+      .sort({ createdAt: -1, _id: -1 })
+      .skip(skip)
+      .limit(limit);
 
     const total = await PettyCashReplenishment.countDocuments(query);
 
@@ -1319,13 +1327,12 @@ exports.getSummary = async (req, res, next) => {
 exports.getTransactions = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
+    const { page, limit, skip } = parseBoundedPage(req.query, { defaultLimit: 50, maxLimit: 100 });
     const {
       floatId,
       type,
       startDate,
       endDate,
-      page = 1,
-      limit = 50,
     } = req.query;
 
     const query = { company: companyId };
@@ -1342,9 +1349,9 @@ exports.getTransactions = async (req, res, next) => {
     const transactions = await PettyCashTransaction.find(query)
       .populate("float", "name")
       .populate("createdBy", "name email")
-      .sort({ transactionDate: -1 })
-      .skip((page - 1) * limit)
-      .limit(parseInt(limit));
+      .sort({ transactionDate: -1, _id: -1 })
+      .skip(skip)
+      .limit(limit);
 
     const total = await PettyCashTransaction.countDocuments(query);
 
@@ -1371,46 +1378,46 @@ exports.getFunds = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const { isActive } = req.query;
+    const { page, limit, skip } = parseBoundedPage(req.query, { defaultLimit: 50, maxLimit: 100 });
 
     const query = { company: companyId };
     if (isActive !== undefined) {
       query.isActive = isActive === "true";
     }
 
-    const floats = await PettyCashFloat.find(query)
-      .populate("custodian", "name email")
-      .sort({ createdAt: -1 });
-
-    // Calculate current balance for each float
-    const floatsWithBalance = await Promise.all(
-      floats.map(async (float) => {
-        const currentBalance = await getCurrentBalance(float._id);
-        const replenishmentNeeded = float.floatAmount - currentBalance;
-
-        // Calculate imprest replenishment if applicable
-        const imprestData = float.imprestMode
-          ? await calculateImprestReplenishmentAmount(float._id)
-          : null;
-
-        return {
-          _id: float._id,
-          name: float.name,
-          ledgerAccountId: float.ledgerAccountId,
-          custodian: float.custodian,
-          floatAmount: float.floatAmount,
-          imprestMode: float.imprestMode,
-          currentBalance,
-          replenishmentNeeded: Math.max(0, replenishmentNeeded),
-          imprestReplenishmentAmount: imprestData?.replenishmentAmount || null,
-          isActive: float.isActive,
-          createdAt: float.createdAt,
-        };
-      }),
-    );
+    const [floats, total] = await Promise.all([
+      PettyCashFloat.find(query)
+        .populate("custodian", "name email")
+        .sort({ createdAt: -1, _id: -1 })
+        .skip(skip)
+        .limit(limit),
+      PettyCashFloat.countDocuments(query),
+    ]);
+    const balances = await getBalancesByFloatIds(companyId, floats.map((float) => float._id));
+    const floatsWithBalance = floats.map((float) => {
+      const currentBalance = balances.get(String(float._id)) || 0;
+      const replenishmentNeeded = Number(float.floatAmount || 0) - currentBalance;
+      return {
+        _id: float._id,
+        name: float.name,
+        ledgerAccountId: float.ledgerAccountId,
+        custodian: float.custodian,
+        floatAmount: float.floatAmount,
+        imprestMode: float.imprestMode,
+        currentBalance,
+        replenishmentNeeded: Math.max(0, replenishmentNeeded),
+        imprestReplenishmentAmount: float.imprestMode ? Math.max(0, replenishmentNeeded) : null,
+        isActive: float.isActive,
+        createdAt: float.createdAt,
+      };
+    });
 
     res.json({
       success: true,
       count: floatsWithBalance.length,
+      total,
+      pages: Math.ceil(total / limit),
+      pagination: { page, limit, total, pages: Math.ceil(total / limit) },
       data: floatsWithBalance,
     });
   } catch (error) {
@@ -1971,7 +1978,8 @@ exports.getFundTransactions = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const { id } = req.params;
-    const { startDate, endDate, type, page = 1, limit = 50 } = req.query;
+    const { page, limit, skip } = parseBoundedPage(req.query, { defaultLimit: 50, maxLimit: 100 });
+    const { startDate, endDate, type } = req.query;
 
     // Find the float
     const float = await PettyCashFloat.findOne({ _id: id, company: companyId });
@@ -1995,25 +2003,11 @@ exports.getFundTransactions = async (req, res, next) => {
     // Get transactions sorted by date
     const transactions = await PettyCashTransaction.find(query)
       .populate("createdBy", "name email")
-      .sort({ transactionDate: 1, createdAt: 1 })
-      .skip((page - 1) * limit)
-      .limit(parseInt(limit));
+      .sort({ transactionDate: 1, createdAt: 1, _id: 1 })
+      .skip(skip)
+      .limit(limit);
 
     const total = await PettyCashTransaction.countDocuments(query);
-
-    // Get ALL transactions to calculate running balance properly (chronologically)
-    // This ensures correct balance calculation regardless of pagination
-    const allTransactions = await PettyCashTransaction.find(query)
-      .sort({ transactionDate: 1, createdAt: 1 })
-      .lean();
-
-    // Calculate running balance for ALL transactions (oldest to newest)
-    let cumulativeBalance = 0;
-    const balanceMap = new Map();
-    for (const tx of allTransactions) {
-      cumulativeBalance += tx.amount;
-      balanceMap.set(tx._id.toString(), cumulativeBalance);
-    }
 
     // Resolve account names for expense accounts + float ledger account (top-up / replenishment)
     const floatLedgerId = float.ledgerAccountId || DEFAULT_ACCOUNTS.pettyCash;
@@ -2027,18 +2021,11 @@ exports.getFundTransactions = async (req, res, next) => {
     ];
     const expenseAccounts = {};
     if (expenseAccountIds.length > 0) {
-      for (const accountId of expenseAccountIds) {
-        try {
-          const account = await ChartOfAccountsService.getAccountByCode(
-            companyId,
-            accountId,
-          );
-          if (account) {
-            expenseAccounts[accountId] = account.name;
-          }
-        } catch (e) {
-          // Account lookup failed, continue without name
-        }
+      try {
+        const accounts = await ChartOfAccountsService.getAccountsByCodes(companyId, expenseAccountIds);
+        for (const account of accounts) expenseAccounts[account.code] = account.name;
+      } catch (e) {
+        // Account lookup failed, continue without names.
       }
     }
 
@@ -2064,8 +2051,10 @@ exports.getFundTransactions = async (req, res, next) => {
                   : tx.type === "adjustment"
                     ? "Adjustment"
                     : "Closing",
-        amount: Math.abs(tx.amount),
-        runningBalance: balanceMap.get(tx._id.toString()),
+        amount: Math.abs(Number(tx.amount || 0)),
+        // balanceAfter is persisted with every PostgreSQL transaction, so the
+        // page does not need to reload the entire history to render a running balance.
+        runningBalance: Number(tx.balanceAfter || 0),
         description: tx.description,
         expenseAccountId: ledgerAccountId || null,
         expenseAccountName: ledgerAccountId
@@ -2088,6 +2077,7 @@ exports.getFundTransactions = async (req, res, next) => {
       count: transactionsWithRunningBalance.length,
       total,
       pages: Math.ceil(total / limit),
+      pagination: { page, limit, total, pages: Math.ceil(total / limit) },
       data: {
         fund: {
           _id: float._id,
@@ -2194,7 +2184,8 @@ exports.getReconciliations = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const { id } = req.params;
-    const { status, page = 1, limit = 20 } = req.query;
+    const { page, limit, skip } = parseBoundedPage(req.query, { defaultLimit: 20, maxLimit: 100 });
+    const { status } = req.query;
 
     // Find the float
     const float = await PettyCashFloat.findOne({ _id: id, company: companyId });
@@ -2210,9 +2201,9 @@ exports.getReconciliations = async (req, res, next) => {
     const reconciliations = await PettyCashReconciliation.find(query)
       .populate("countedBy", "name email")
       .populate("approvedBy", "name email")
-      .sort({ countDate: -1 })
-      .skip((page - 1) * limit)
-      .limit(parseInt(limit));
+      .sort({ countDate: -1, _id: -1 })
+      .skip(skip)
+      .limit(limit);
 
     const total = await PettyCashReconciliation.countDocuments(query);
 
@@ -2221,6 +2212,7 @@ exports.getReconciliations = async (req, res, next) => {
       count: reconciliations.length,
       total,
       pages: Math.ceil(total / limit),
+      pagination: { page, limit, total, pages: Math.ceil(total / limit) },
       data: reconciliations,
     });
   } catch (error) {

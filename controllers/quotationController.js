@@ -8,6 +8,7 @@ const CurrencyService = require('../services/CurrencyService');
 const PDFDocument = require('pdfkit');
 const jwt = require('jsonwebtoken');
 const emailService = require('../services/emailService');
+const { emitDataChanged } = require('../lib/realtimeEvents');
 const {
   notifyQuotationCreated,
   notifyQuotationApproved,
@@ -1176,6 +1177,7 @@ exports.acceptQuotation = async (req, res, next) => {
       await emailService.sendQuotationEmail(quotation, company, client, 'accepted');
     }
 
+    emitDataChanged(companyId, 'quotations');
     res.json({
       success: true,
       message: 'Quotation accepted successfully',

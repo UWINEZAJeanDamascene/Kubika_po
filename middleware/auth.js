@@ -111,6 +111,29 @@ const protect = async (req, res, next) => {
     recordUserSessionActivity(entityId(user));
     return next();
   } catch (error) {
+    // Expired access tokens are an expected session boundary, not an
+    // application error. Return a stable machine-readable contract so clients
+    // can refresh once instead of treating the response as a generic 401.
+    if (error?.name === 'TokenExpiredError') {
+      const message = 'Access token expired';
+      return res.status(401).json({
+        success: false,
+        code: 'TOKEN_EXPIRED',
+        message,
+        error: { code: 'TOKEN_EXPIRED', message },
+      });
+    }
+
+    if (error?.name === 'JsonWebTokenError' || error?.name === 'NotBeforeError') {
+      const message = 'Invalid access token';
+      return res.status(401).json({
+        success: false,
+        code: 'TOKEN_INVALID',
+        message,
+        error: { code: 'TOKEN_INVALID', message },
+      });
+    }
+
     console.error(error);
     const nodeEnv = config.server.env;
     if (nodeEnv === 'test' && token) {
@@ -130,7 +153,9 @@ const protect = async (req, res, next) => {
 
     return res.status(401).json({
       success: false,
+      code: 'TOKEN_INVALID',
       message: 'Not authorized, token failed',
+      error: { code: 'TOKEN_INVALID', message: 'Not authorized, token failed' },
     });
   }
 };

@@ -1,118 +1,50 @@
-const mongoose = require('mongoose');
+'use strict';
 
-const paymentScheduleSchema = new mongoose.Schema({
-  // Multi-tenancy: company reference
-  company: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Company',
-    required: [true, 'Payment schedule must belong to a company']
-  },
-  
-  // Reference to purchase
-  purchase: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Purchase',
-    required: true
-  },
-  
-  // Reference to supplier
-  supplier: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Supplier',
-    required: true
-  },
-  
-  // Payment schedule details
-  installmentNumber: {
-    type: Number,
-    required: true,
-    min: 1
-  },
-  
-  scheduledAmount: {
-    type: Number,
-    required: true,
-    min: 0
-  },
-  
-  scheduledDate: {
-    type: Date,
-    required: true
-  },
-  
-  // Status
-  status: {
-    type: String,
-    enum: ['pending', 'paid', 'overdue', 'cancelled'],
-    default: 'pending'
-  },
-  
-  // Payment details (filled when paid)
-  paidAmount: {
-    type: Number,
-    default: 0
-  },
-  paidDate: Date,
-  paymentMethod: {
-    type: String,
-    enum: ['cash', 'card', 'bank_transfer', 'cheque', 'mobile_money', 'credit', null],
-    default: null
-  },
-  paymentReference: String,
-  paymentNotes: String,
-  
-  // Early payment discount info
-  earlyPaymentDiscount: {
-    applied: {
-      type: Boolean,
-      default: false
-    },
-    discountPercent: {
-      type: Number,
-      default: 0
-    },
-    discountAmount: {
-      type: Number,
-      default: 0
-    },
-    originalAmount: {
-      type: Number,
-      default: 0
-    }
-  },
-  
-  // Notes
-  notes: String,
-  
-  // User tracking
-  createdBy: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User'
-  },
-  updatedBy: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User'
+const { buildTenantModel } = require('../utils/masterDataCommon');
+const { generateObjectId, toIdString } = require('../utils/objectId');
+const { decimalToNumber } = require('../utils/decimalHelpers');
+
+const map = { company: 'companyId', purchase: 'purchaseId', supplier: 'supplierId', installmentNumber: 'installmentNumber', scheduledAmount: 'scheduledAmount', scheduledDate: 'scheduledDate', paidAmount: 'paidAmount', paidDate: 'paidDate', paymentMethod: 'paymentMethod', paymentReference: 'paymentReference', paymentNotes: 'paymentNotes', earlyPaymentDiscount: 'earlyPaymentDiscount', notes: 'notes', createdBy: 'createdBy', updatedBy: 'updatedBy' };
+const FIELD_MAP = { _id: { target: 'id', isId: true }, id: { target: 'id', isId: true } };
+for (const [source, target] of Object.entries(map)) FIELD_MAP[source] = { target, isId: /Id$/.test(target) };
+
+function toApi(row) {
+  if (!row) return null;
+  const result = { _id: row.id };
+  for (const [source, target] of Object.entries(map)) result[source] = row[target];
+  result.scheduledAmount = decimalToNumber(row.scheduledAmount, 0);
+  result.paidAmount = decimalToNumber(row.paidAmount, 0);
+  result.createdAt = row.createdAt;
+  result.updatedAt = row.updatedAt;
+  return result;
+}
+
+function translateCreate(data = {}) {
+  const result = { id: toIdString(data._id || data.id) || generateObjectId() };
+  for (const [source, target] of Object.entries(map)) {
+    if (data[source] !== undefined) result[target] = /Id$/.test(target) ? (data[source] ? toIdString(data[source]) : null) : data[source];
   }
-}, {
-  timestamps: true
-});
+  return result;
+}
 
-// Compound indexes
-paymentScheduleSchema.index({ company: 1, purchase: 1 });
-paymentScheduleSchema.index({ company: 1, supplier: 1 });
-paymentScheduleSchema.index({ company: 1, scheduledDate: 1 });
-paymentScheduleSchema.index({ company: 1, status: 1 });
-
-// Calculate overdue status before saving
-paymentScheduleSchema.pre('save', function(next) {
-  if (this.status === 'pending') {
-    const now = new Date();
-    const scheduledDate = new Date(this.scheduledDate);
-    if (scheduledDate < now) {
-      this.status = 'overdue';
-    }
+function translateUpdate(update = {}) {
+  const sourceData = update.$set ? { ...update, ...update.$set } : { ...update };
+  delete sourceData.$set;
+  delete sourceData.$unset;
+  const result = {};
+  for (const [sourceKey, target] of Object.entries(map)) {
+    if (sourceData[sourceKey] !== undefined) result[target] = /Id$/.test(target) ? (sourceData[sourceKey] ? toIdString(sourceData[sourceKey]) : null) : sourceData[sourceKey];
   }
-  next();
-});
+  return result;
+}
 
-module.exports = mongoose.model('PaymentSchedule', paymentScheduleSchema);
+module.exports = buildTenantModel({
+  name: 'PaymentSchedule',
+  collection: 'payment_schedules',
+  delegateName: 'paymentSchedule',
+  fieldMap: FIELD_MAP,
+  toApi,
+  translateCreate,
+  translateUpdate,
+  mutable: true,
+});

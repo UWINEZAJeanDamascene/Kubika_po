@@ -3,14 +3,14 @@ const TaxRate = require("../models/TaxRate");
 const Invoice = require("../models/Invoice");
 const Expense = require("../models/Expense");
 const Payroll = require("../models/Payroll");
-const mongoose = require("mongoose");
 const JournalEntry = require("../models/JournalEntry");
 const JournalService = require("../services/journalService");
 const journalAgg = require("../services/journalAggregationService");
 const TaxService = require("../services/taxService");
 const TaxAutomationService = require("../services/taxAutomationService");
 const { parsePagination, paginationMeta } = require("../utils/pagination");
-const { safeAggregate } = require("../utils/mongoAggregation");
+const { Prisma } = require('@prisma/client');
+const { dbClient } = require('../lib/prisma');
 
 // =====================================================
 // TAX RATE CONFIGURATION (Module 9: Taxes)
@@ -243,28 +243,23 @@ exports.getTaxSummary = async (req, res) => {
     const taxes = await Tax.find({ company: companyId });
 
     // Calculate VAT summary from invoices and expenses
-    const vatOutput = await Invoice.aggregate([
-      { $match: { company: new mongoose.Types.ObjectId(companyId) } },
-      { $group: { _id: null, total: { $sum: "$taxAmount" } } },
-    ]);
+    const vatOutput = await dbClient().invoice.aggregate({
+      where: { companyId: String(companyId) },
+      _sum: { taxAmount: true },
+    });
 
-    const vatInput = await Expense.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          taxType: "vat",
-        },
-      },
-      { $group: { _id: null, total: { $sum: "$taxAmount" } } },
-    ]);
+    const vatInput = await dbClient().expense.aggregate({
+      where: { companyId: String(companyId), rraTaxCategory: 'vat_standard' },
+      _sum: { taxAmount: true },
+    });
 
-    const netVAT = (vatOutput[0]?.total || 0) - (vatInput[0]?.total || 0);
+    const netVAT = Number(vatOutput._sum?.taxAmount || 0) - Number(vatInput._sum?.taxAmount || 0);
 
     // Get PAYE from payroll
-    const payrollPAYE = await Payroll.aggregate([
-      { $match: { company: new mongoose.Types.ObjectId(companyId) } },
-      { $group: { _id: null, total: { $sum: "$deductions.paye" } } },
-    ]);
+    const [payrollPAYE] = await dbClient().$queryRaw(Prisma.sql`
+      SELECT COALESCE(SUM(COALESCE((deductions->>'paye')::numeric, 0)), 0) AS total
+      FROM payrolls WHERE company_id = ${String(companyId)}
+    `);
 
     // Calculate upcoming deadlines
     const now = new Date();
@@ -300,14 +295,14 @@ exports.getTaxSummary = async (req, res) => {
 
     // Total tax owed
     const totalVatOwed = netVAT > 0 ? netVAT : 0;
-    const totalPayeOwed = payrollPAYE[0]?.total || 0;
+    const totalPayeOwed = Number(payrollPAYE?.total || 0);
 
     res.json({
       success: true,
       data: {
         vat: {
-          output: vatOutput[0]?.total || 0,
-          input: vatInput[0]?.total || 0,
+          output: Number(vatOutput._sum?.taxAmount || 0),
+          input: Number(vatInput._sum?.taxAmount || 0),
           net: netVAT,
           isPayable: netVAT > 0,
           refund: netVAT < 0 ? Math.abs(netVAT) : 0,
@@ -651,40 +646,21 @@ exports.prepareVATReturn = async (req, res) => {
     const { month, year } = req.query;
 
     // Get output VAT from invoices
-    const outputVAT = await Invoice.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          status: { $in: ["sent", "paid"] },
-          $expr: {
-            $and: [
-              { $eq: [{ $month: "$invoiceDate" }, parseInt(month)] },
-              { $eq: [{ $year: "$invoiceDate" }, parseInt(year)] },
-            ],
-          },
-        },
-      },
-      { $group: { _id: null, total: { $sum: "$taxAmount" } } },
-    ]);
+    const periodStart = new Date(parseInt(year), parseInt(month) - 1, 1);
+    const periodEnd = new Date(parseInt(year), parseInt(month), 0, 23, 59, 59, 999);
+    const outputVAT = await dbClient().invoice.aggregate({
+      where: { companyId: String(companyId), status: { in: ['sent', 'paid'] }, invoiceDate: { gte: periodStart, lte: periodEnd } },
+      _sum: { taxAmount: true },
+    });
 
     // Get input VAT from expenses
-    const inputVAT = await Expense.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          $expr: {
-            $and: [
-              { $eq: [{ $month: "$date" }, parseInt(month)] },
-              { $eq: [{ $year: "$date" }, parseInt(year)] },
-            ],
-          },
-        },
-      },
-      { $group: { _id: null, total: { $sum: "$taxAmount" } } },
-    ]);
+    const inputVAT = await dbClient().expense.aggregate({
+      where: { companyId: String(companyId), expenseDate: { gte: periodStart, lte: periodEnd } },
+      _sum: { taxAmount: true },
+    });
 
-    const vatOutput = outputVAT[0]?.total || 0;
-    const vatInput = inputVAT[0]?.total || 0;
+    const vatOutput = Number(outputVAT._sum?.taxAmount || 0);
+    const vatInput = Number(inputVAT._sum?.taxAmount || 0);
     const netVAT = vatOutput - vatInput;
 
     // Get filing status
@@ -834,84 +810,39 @@ exports.getTaxDashboard = async (req, res) => {
     }
 
     // 1. Get VAT Output from Invoices (auto-detected)
-    const invoiceVatMatch = {
-      company: new mongoose.Types.ObjectId(companyId),
-      status: { $in: ["sent", "paid"] },
-    };
-    if (Object.keys(dateFilter).length > 0) {
-      invoiceVatMatch.invoiceDate = dateFilter;
-    }
-
-    const vatOutput = await Invoice.aggregate([
-      { $match: invoiceVatMatch },
-      {
-        $group: {
-          _id: null,
-          total: { $sum: "$taxAmount" },
-          count: { $sum: 1 },
-          subtotal: { $sum: { $subtract: ["$totalAmount", "$taxAmount"] } },
-        },
+    const vatOutput = await dbClient().invoice.aggregate({
+      where: {
+        companyId: String(companyId),
+        status: { in: ['sent', 'paid'] },
+        ...(dateFilter.$gte || dateFilter.$lte ? { invoiceDate: { ...(dateFilter.$gte ? { gte: dateFilter.$gte } : {}), ...(dateFilter.$lte ? { lte: dateFilter.$lte } : {}) } } : {}),
       },
-    ]);
+      _sum: { taxAmount: true, totalAmount: true },
+      _count: { _all: true },
+    });
 
     // 2. Get VAT Input from Expenses (auto-detected)
-    const expenseVatMatch = {
-      company: new mongoose.Types.ObjectId(companyId),
-      taxType: "vat",
-    };
-    if (Object.keys(dateFilter).length > 0) {
-      expenseVatMatch.date = dateFilter;
-    }
-
-    const vatInput = await safeAggregate(Expense, [
-      { $match: expenseVatMatch },
-      {
-        $group: {
-          _id: null,
-          total: { $sum: "$taxAmount" },
-          count: { $sum: 1 },
-          subtotal: { $sum: { $subtract: ["$totalAmount", "$taxAmount"] } },
-        },
+    const vatInput = await dbClient().expense.aggregate({
+      where: {
+        companyId: String(companyId),
+        rraTaxCategory: 'vat_standard',
+        ...(dateFilter.$gte || dateFilter.$lte ? { expenseDate: { ...(dateFilter.$gte ? { gte: dateFilter.$gte } : {}), ...(dateFilter.$lte ? { lte: dateFilter.$lte } : {}) } } : {}),
       },
-    ]);
+      _sum: { taxAmount: true, totalAmount: true },
+      _count: { _all: true },
+    });
 
     // 3. Get PAYE from Payroll (auto-detected)
-    const payrollMatch = {
-      company: new mongoose.Types.ObjectId(companyId),
-      record_status: { $in: ["finalised", "paid"] },
-    };
-    if (Object.keys(dateFilter).length > 0) {
-      payrollMatch.pay_period_start = dateFilter;
-    }
-
-    const payeData = await safeAggregate(Payroll, [
-      { $match: payrollMatch },
-      {
-        $group: {
-          _id: null,
-          totalPaye: { $sum: "$deductions.paye" },
-          totalGross: { $sum: "$salary.grossSalary" },
-          totalRssbEmployee: {
-            $sum: {
-              $add: [
-                "$deductions.rssbEmployeePension",
-                "$deductions.rssbEmployeeMaternity",
-              ],
-            },
-          },
-          totalRssbEmployer: {
-            $sum: {
-              $add: [
-                "$contributions.rssbEmployerPension",
-                "$contributions.rssbEmployerMaternity",
-                "$contributions.occupationalHazard",
-              ],
-            },
-          },
-          employeeCount: { $addToSet: "$employee.employeeId" },
-        },
-      },
-    ]);
+    const [payeData] = await dbClient().$queryRaw(Prisma.sql`
+      SELECT COALESCE(SUM(COALESCE((deductions->>'paye')::numeric, 0)), 0) AS "totalPaye",
+             COALESCE(SUM(COALESCE((salary->>'grossSalary')::numeric, 0)), 0) AS "totalGross",
+             COALESCE(SUM(COALESCE((deductions->>'rssbEmployeePension')::numeric, 0) + COALESCE((deductions->>'rssbEmployeeMaternity')::numeric, 0)), 0) AS "totalRssbEmployee",
+             COALESCE(SUM(COALESCE((contributions->>'rssbEmployerPension')::numeric, 0) + COALESCE((contributions->>'rssbEmployerMaternity')::numeric, 0) + COALESCE((contributions->>'occupationalHazard')::numeric, 0)), 0) AS "totalRssbEmployer",
+             COUNT(DISTINCT COALESCE(employee->>'employeeId', employee_ref_id))::int AS "employeeCount"
+      FROM payrolls
+      WHERE company_id = ${String(companyId)} AND record_status IN ('finalised', 'paid')
+        ${dateFilter.$gte ? Prisma.sql`AND pay_period_start >= ${dateFilter.$gte}` : Prisma.empty}
+        ${dateFilter.$lte ? Prisma.sql`AND pay_period_start <= ${dateFilter.$lte}` : Prisma.empty}
+    `);
 
     // 4. Get Withholding Tax from Journal Entries (auto-detected)
     const withholdingTax = (await journalAgg.sumJournalLines(companyId, {
@@ -944,10 +875,10 @@ exports.getTaxDashboard = async (req, res) => {
     })).map((r) => ({ _id: null, totalCredit: r.credit, totalDebit: r.debit }));
 
     // Calculate totals
-    const vatOutputTotal = vatOutput[0]?.total || 0;
-    const vatInputTotal = vatInput[0]?.total || 0;
+    const vatOutputTotal = Number(vatOutput._sum?.taxAmount || 0);
+    const vatInputTotal = Number(vatInput._sum?.taxAmount || 0);
     const netVat = vatOutputTotal - vatInputTotal;
-    const payeTotal = payeData[0]?.totalPaye || 0;
+    const payeTotal = Number(payeData?.totalPaye || 0);
     const whtTotal = withholdingTax[0]?.total || 0;
     const citTotal = corporateTax[0]?.total || 0;
 

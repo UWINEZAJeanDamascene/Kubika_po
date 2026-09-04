@@ -345,29 +345,14 @@ class MonthlyReportsService {
 
   // Helper: Get expenses by category
   static async _getExpensesByCategory(companyId, start, end) {
-    const JournalEntry = JournalEntry;
+    const expenses = await dbClient().expense.groupBy({
+      by: ['category'],
+      where: { companyId: String(companyId), expenseDate: { gte: start, lte: end }, status: { not: 'cancelled' } },
+      _sum: { amount: true },
+      orderBy: { _sum: { amount: 'desc' } },
+    });
 
-    const expenses = await Expense.aggregate([
-      {
-        $match: {
-          company: toObjectId(companyId),
-          $or: [
-            { expense_date: { $gte: start, $lte: end } },
-            { date: { $gte: start, $lte: end } }
-          ],
-          status: { $ne: 'cancelled' }
-        }
-      },
-      {
-        $group: {
-          _id: '$category',
-          amount: { $sum: { $toDouble: '$amount' } }
-        }
-      },
-      { $sort: { amount: -1 } }
-    ]);
-
-    return expenses.map(e => ({ category: e._id || 'Uncategorized', amount: e.amount }));
+    return expenses.map(e => ({ category: e.category || 'Uncategorized', amount: Number(e._sum?.amount || 0) }));
   }
 
   // Helper: Get account total by account type/name

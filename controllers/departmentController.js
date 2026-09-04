@@ -1,6 +1,7 @@
 const Department = require('../models/Department');
 const User = require('../models/User');
 const Employee = require('../models/Employee');
+const { dbClient } = require('../lib/prisma');
 
 // @desc    Get all departments
 // @route   GET /api/departments
@@ -40,13 +41,14 @@ exports.getDepartments = async (req, res, next) => {
       .sort({ code: 1 });
 
     // Get employee counts per department (using departmentRef)
-    const employeeCounts = await Employee.aggregate([
-      { $match: { company: companyId, departmentRef: { $ne: null } } },
-      { $group: { _id: '$departmentRef', count: { $sum: 1 } } }
-    ]);
+    const employeeCounts = await dbClient().employee.groupBy({
+      by: ['departmentId'],
+      where: { companyId: String(companyId), departmentId: { not: null } },
+      _count: { _all: true },
+    });
 
     const countMap = {};
-    employeeCounts.forEach(ec => { countMap[ec._id.toString()] = ec.count; });
+    employeeCounts.forEach(ec => { countMap[ec.departmentId.toString()] = ec._count._all; });
 
     const data = departments.map(d => ({
       ...d.toObject(),

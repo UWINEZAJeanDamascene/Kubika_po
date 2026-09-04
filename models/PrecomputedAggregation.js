@@ -1,135 +1,89 @@
-/**
- * Pre-computed Aggregations Model
- * Stores nightly/daily pre-computed report data for fast retrieval
- */
+'use strict';
 
-const mongoose = require('mongoose');
+const { buildGlobalModel } = require('../utils/masterDataCommon');
+const { generateObjectId, toIdString } = require('../utils/objectId');
 
-const precomputedAggregationSchema = new mongoose.Schema({
-  company: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Company',
-    required: true,
-    index: true
-  },
-  type: {
-    type: String,
-    enum: [
-      'balance-sheet',
-      'profit-and-loss',
-      'inventory-valuation',
-      'daily-summary',
-      'monthly-summary',
-      'vat-summary'
-    ],
-    required: true,
-    index: true
-  },
-  period: {
-    type: String, // 'daily', 'monthly', 'yearly', or date string '2024-01'
-    required: true,
-    index: true
-  },
-  asOfDate: {
-    type: Date,
-    default: Date.now,
-    index: true
-  },
-  // Pre-computed data fields
-  data: {
-    type: mongoose.Schema.Types.Mixed,
-    required: true
-  },
-  // Metadata
-  computedAt: {
-    type: Date,
-    default: Date.now
-  },
-  computationTimeMs: {
-    type: Number
-  },
-  status: {
-    type: String,
-    enum: ['success', 'failed', 'in-progress'],
-    default: 'success'
-  },
-  errorMessage: {
-    type: String
-  }
-}, {
-  timestamps: true,
-  capped: { size: 1073741824 } // 1GB capped collection
-});
-
-// Compound index for efficient queries
-precomputedAggregationSchema.index({ company: 1, type: 1, period: -1 });
-precomputedAggregationSchema.index({ company: 1, type: 1, asOfDate: -1 });
-
-/**
- * Get the latest pre-computed data for a company and type
- */
-precomputedAggregationSchema.statics.getLatest = async function(companyId, type, period = 'latest') {
-  const query = { company: companyId, type, status: 'success' };
-  
-  if (period !== 'latest') {
-    query.period = period;
-  }
-  
-  return await this.findOne(query).sort({ asOfDate: -1 });
+const FIELD_MAP = {
+  _id: { target: 'id', isId: true },
+  company: { target: 'company' },
+  asOfDate: { target: 'asOfDate' },
+  computedAt: { target: 'computedAt' },
+  computationTimeMs: { target: 'computationTimeMs' },
+  errorMessage: { target: 'errorMessage' },
 };
 
-/**
- * Store pre-computed data
- */
-precomputedAggregationSchema.statics.store = async function(companyId, type, period, data, computationTimeMs) {
-  return await this.findOneAndUpdate(
+function toApi(row) {
+  if (!row) return null;
+  return { ...row, _id: row.id, id: undefined };
+}
+
+function translateCreate(data = {}) {
+  return {
+    id: toIdString(data._id || data.id) || generateObjectId(),
+    company: toIdString(data.company),
+    type: data.type,
+    period: data.period,
+    asOfDate: data.asOfDate || new Date(),
+    data: data.data,
+    computedAt: data.computedAt || new Date(),
+    computationTimeMs: data.computationTimeMs ?? null,
+    status: data.status || 'success',
+    errorMessage: data.errorMessage || null,
+  };
+}
+
+function translateUpdate(update = {}) {
+  const source = update.$set ? { ...update, ...update.$set } : { ...update };
+  delete source.$set;
+  delete source.$unset;
+  const result = {};
+  for (const field of ['company', 'type', 'period', 'asOfDate', 'data', 'computedAt', 'computationTimeMs', 'status', 'errorMessage']) {
+    if (source[field] !== undefined) result[field] = field === 'company' ? toIdString(source[field]) : source[field];
+  }
+  return result;
+}
+
+const PrecomputedAggregation = buildGlobalModel({
+  name: 'PrecomputedAggregation',
+  collection: 'precomputed_aggregations',
+  delegateName: 'precomputedAggregation',
+  fieldMap: FIELD_MAP,
+  toApi,
+  translateCreate,
+  translateUpdate,
+  mutable: true,
+});
+
+PrecomputedAggregation.getLatest = async function getLatest(companyId, type, period = 'latest') {
+  const query = { company: companyId, type, status: 'success' };
+  if (period !== 'latest') query.period = period;
+  return PrecomputedAggregation.findOne(query).sort({ asOfDate: -1 });
+};
+
+PrecomputedAggregation.store = async function store(companyId, type, period, data, computationTimeMs) {
+  return PrecomputedAggregation.findOneAndUpdate(
     { company: companyId, type, period },
-    {
-      company: companyId,
-      type,
-      period,
-      asOfDate: new Date(),
-      data,
-      computedAt: new Date(),
-      computationTimeMs,
-      status: 'success'
-    },
-    { upsert: true, new: true }
+    { $set: { company: companyId, type, period, asOfDate: new Date(), data, computedAt: new Date(), computationTimeMs, status: 'success' } },
+    { upsert: true, new: true },
   );
 };
 
-/**
- * Get balance sheet data (from cache or compute)
- */
-precomputedAggregationSchema.statics.getBalanceSheet = async function(companyId, options = {}) {
-  const { useCache = true, cacheAge = 15 } = options; // cacheAge in minutes
-  
+PrecomputedAggregation.getBalanceSheet = async function getBalanceSheet(companyId, options = {}) {
+  const { useCache = true, cacheAge = 15 } = options;
   if (useCache) {
-    const cached = await this.getLatest(companyId, 'balance-sheet');
+    const cached = await PrecomputedAggregation.getLatest(companyId, 'balance-sheet');
     if (cached) {
-      const age = (Date.now() - cached.computedAt.getTime()) / (1000 * 60);
-      if (age < cacheAge) {
-        return { data: cached.data, fromCache: true, computedAt: cached.computedAt };
-      }
+      const age = (Date.now() - new Date(cached.computedAt).getTime()) / (1000 * 60);
+      if (age < cacheAge) return { data: cached.data, fromCache: true, computedAt: cached.computedAt };
     }
   }
-  
   return { fromCache: false };
 };
 
-/**
- * Clean old pre-computed data
- */
-precomputedAggregationSchema.statics.cleanOld = async function(companyId, olderThanDays = 30) {
+PrecomputedAggregation.cleanOld = async function cleanOld(companyId, olderThanDays = 30) {
   const cutoff = new Date();
   cutoff.setDate(cutoff.getDate() - olderThanDays);
-  
-  return await this.deleteMany({
-    company: companyId,
-    computedAt: { $lt: cutoff }
-  });
+  return PrecomputedAggregation.deleteMany({ company: companyId, computedAt: { $lt: cutoff } });
 };
-
-const PrecomputedAggregation = mongoose.model('PrecomputedAggregation', precomputedAggregationSchema);
 
 module.exports = PrecomputedAggregation;

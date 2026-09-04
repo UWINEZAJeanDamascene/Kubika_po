@@ -3,7 +3,6 @@
  * Atomic adjust() via upsert + increment for fast trial balance reads.
  */
 
-const mongoose = require('mongoose');
 const { prisma, dbClient } = require('../lib/prisma');
 const { makeCompatModel, translateFilter, IMPOSSIBLE, toId } = require('../utils/prismaCompat');
 const { generateObjectId } = require('../utils/objectId');
@@ -16,10 +15,6 @@ const FIELD_MAP = {
   companyId: { target: 'companyId', isId: true },
   accountCode: { target: 'accountCode' },
 };
-
-if (!mongoose.models.AccountBalance) {
-  mongoose.model('AccountBalance', new mongoose.Schema({}, { strict: false, collection: 'accountbalances' }));
-}
 
 const base = makeCompatModel({
   delegate: () => prisma.accountBalance,

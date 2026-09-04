@@ -50,6 +50,14 @@ const errorHandler = (err, req, res, next) => {
     statusCode = 413;
     code = 'AGGREGATE_ROW_LIMIT';
     message = err.message || 'This report is too large to calculate in the API process.';
+  } else if (['QUERY_LIMIT_EXCEEDED', 'QUERY_PARAMETER_INVALID', 'READ_BATCH_EXCEEDED'].includes(err.code)) {
+    statusCode = err.statusCode || (err.code === 'QUERY_PARAMETER_INVALID' ? 400 : 413);
+    code = err.code;
+    message = err.message || 'The requested read exceeds the allowed page or batch size.';
+  } else if (err.code === 'TENANT_SCOPE_REQUIRED' || err.code === 'QUERY_LIMIT_REQUIRED') {
+    statusCode = 500;
+    code = err.code;
+    message = err.message || 'The server rejected an unsafe data query.';
   } else if (err.code === 50 || err.codeName === 'MaxTimeMSExpired') {
     statusCode = 503;
     code = 'QUERY_TIMEOUT';

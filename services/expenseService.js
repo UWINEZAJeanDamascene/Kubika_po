@@ -1,4 +1,3 @@
-const mongoose = require('mongoose');
 const Expense = require('../models/Expense');
 const JournalEntry = require('../models/JournalEntry');
 const ChartOfAccount = require('../models/ChartOfAccount');

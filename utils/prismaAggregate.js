@@ -3,6 +3,8 @@
  * Supports the pipeline patterns used by dashboard services.
  */
 
+const { getReadContext, runReadContext } = require('../lib/readContext');
+
 const LOOKUP_MODELS = {
   products: () => require('../models/Product'),
   clients: () => require('../models/Client'),
@@ -22,12 +24,12 @@ function modelLabel(config) {
   return match ? match[1] : 'unknown';
 }
 
-function aggregateLimitError(config, matchStage) {
-  const error = new Error(`Aggregate on ${modelLabel(config)} exceeds the ${AGG_MAX_ROWS.toLocaleString()} row safety limit. Use a SQL/Prisma aggregate or add a narrower filter.`);
+function aggregateLimitError(config, matchStage, maxRows = AGG_MAX_ROWS) {
+  const error = new Error(`Aggregate on ${modelLabel(config)} exceeds ${maxRows.toLocaleString()} rows, the active safety limit. Use a SQL/Prisma aggregate or add a narrower filter.`);
   error.name = 'AggregateRowLimitError';
   error.code = 'AGGREGATE_ROW_LIMIT';
   error.status = 413;
-  error.aggregate = { model: modelLabel(config), match: matchStage, maxRows: AGG_MAX_ROWS };
+  error.aggregate = { model: modelLabel(config), match: matchStage, maxRows };
   return error;
 }
 
@@ -531,9 +533,22 @@ async function fetchMatchDocs(matchStage, config, fullPipeline = [], metrics = n
   const fetch = async (where) => {
     // Read one extra row so a group after a truncated read never returns an
     // inaccurate result. The caller receives a clear, retryable 413 instead.
-    const rows = await config.delegate().findMany({ where, include, take: AGG_MAX_ROWS + 1 });
+    // This is an intentional bounded probe, not a caller-requested HTTP read;
+    // mark it internal just like the compat model's unbounded-find probe so
+    // the Prisma query extension does not reject AGG_MAX_ROWS + 1 against the
+    // ordinary 500-row request ceiling before this shim can enforce its own
+    // aggregate safety limit.
+    const readContext = getReadContext();
+    // Respect the active request/job ceiling as well as the aggregate shim's
+    // hard ceiling. The larger aggregate cap must not become an HTTP escape
+    // hatch just because this query is an internal probe.
+    const maxRows = Math.min(AGG_MAX_ROWS, Math.max(1, Number(readContext.maxRows || AGG_MAX_ROWS)));
+    const rows = await runReadContext(
+      { ...readContext, internalProbe: true, maxRows },
+      () => config.delegate().findMany({ where, include, take: maxRows + 1 }),
+    );
     if (metrics) metrics.rowsFetched = rows.length;
-    if (rows.length > AGG_MAX_ROWS) throw aggregateLimitError(config, matchStage);
+    if (rows.length > maxRows) throw aggregateLimitError(config, matchStage, maxRows);
     return rows;
   };
 

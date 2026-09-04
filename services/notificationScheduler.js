@@ -11,7 +11,25 @@ const smsService = require('./smsService');
 const { notifyLowStock, notifyOutOfStock } = require('./notificationHelper');
 const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
 const JournalService = require('./journalService');
-const { aggregateWithTimeout } = require('../utils/mongoAggregation');
+const { dbClient } = require('../lib/prisma');
+
+const SCHEDULER_PAGE_SIZE = Math.min(100, Math.max(10, Number(process.env.SCHEDULER_PAGE_SIZE || 100)));
+const SCHEDULER_MAX_ROWS = Math.max(SCHEDULER_PAGE_SIZE, Number(process.env.SCHEDULER_MAX_ROWS || 10000));
+
+async function fetchPaged(model, filter, configure = (query) => query, pageSize = SCHEDULER_PAGE_SIZE) {
+  const rows = [];
+  for (let page = 0; page * pageSize < SCHEDULER_MAX_ROWS; page += 1) {
+    let query = model.find(filter)
+      .sort({ _id: 1 })
+      .skip(page * pageSize)
+      .limit(Math.min(pageSize, SCHEDULER_MAX_ROWS - page * pageSize));
+    query = configure(query) || query;
+    const batch = await query;
+    rows.push(...batch);
+    if (batch.length < pageSize) return rows;
+  }
+  throw Object.assign(new Error(`scheduler read exceeded ${SCHEDULER_MAX_ROWS} rows`), { code: 'READ_BATCH_EXCEEDED', statusCode: 413 });
+}
 
 // ============================================
 // HELPER FUNCTIONS
@@ -56,12 +74,12 @@ const getNotificationSettings = async (companyId) => {
 
 // Get admin users with phones for SMS
 const getAdminPhones = async (companyId) => {
-  const admins = await User.find({ 
-    company: companyId, 
-    role: 'admin', 
-    isActive: true 
-  }).select('phone');
-  
+  const admins = await fetchPaged(User, {
+    company: companyId,
+    role: 'admin',
+    isActive: true,
+  }, (query) => query.select('phone'));
+
   const phones = admins.map(a => a.phone).filter(Boolean);
   const settings = await getNotificationSettings(companyId);
   
@@ -80,7 +98,7 @@ async function sendPaymentReminders() {
   console.log('🔔 Running payment reminder job...');
   
   try {
-    const companies = await Company.find({});
+const companies = await fetchPaged(Company, {});
     
     for (const company of companies) {
       const settings = await getNotificationSettings(company._id);
@@ -96,12 +114,13 @@ async function sendPaymentReminders() {
       const target = new Date(now.getTime() + daysBefore * 24 * 60 * 60 * 1000);
 
       // Find due invoices
-      const invoices = await Invoice.find({
+      const invoices = await fetchPaged(Invoice, {
         company: company._id,
         dueDate: { $lte: target },
         status: { $in: ['draft', 'confirmed'] },
-        balance: { $gt: 0 }
-      }).populate('client company');
+        balance: { $gt: 0 },
+      }, (query) => query.populate('client company'));
+
 
       for (const inv of invoices) {
         const clientEmail = inv.client?.contact?.email || inv.customerEmail;
@@ -116,11 +135,11 @@ async function sendPaymentReminders() {
       }
       
       // Check for overdue invoices - send SMS for critical
-      const overdueInvoices = await Invoice.find({
+      const overdueInvoices = await fetchPaged(Invoice, {
         company: company._id,
         dueDate: { $lt: now },
         status: { $in: ['draft', 'confirmed'] },
-        balance: { $gt: 0 }
+        balance: { $gt: 0 },
       });
       
       if (settings?.smsNotifications?.enabled && overdueInvoices.length > 0) {
@@ -145,7 +164,7 @@ async function checkLowStock() {
   console.log('🔔 Running low stock check job...');
   
   try {
-    const companies = await Company.find({});
+const companies = await fetchPaged(Company, {});
     const threshold = process.env.LOW_STOCK_THRESHOLD || 10;
 
     for (const company of companies) {
@@ -154,11 +173,14 @@ async function checkLowStock() {
 
       // Find low stock products
       // Use `defaultWarehouse` field (if present) instead of `warehouse` which is not in the schema
-      const products = await Product.find({
+      const products = await fetchPaged(Product, {
         company: company._id,
-        currentStock: { $lte: companyThreshold }
-      }).populate('company');
+        currentStock: { $lte: companyThreshold },
+      }, (query) => query.populate('company'));
 
+      const criticalPhones = settings?.smsNotifications?.enabled
+        ? await getAdminPhones(company._id)
+        : [];
       for (const p of products) {
         const isCritical = p.currentStock <= Math.floor(companyThreshold / 2);
         
@@ -187,11 +209,8 @@ async function checkLowStock() {
         }
         
         // Send SMS for critical stock
-        if (settings?.smsNotifications?.enabled) {
-          const phones = await getAdminPhones(company._id);
-          if (phones.length > 0 && isCritical) {
-            await smsService.sendLowStockCriticalSMS(p, company, phones);
-          }
+        if (criticalPhones.length > 0 && isCritical) {
+          await smsService.sendLowStockCriticalSMS(p, company, criticalPhones);
         }
       }
     }
@@ -208,7 +227,7 @@ async function sendDailySummaryReports() {
   console.log('🔔 Running daily summary job...');
   
   try {
-    const companies = await Company.find({});
+const companies = await fetchPaged(Company, {});
 
     for (const company of companies) {
       const settings = await getNotificationSettings(company._id);
@@ -269,7 +288,7 @@ async function sendWeeklySummaryReports() {
   console.log('🔔 Running weekly summary job...');
   
   try {
-    const companies = await Company.find({});
+const companies = await fetchPaged(Company, {});
 
     for (const company of companies) {
       const settings = await getNotificationSettings(company._id);
@@ -290,28 +309,30 @@ async function sendWeeklySummaryReports() {
         categoryBreakdown
       ] = await Promise.all([
         Invoice.countDocuments({ company: company._id, createdAt: { $gte: since } }),
-        aggregateWithTimeout(Invoice, [
-          { $match: { company: company._id, status: 'confirmed', createdAt: { $gte: since } } },
-          { $group: { _id: null, total: { $sum: '$total' } } }
-        ], 'report'),
+        dbClient().invoice.aggregate({
+          where: { companyId: String(company._id), status: 'confirmed', createdAt: { gte: since } },
+          _sum: { totalAmount: true },
+        }),
         require('../models/Purchase').countDocuments({ company: company._id, createdAt: { $gte: since } }),
         Product.countDocuments({ company: company._id, currentStock: { $lte: Number(process.env.LOW_STOCK_THRESHOLD || 5) } }),
         // Category breakdown (simplified)
-        aggregateWithTimeout(Product, [
-          { $match: { company: company._id } },
-          { $group: { _id: '$category', revenue: { $sum: '$currentStock' } } },
-          { $limit: 5 }
-        ], 'report')
+        dbClient().product.groupBy({
+          by: ['categoryId'],
+          where: { companyId: String(company._id) },
+          _sum: { currentStock: true },
+          orderBy: { _sum: { currentStock: 'desc' } },
+          take: 5,
+        })
       ]);
 
       const stats = {
         totalInvoices,
-        totalRevenue: totalRevenue[0]?.total || 0,
+        totalRevenue: Number(totalRevenue._sum.totalAmount || 0),
         totalPurchases,
         lowStockCount,
-        categoryBreakdown: categoryBreakdown.map(c => ({ 
-          category: c._id || 'Uncategorized', 
-          revenue: c.revenue 
+        categoryBreakdown: categoryBreakdown.map(c => ({
+          category: c.categoryId || 'Uncategorized',
+          revenue: Number(c._sum.currentStock || 0),
         }))
       };
 
@@ -335,16 +356,16 @@ async function runAutomaticDepreciation() {
   console.log('📊 Running automatic depreciation job...');
   
   try {
-    const companies = await Company.find({});
+const companies = await fetchPaged(Company, {});
     const now = new Date();
     const currentMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
     const monthLabel = `${currentMonth.getUTCFullYear()}-${String(currentMonth.getUTCMonth() + 1).padStart(2, '0')}`;
     
     for (const company of companies) {
       // Get all active fixed assets for the company
-      const assets = await FixedAsset.find({ 
+      const assets = await fetchPaged(FixedAsset, {
         company: company._id,
-        status: { $in: ['active', 'in_use'] }
+        status: { $in: ['active', 'in_use'] },
       });
       
       for (const asset of assets) {
