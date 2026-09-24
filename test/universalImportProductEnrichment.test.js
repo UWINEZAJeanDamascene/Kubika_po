@@ -64,4 +64,9 @@ describe('universal product import enrichment contract', () => {
       { name: 'Other Supplier' },
     ]).candidate.name).toBe('Kigali Fresh Foods Ltd');
   });
+
+  it('recognizes explicit RRA item class codes even when the local cache is incomplete', () => {
+    expect(ImportService.__test__.isWellFormedRraItemClassCode('50202306')).toBe(true);
+    expect(ImportService.__test__.isWellFormedRraItemClassCode('not-a-code')).toBe(false);
+  });
 });

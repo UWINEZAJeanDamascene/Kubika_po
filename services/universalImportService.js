@@ -210,6 +210,10 @@ function quantityUnitFor(unit) {
   return 'U';
 }
 
+function isWellFormedRraItemClassCode(value) {
+  return /^\d{6,14}$/.test(String(value || '').trim());
+}
+
 async function buildProductEnrichmentContext(companyId) {
   const Category = require('../models/Category');
   const Warehouse = require('../models/Warehouse');
@@ -324,6 +328,12 @@ async function enrichProductRow(companyId, clean, context, rowNumber) {
     : bestMatch(`${clean.name} ${clean.description}`, context.itemClasses, (itemClass) => itemClass.itemClassName);
   if (classMatch && classMatch.score >= (exactClass ? 1 : 0.65)) {
     clean.itemClassCode = classMatch.candidate.itemClassCode;
+  } else if (!exactClass && isWellFormedRraItemClassCode(suppliedItemClassCode)) {
+    clean.itemClassCode = suppliedItemClassCode;
+    warnings.push({
+      field: 'itemClassCode',
+      message: 'The supplied RRA item classification was preserved but is not in the local cache; verify it during EBM registration.',
+    });
   } else {
     clean.itemClassCode = null;
     warnings.push({ field: 'itemClassCode', blocking: true, message: 'No confident synced RRA item classification was found; review this row before importing.' });
@@ -1088,6 +1098,7 @@ module.exports = {
     matchScore,
     bestMatch,
     quantityUnitFor,
+    isWellFormedRraItemClassCode,
     productPayload,
   }
 };
