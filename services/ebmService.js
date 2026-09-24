@@ -522,11 +522,16 @@ class EBMService {
       }
 
       case VSDC_ENDPOINTS.SELECT_BRANCHES:
+        const requestedBranchId = String(payload.bhfId || payload.branchId || '').padStart(2, '0').slice(-2);
+        const mockBranches = [
+          { tin, bhfId: '00', bhfNm: 'Headquarter', hqYn: 'Y', useYn: 'Y' },
+          { tin, bhfId: '01', bhfNm: 'Branch 01', hqYn: 'N', useYn: 'Y' },
+        ];
+        if (requestedBranchId && !mockBranches.some((branch) => branch.bhfId === requestedBranchId)) {
+          mockBranches.push({ tin, bhfId: requestedBranchId, bhfNm: `Branch ${requestedBranchId}`, hqYn: 'N', useYn: 'Y' });
+        }
         return makeSuccessResponse({
-          bhfList: [
-            { tin, bhfId: '00', bhfNm: 'Headquarter', hqYn: 'Y', useYn: 'Y' },
-            { tin, bhfId: '01', bhfNm: 'Branch 01', hqYn: 'N', useYn: 'Y' },
-          ],
+          bhfList: mockBranches,
         }, now);
 
       case VSDC_ENDPOINTS.SELECT_NOTICES:
