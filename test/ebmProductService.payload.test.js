@@ -135,5 +135,23 @@ describe('EBM product registration payload', () => {
     expect(product.ebm.ebmItemCode).not.toBe(product.sku);
     expect(EBMProductService.__test__.isValidRraItemCode(product.ebm.ebmItemCode)).toBe(true);
   });
+
+  it('returns an actionable validation error when EBM product fields are missing', async () => {
+    const product = baseProduct({
+      ebm: {
+        taxTyCd: 'B',
+      },
+    });
+    Product.findOne.mockResolvedValue(product);
+
+    await expect(
+      EBMProductService.registerProduct('company-1', 'product-1'),
+    ).rejects.toMatchObject({
+      code: 'EBM_PRODUCT_FIELDS_MISSING',
+      statusCode: 422,
+      message: 'Missing EBM product fields: itemClassCd, pkgUnitCd, qtyUnitCd',
+    });
+    expect(ebmService.saveItems).not.toHaveBeenCalled();
+  });
 });
 

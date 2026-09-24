@@ -91,8 +91,12 @@ async function validateProductCodes(companyId, product) {
   if (!taxTyCd) missing.push("taxTyCd");
   if (!pkgUnitCd) missing.push("pkgUnitCd");
   if (!qtyUnitCd) missing.push("qtyUnitCd");
-  if (missing.length)
-    throw new Error(`Missing EBM product fields: ${missing.join(", ")}`);
+  if (missing.length) {
+    const error = new Error(`Missing EBM product fields: ${missing.join(", ")}`);
+    error.code = "EBM_PRODUCT_FIELDS_MISSING";
+    error.statusCode = 422;
+    throw error;
+  }
 
   const [itemClass, pkgUnit, qtyUnit] = await Promise.all([
     EBMItemClass.exists({
@@ -130,13 +134,30 @@ async function validateProductCodes(companyId, product) {
     }
   }
 
-  if (!itemClass)
-    throw new Error(`Invalid RRA item classification code: ${itemClassCd}`);
-  if (!["A", "B", "C", "D"].includes(taxTyCd))
-    throw new Error(`Invalid RRA tax type code: ${taxTyCd}`);
-  if (!pkgUnit)
-    throw new Error(`Invalid RRA packaging unit code: ${pkgUnitCd}`);
-  if (!qtyUnit) throw new Error(`Invalid RRA quantity unit code: ${qtyUnitCd}`);
+  if (!itemClass) {
+    const error = new Error(`Invalid RRA item classification code: ${itemClassCd}`);
+    error.code = "EBM_PRODUCT_ITEM_CLASS_INVALID";
+    error.statusCode = 422;
+    throw error;
+  }
+  if (!["A", "B", "C", "D"].includes(taxTyCd)) {
+    const error = new Error(`Invalid RRA tax type code: ${taxTyCd}`);
+    error.code = "EBM_PRODUCT_TAX_CODE_INVALID";
+    error.statusCode = 422;
+    throw error;
+  }
+  if (!pkgUnit) {
+    const error = new Error(`Invalid RRA packaging unit code: ${pkgUnitCd}`);
+    error.code = "EBM_PRODUCT_PACKAGING_UNIT_INVALID";
+    error.statusCode = 422;
+    throw error;
+  }
+  if (!qtyUnit) {
+    const error = new Error(`Invalid RRA quantity unit code: ${qtyUnitCd}`);
+    error.code = "EBM_PRODUCT_QUANTITY_UNIT_INVALID";
+    error.statusCode = 422;
+    throw error;
+  }
 }
 
 class EBMProductService {
