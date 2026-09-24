@@ -102,6 +102,7 @@ exports.getCreditNotes = async (req, res, next) => {
     const {
       status,
       client,
+      invoiceId,
       type,
       dateFrom,
       dateTo,
@@ -121,6 +122,10 @@ exports.getCreditNotes = async (req, res, next) => {
     // Client filter
     if (client && client !== "all") {
       query.client = client;
+    }
+
+    if (invoiceId) {
+      query.invoice = invoiceId;
     }
 
     // Type filter
