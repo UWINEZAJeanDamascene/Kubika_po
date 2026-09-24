@@ -267,13 +267,19 @@ async function enrichProductRow(companyId, clean, context, rowNumber) {
     }
   }
 
-  const warehouseMatch = bestMatch(clean.warehouse, context.warehouses);
+  const warehouseMatch = bestMatch(
+    clean.warehouse,
+    context.warehouses,
+    (warehouse) => `${warehouse.name || ''} ${warehouse.code || ''} ${warehouse.rraBranchId || ''}`,
+  );
   const defaultWarehouse = context.warehouses.find((warehouse) => warehouse.isDefault)
     || context.warehouses.find((warehouse) => normalizeMatch(warehouse.name).includes('main'))
     || context.warehouses[0];
-  clean.warehouse = warehouseMatch && warehouseMatch.score >= 0.75
-    ? warehouseMatch.candidate.name
-    : (defaultWarehouse?.name || null);
+  const selectedWarehouse = warehouseMatch && warehouseMatch.score >= 0.75
+    ? warehouseMatch.candidate
+    : defaultWarehouse;
+  clean.warehouse = selectedWarehouse?.name || null;
+  clean.warehouseId = selectedWarehouse?._id || null;
   if (!warehouseMatch && !defaultWarehouse) {
     warnings.push({ field: 'warehouse', message: 'No warehouse exists; create one before importing opening stock.' });
   }
@@ -331,20 +337,22 @@ async function enrichProductRow(companyId, clean, context, rowNumber) {
 
   const suppliedItemClassCode = String(clean.itemClassCode || '').trim();
   const exactClass = context.itemClasses.find((itemClass) => String(itemClass.itemClassCode) === suppliedItemClassCode);
-  const classMatch = exactClass
-    ? { candidate: exactClass, score: 1 }
-    : bestMatch(`${clean.name} ${clean.description}`, context.itemClasses, (itemClass) => itemClass.itemClassName);
-  if (classMatch && classMatch.score >= (exactClass ? 1 : 0.65)) {
-    clean.itemClassCode = classMatch.candidate.itemClassCode;
-  } else if (!exactClass && isWellFormedRraItemClassCode(suppliedItemClassCode)) {
+  if (exactClass) {
+    clean.itemClassCode = exactClass.itemClassCode;
+  } else if (isWellFormedRraItemClassCode(suppliedItemClassCode)) {
     clean.itemClassCode = suppliedItemClassCode;
     warnings.push({
       field: 'itemClassCode',
       message: 'The supplied RRA item classification was preserved but is not in the local cache; verify it during EBM registration.',
     });
   } else {
-    clean.itemClassCode = null;
-    warnings.push({ field: 'itemClassCode', blocking: true, message: 'No confident synced RRA item classification was found; review this row before importing.' });
+    const classMatch = bestMatch(`${clean.name} ${clean.description}`, context.itemClasses, (itemClass) => itemClass.itemClassName);
+    if (classMatch && classMatch.score >= 0.65) {
+      clean.itemClassCode = classMatch.candidate.itemClassCode;
+    } else {
+      clean.itemClassCode = null;
+      warnings.push({ field: 'itemClassCode', blocking: true, message: 'No confident synced RRA item classification was found; review this row before importing.' });
+    }
   }
 
   clean.costingMethod = clean.costingMethod || 'fifo';
@@ -634,13 +642,25 @@ async function captureProductOpeningStock(companyId, userId, productId, data) {
   if (quantity == null || quantity <= 0) return false;
 
   const Warehouse = require('../models/Warehouse');
+  const StockMovement = require('../models/StockMovement');
   const OpeningStockService = require('./openingStockService');
   const warehouses = await Warehouse.find({ company: companyId }).lean();
   const requestedName = String(data.warehouse || '').trim().toLowerCase();
-  const warehouse = warehouses.find((candidate) => String(candidate.name || '').trim().toLowerCase() === requestedName);
+  const warehouse = data.warehouseId
+    ? warehouses.find((candidate) => String(candidate._id) === String(data.warehouseId))
+    : warehouses.find((candidate) => [candidate.name, candidate.code, candidate.rraBranchId]
+      .some((value) => String(value || '').trim().toLowerCase() === requestedName));
   if (!warehouse) {
     throw new Error(`Warehouse "${data.warehouse || ''}" not found for opening stock.`);
   }
+
+  const existingOpening = await StockMovement.findOne({
+    company: companyId,
+    product: productId,
+    warehouse: warehouse._id,
+    reason: 'initial_stock',
+  }).select('_id').lean();
+  if (existingOpening) return false;
 
   await OpeningStockService.createOpeningStock({
     companyId,
@@ -820,13 +840,13 @@ function productPayload(companyId, userId, data) {
 async function upsertRow(entityType, companyId, userId, data, duplicateAction, context = {}) {
   if (entityType === 'products') {
     const Product = require('../models/Product');
-    const warehouseId = await resolveWarehouseId(companyId, data.warehouse);
+    const warehouseId = data.warehouseId || await resolveWarehouseId(companyId, data.warehouse);
     const payload = productPayload(companyId, userId, data);
     if (warehouseId) payload.defaultWarehouse = warehouseId;
     payload.category = await ensureCategory(companyId, data.category);
     const existing = await Product.findOne({ company: companyId, sku: payload.sku });
     if (existing && duplicateAction === 'skip') {
-      if (warehouseId && !existing.defaultWarehouse) {
+      if (warehouseId && String(existing.defaultWarehouse || '') !== String(warehouseId)) {
         await Product.updateOne({ _id: existing._id, company: companyId }, { $set: { defaultWarehouse: warehouseId } });
       }
       const stockCaptured = await captureProductOpeningStock(companyId, userId, existing._id, data);
