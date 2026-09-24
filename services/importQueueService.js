@@ -1,5 +1,5 @@
 const { Queue, Worker, QueueEvents } = require('bullmq');
-const { isRedisConfigured, getClient } = require('../config/redis');
+const { isRedisConfigured, createQueueConnection } = require('../config/redis');
 const ImportLog = require('../models/ImportLog');
 const { processValidatedRows } = require('./universalImportService');
 
@@ -34,9 +34,7 @@ async function runWithTenantLimit(companyId, task) {
 }
 
 function createBullConnection() {
-  const client = getClient();
-  if (!client || typeof client.duplicate !== 'function') return null;
-  return client;
+  return createQueueConnection();
 }
 
 function ensureBull() {

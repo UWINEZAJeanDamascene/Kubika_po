@@ -239,6 +239,9 @@ process.on('SIGTERM', gracefulShutdown);
  */
 const createQueueConnection = () => {
   if (!isRedisConfigured()) return null;
+  if (cacheConfig.upstashUrl && !cacheConfig.redisUrl && !process.env.REDIS_HOST && !cacheConfig.clusterNodes) {
+    return null;
+  }
   const options = {
     maxRetriesPerRequest: null,   // required by BullMQ
     enableReadyCheck: false,      // recommended for BullMQ connections
