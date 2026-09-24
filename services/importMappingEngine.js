@@ -25,6 +25,8 @@ const ALIASES = {
   itemClassCode: ['item_class_code', 'item_classification_code', 'item_class_cd', 'rra_class_code'],
   packagingUnitCode: ['packaging_unit_code', 'pkg_unit_cd', 'package_unit', 'packaging'],
   quantityUnitCode: ['quantity_unit_code', 'qty_unit_cd', 'uom', 'unit', 'unit_code'],
+  supplier: ['supplier', 'supplier_name', 'vendor', 'vendor_name'],
+  brand: ['brand', 'brand_name', 'manufacturer'],
   reorderLevel: ['reorder_level', 'reorder_point', 'minimum_stock', 'min_stock'],
   warehouse: ['warehouse', 'location', 'store', 'stock_location'],
   address: ['address', 'adresse', 'street', 'location'],

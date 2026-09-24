@@ -3,6 +3,7 @@ services:
     env: node
     region: oregon
     buildCommand: npm install
+    preDeployCommand: npx prisma migrate deploy --schema=./prisma/schema.prisma
     startCommand: npm start
     envVars:
       - key: NODE_ENV

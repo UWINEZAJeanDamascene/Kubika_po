@@ -179,6 +179,173 @@ function buildValidationError(rowNumber, field, message, value) {
   return { row: rowNumber, field, message, value };
 }
 
+function normalizeMatch(value) {
+  return String(value || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, ' ');
+}
+
+function matchScore(left, right) {
+  const a = normalizeMatch(left);
+  const b = normalizeMatch(right);
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  if (a.includes(b) || b.includes(a)) return 0.9;
+  const aWords = new Set(a.split(' '));
+  const bWords = new Set(b.split(' '));
+  const overlap = [...aWords].filter((word) => bWords.has(word)).length;
+  return overlap / Math.max(aWords.size, bWords.size);
+}
+
+function bestMatch(value, candidates, text = (candidate) => candidate.name) {
+  let best = null;
+  for (const candidate of candidates || []) {
+    const score = matchScore(value, text(candidate));
+    if (!best || score > best.score) best = { candidate, score };
+  }
+  return best;
+}
+
+function quantityUnitFor(unit) {
+  const normalized = normalizeMatch(unit);
+  if (['kg', 'kilogram', 'kilograms'].includes(normalized)) return 'KGM';
+  return 'U';
+}
+
+async function buildProductEnrichmentContext(companyId) {
+  const Category = require('../models/Category');
+  const Warehouse = require('../models/Warehouse');
+  const Supplier = require('../models/Supplier');
+  const Product = require('../models/Product');
+  const EBMItemClass = require('../models/EBMItemClass');
+  const EBMCode = require('../models/EBMCode');
+  const ChartOfAccount = require('../models/ChartOfAccount');
+  const Company = require('../models/Company');
+
+  const [company, categories, warehouses, suppliers, products, itemClasses, ebmCodes, accounts] = await Promise.all([
+    Company.findById(companyId).lean(),
+    Category.find({ company: companyId }).lean(),
+    Warehouse.find({ company: companyId, isActive: { $ne: false } }).lean(),
+    Supplier.find({ company: companyId, isActive: { $ne: false } }).lean(),
+    Product.find({ company: companyId }).select('brand').lean(),
+    EBMItemClass.find({ company: companyId, active: { $ne: false } }).lean(),
+    EBMCode.find({ company: companyId, active: { $ne: false } }).lean(),
+    ChartOfAccount.find({ company: companyId, code: { $in: ['1400', '5000', '4000'] } }).lean(),
+  ]);
+
+  return { company, categories, warehouses, suppliers, products, itemClasses, ebmCodes, accounts };
+}
+
+async function enrichProductRow(companyId, clean, context, rowNumber) {
+  const warnings = [];
+  const categoryMatch = bestMatch(clean.category, context.categories);
+  if (categoryMatch && categoryMatch.score >= 0.8) {
+    clean.category = categoryMatch.candidate.name;
+  } else {
+    const general = context.categories.find((category) => normalizeMatch(category.name) === 'general');
+    clean.category = general?.name || 'General';
+    if (!general) {
+      const created = await require('../models/Category').create({
+        company: companyId,
+        name: 'General',
+        description: 'Created automatically during product import',
+      });
+      context.categories.push(created);
+    }
+    if (clean.category !== (categoryMatch?.candidate?.name || '')) {
+      warnings.push({ field: 'category', message: 'Category was resolved to General because no confident match was found.' });
+    }
+  }
+
+  const warehouseMatch = bestMatch(clean.warehouse, context.warehouses);
+  const defaultWarehouse = context.warehouses.find((warehouse) => warehouse.isDefault)
+    || context.warehouses.find((warehouse) => normalizeMatch(warehouse.name).includes('main'))
+    || context.warehouses[0];
+  clean.warehouse = warehouseMatch && warehouseMatch.score >= 0.75
+    ? warehouseMatch.candidate.name
+    : (defaultWarehouse?.name || null);
+  if (!warehouseMatch && !defaultWarehouse) {
+    warnings.push({ field: 'warehouse', message: 'No warehouse exists; create one before importing opening stock.' });
+  }
+
+  const supplierMatch = bestMatch(clean.supplier, context.suppliers);
+  if (clean.supplier && supplierMatch && supplierMatch.score >= 0.8) {
+    clean.supplier = supplierMatch.candidate.name;
+    clean.supplierId = supplierMatch.candidate._id;
+  } else if (clean.supplier) {
+    const Supplier = require('../models/Supplier');
+    const draftName = String(clean.supplier).trim();
+    const draft = await Supplier.create({
+      company: companyId,
+      name: draftName,
+      code: `IMP-${Date.now().toString(36).toUpperCase().slice(-8)}`,
+      contact: {},
+      isActive: true,
+      notes: 'Draft supplier created automatically during product import; add contact details.',
+      customFields: { importNeedsContactInfo: true },
+    });
+    context.suppliers.push(draft);
+    clean.supplierId = draft._id;
+    warnings.push({ field: 'supplier', message: `Draft supplier created for ${draftName}; contact details still need completion.` });
+  }
+
+  if (clean.brand) {
+    const brands = [...new Set(context.products.map((product) => product.brand).filter(Boolean))].map((name) => ({ name }));
+    const brandMatch = bestMatch(clean.brand, brands);
+    clean.brand = brandMatch && brandMatch.score >= 0.8 ? brandMatch.candidate.name : null;
+  }
+
+  const taxDefault = context.company?.is_vat_registered === false ? 'A' : 'B';
+  clean.taxTypeCode = String(clean.taxTypeCode || taxDefault).toUpperCase();
+
+  const unit = clean.quantityUnitCode || clean.unit || 'pcs';
+  const unitCode = String(clean.quantityUnitCode || '').toUpperCase();
+  const quantityCandidates = context.ebmCodes.filter((code) => /quantity|unit|uom|qty/i.test(`${code.codeClassName || ''} ${code.codeClass || ''}`));
+  const packagingCandidates = context.ebmCodes.filter((code) => /pack|pkg/i.test(`${code.codeClassName || ''} ${code.codeClass || ''}`));
+  const quantityMatch = clean.quantityUnitCode
+    ? bestMatch(clean.quantityUnitCode, quantityCandidates.length ? quantityCandidates : context.ebmCodes, (code) => `${code.code} ${code.name}`)
+    : null;
+  clean.quantityUnitCode = quantityMatch && quantityMatch.score >= 0.8
+    ? quantityMatch.candidate.code
+    : (context.ebmCodes.find((code) => code.code === (unitCode || quantityUnitFor(unit)))?.code
+      || quantityCandidates[0]?.code
+      || quantityUnitFor(unit));
+  const packagingMatch = clean.packagingUnitCode
+    ? bestMatch(clean.packagingUnitCode, packagingCandidates.length ? packagingCandidates : context.ebmCodes, (code) => `${code.code} ${code.name}`)
+    : null;
+  clean.packagingUnitCode = packagingMatch && packagingMatch.score >= 0.8
+    ? packagingMatch.candidate.code
+    : (context.ebmCodes.find((code) => code.code === (String(unit).toLowerCase().includes('kg') ? 'NT' : 'CT'))?.code
+      || packagingCandidates[0]?.code
+      || (String(unit).toLowerCase().includes('kg') ? 'NT' : 'CT'));
+
+  const suppliedItemClassCode = String(clean.itemClassCode || '').trim();
+  const exactClass = context.itemClasses.find((itemClass) => String(itemClass.itemClassCode) === suppliedItemClassCode);
+  const classMatch = exactClass
+    ? { candidate: exactClass, score: 1 }
+    : bestMatch(`${clean.name} ${clean.description}`, context.itemClasses, (itemClass) => itemClass.itemClassName);
+  if (classMatch && classMatch.score >= (exactClass ? 1 : 0.65)) {
+    clean.itemClassCode = classMatch.candidate.itemClassCode;
+  } else {
+    clean.itemClassCode = null;
+    warnings.push({ field: 'itemClassCode', blocking: true, message: 'No confident synced RRA item classification was found; review this row before importing.' });
+  }
+
+  clean.costingMethod = clean.costingMethod || 'fifo';
+  clean.trackingType = clean.trackingType || 'none';
+  clean.isStockable = clean.isStockable == null ? true : clean.isStockable;
+  clean.barcodeType = clean.barcodeType || 'CODE128';
+  const openingQuantity = parseNumber(clean.openingStockQuantity) || 0;
+  clean.reorderLevel = isBlank(clean.reorderLevel) ? Math.round(openingQuantity * 0.2 * 100) / 100 : clean.reorderLevel;
+  clean.reorderQuantity = isBlank(clean.reorderQuantity) ? clean.reorderLevel : clean.reorderQuantity;
+
+  const category = context.categories.find((candidate) => normalizeMatch(candidate.name) === normalizeMatch(clean.category));
+  const accountByCode = new Map(context.accounts.map((account) => [String(account.code), account]));
+  clean.inventoryAccount = category?.defaultInventoryAccount || accountByCode.get('1400')?.code || null;
+  clean.cogsAccount = category?.defaultCogsAccount || accountByCode.get('5000')?.code || null;
+  clean.revenueAccount = category?.defaultRevenueAccount || accountByCode.get('4000')?.code || null;
+
+  return warnings.map((warning) => ({ ...warning, row: rowNumber }));
+}
+
 async function detectDuplicate(entityType, companyId, clean) {
   if (entityType === 'products' && clean.sku) {
     const Product = require('../models/Product');
@@ -260,6 +427,17 @@ function validateCleanRow(entityType, clean, rowNumber) {
     errors.push(buildValidationError(rowNumber, 'warehouse', 'Warehouse is required when opening stock quantity is provided.', clean.warehouse));
   }
 
+  if (entityType === 'products') {
+    const cost = parseNumber(clean.costPrice);
+    const price = parseNumber(clean.sellingPrice);
+    if (!isBlank(clean.costPrice) && (cost == null || cost <= 0)) {
+      errors.push(buildValidationError(rowNumber, 'costPrice', 'Cost price must be greater than zero when provided.', clean.costPrice));
+    }
+    if (!isBlank(clean.sellingPrice) && cost != null && price != null && price < cost) {
+      errors.push(buildValidationError(rowNumber, 'sellingPrice', 'Selling price must be greater than or equal to cost price.', clean.sellingPrice));
+    }
+  }
+
   return { errors, warnings };
 }
 
@@ -280,11 +458,22 @@ async function validateImport({ entityType, mapping, rows, file, companyId }) {
   const warehouseCache = new Map(); // lower(name) -> warehouse
   const openingKeySeen = new Set(); // productId-warehouseId within file
   const openingExistingCache = new Map(); // key -> true if opening already exists in DB
+  const productContext = entityType === 'products' ? await buildProductEnrichmentContext(companyId) : null;
 
   for (let index = 0; index < fullRows.length; index++) {
     const rowNumber = index + 2;
     const clean = cleanMappedRow(entityType, fullRows[index], mapping);
     const { errors, warnings } = validateCleanRow(entityType, clean, rowNumber);
+    if (productContext) {
+      const enrichmentWarnings = await enrichProductRow(companyId, clean, productContext, rowNumber);
+      for (const warning of enrichmentWarnings) {
+        if (warning.blocking) {
+          errors.push(buildValidationError(rowNumber, warning.field, warning.message, clean[warning.field]));
+        } else {
+          warnings.push(warning);
+        }
+      }
+    }
     if (!PROCESSABLE_ENTITY_TYPES.has(entityType)) {
       errors.push(buildValidationError(
         rowNumber,
@@ -562,17 +751,28 @@ async function writeOpeningGl(companyId, userId, rows) {
 }
 
 function productPayload(companyId, userId, data) {
+  const importedUnit = String(data.quantityUnitCode || '').toUpperCase();
+  const unit = importedUnit === 'KGM' ? 'kg' : importedUnit === 'U' ? 'pcs' : (data.unit || 'pcs');
   return {
     company: companyId,
     name: data.name,
     sku: String(data.sku).toUpperCase(),
     description: data.description,
-    unit: data.quantityUnitCode || 'pcs',
+    unit,
     currentStock: 0,
     lowStockThreshold: parseNumber(data.reorderLevel) || 0,
+    reorderQuantity: parseNumber(data.reorderQuantity) || 0,
     averageCost: parseNumber(data.costPrice) || 0,
     costPrice: parseNumber(data.costPrice) || 0,
     sellingPrice: parseNumber(data.sellingPrice) || 0,
+    costingMethod: data.costingMethod || 'fifo',
+    trackingType: data.trackingType || 'none',
+    isStockable: data.isStockable !== false,
+    barcodeType: data.barcodeType || 'CODE128',
+    brand: data.brand || null,
+    inventoryAccount: data.inventoryAccount || null,
+    cogsAccount: data.cogsAccount || null,
+    revenueAccount: data.revenueAccount || null,
     taxCode: String(data.taxTypeCode || 'A').toUpperCase(),
     ebm: {
       taxTyCd: String(data.taxTypeCode || 'A').toUpperCase(),
@@ -584,7 +784,8 @@ function productPayload(companyId, userId, data) {
       packagingUnitCode: data.packagingUnitCode,
       quantityUnitCode: data.quantityUnitCode
     },
-    createdBy: userId
+    createdBy: userId,
+    ...(data.supplierId ? { supplier: data.supplierId } : {})
   };
 }
 
@@ -881,5 +1082,12 @@ module.exports = {
   parseHeaders,
   validateImport,
   processValidatedRows,
-  generateTemplate
+  generateTemplate,
+  __test__: {
+    normalizeMatch,
+    matchScore,
+    bestMatch,
+    quantityUnitFor,
+    productPayload,
+  }
 };
