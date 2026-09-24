@@ -6,6 +6,9 @@ const { protect, authorize } = require('../middleware/auth');
 const { attachCompanyId } = require('../middleware/companyContext');
 const validateRequest = require('../middleware/validateRequest');
 const stripUnvalidatedBody = require('../middleware/stripUnvalidatedBody');
+const { cacheInvalidationMiddleware } = require('../middleware/cacheMiddleware');
+
+const invalidateWarehouses = cacheInvalidationMiddleware({ type: 'warehouse', invalidateAll: true });
 
 router.use(protect);
 router.use(attachCompanyId);
@@ -65,6 +68,7 @@ router.post(
   body('bhfId').optional({ nullable: true, checkFalsy: true }).isString().trim().isLength({ min: 1, max: 2 }),
   validateRequest,
   stripUnvalidatedBody,
+  invalidateWarehouses,
   ebmController.registerBranch,
 );
 
