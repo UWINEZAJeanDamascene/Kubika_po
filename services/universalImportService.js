@@ -4,7 +4,6 @@ const crypto = require('crypto');
 const ExcelJS = require('exceljs');
 const { parse } = require('csv-parse/sync');
 const { stringify } = require('csv-stringify/sync');
-const mongoose = require('mongoose');
 const { getEntityDefinition } = require('./importDefinitions');
 const { mapColumns } = require('./importMappingEngine');
 
@@ -243,8 +242,8 @@ function validateCleanRow(entityType, clean, rowNumber) {
     errors.push(buildValidationError(rowNumber, 'accountType', `Account type must be Asset, Liability, Equity, Revenue, or Expense - found '${clean.accountType}'.`, clean.accountType));
   }
 
-  if (entityType === 'products' && !isBlank(clean.openingStockQuantity) && (parseNumber(clean.openingStockQuantity) || 0) > 0) {
-    errors.push(buildValidationError(rowNumber, 'openingStockQuantity', 'Opening stock must be imported via the Opening Stock import, not the product import.', clean.openingStockQuantity));
+  if (entityType === 'products' && !isBlank(clean.openingStockQuantity) && (parseNumber(clean.openingStockQuantity) || 0) > 0 && isBlank(clean.warehouse)) {
+    errors.push(buildValidationError(rowNumber, 'warehouse', 'Warehouse is required when opening stock quantity is provided.', clean.warehouse));
   }
 
   return { errors, warnings };
@@ -391,6 +390,30 @@ async function ensureCategory(companyId, name) {
   return category._id;
 }
 
+async function captureProductOpeningStock(companyId, userId, productId, data) {
+  const quantity = parseNumber(data.openingStockQuantity);
+  if (quantity == null || quantity <= 0) return;
+
+  const Warehouse = require('../models/Warehouse');
+  const OpeningStockService = require('./openingStockService');
+  const warehouses = await Warehouse.find({ company: companyId }).lean();
+  const requestedName = String(data.warehouse || '').trim().toLowerCase();
+  const warehouse = warehouses.find((candidate) => String(candidate.name || '').trim().toLowerCase() === requestedName);
+  if (!warehouse) {
+    throw new Error(`Warehouse "${data.warehouse || ''}" not found for opening stock.`);
+  }
+
+  await OpeningStockService.createOpeningStock({
+    companyId,
+    userId,
+    productId,
+    warehouseId: warehouse._id,
+    quantity,
+    unitCost: parseNumber(data.costPrice) || 0,
+    notes: 'Opening stock included with product import'
+  });
+}
+
 function productPayload(companyId, userId, data) {
   return {
     company: companyId,
@@ -398,11 +421,11 @@ function productPayload(companyId, userId, data) {
     sku: String(data.sku).toUpperCase(),
     description: data.description,
     unit: data.quantityUnitCode || 'pcs',
-    currentStock: mongoose.Types.Decimal128.fromString('0'),
-    lowStockThreshold: mongoose.Types.Decimal128.fromString(String(parseNumber(data.reorderLevel) || 0)),
-    averageCost: mongoose.Types.Decimal128.fromString(String(parseNumber(data.costPrice) || 0)),
-    costPrice: mongoose.Types.Decimal128.fromString(String(parseNumber(data.costPrice) || 0)),
-    sellingPrice: mongoose.Types.Decimal128.fromString(String(parseNumber(data.sellingPrice) || 0)),
+    currentStock: 0,
+    lowStockThreshold: parseNumber(data.reorderLevel) || 0,
+    averageCost: parseNumber(data.costPrice) || 0,
+    costPrice: parseNumber(data.costPrice) || 0,
+    sellingPrice: parseNumber(data.sellingPrice) || 0,
     taxCode: String(data.taxTypeCode || 'A').toUpperCase(),
     ebm: {
       taxTyCd: String(data.taxTypeCode || 'A').toUpperCase(),
@@ -430,7 +453,8 @@ async function upsertRow(entityType, companyId, userId, data, duplicateAction) {
       return { status: 'success', message: 'Updated duplicate product.' };
     }
     if (existing && duplicateAction !== 'create') return { status: 'skipped', message: 'Skipped duplicate product.' };
-    await Product.create(payload);
+    const product = await Product.create(payload);
+    await captureProductOpeningStock(companyId, userId, product._id, data);
     return { status: 'success', message: 'Created product.' };
   }
 

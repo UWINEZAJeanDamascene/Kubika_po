@@ -4,7 +4,6 @@
  * Flow: validate -> persist movement + batch + inventory layer -> journal -> EBM.
  */
 
-const mongoose = require('mongoose');
 const Product = require('../models/Product');
 const Warehouse = require('../models/Warehouse');
 const StockMovement = require('../models/StockMovement');
@@ -144,8 +143,8 @@ async function createOpeningStock({
     const currentValue = previousStock * toNumber(product.averageCost || product.costPrice || 0);
     const newAverage = newStock > 0 ? (currentValue + totalCost) / newStock : cost;
     product.currentStock = newStock;
-    product.averageCost = mongoose.Types.Decimal128.fromString(String(newAverage || 0));
-    product.costPrice = mongoose.Types.Decimal128.fromString(String(cost));
+    product.averageCost = newAverage || 0;
+    product.costPrice = cost;
     product.lastSupplyDate = movementDate;
     await product.save(opts);
 

@@ -26,7 +26,7 @@ const ENTITY_DEFINITIONS = {
       { key: 'reorderLevel', label: 'Reorder Level', required: false, section: 'Inventory', example: '20', instructions: 'Minimum stock before reorder.' },
       { key: 'description', label: 'Description', required: false, section: 'Basic information', example: 'Long life milk', instructions: 'Optional product notes.' },
       { key: 'warehouse', label: 'Warehouse', required: false, section: 'Inventory', example: 'Main Warehouse', instructions: 'Matched by warehouse name. Defaults to main warehouse.' },
-      { key: 'openingStockQuantity', label: 'Opening Stock Quantity', required: false, section: 'Inventory', example: '100', instructions: 'Opening stock quantity.' },
+      { key: 'openingStockQuantity', label: 'Opening Stock Quantity', required: false, section: 'Inventory', example: '100', instructions: 'Optional opening quantity. When provided, Warehouse is required and opening stock is created with the product.' },
       { key: 'imageUrl', label: 'Image URL', required: false, section: 'Basic information', example: 'https://example.com/product.jpg', instructions: 'Optional product image URL.' }
     ]
   },
