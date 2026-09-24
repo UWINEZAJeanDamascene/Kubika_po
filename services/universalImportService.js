@@ -414,7 +414,7 @@ async function ensureCategory(companyId, name) {
 
 async function captureProductOpeningStock(companyId, userId, productId, data) {
   const quantity = parseNumber(data.openingStockQuantity);
-  if (quantity == null || quantity <= 0) return;
+  if (quantity == null || quantity <= 0) return false;
 
   const Warehouse = require('../models/Warehouse');
   const OpeningStockService = require('./openingStockService');
@@ -434,6 +434,7 @@ async function captureProductOpeningStock(companyId, userId, productId, data) {
     unitCost: parseNumber(data.costPrice) || 0,
     notes: 'Opening stock included with product import'
   });
+  return true;
 }
 
 async function writeFixedAsset(companyId, userId, data) {
@@ -585,10 +586,14 @@ async function upsertRow(entityType, companyId, userId, data, duplicateAction, c
     const payload = productPayload(companyId, userId, data);
     payload.category = await ensureCategory(companyId, data.category);
     const existing = await Product.findOne({ company: companyId, sku: payload.sku });
-    if (existing && duplicateAction === 'skip') return { status: 'skipped', message: 'Skipped duplicate product.' };
+    if (existing && duplicateAction === 'skip') {
+      const stockCaptured = await captureProductOpeningStock(companyId, userId, existing._id, data);
+      return { status: 'skipped', message: stockCaptured ? 'Skipped duplicate product; captured opening stock.' : 'Skipped duplicate product.' };
+    }
     if (existing && duplicateAction === 'update') {
       await Product.updateOne({ _id: existing._id, company: companyId }, { $set: payload });
-      return { status: 'success', message: 'Updated duplicate product.' };
+      const stockCaptured = await captureProductOpeningStock(companyId, userId, existing._id, data);
+      return { status: 'success', message: stockCaptured ? 'Updated duplicate product and captured opening stock.' : 'Updated duplicate product.' };
     }
     if (existing && duplicateAction !== 'create') return { status: 'skipped', message: 'Skipped duplicate product.' };
     const product = await Product.create(payload);
