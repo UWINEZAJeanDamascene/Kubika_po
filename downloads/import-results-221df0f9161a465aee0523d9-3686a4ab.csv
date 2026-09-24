@@ -1,0 +1,133 @@
+row,status,message,data
+2,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Inyange Milk 1L"",""sku"":""PRD-001"",""category"":""General"",""sellingPrice"":""1200"",""costPrice"":""950"",""taxTypeCode"":""B"",""itemClassCode"":""50202306"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""20"",""description"":""Long life milk"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""100"",""imageUrl"":""https://example.com/products/inyange-milk-1l.jpg"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""20"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+3,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Inyange Yogurt 500ml"",""sku"":""PRD-002"",""category"":""General"",""sellingPrice"":""1500"",""costPrice"":""1100"",""taxTypeCode"":""B"",""itemClassCode"":""50202306"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""15"",""description"":""Plain yogurt"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""60"",""imageUrl"":null,""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""15"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+4,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Skol Lager 500ml"",""sku"":""PRD-003"",""category"":""General"",""sellingPrice"":""1000"",""costPrice"":""750"",""taxTypeCode"":""B"",""itemClassCode"":""50202410"",""packagingUnitCode"":""CT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""48"",""description"":""Crate of 12 bottles"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""240"",""imageUrl"":null,""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""48"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+5,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Mutzig Beer 500ml"",""sku"":""PRD-004"",""category"":""General"",""sellingPrice"":""1100"",""costPrice"":""800"",""taxTypeCode"":""B"",""itemClassCode"":""50202410"",""packagingUnitCode"":""CT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""48"",""description"":""Crate of 12 bottles"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""192"",""imageUrl"":null,""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""48"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+6,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Novida Soda 350ml"",""sku"":""PRD-005"",""category"":""General"",""sellingPrice"":""500"",""costPrice"":""350"",""taxTypeCode"":""B"",""itemClassCode"":""50202410"",""packagingUnitCode"":""CT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""24"",""description"":null,""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""144"",""imageUrl"":null,""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""24"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+7,success,Created product.,"{""name"":""Rice 25kg Bag"",""sku"":""PRD-006"",""category"":""General"",""sellingPrice"":""28000"",""costPrice"":""24000"",""taxTypeCode"":""B"",""itemClassCode"":""10005001"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""5"",""description"":""Premium long grain rice"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""40"",""imageUrl"":null,""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""5"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+8,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Maize Flour 25kg"",""sku"":""PRD-007"",""category"":""General"",""sellingPrice"":""18000"",""costPrice"":""15500"",""taxTypeCode"":""B"",""itemClassCode"":""10005002"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""8"",""description"":""Fine ground maize flour"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""35"",""imageUrl"":null,""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""8"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+9,success,Created product.,"{""name"":""Dry Beans 50kg"",""sku"":""PRD-008"",""category"":""General"",""sellingPrice"":""45000"",""costPrice"":""39000"",""taxTypeCode"":""B"",""itemClassCode"":""10005003"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""3"",""description"":null,""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""20"",""imageUrl"":null,""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""3"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+10,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Samsung Galaxy A14"",""sku"":""PRD-009"",""category"":""Electronics"",""sellingPrice"":""165000"",""costPrice"":""140000"",""taxTypeCode"":""B"",""itemClassCode"":""85171200"",""packagingUnitCode"":""CT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""5"",""description"":""Dual SIM, 64GB"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""12"",""imageUrl"":""https://example.com/products/galaxy-a14.jpg"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""5"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+11,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Phone Charger Type-C"",""sku"":""PRD-010"",""category"":""Electronics"",""sellingPrice"":""5000"",""costPrice"":""3200"",""taxTypeCode"":""B"",""itemClassCode"":""85044090"",""packagingUnitCode"":""CT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""20"",""description"":""Fast charging cable and adapter"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""50"",""imageUrl"":null,""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""20"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+12,error,"
+Invalid `delegate().findFirst()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1148:38
+
+  1145 const where = applyTenant(translateFilter(filter, fieldMap), opts);
+  1146 if (where === IMPOSSIBLE) return null;
+  1147 const include = buildInclude(opts.populate);
+→ 1148 const row = await delegate().findFirst(
+Transaction API error: Transaction already closed: A query cannot be executed on an expired transaction. The timeout for this transaction was 30000 ms, however 32029 ms passed since the start of the transaction. Consider increasing the interactive transaction timeout or doing less work in the transaction.","{""name"":""LED Bulb 9W"",""sku"":""PRD-011"",""category"":""Electronics"",""sellingPrice"":""2500"",""costPrice"":""1600"",""taxTypeCode"":""B"",""itemClassCode"":""85395000"",""packagingUnitCode"":""CT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""30"",""description"":""Energy saving bulb"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""80"",""imageUrl"":null,""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""30"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+13,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Omo Detergent 1kg"",""sku"":""PRD-012"",""category"":""General"",""sellingPrice"":""3200"",""costPrice"":""2400"",""taxTypeCode"":""B"",""itemClassCode"":""34022000"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""15"",""description"":null,""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""45"",""imageUrl"":null,""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""15"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+14,success,Created product.,"{""name"":""Jik Bleach 750ml"",""sku"":""PRD-013"",""category"":""General"",""sellingPrice"":""1800"",""costPrice"":""1300"",""taxTypeCode"":""B"",""itemClassCode"":""34029000"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""10"",""description"":""Household bleach"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""30"",""imageUrl"":null,""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""10"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+15,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Toilet Paper 10-Pack"",""sku"":""PRD-014"",""category"":""General"",""sellingPrice"":""3500"",""costPrice"":""2600"",""taxTypeCode"":""B"",""itemClassCode"":""48181000"",""packagingUnitCode"":""CT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""20"",""description"":null,""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""60"",""imageUrl"":null,""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""20"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+16,success,Created product.,"{""name"":""Fresh Tomatoes 1kg"",""sku"":""PRD-015"",""category"":""General"",""sellingPrice"":""800"",""costPrice"":""500"",""taxTypeCode"":""A"",""itemClassCode"":""07020000"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""10"",""description"":""Locally sourced"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""150"",""imageUrl"":null,""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""10"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+17,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Fresh Onions 1kg"",""sku"":""PRD-016"",""category"":""General"",""sellingPrice"":""700"",""costPrice"":""450"",""taxTypeCode"":""A"",""itemClassCode"":""07031000"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""10"",""description"":""Locally sourced"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""150"",""imageUrl"":null,""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""10"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+18,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Irish Potatoes 1kg"",""sku"":""PRD-017"",""category"":""General"",""sellingPrice"":""600"",""costPrice"":""380"",""taxTypeCode"":""A"",""itemClassCode"":""07019000"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""15"",""description"":""Locally sourced"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""200"",""imageUrl"":null,""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""15"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+19,success,Created product.,"{""name"":""Export Coffee Beans 1kg"",""sku"":""PRD-018"",""category"":""General"",""sellingPrice"":""6500"",""costPrice"":""4800"",""taxTypeCode"":""C"",""itemClassCode"":""09011100"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""5"",""description"":""Grade A arabica for export"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""25"",""imageUrl"":null,""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""5"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+20,success,Created product.,"{""name"":""Service Voucher 5000 RWF"",""sku"":""PRD-019"",""category"":""General"",""sellingPrice"":""5000"",""costPrice"":null,""taxTypeCode"":""D"",""itemClassCode"":""99999999"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""U"",""supplier"":null,""brand"":null,""reorderLevel"":0,""description"":""Non-taxable gift voucher"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":null,""imageUrl"":null,""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":0,""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+21,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Exercise Book A4"",""sku"":""PRD-020"",""category"":""General"",""sellingPrice"":""600"",""costPrice"":""400"",""taxTypeCode"":""B"",""itemClassCode"":""48201000"",""packagingUnitCode"":""CT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""25"",""description"":""96-page ruled notebook"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""100"",""imageUrl"":null,""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""25"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"

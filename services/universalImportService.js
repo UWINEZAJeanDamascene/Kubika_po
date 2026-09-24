@@ -179,6 +179,14 @@ function buildValidationError(rowNumber, field, message, value) {
   return { row: rowNumber, field, message, value };
 }
 
+function duplicateKeyFor(entityType, clean) {
+  if (entityType === 'products' && clean.sku) return String(clean.sku).trim().toUpperCase();
+  if ((entityType === 'customers' || entityType === 'clients' || entityType === 'suppliers') && clean.tin) return String(clean.tin).trim();
+  if (entityType === 'employees' && clean.employeeId) return String(clean.employeeId).trim().toUpperCase();
+  if (entityType === 'chart_of_accounts' && clean.accountCode) return String(clean.accountCode).trim();
+  return null;
+}
+
 function normalizeMatch(value) {
   return String(value || '').toLowerCase().trim().replace(/[^a-z0-9]+/g, ' ');
 }
@@ -469,6 +477,7 @@ async function validateImport({ entityType, mapping, rows, file, companyId }) {
   const openingKeySeen = new Set(); // productId-warehouseId within file
   const openingExistingCache = new Map(); // key -> true if opening already exists in DB
   const productContext = entityType === 'products' ? await buildProductEnrichmentContext(companyId) : null;
+  const fileDuplicateKeys = new Map();
 
   for (let index = 0; index < fullRows.length; index++) {
     const rowNumber = index + 2;
@@ -564,7 +573,16 @@ async function validateImport({ entityType, mapping, rows, file, companyId }) {
       if (movementDate) clean.movementDate = movementDate;
       if (openingKey) openingKeySeen.add(openingKey);
     }
-    const duplicate = errors.length ? { duplicate: false } : await detectDuplicate(entityType, companyId, clean);
+    let duplicate = errors.length ? { duplicate: false } : await detectDuplicate(entityType, companyId, clean);
+    const fileKey = duplicateKeyFor(entityType, clean);
+    if (!errors.length && fileKey) {
+      const previousRow = fileDuplicateKeys.get(`${entityType}:${fileKey}`);
+      if (previousRow) {
+        duplicate = { duplicate: true, key: fileKey, existingId: `file-row-${previousRow}` };
+      } else {
+        fileDuplicateKeys.set(`${entityType}:${fileKey}`, rowNumber);
+      }
+    }
     if (duplicate.duplicate) {
       const type = definition.uniqueField || 'record';
       duplicateGroups[type] = duplicateGroups[type] || { field: type, count: 0, keys: [] };
@@ -1097,6 +1115,7 @@ module.exports = {
     normalizeMatch,
     matchScore,
     bestMatch,
+    duplicateKeyFor,
     quantityUnitFor,
     isWellFormedRraItemClassCode,
     productPayload,

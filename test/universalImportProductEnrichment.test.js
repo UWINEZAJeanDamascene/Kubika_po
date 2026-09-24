@@ -69,4 +69,8 @@ describe('universal product import enrichment contract', () => {
     expect(ImportService.__test__.isWellFormedRraItemClassCode('50202306')).toBe(true);
     expect(ImportService.__test__.isWellFormedRraItemClassCode('not-a-code')).toBe(false);
   });
+
+  it('normalizes duplicate product keys within an import file', () => {
+    expect(ImportService.__test__.duplicateKeyFor('products', { sku: ' prd-025 ' })).toBe('PRD-025');
+  });
 });
