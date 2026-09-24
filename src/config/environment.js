@@ -114,7 +114,10 @@ function buildConfig() {
       port: number(process.env.PORT, 3000),
       frontendUrl: process.env.FRONTEND_URL || 'http://localhost:5173',
       allowedOrigins: array(process.env.ALLOWED_ORIGINS, ['http://localhost:3000', 'http://localhost:5173']),
-      corsOrigins: array(process.env.CORS_ORIGINS, []),
+      corsOrigins: array(
+        process.env.CORS_ORIGINS || process.env.ALLOWED_ORIGINS,
+        [],
+      ),
     },
     
     // =====================

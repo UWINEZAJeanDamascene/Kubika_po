@@ -59,6 +59,7 @@ services:
       - key: EMAIL_FROM_NAME
         value: KUBIKA system
       - key: FRONTEND_URL
+        value: https://kubika.techmat.rw
       - key: CORS_ORIGINS
-        sync: false
+        value: https://kubika.techmat.rw
     autoDeploy: true
