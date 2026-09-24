@@ -1070,3 +1070,24 @@ exports.registerProductWithEBM = async (req, res, next) => {
     next(error);
   }
 };
+
+// @desc    Register all active products with RRA EBM
+// @route   POST /api/products/ebm/register-all
+// @access  Private (admin)
+exports.registerAllProductsWithEBM = async (req, res, next) => {
+  try {
+    const company = req.user && req.user.company;
+    const companyId = (company && company._id) ? company._id : company;
+    const EBMProductService = require('../services/ebmProductService');
+    const options = {};
+    if (req.body && req.body.tin) options.tin = req.body.tin;
+    const result = await EBMProductService.registerAllProducts(companyId, options);
+    res.json({
+      success: true,
+      data: result,
+      message: `${result.registered} product(s) registered with RRA EBM; ${result.failed} failed.`,
+    });
+  } catch (error) {
+    next(error);
+  }
+};

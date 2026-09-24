@@ -251,6 +251,56 @@ class EBMProductService {
     });
   }
 
+  static async registerAllProducts(companyId, options = {}) {
+    const baseFilter = {
+      company: companyId,
+      isActive: { $ne: false },
+      isArchived: { $ne: true },
+      $or: [
+        { "ebm.isRegisteredWithEBM": { $ne: true } },
+        { "ebm.ebmRegistrationError": { $ne: null } },
+      ],
+    };
+    const results = [];
+    const maximum = Math.min(Number(options.limit) || 5000, 5000);
+    let lastId = null;
+
+    while (results.length < maximum) {
+      const filter = lastId ? { ...baseFilter, _id: { $gt: lastId } } : baseFilter;
+      const products = await Product.find(filter)
+        .select("_id sku name")
+        .sort({ _id: 1 })
+        .limit(Math.min(500, maximum - results.length))
+        .lean();
+      if (!products.length) break;
+
+      for (const product of products) {
+        try {
+          await EBMProductService.registerProduct(companyId, product._id, options);
+          results.push({ productId: product._id, sku: product.sku, name: product.name, status: "registered" });
+        } catch (error) {
+          results.push({
+            productId: product._id,
+            sku: product.sku,
+            name: product.name,
+            status: "failed",
+            error: error.message || "Product EBM registration failed",
+          });
+        }
+      }
+
+      lastId = products[products.length - 1]._id;
+      if (products.length < 500) break;
+    }
+
+    return {
+      attempted: results.length,
+      registered: results.filter((result) => result.status === "registered").length,
+      failed: results.filter((result) => result.status === "failed").length,
+      results,
+    };
+  }
+
   static async assertProductsRegistered(companyId, productIds) {
     const ids = [...new Set((productIds || []).filter(Boolean).map(String))];
     if (!ids.length) return;

@@ -14,12 +14,13 @@ const {
   checkLowStockAndNotify,
   analyzeReorder,
   triggerAutoReorder,
-  registerProductWithEBM
+  registerProductWithEBM,
+  registerAllProductsWithEBM
 } = require('../controllers/productController');
 const { protect } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/rbacMiddleware');
 const logAction = require('../middleware/logAction');
-const { cacheMiddleware } = require('../middleware/cacheMiddleware');
+const { cacheMiddleware, cacheInvalidationMiddleware } = require('../middleware/cacheMiddleware');
 
 // All routes require authentication
 router.use(protect);
@@ -48,6 +49,7 @@ router.route('/:id')
 
 router.put('/:id/archive', requirePermission('products', 'delete'), logAction('product'), archiveProduct);
 router.put('/:id/restore', requirePermission('products', 'update'), logAction('product'), restoreProduct);
+router.post('/ebm/register-all', requirePermission('products', 'update'), logAction('product'), cacheInvalidationMiddleware({ type: 'product', invalidateAll: true }), registerAllProductsWithEBM);
 router.post('/:id/ebm/register', requirePermission('products', 'update'), logAction('product'), registerProductWithEBM);
 router.get('/:id/reorder-analysis', requirePermission('products', 'read'), cacheMiddleware({ type: 'product', ttl: 180, keyGenerator: (req) => cacheMiddlewareKey(req) }), analyzeReorder);
 router.post('/:id/auto-reorder', requirePermission('products', 'update'), logAction('product'), triggerAutoReorder);
