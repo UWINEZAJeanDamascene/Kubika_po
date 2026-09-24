@@ -171,7 +171,7 @@ exports.getProducts = async (req, res, next) => {
       '_id', 'company', 'name', 'sku', 'barcode', 'category', 'unit', 'supplier',
       'currentStock', 'reservedQuantity', 'isActive', 'lowStockThreshold',
       'averageCost', 'sellingPrice', 'costPrice', 'costingMethod', 'isArchived',
-      'trackingType', 'trackBatch', 'trackSerialNumbers', 'defaultWarehouse', 'createdAt', 'updatedAt'
+      'trackingType', 'trackBatch', 'trackSerialNumbers', 'defaultWarehouse', 'ebm', 'createdAt', 'updatedAt'
     ]).join(' ');
 
     const hasComplexFilter = !!(query.$or || query.$expr || query.$text);
@@ -1082,10 +1082,10 @@ exports.registerAllProductsWithEBM = async (req, res, next) => {
     const options = {};
     if (req.body && req.body.tin) options.tin = req.body.tin;
     const result = await EBMProductService.registerAllProducts(companyId, options);
-    res.json({
+      return res.json({
       success: true,
       data: result,
-      message: `${result.registered} product(s) registered with RRA EBM; ${result.failed} failed.`,
+      message: `${result.registered} newly registered; ${result.alreadyRegistered} already registered; ${result.failed} failed.`,
     });
   } catch (error) {
     next(error);

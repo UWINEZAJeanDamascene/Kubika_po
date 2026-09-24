@@ -256,10 +256,6 @@ class EBMProductService {
       company: companyId,
       isActive: { $ne: false },
       isArchived: { $ne: true },
-      $or: [
-        { "ebm.isRegisteredWithEBM": { $ne: true } },
-        { "ebm.ebmRegistrationError": { $ne: null } },
-      ],
     };
     const results = [];
     const maximum = Math.min(Number(options.limit) || 5000, 5000);
@@ -268,13 +264,17 @@ class EBMProductService {
     while (results.length < maximum) {
       const filter = lastId ? { ...baseFilter, _id: { $gt: lastId } } : baseFilter;
       const products = await Product.find(filter)
-        .select("_id sku name")
+        .select("_id sku name ebm")
         .sort({ _id: 1 })
         .limit(Math.min(500, maximum - results.length))
         .lean();
       if (!products.length) break;
 
       for (const product of products) {
+        if (product.ebm?.isRegisteredWithEBM === true && !product.ebm?.ebmRegistrationError) {
+          results.push({ productId: product._id, sku: product.sku, name: product.name, status: "already_registered" });
+          continue;
+        }
         try {
           await EBMProductService.registerProduct(companyId, product._id, options);
           results.push({ productId: product._id, sku: product.sku, name: product.name, status: "registered" });
@@ -297,6 +297,7 @@ class EBMProductService {
       attempted: results.length,
       registered: results.filter((result) => result.status === "registered").length,
       failed: results.filter((result) => result.status === "failed").length,
+      alreadyRegistered: results.filter((result) => result.status === "already_registered").length,
       results,
     };
   }
