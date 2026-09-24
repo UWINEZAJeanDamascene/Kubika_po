@@ -8,6 +8,7 @@ const { prisma } = require('../lib/prisma');
 const { generateObjectId } = require('../utils/objectId');
 const { CHART_OF_ACCOUNTS } = require('../constants/chartOfAccounts');
 const { syncSystemRoles } = require('../scripts/seedSystemRoles');
+const CurrencyService = require('./CurrencyService');
 
 function accountData(definition, createdById = null) {
   return {
@@ -55,6 +56,7 @@ async function syncCompanyChartOfAccounts(companyId, createdById = null) {
 
 async function initializeRequiredData() {
   const roles = await syncSystemRoles();
+  await CurrencyService.seedCurrencies();
   const companies = await prisma.company.findMany({ select: { id: true } });
   let accountsCreated = 0;
   let accountsUpdated = 0;
@@ -67,7 +69,8 @@ async function initializeRequiredData() {
 
   console.log(
     `[Bootstrap] System roles synced (${roles.created} created, ${roles.updated} updated); `
-      + `chart of accounts synced for ${companies.length} companies (${accountsCreated} created, ${accountsUpdated} updated).`,
+      + `currencies are ready; chart of accounts synced for ${companies.length} companies `
+      + `(${accountsCreated} created, ${accountsUpdated} updated).`,
   );
 }
 

@@ -219,6 +219,8 @@ class CurrencyService {
    * (which will surface as `stale` in getLatestRates).
    */
   static async syncRates(companyId, userId = null) {
+    // Keep the sync endpoint self-healing when a deployment has no worker process.
+    await CurrencyService.seedCurrencies();
     const base = await CurrencyService.getCompanyBase(companyId);
     const marketRates = await CurrencyService.fetchMarketRates(base);
     const currencies = await Currency.find({ is_active: true }).lean();
