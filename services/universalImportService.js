@@ -9,6 +9,20 @@ const { mapColumns } = require('./importMappingEngine');
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 const MAX_ROWS = 10000;
+const PROCESSABLE_ENTITY_TYPES = new Set([
+  'products',
+  'customers',
+  'clients',
+  'suppliers',
+  'employees',
+  'chart_of_accounts',
+  'opening_stock',
+  'fixed_assets',
+  'budget',
+  'opening_gl_balances',
+  'opening_ar_balances',
+  'opening_ap_balances',
+]);
 
 function getCompanyId(req) {
   return req.company?._id || req.companyId || req.user?.company || req.headers['x-company-id'];
@@ -271,6 +285,14 @@ async function validateImport({ entityType, mapping, rows, file, companyId }) {
     const rowNumber = index + 2;
     const clean = cleanMappedRow(entityType, fullRows[index], mapping);
     const { errors, warnings } = validateCleanRow(entityType, clean, rowNumber);
+    if (!PROCESSABLE_ENTITY_TYPES.has(entityType)) {
+      errors.push(buildValidationError(
+        rowNumber,
+        '_entity',
+        `${definition.label} import is not available yet. No records were written.`,
+        entityType,
+      ));
+    }
     if (entityType === 'opening_gl_balances') {
       debitTotal += parseNumber(clean.debitBalance) || 0;
       creditTotal += parseNumber(clean.creditBalance) || 0;
@@ -414,6 +436,122 @@ async function captureProductOpeningStock(companyId, userId, productId, data) {
   });
 }
 
+async function writeFixedAsset(companyId, userId, data) {
+  const FixedAsset = require('../models/FixedAsset');
+  const AssetCategory = require('../models/AssetCategory');
+  const ChartOfAccount = require('../models/ChartOfAccount');
+  const category = await AssetCategory.findOne({ company: companyId, name: data.category }).lean();
+  if (!category) throw new Error(`Asset category not found: ${data.category}`);
+
+  const accountCodes = {
+    asset: category.defaultAssetAccountCode || '1700',
+    accumulated: category.defaultAccumDepreciationAccountCode || '1810',
+    expense: category.defaultDepreciationExpenseAccountCode || '5800',
+  };
+  const accounts = await Promise.all(Object.values(accountCodes).map((code) => ChartOfAccount.findOne({ company: companyId, code }).lean()));
+  if (accounts.some((account) => !account)) throw new Error('Required fixed-asset accounts do not exist.');
+
+  const purchaseCost = parseNumber(data.cost);
+  const accumulatedDepreciation = parseNumber(data.accumulatedDepreciation);
+  const usefulLifeMonths = Math.round(parseNumber(data.usefulLifeYears) * 12);
+  if (!purchaseCost || purchaseCost < 0 || !usefulLifeMonths || usefulLifeMonths < 1) {
+    throw new Error('Fixed asset cost and useful life must be valid positive values.');
+  }
+
+  const asset = new FixedAsset({
+    company: companyId,
+    name: data.assetName,
+    categoryId: category._id,
+    assetAccountId: accounts[0]._id,
+    assetAccountCode: accountCodes.asset,
+    accumDepreciationAccountId: accounts[1]._id,
+    accumDepreciationAccountCode: accountCodes.accumulated,
+    depreciationExpenseAccountId: accounts[2]._id,
+    depreciationExpenseAccountCode: accountCodes.expense,
+    purchaseDate: parseDateValue(data.purchaseDate),
+    purchaseCost,
+    accumulatedDepreciation: accumulatedDepreciation || 0,
+    netBookValue: purchaseCost - (accumulatedDepreciation || 0),
+    usefulLifeMonths,
+    depreciationMethod: String(data.depreciationMethod || 'straight_line').toLowerCase().replace(/\s+/g, '_'),
+    location: data.location || null,
+    createdBy: userId,
+    status: 'in_transit',
+  });
+  asset.referenceNo = await FixedAsset.generateReferenceNo(companyId);
+  await asset.save();
+  return { status: 'success', message: 'Created fixed asset.' };
+}
+
+async function writeBudgetLine(companyId, userId, data) {
+  const Budget = require('../models/Budget');
+  const BudgetLine = require('../models/BudgetLine');
+  const ChartOfAccount = require('../models/ChartOfAccount');
+  const account = await ChartOfAccount.findOne({ company: companyId, code: data.accountCode }).lean();
+  if (!account) throw new Error(`Account not found: ${data.accountCode}`);
+  const [year, month] = String(data.period || '').split('-').map(Number);
+  if (!year || month < 1 || month > 12) throw new Error(`Invalid budget period: ${data.period}`);
+
+  const budgetName = `Imported Budget ${year}`;
+  let budget = await Budget.findOne({ company_id: companyId, fiscal_year: year, name: budgetName }).lean();
+  if (!budget) {
+    budget = await Budget.create({ company: companyId, name: budgetName, fiscal_year: year, type: 'expense', budget_cycle: 'fixed_year', periodType: 'monthly', status: 'draft', amount: 0, created_by: userId });
+  }
+  const existing = await BudgetLine.findOne({ company_id: companyId, budget_id: budget._id, account_id: account._id, period_month: month, period_year: year }).lean();
+  const line = { company_id: companyId, budget_id: budget._id, account_id: account._id, period_month: month, period_year: year, budgeted_amount: parseNumber(data.budgetedAmount), category: '', notes: 'Universal Smart Import' };
+  if (existing) await BudgetLine.updateOne({ _id: existing._id, company: companyId }, { $set: line });
+  else await BudgetLine.create(line);
+  return { status: 'success', message: 'Created budget line.' };
+}
+
+async function writeOpeningAr(companyId, userId, data, balances) {
+  const Client = require('../models/Client');
+  const ARTransactionLedger = require('../models/ARTransactionLedger');
+  const { generateObjectId } = require('../utils/objectId');
+  const client = await Client.findOne({ company: companyId, name: data.customerIdentifier }).lean();
+  if (!client) throw new Error(`Customer not found: ${data.customerIdentifier}`);
+  const amount = parseNumber(data.amountOutstanding);
+  if (!amount || amount <= 0) throw new Error('Opening AR amount must be greater than zero.');
+  const key = String(client._id);
+  const current = (balances.get(key) || 0) + amount;
+  const sourceId = generateObjectId();
+  await Client.updateOne({ _id: client._id, company: companyId }, { $set: { outstandingBalance: current } });
+  await ARTransactionLedger.create({ company: companyId, client: client._id, transactionType: 'opening_balance', transactionDate: parseDateValue(data.dueDate) || new Date(), referenceNo: data.invoiceReference || `OPEN-AR-${sourceId}`, description: `Opening AR balance for ${client.name}`, amount, direction: 'increase', clientBalanceAfter: current, invoiceBalanceAfter: amount, sourceType: 'opening_ar', sourceId, sourceReference: data.invoiceReference || null, createdBy: userId, reconciliationStatus: 'verified', metadata: { imported: true } });
+  balances.set(key, current);
+  return { status: 'success', message: 'Created opening AR balance.' };
+}
+
+async function writeOpeningAp(companyId, userId, data, balances) {
+  const Supplier = require('../models/Supplier');
+  const APTransactionLedger = require('../models/APTransactionLedger');
+  const { generateObjectId } = require('../utils/objectId');
+  const supplier = await Supplier.findOne({ company: companyId, name: data.supplierIdentifier }).lean();
+  if (!supplier) throw new Error(`Supplier not found: ${data.supplierIdentifier}`);
+  const amount = parseNumber(data.amountOutstanding);
+  if (!amount || amount <= 0) throw new Error('Opening AP amount must be greater than zero.');
+  const key = String(supplier._id);
+  const current = (balances.get(key) || 0) + amount;
+  const sourceId = generateObjectId();
+  await APTransactionLedger.create({ company: companyId, supplier: supplier._id, transactionType: 'opening_balance', transactionDate: parseDateValue(data.dueDate) || new Date(), referenceNo: data.invoiceReference || `OPEN-AP-${sourceId}`, description: `Opening AP balance for ${supplier.name}`, amount, direction: 'increase', supplierBalanceAfter: current, sourceType: 'opening_ap', sourceId, sourceReference: data.invoiceReference || null, createdBy: userId, reconciliationStatus: 'verified', metadata: { imported: true } });
+  balances.set(key, current);
+  return { status: 'success', message: 'Created opening AP balance.' };
+}
+
+async function writeOpeningGl(companyId, userId, rows) {
+  const ChartOfAccount = require('../models/ChartOfAccount');
+  const OpeningBalanceService = require('./OpeningBalanceService');
+  const balances = [];
+  for (const row of rows) {
+    const account = await ChartOfAccount.findOne({ company: companyId, code: row.accountCode }).lean();
+    if (!account) throw new Error(`Account not found: ${row.accountCode}`);
+    const debit = parseNumber(row.debitBalance) || 0;
+    const credit = parseNumber(row.creditBalance) || 0;
+    if (debit > 0) balances.push({ account_id: account._id, entry_type: 'debit', amount: debit, description: `Opening balance - ${row.accountCode}` });
+    if (credit > 0) balances.push({ account_id: account._id, entry_type: 'credit', amount: credit, description: `Opening balance - ${row.accountCode}` });
+  }
+  return OpeningBalanceService.import(companyId, { asOfDate: rows[0]?.asOfDate, balances }, userId);
+}
+
 function productPayload(companyId, userId, data) {
   return {
     company: companyId,
@@ -441,7 +579,7 @@ function productPayload(companyId, userId, data) {
   };
 }
 
-async function upsertRow(entityType, companyId, userId, data, duplicateAction) {
+async function upsertRow(entityType, companyId, userId, data, duplicateAction, context = {}) {
   if (entityType === 'products') {
     const Product = require('../models/Product');
     const payload = productPayload(companyId, userId, data);
@@ -581,7 +719,12 @@ async function upsertRow(entityType, companyId, userId, data, duplicateAction) {
     return { status: 'success', message: 'Captured opening stock.' };
   }
 
-  return { status: 'skipped', message: `${entityType} validation is available; database writer is not enabled yet.` };
+  if (entityType === 'fixed_assets') return writeFixedAsset(companyId, userId, data);
+  if (entityType === 'budget') return writeBudgetLine(companyId, userId, data);
+  if (entityType === 'opening_ar_balances') return writeOpeningAr(companyId, userId, data, context.arBalances || new Map());
+  if (entityType === 'opening_ap_balances') return writeOpeningAp(companyId, userId, data, context.apBalances || new Map());
+
+  throw new Error(`${entityType} import is not available yet. No records were written.`);
 }
 
 async function processValidatedRows({ logId, entityType, companyId, userId, rows, duplicateAction = 'skip', onProgress }) {
@@ -590,7 +733,25 @@ async function processValidatedRows({ logId, entityType, companyId, userId, rows
   let successRows = 0;
   let errorRows = 0;
   let skippedRows = 0;
+  const context = { arBalances: new Map(), apBalances: new Map() };
   await ImportLog.updateOne({ _id: logId, companyId }, { $set: { status: 'processing', startedAt: new Date() } });
+
+  if (entityType === 'opening_gl_balances') {
+    try {
+      await writeOpeningGl(companyId, userId, rows.filter((row) => row.valid).map((row) => row.data));
+      successRows = rows.filter((row) => row.valid).length;
+      errorRows = rows.length - successRows;
+      outcomes.push(...rows.map((row) => row.valid
+        ? { rowNumber: row.rowNumber, status: 'success', message: 'Created opening GL balance.', data: row.data }
+        : { rowNumber: row.rowNumber, status: 'error', errors: row.errors, data: row.data }));
+    } catch (error) {
+      errorRows = rows.length;
+      outcomes.push(...rows.map((row) => ({ rowNumber: row.rowNumber, status: 'error', errors: [{ message: error.message }], data: row.data })));
+    }
+    const reports = await writeReports(logId, outcomes);
+    await ImportLog.updateOne({ _id: logId, companyId }, { $set: { status: errorRows > 0 ? 'completed_with_errors' : 'completed', completedAt: new Date(), totalRows: rows.length, successRows, errorRows, skippedRows, rowOutcomes: outcomes, errorReportUrl: reports.errorReportUrl, resultsReportUrl: reports.resultsReportUrl } });
+    return { totalRows: rows.length, successRows, errorRows, skippedRows, outcomes, ...reports };
+  }
 
   for (let offset = 0; offset < rows.length; offset += 100) {
     const batch = rows.slice(offset, offset + 100);
@@ -602,7 +763,7 @@ async function processValidatedRows({ logId, entityType, companyId, userId, rows
       }
       try {
         const action = row.duplicate?.duplicate ? duplicateAction : 'create';
-        const outcome = await upsertRow(entityType, companyId, userId, row.data, action);
+        const outcome = await upsertRow(entityType, companyId, userId, row.data, action, context);
         if (outcome.status === 'success') successRows += 1;
         if (outcome.status === 'skipped') skippedRows += 1;
         outcomes.push({ rowNumber: row.rowNumber, ...outcome, data: row.data });
@@ -697,6 +858,7 @@ async function generateTemplate(entityType) {
 module.exports = {
   MAX_FILE_SIZE,
   MAX_ROWS,
+  PROCESSABLE_ENTITY_TYPES,
   getCompanyId,
   parseHeaders,
   validateImport,
