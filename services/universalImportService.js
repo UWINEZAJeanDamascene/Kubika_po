@@ -437,6 +437,14 @@ async function captureProductOpeningStock(companyId, userId, productId, data) {
   return true;
 }
 
+async function resolveWarehouseId(companyId, name) {
+  if (!name) return null;
+  const Warehouse = require('../models/Warehouse');
+  const requestedName = String(name).trim().toLowerCase();
+  const warehouse = await Warehouse.findOne({ company: companyId, name: new RegExp(`^${requestedName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'i') }).lean();
+  return warehouse?._id || null;
+}
+
 async function writeFixedAsset(companyId, userId, data) {
   const FixedAsset = require('../models/FixedAsset');
   const AssetCategory = require('../models/AssetCategory');
@@ -583,10 +591,15 @@ function productPayload(companyId, userId, data) {
 async function upsertRow(entityType, companyId, userId, data, duplicateAction, context = {}) {
   if (entityType === 'products') {
     const Product = require('../models/Product');
+    const warehouseId = await resolveWarehouseId(companyId, data.warehouse);
     const payload = productPayload(companyId, userId, data);
+    if (warehouseId) payload.defaultWarehouse = warehouseId;
     payload.category = await ensureCategory(companyId, data.category);
     const existing = await Product.findOne({ company: companyId, sku: payload.sku });
     if (existing && duplicateAction === 'skip') {
+      if (warehouseId && !existing.defaultWarehouse) {
+        await Product.updateOne({ _id: existing._id, company: companyId }, { $set: { defaultWarehouse: warehouseId } });
+      }
       const stockCaptured = await captureProductOpeningStock(companyId, userId, existing._id, data);
       return { status: 'skipped', message: stockCaptured ? 'Skipped duplicate product; captured opening stock.' : 'Skipped duplicate product.' };
     }

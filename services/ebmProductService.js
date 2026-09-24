@@ -252,6 +252,7 @@ class EBMProductService {
   }
 
   static async registerAllProducts(companyId, options = {}) {
+    await EBMProductService.backfillDefaultWarehouses(companyId, options);
     const baseFilter = {
       company: companyId,
       isActive: { $ne: false },
@@ -298,6 +299,51 @@ class EBMProductService {
       registered: results.filter((result) => result.status === "registered").length,
       failed: results.filter((result) => result.status === "failed").length,
       alreadyRegistered: results.filter((result) => result.status === "already_registered").length,
+      results,
+    };
+  }
+
+  static async backfillDefaultWarehouses(companyId, options = {}) {
+    const Product = require("../models/Product");
+    const StockMovement = require("../models/StockMovement");
+    const maximum = Math.min(Number(options.limit) || 5000, 5000);
+    const results = [];
+    let lastId = null;
+
+    while (results.length < maximum) {
+      const filter = {
+        company: companyId,
+        isArchived: { $ne: true },
+        defaultWarehouse: null,
+        ...(lastId ? { _id: { $gt: lastId } } : {}),
+      };
+      const products = await Product.find(filter)
+        .select("_id sku name defaultWarehouse")
+        .sort({ _id: 1 })
+        .limit(Math.min(500, maximum - results.length))
+        .lean();
+      if (!products.length) break;
+
+      for (const product of products) {
+        const movement = await StockMovement.findOne({ company: companyId, product: product._id })
+          .sort({ movementDate: -1, createdAt: -1 })
+          .select("warehouse")
+          .lean();
+        if (movement?.warehouse) {
+          await Product.updateOne({ _id: product._id, company: companyId }, { $set: { defaultWarehouse: movement.warehouse } });
+          results.push({ sku: product.sku, name: product.name, status: "updated", warehouseId: movement.warehouse });
+        } else {
+          results.push({ sku: product.sku, name: product.name, status: "no_stock_warehouse" });
+        }
+      }
+      lastId = products[products.length - 1]._id;
+      if (products.length < 500) break;
+    }
+
+    return {
+      attempted: results.length,
+      updated: results.filter((result) => result.status === "updated").length,
+      withoutWarehouse: results.filter((result) => result.status === "no_stock_warehouse").length,
       results,
     };
   }

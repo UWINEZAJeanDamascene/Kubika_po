@@ -1091,3 +1091,15 @@ exports.registerAllProductsWithEBM = async (req, res, next) => {
     next(error);
   }
 };
+
+exports.backfillProductWarehouses = async (req, res, next) => {
+  try {
+    const company = req.user && req.user.company;
+    const companyId = (company && company._id) ? company._id : company;
+    const EBMProductService = require('../services/ebmProductService');
+    const result = await EBMProductService.backfillDefaultWarehouses(companyId);
+    res.json({ success: true, data: result, message: `${result.updated} product default warehouse(s) updated.` });
+  } catch (error) {
+    next(error);
+  }
+};

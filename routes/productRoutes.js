@@ -15,7 +15,8 @@ const {
   analyzeReorder,
   triggerAutoReorder,
   registerProductWithEBM,
-  registerAllProductsWithEBM
+  registerAllProductsWithEBM,
+  backfillProductWarehouses
 } = require('../controllers/productController');
 const { protect } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/rbacMiddleware');
@@ -50,6 +51,7 @@ router.route('/:id')
 router.put('/:id/archive', requirePermission('products', 'delete'), logAction('product'), archiveProduct);
 router.put('/:id/restore', requirePermission('products', 'update'), logAction('product'), restoreProduct);
 router.post('/ebm/register-all', requirePermission('products', 'update'), logAction('product'), cacheInvalidationMiddleware({ type: 'product', invalidateAll: true }), registerAllProductsWithEBM);
+router.post('/import/backfill-default-warehouses', requirePermission('products', 'update'), logAction('product'), cacheInvalidationMiddleware({ type: 'product', invalidateAll: true }), backfillProductWarehouses);
 router.post('/:id/ebm/register', requirePermission('products', 'update'), logAction('product'), registerProductWithEBM);
 router.get('/:id/reorder-analysis', requirePermission('products', 'read'), cacheMiddleware({ type: 'product', ttl: 180, keyGenerator: (req) => cacheMiddlewareKey(req) }), analyzeReorder);
 router.post('/:id/auto-reorder', requirePermission('products', 'update'), logAction('product'), triggerAutoReorder);
