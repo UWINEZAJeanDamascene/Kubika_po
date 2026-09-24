@@ -705,6 +705,18 @@ async function linkImportedProductToSupplier(companyId, productId, supplierId, d
   return true;
 }
 
+async function calculateStockFromMovements(companyId, productId) {
+  const StockMovement = require('../models/StockMovement');
+  const movements = await StockMovement.find({ company: companyId, product: productId })
+    .select('type quantity')
+    .lean();
+  if (!movements.length) return null;
+  return movements.reduce((total, movement) => {
+    const quantity = Number(movement.quantity) || 0;
+    return total + (String(movement.type).toLowerCase() === 'out' ? -quantity : quantity);
+  }, 0);
+}
+
 async function resolveWarehouseId(companyId, name) {
   if (!name) return null;
   const Warehouse = require('../models/Warehouse');
@@ -885,7 +897,11 @@ async function upsertRow(entityType, companyId, userId, data, duplicateAction, c
       return { status: 'skipped', message: stockCaptured ? 'Skipped duplicate product; captured opening stock.' : 'Skipped duplicate product.' };
     }
     if (existing && duplicateAction === 'update') {
-      await Product.updateOne({ _id: existing._id, company: companyId }, { $set: payload });
+      const updatePayload = { ...payload };
+      delete updatePayload.currentStock;
+      const movementStock = await calculateStockFromMovements(companyId, existing._id);
+      if (movementStock != null) updatePayload.currentStock = movementStock;
+      await Product.updateOne({ _id: existing._id, company: companyId }, { $set: updatePayload });
       const stockCaptured = await captureProductOpeningStock(companyId, userId, existing._id, data);
       await linkImportedProductToSupplier(companyId, existing._id, payload.supplier, data);
       return { status: 'success', message: stockCaptured ? 'Updated duplicate product and captured opening stock.' : 'Updated duplicate product.' };
