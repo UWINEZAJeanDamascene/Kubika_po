@@ -1,0 +1,73 @@
+row,status,message,data
+2,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Inyange Milk 500ml"",""sku"":""PRD-021"",""category"":""General"",""sellingPrice"":""700"",""costPrice"":""520"",""taxTypeCode"":""B"",""itemClassCode"":""50202306"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":""Inyange Industries"",""brand"":null,""reorderLevel"":""25"",""description"":""Half-litre pasteurized milk"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""120"",""imageUrl"":""https://example.com/products/inyange-milk-500.jpg"",""warehouseId"":""19766f0c3596f6f909ae2d3a"",""supplierId"":""c6ce5f5cc91e0efd9bc29c28"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""25"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+3,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Generic Cooking Oil 1L"",""sku"":""PRD-022"",""category"":""General"",""sellingPrice"":""3200"",""costPrice"":""2500"",""taxTypeCode"":""B"",""itemClassCode"":""15079000"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""10"",""description"":null,""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""40"",""imageUrl"":null,""warehouseId"":""19766f0c3596f6f909ae2d3a"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""10"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+5,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Fresh Baguette"",""sku"":""PRD-024"",""category"":""General"",""sellingPrice"":""500"",""costPrice"":""300"",""taxTypeCode"":""B"",""itemClassCode"":""19059000"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""20"",""description"":""Baked daily on site"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""30"",""imageUrl"":null,""warehouseId"":""19766f0c3596f6f909ae2d3a"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""20"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+12,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Inyange Milk 1L"",""sku"":""PRD-030"",""category"":""General"",""sellingPrice"":""1250"",""costPrice"":""980"",""taxTypeCode"":""B"",""itemClassCode"":""50202306"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":""Inyange Industries"",""brand"":null,""reorderLevel"":""20"",""description"":""Second SKU for same name on purpose"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""50"",""imageUrl"":null,""warehouseId"":""19766f0c3596f6f909ae2d3a"",""supplierId"":""c6ce5f5cc91e0efd9bc29c28"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""20"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+16,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Bluetooth Speaker Mini"",""sku"":""PRD-034"",""category"":""Electronics"",""sellingPrice"":""22000"",""costPrice"":""16000"",""taxTypeCode"":""B"",""itemClassCode"":""85182200"",""packagingUnitCode"":""CT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""8"",""description"":""Malformed image URL on purpose"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""14"",""imageUrl"":""not-a-valid-url"",""warehouseId"":""19766f0c3596f6f909ae2d3a"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""8"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+17,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Premium Extra Virgin Imported Olive Oil Cold Pressed Family Size Bottle 2 Litre"",""sku"":""PRD-035"",""category"":""General"",""sellingPrice"":""9800"",""costPrice"":""7200"",""taxTypeCode"":""B"",""itemClassCode"":""15091000"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""6"",""description"":""Deliberately long name on purpose"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""10"",""imageUrl"":null,""warehouseId"":""19766f0c3596f6f909ae2d3a"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""6"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+20,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""MTN MoMo Scratch Card 5000 RWF"",""sku"":""PRD-038"",""category"":""General"",""sellingPrice"":""5000"",""costPrice"":""4800"",""taxTypeCode"":""D"",""itemClassCode"":""99999901"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""U"",""supplier"":""MTN Rwanda"",""brand"":null,""reorderLevel"":""50"",""description"":""Non-taxable mobile money voucher"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""200"",""imageUrl"":""https://example.com/products/momo-card.jpg"",""warehouseId"":""19766f0c3596f6f909ae2d3a"",""supplierId"":""0287427540c325e2c0418b82"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""50"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+21,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Export Dried Chili 1kg"",""sku"":""PRD-039"",""category"":""General"",""sellingPrice"":""7200"",""costPrice"":""5300"",""taxTypeCode"":""C"",""itemClassCode"":""09042100"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":""Rwanda Agro Exports Ltd"",""brand"":null,""reorderLevel"":""5"",""description"":""Grade A dried chili for export"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""18"",""imageUrl"":null,""warehouseId"":""19766f0c3596f6f909ae2d3a"",""supplierId"":""5bad2efd9a8b1a31c622b023"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""5"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"

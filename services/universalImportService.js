@@ -674,6 +674,37 @@ async function captureProductOpeningStock(companyId, userId, productId, data) {
   return true;
 }
 
+async function linkImportedProductToSupplier(companyId, productId, supplierId, data) {
+  if (!supplierId || !productId) return false;
+
+  const Supplier = require('../models/Supplier');
+  const StockMovement = require('../models/StockMovement');
+  const supplier = await Supplier.findOne({ _id: supplierId, company: companyId });
+  if (!supplier) return false;
+
+  const suppliedProducts = Array.isArray(supplier.productsSupplied) ? supplier.productsSupplied : [];
+  const alreadyLinked = suppliedProducts.some((id) => String(id) === String(productId));
+  if (alreadyLinked) return false;
+
+  suppliedProducts.push(productId);
+  supplier.productsSupplied = suppliedProducts;
+
+  const quantity = parseNumber(data.openingStockQuantity) || 0;
+  const unitCost = parseNumber(data.costPrice) || 0;
+  let importedValue = quantity > 0 ? quantity * unitCost : 0;
+  if (!importedValue) {
+    const movement = await StockMovement.findOne({
+      company: companyId,
+      product: productId,
+      reason: 'initial_stock',
+    }).select('quantity unitCost totalCost').sort({ movementDate: -1 }).lean();
+    importedValue = Number(movement?.totalCost) || (Number(movement?.quantity || 0) * Number(movement?.unitCost || 0));
+  }
+  if (importedValue > 0) supplier.totalPurchases = (Number(supplier.totalPurchases) || 0) + importedValue;
+  await supplier.save();
+  return true;
+}
+
 async function resolveWarehouseId(companyId, name) {
   if (!name) return null;
   const Warehouse = require('../models/Warehouse');
@@ -850,16 +881,19 @@ async function upsertRow(entityType, companyId, userId, data, duplicateAction, c
         await Product.updateOne({ _id: existing._id, company: companyId }, { $set: { defaultWarehouse: warehouseId } });
       }
       const stockCaptured = await captureProductOpeningStock(companyId, userId, existing._id, data);
+      await linkImportedProductToSupplier(companyId, existing._id, payload.supplier, data);
       return { status: 'skipped', message: stockCaptured ? 'Skipped duplicate product; captured opening stock.' : 'Skipped duplicate product.' };
     }
     if (existing && duplicateAction === 'update') {
       await Product.updateOne({ _id: existing._id, company: companyId }, { $set: payload });
       const stockCaptured = await captureProductOpeningStock(companyId, userId, existing._id, data);
+      await linkImportedProductToSupplier(companyId, existing._id, payload.supplier, data);
       return { status: 'success', message: stockCaptured ? 'Updated duplicate product and captured opening stock.' : 'Updated duplicate product.' };
     }
     if (existing && duplicateAction !== 'create') return { status: 'skipped', message: 'Skipped duplicate product.' };
     const product = await Product.create(payload);
     await captureProductOpeningStock(companyId, userId, product._id, data);
+    await linkImportedProductToSupplier(companyId, product._id, payload.supplier, data);
     return { status: 'success', message: 'Created product.' };
   }
 

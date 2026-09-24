@@ -1,0 +1,80 @@
+row,status,message,data
+2,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Transaction API error: Transaction already closed: A query cannot be executed on an expired transaction. The timeout for this transaction was 30000 ms, however 41386 ms passed since the start of the transaction. Consider increasing the interactive transaction timeout or doing less work in the transaction.","{""name"":""Inyange Milk 500ml"",""sku"":""PRD-021"",""category"":""General"",""sellingPrice"":""700"",""costPrice"":""520"",""taxTypeCode"":""B"",""itemClassCode"":""50202306"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":""Inyange Industries"",""brand"":null,""reorderLevel"":""25"",""description"":""Half-litre pasteurized milk"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""120"",""imageUrl"":""https://example.com/products/inyange-milk-500.jpg"",""warehouseId"":""19766f0c3596f6f909ae2d3a"",""supplierId"":""c6ce5f5cc91e0efd9bc29c28"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""25"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+3,success,Created product.,"{""name"":""Generic Cooking Oil 1L"",""sku"":""PRD-022"",""category"":""General"",""sellingPrice"":""3200"",""costPrice"":""2500"",""taxTypeCode"":""B"",""itemClassCode"":""15079000"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""10"",""description"":null,""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""40"",""imageUrl"":null,""warehouseId"":""19766f0c3596f6f909ae2d3a"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""10"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+5,success,Created product.,"{""name"":""Fresh Baguette"",""sku"":""PRD-024"",""category"":""General"",""sellingPrice"":""500"",""costPrice"":""300"",""taxTypeCode"":""B"",""itemClassCode"":""19059000"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""20"",""description"":""Baked daily on site"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""30"",""imageUrl"":null,""warehouseId"":""19766f0c3596f6f909ae2d3a"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""20"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+6,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Coca-Cola 1.5L"",""sku"":""PRD-025"",""category"":""General"",""sellingPrice"":""1500"",""costPrice"":""1050"",""taxTypeCode"":""B"",""itemClassCode"":""50202410"",""packagingUnitCode"":""CT"",""quantityUnitCode"":""KGM"",""supplier"":""Bralirwa"",""brand"":null,""reorderLevel"":""20"",""description"":""Singular spelling on purpose"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""60"",""imageUrl"":null,""warehouseId"":""19766f0c3596f6f909ae2d3a"",""supplierId"":""806904db5ce3e7fe9ea0a099"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""20"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+7,error,"
+Invalid `delegate().findFirst()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1148:38
+
+  1145 const where = applyTenant(translateFilter(filter, fieldMap), opts);
+  1146 if (where === IMPOSSIBLE) return null;
+  1147 const include = buildInclude(opts.populate);
+→ 1148 const row = await delegate().findFirst(
+Transaction API error: Transaction already closed: A query cannot be executed on an expired transaction. The timeout for this transaction was 30000 ms, however 30207 ms passed since the start of the transaction. Consider increasing the interactive transaction timeout or doing less work in the transaction.","{""name"":""Coca-Cola 500ml"",""sku"":""PRD-025"",""category"":""General"",""sellingPrice"":""700"",""costPrice"":""480"",""taxTypeCode"":""B"",""itemClassCode"":""50202410"",""packagingUnitCode"":""CT"",""quantityUnitCode"":""KGM"",""supplier"":""Bralirwa"",""brand"":null,""reorderLevel"":""20"",""description"":""Same SKU as previous row on purpose"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""90"",""imageUrl"":null,""warehouseId"":""19766f0c3596f6f909ae2d3a"",""supplierId"":""806904db5ce3e7fe9ea0a099"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""20"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+11,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Colgate Toothpaste 100ml"",""sku"":""PRD-029"",""category"":""General"",""sellingPrice"":""1800"",""costPrice"":""1200"",""taxTypeCode"":""B"",""itemClassCode"":""33061000"",""packagingUnitCode"":""CT"",""quantityUnitCode"":""KGM"",""supplier"":""Colgate-Palmolive"",""brand"":null,""reorderLevel"":""20"",""description"":""Extra spaces in code on purpose"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""70"",""imageUrl"":null,""warehouseId"":""19766f0c3596f6f909ae2d3a"",""supplierId"":""6f921ca78de27bd8b18e7656"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""20"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+12,success,Created product.,"{""name"":""Inyange Milk 1L"",""sku"":""PRD-030"",""category"":""General"",""sellingPrice"":""1250"",""costPrice"":""980"",""taxTypeCode"":""B"",""itemClassCode"":""50202306"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":""Inyange Industries"",""brand"":null,""reorderLevel"":""20"",""description"":""Second SKU for same name on purpose"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""50"",""imageUrl"":null,""warehouseId"":""19766f0c3596f6f909ae2d3a"",""supplierId"":""c6ce5f5cc91e0efd9bc29c28"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""20"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+13,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Inyange Cheese 250g"",""sku"":""PRD-031"",""category"":""General"",""sellingPrice"":""2200"",""costPrice"":""1700"",""taxTypeCode"":""B"",""itemClassCode"":""50202306"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":""Inyange Industries"",""brand"":null,""reorderLevel"":""12"",""description"":null,""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""35"",""imageUrl"":null,""warehouseId"":""19766f0c3596f6f909ae2d3a"",""supplierId"":""c6ce5f5cc91e0efd9bc29c28"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""12"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+14,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Assorted Fresh Vegetables Crate"",""sku"":""PRD-032"",""category"":""General"",""sellingPrice"":""12000"",""costPrice"":""8500"",""taxTypeCode"":""A"",""itemClassCode"":""07099300"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":""Kigali Fresh Distributors Ltd"",""brand"":null,""reorderLevel"":""5"",""description"":""Mixed vegetable crate"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""18"",""imageUrl"":null,""warehouseId"":""19766f0c3596f6f909ae2d3a"",""supplierId"":""ddd13ff2025f4f20f7f98557"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""5"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+16,success,Created product.,"{""name"":""Bluetooth Speaker Mini"",""sku"":""PRD-034"",""category"":""Electronics"",""sellingPrice"":""22000"",""costPrice"":""16000"",""taxTypeCode"":""B"",""itemClassCode"":""85182200"",""packagingUnitCode"":""CT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""8"",""description"":""Malformed image URL on purpose"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""14"",""imageUrl"":""not-a-valid-url"",""warehouseId"":""19766f0c3596f6f909ae2d3a"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""8"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+17,success,Created product.,"{""name"":""Premium Extra Virgin Imported Olive Oil Cold Pressed Family Size Bottle 2 Litre"",""sku"":""PRD-035"",""category"":""General"",""sellingPrice"":""9800"",""costPrice"":""7200"",""taxTypeCode"":""B"",""itemClassCode"":""15091000"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""6"",""description"":""Deliberately long name on purpose"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""10"",""imageUrl"":null,""warehouseId"":""19766f0c3596f6f909ae2d3a"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""6"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+18,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Umuneke Honey 500g (100% Organic)"",""sku"":""PRD-036"",""category"":""General"",""sellingPrice"":""4200"",""costPrice"":""3000"",""taxTypeCode"":""B"",""itemClassCode"":""04090000"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":""Umuneke Cooperative"",""brand"":null,""reorderLevel"":""10"",""description"":""Special characters on purpose"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""22"",""imageUrl"":null,""warehouseId"":""19766f0c3596f6f909ae2d3a"",""supplierId"":""a4a3e7bd205f6732f5cbde00"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""10"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+19,error,"
+Invalid `delegate().create()` invocation in
+D:\Stock-management\Stock_tenancy_system\utils\prismaCompat.js:1025:34
+
+  1022 
+  1023 async function createOne(data) {
+  1024   const createData = await translateCreate(data);
+→ 1025   const row = await delegate().create(
+Unique constraint failed on the fields: (`company_id`,`sku`)","{""name"":""Clearance Item Sample"",""sku"":""PRD-037"",""category"":""General"",""sellingPrice"":""1000"",""costPrice"":""600"",""taxTypeCode"":""B"",""itemClassCode"":""39269099"",""packagingUnitCode"":""CT"",""quantityUnitCode"":""KGM"",""supplier"":null,""brand"":null,""reorderLevel"":""0"",""description"":""Reorder level zero on purpose"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""5"",""imageUrl"":null,""warehouseId"":""19766f0c3596f6f909ae2d3a"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""0"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+20,success,Created product.,"{""name"":""MTN MoMo Scratch Card 5000 RWF"",""sku"":""PRD-038"",""category"":""General"",""sellingPrice"":""5000"",""costPrice"":""4800"",""taxTypeCode"":""D"",""itemClassCode"":""99999901"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""U"",""supplier"":""MTN Rwanda"",""brand"":null,""reorderLevel"":""50"",""description"":""Non-taxable mobile money voucher"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""200"",""imageUrl"":""https://example.com/products/momo-card.jpg"",""warehouseId"":""19766f0c3596f6f909ae2d3a"",""supplierId"":""0287427540c325e2c0418b82"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""50"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
+21,success,Created product.,"{""name"":""Export Dried Chili 1kg"",""sku"":""PRD-039"",""category"":""General"",""sellingPrice"":""7200"",""costPrice"":""5300"",""taxTypeCode"":""C"",""itemClassCode"":""09042100"",""packagingUnitCode"":""NT"",""quantityUnitCode"":""KGM"",""supplier"":""Rwanda Agro Exports Ltd"",""brand"":null,""reorderLevel"":""5"",""description"":""Grade A dried chili for export"",""warehouse"":""Main Kicukiro "",""openingStockQuantity"":""18"",""imageUrl"":null,""warehouseId"":""19766f0c3596f6f909ae2d3a"",""supplierId"":""5bad2efd9a8b1a31c622b023"",""costingMethod"":""fifo"",""trackingType"":""none"",""isStockable"":true,""barcodeType"":""CODE128"",""reorderQuantity"":""5"",""inventoryAccount"":""1400"",""cogsAccount"":""5000"",""revenueAccount"":""4000""}"
