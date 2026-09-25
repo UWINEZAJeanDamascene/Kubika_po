@@ -7,6 +7,7 @@ const {
   hasPermission,
   filterFactsForPermissions,
 } = require('../../context-builder/permissionUtils');
+const { allowedToolNames, filterToolsForUser } = require('../../context-builder/toolPermissions');
 
 describe('AI Context Builder utilities', () => {
   test('infers domains from query text', () => {
@@ -62,5 +63,20 @@ describe('AI Context Builder utilities', () => {
     expect(filterFactsForPermissions(facts, ['products.read']).map((fact) => fact.id)).toEqual(['fact_1']);
     expect(hasPermission(['*'], ['payroll.read'])).toBe(true);
   });
-});
 
+  test('filters chat data tools to permissions held by the user', () => {
+    const tools = [
+      { type: 'function', function: { name: 'get_products' } },
+      { type: 'function', function: { name: 'get_payroll_summary' } },
+      { type: 'function', function: { name: 'get_module_records' } },
+      { type: 'function', function: { name: 'get_module_catalog' } },
+    ];
+    const user = { role: 'staff', roles: [{ permissions: ['products.read'] }] };
+
+    expect(filterToolsForUser(tools, user).map((tool) => tool.function.name)).toEqual([
+      'get_products',
+      'get_module_catalog',
+    ]);
+    expect(allowedToolNames(user).has('get_module_records')).toBe(false);
+  });
+});

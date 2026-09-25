@@ -9,9 +9,10 @@ const REQUIRED_PERMISSIONS = ['products.read', 'inventory.read', 'stock.read', '
 async function collect({ companyId }) {
   const facts = [];
   const warnings = [];
-  const [{ result: summary }, { result: products }] = await Promise.all([
+  const [{ result: summary }, { result: products }, { result: deadStock }] = await Promise.all([
     runTool(companyId, 'get_stock_summary'),
     runTool(companyId, 'get_products', { limit: 20, lowStock: true }),
+    runTool(companyId, 'get_dead_stock_candidates', { days: 60 }),
   ]);
 
   const productIds = sourceIdsFrom(products.products, 'get_products');
@@ -24,6 +25,20 @@ async function collect({ companyId }) {
     sourceMethod: 'get_stock_summary',
     sourceIds: productIds,
     permissions: REQUIRED_PERMISSIONS,
+  });
+  addNumericFact(facts, {
+    companyId,
+    domain: AI_DOMAINS.INVENTORY,
+    label: 'Dead stock candidate count',
+    value: deadStock.count,
+    unit: 'count',
+    sourceMethod: 'get_dead_stock_candidates',
+    sourceIds: deadStock.sourceIds,
+    permissions: REQUIRED_PERMISSIONS,
+    metadata: {
+      deadStockWindowDays: deadStock.daysThreshold || 60,
+      truncatedSourceIds: deadStock.truncatedSourceIds || 0,
+    },
   });
   addNumericFact(facts, {
     companyId,
@@ -82,4 +97,3 @@ module.exports = {
   requiredPermissions: REQUIRED_PERMISSIONS,
   collect,
 };
-

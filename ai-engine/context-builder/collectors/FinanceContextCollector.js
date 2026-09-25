@@ -66,6 +66,19 @@ async function collect({ companyId, dateRange }) {
     addNumericFact(facts, {
       companyId,
       domain: AI_DOMAINS.FINANCE,
+      label: 'Cost of goods sold',
+      value: pl.cogs,
+      unit: 'RWF',
+      sourceMethod: 'get_profit_loss_summary',
+      sourceIds: ['get_profit_loss_summary'],
+      computed: Boolean(pl.cogsEstimated),
+      formula: pl.cogsEstimated ? 'Estimated as 60% of revenue because no recorded COGS was available.' : null,
+      metadata: pl.cogsEstimated ? { caveat: 'COGS is a 60% revenue estimate because recorded invoice-line COGS was unavailable.' } : {},
+      permissions: REQUIRED_PERMISSIONS,
+    });
+    addNumericFact(facts, {
+      companyId,
+      domain: AI_DOMAINS.FINANCE,
       label: 'Profit and loss net profit',
       value: pl.netProfit || pl.profit || 0,
       unit: 'RWF',
@@ -99,4 +112,3 @@ module.exports = {
   requiredPermissions: REQUIRED_PERMISSIONS,
   collect,
 };
-

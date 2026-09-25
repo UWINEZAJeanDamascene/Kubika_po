@@ -25,6 +25,7 @@ const DOMAIN_KEYWORDS = Object.freeze({
   [AI_DOMAINS.SUPPLIERS]: ['supplier', 'vendor'],
   [AI_DOMAINS.PAYROLL]: ['payroll', 'salary', 'employee', 'timesheet'],
   [AI_DOMAINS.REPORTS]: ['report', 'ratio', 'balance sheet', 'cash flow', 'p&l', 'trial balance'],
+  [AI_DOMAINS.TAX]: ['vat', 'tax', 'paye', 'rra', 'ebm', 'withholding'],
 });
 
 function stableHash(value) {

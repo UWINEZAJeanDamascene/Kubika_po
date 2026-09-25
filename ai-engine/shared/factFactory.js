@@ -50,6 +50,7 @@ function createFact({
     formula,
     permissions,
     observedAt,
+    metadata,
   };
 
   return assertValidFactRecord(fact);
@@ -66,4 +67,3 @@ module.exports = {
   addNumericFact,
   sourceIdsFrom,
 };
-

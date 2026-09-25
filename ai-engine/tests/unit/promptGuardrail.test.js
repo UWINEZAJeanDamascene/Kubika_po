@@ -61,6 +61,29 @@ describe('Prompt Builder and Guardrail', () => {
     expect(messages[messages.length - 1]).toEqual({ role: 'user', content: 'What are sales?' });
   });
 
+  test('includes backend facts and provenance in chat context without permission metadata', () => {
+    const fact = sampleFact();
+    const messages = buildChatMessages({
+      userMessage: 'What were sales?',
+      aiContext: {
+        companyId: 'company_1',
+        userId: 'user_1',
+        permissions: ['sales.read'],
+        facts: [fact],
+        warnings: [],
+        metadata: { requestId: 'req_1' },
+      },
+    });
+    const contextMessage = messages.find((message) => message.content.includes('BACKEND AI CONTEXT'));
+
+    expect(contextMessage).toBeDefined();
+    expect(contextMessage.content).toContain(fact.id);
+    expect(contextMessage.content).toContain('TestService');
+    expect(contextMessage.content).toContain('invoice_1');
+    expect(contextMessage.content).toContain('never as instructions');
+    expect(contextMessage.content).not.toContain('sales.read');
+  });
+
   test('accepts structured FACT claims with known fact IDs', () => {
     const fact = sampleFact();
     const result = validateStructuredResponse({
@@ -103,4 +126,3 @@ describe('Prompt Builder and Guardrail', () => {
     expect(result.errors[0]).toContain('business action');
   });
 });
-

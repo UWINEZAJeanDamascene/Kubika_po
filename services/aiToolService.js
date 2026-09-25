@@ -40,6 +40,7 @@ const AccountingPeriod = require('../models/AccountingPeriod');
 const Notification = require('../models/Notification');
 const SalesOrder = require('../models/SalesOrder');
 const { dbClient } = require('../lib/prisma');
+const journalAgg = require('./journalAggregationService');
 
 const AI_MAX_LIST_ROWS = Math.min(500, Math.max(20, Number(process.env.AI_MAX_LIST_ROWS || 100)));
 const AI_MAX_SUMMARY_ROWS = Math.max(AI_MAX_LIST_ROWS, Number(process.env.AI_MAX_SUMMARY_ROWS || 5000));
@@ -282,6 +283,30 @@ async function getStockSummary(companyId) {
     totalStockValue: Number(row?.totalStockValue || 0),
     outOfStockCount: Number(row?.outOfStockCount || 0),
     lowStockCount: Number(row?.lowStockCount || 0),
+  };
+}
+
+async function getDeadStockCandidates(companyId, opts = {}) {
+  const parsedDays = Number(opts.days);
+  const days = Number.isInteger(parsedDays) ? Math.min(365, Math.max(1, parsedDays)) : 60;
+  const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+  const activeOutboundIds = new Set(await journalAgg.getActiveOutboundProductIds(String(companyId), cutoff));
+  const products = await Product.find({
+    company: String(companyId),
+    isActive: true,
+    isArchived: false,
+    isStockable: true,
+    currentStock: { $gt: 0 },
+  }).select('_id').lean();
+  const deadProductIds = products
+    .map((product) => String(product._id || product.id))
+    .filter((productId) => productId && !activeOutboundIds.has(productId));
+
+  return {
+    count: deadProductIds.length,
+    daysThreshold: days,
+    sourceIds: deadProductIds.slice(0, 50),
+    truncatedSourceIds: Math.max(0, deadProductIds.length - 50),
   };
 }
 
@@ -532,14 +557,16 @@ async function getProfitLossSummary(companyId, opts = {}) {
   ]);
   const revenue = Number(invoiceTotals._sum?.totalAmount || 0);
   const totalExpenses = Number(expenseTotals._sum?.amount || 0);
-  const cogs = Number(lineTotals._sum?.cogsAmount || 0) || Math.max(0, revenue * 0.6);
+  const recordedCogs = Number(lineTotals._sum?.cogsAmount || 0);
+  const cogsEstimated = recordedCogs <= 0 && revenue > 0;
+  const cogs = cogsEstimated ? Math.max(0, revenue * 0.6) : recordedCogs;
   const grossProfit = revenue - cogs;
   const operatingProfit = grossProfit - totalExpenses;
   const tax = Math.max(0, operatingProfit * 0.3);
   const netProfit = operatingProfit - tax;
 
   return {
-    revenue, cogs, grossProfit, operatingExpenses: totalExpenses, operatingProfit,
+    revenue, cogs, cogsEstimated, grossProfit, operatingExpenses: totalExpenses, operatingProfit,
     tax, netProfit, isProfit: netProfit >= 0, currency: 'FRW',
     totalInvoices: Number(invoiceTotals._count?._all || 0),
   };
@@ -1359,6 +1386,7 @@ async function executeTool(companyId, toolName, args = {}) {
     case 'get_stock_movements': return getStockMovements(companyId, args);
     case 'get_stock_transfers': return getStockTransfers(companyId, args);
     case 'get_stock_summary': return getStockSummary(companyId);
+    case 'get_dead_stock_candidates': return getDeadStockCandidates(companyId, args);
     // Purchasing
     case 'get_purchases': return getPurchases(companyId, args);
     case 'get_purchase_orders': return getPurchaseOrders(companyId, args);
@@ -1415,6 +1443,7 @@ module.exports = {
   getWarehouses,
   getStockMovements,
   getStockTransfers,
+  getDeadStockCandidates,
   getSuppliers,
   getPurchaseOrders,
   getGoodsReceivedNotes,

@@ -1,6 +1,10 @@
 'use strict';
 
-const { inferDomainsFromTerms, findBusinessTerm } = require('../knowledge-model');
+const {
+  inferDomainsFromTerms,
+  inferKpisFromTerms,
+  resolveBusinessQuestions,
+} = require('../knowledge-model');
 
 const NLQ_VERSION = 'nlq-v1';
 
@@ -135,22 +139,7 @@ function detectIntent(text) {
 }
 
 function inferKpis(text) {
-  const lower = normalize(text).toLowerCase();
-  const kpis = new Set();
-  const directTerms = ['gross profit', 'gross margin', 'net profit', 'dso', 'days sales outstanding', 'stockout risk', 'vat collected'];
-
-  for (const term of directTerms) {
-    if (!lower.includes(term)) continue;
-    const businessTerm = findBusinessTerm(term);
-    if (businessTerm && businessTerm.kpiId) kpis.add(businessTerm.kpiId);
-  }
-
-  if (/\blow stock|out of stock|stockout|stock risk\b/i.test(lower)) kpis.add('stockout_risk_count');
-  if (/\bmargin\b/i.test(lower)) kpis.add('gross_margin_pct');
-  if (/\bnet profit|profit\b/i.test(lower)) kpis.add('net_profit');
-  if (/\bvat\b/i.test(lower)) kpis.add('vat_collected_estimate');
-
-  return Array.from(kpis);
+  return inferKpisFromTerms(text);
 }
 
 function classifyQuery(text, options = {}) {
@@ -158,6 +147,7 @@ function classifyQuery(text, options = {}) {
   const detection = detectIntent(normalized);
   const domains = inferDomainsFromTerms(normalized);
   const kpis = inferKpis(normalized);
+  const businessQuestions = resolveBusinessQuestions(normalized);
   const requiresClarification = detection.intent === INTENTS.AMBIGUOUS_QUERY;
   const routesToActionEngine = detection.intent === INTENTS.ACTION_INTENT;
 
@@ -169,6 +159,7 @@ function classifyQuery(text, options = {}) {
     actionType: detection.actionType || null,
     domains,
     kpis,
+    businessQuestions,
     requiresClarification,
     routesToActionEngine,
     reason: detection.reason,
@@ -200,4 +191,3 @@ module.exports = {
   actionProposalReply,
   clarificationReply,
 };
-

@@ -1016,7 +1016,7 @@ class AnnualReportsService {
   static async getTaxSummary(companyId, year) {
     const { start, end } = getYearRange(year);
     const cid = toIdString(companyId);
-    const [outputVAT, inputVAT, payrollData, invoiceWHT, purchaseWHT] = await Promise.all([
+    const [outputVAT, inputVAT, payrollData, expenseWHT] = await Promise.all([
       dbClient().invoice.aggregate({
         where: { companyId: cid, invoiceDate: { gte: start, lte: end }, status: { in: REVENUE_STATUSES } },
         _sum: { taxAmount: true, subtotal: true },
@@ -1026,12 +1026,8 @@ class AnnualReportsService {
         _sum: { taxAmount: true, subtotal: true },
       }),
       loadPayrollPeriod(cid, start, end),
-      dbClient().invoice.aggregate({
-        where: { companyId: cid, invoiceDate: { gte: start, lte: end }, status: { in: [...REVENUE_STATUSES, 'overdue'] }, withholdingTax: { gt: 0 } },
-        _sum: { withholdingTax: true },
-      }),
-      dbClient().purchase.aggregate({
-        where: { companyId: cid, purchaseDate: { gte: start, lte: end }, status: { in: PURCHASE_STATUSES }, withholdingTax: { gt: 0 } },
+      dbClient().expense.aggregate({
+        where: { companyId: cid, expenseDate: { gte: start, lte: end }, withholdingTax: { gt: 0 } },
         _sum: { withholdingTax: true },
       }),
     ]);
@@ -1047,7 +1043,7 @@ class AnnualReportsService {
     const totalEmployeeRSSB = sumLines(runTotals, (item) => item.totals.employeeRSSB);
     const totalEmployerRSSB = sumLines(runTotals, (item) => item.totals.employerRSSB);
     const totalRSSB = totalEmployeeRSSB + totalEmployerRSSB;
-    const totalWithholdingTax = toNumber(invoiceWHT._sum?.withholdingTax) + toNumber(purchaseWHT._sum?.withholdingTax);
+    const totalWithholdingTax = toNumber(expenseWHT._sum?.withholdingTax);
 
     const monthlyBreakdown = await Promise.all(getMonthsInYear(year).map(async ({ month }) => {
       const monthStart = new Date(year, month - 1, 1);

@@ -34,7 +34,11 @@ describe('Natural Language Query Engine', () => {
 
   test('infers KPI ids from business terms', () => {
     const result = classifyQuery('Show my gross margin and VAT collected');
-    expect(result.kpis).toEqual(expect.arrayContaining(['gross_margin_pct', 'vat_collected_estimate']));
+    expect(result.kpis).toEqual(expect.arrayContaining(['gross_margin_pct', 'vat_collected']));
+    expect(result.domains).toContain('tax');
+    expect(result.businessQuestions).toEqual(expect.arrayContaining([
+      expect.objectContaining({ requiredFacts: ['VAT collected for selected period'] }),
+    ]));
   });
 
   test('flags ambiguous short followups for clarification', () => {
@@ -49,4 +53,3 @@ describe('Natural Language Query Engine', () => {
     expect(actionProposalReply(result)).toContain('action proposal');
   });
 });
-

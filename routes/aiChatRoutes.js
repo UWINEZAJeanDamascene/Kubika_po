@@ -1,8 +1,15 @@
 const express = require('express');
+const crypto = require('crypto');
 const router = express.Router();
 const { protect } = require('../middleware/auth');
 const { TOOL_DEFINITIONS, executeTool } = require('../services/aiToolService');
-const { buildStacySystemPrompt, PROMPT_TEMPLATE_VERSION } = require('../ai-engine/prompt-builder');
+const { buildContext } = require('../ai-engine/context-builder/ContextBuilder');
+const { filterToolsForUser, allowedToolNames } = require('../ai-engine/context-builder/toolPermissions');
+const {
+  buildChatMessages,
+  serializeAIContext,
+  PROMPT_TEMPLATE_VERSION,
+} = require('../ai-engine/prompt-builder');
 const { validateFreeTextResponse, guardedFallback, GUARDRAIL_VERSION } = require('../ai-engine/guardrail');
 const { classifyQuery, actionProposalReply, clarificationReply, NLQ_VERSION } = require('../ai-engine/nlq');
 const {
@@ -12,9 +19,6 @@ const {
   getProviderStatus,
 } = require('../services/aiProviderService');
 
-function buildSystemPrompt(userName, companyName) {
-  return buildStacySystemPrompt({ userName, companyName });
-}
 router.post('/', protect, async (req, res) => {
   try {
     const { message, history = [] } = req.body;
@@ -59,14 +63,26 @@ router.post('/', protect, async (req, res) => {
     const companyId = req.user.company;
     const userName = req.user.name || 'there';
     const companyName = req.user.companyName || 'your company';
+    const requestId = req.headers['x-request-id'] || crypto.randomUUID();
+    const aiContext = await buildContext({
+      user: req.user,
+      company: req.company || req.user.company,
+      query: message.trim(),
+      domains: nlq.domains,
+      requestId,
+    });
+    const availableTools = filterToolsForUser(TOOL_DEFINITIONS, req.user);
+    const allowedTools = allowedToolNames(req.user);
 
-    // Build messages
-    const systemPrompt = buildSystemPrompt(userName, companyName);
-    const messages = [
-      { role: 'system', content: systemPrompt },
-      ...history.slice(-20).map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content })),
-      { role: 'user', content: message.trim() },
-    ];
+    // The backend-built, permission-filtered facts are sent as evidence. Existing
+    // tool calls remain available for follow-up data the collectors do not cover.
+    const messages = buildChatMessages({
+      userName,
+      companyName,
+      history,
+      userMessage: message,
+      aiContext,
+    });
 
     // Tool calling loop (max 5 iterations to prevent runaway)
     let finalReply = '';
@@ -79,8 +95,7 @@ router.post('/', protect, async (req, res) => {
       try {
         completionResult = await createCompletion({
           messages,
-          tools: TOOL_DEFINITIONS,
-          tool_choice: 'auto',
+          ...(availableTools.length ? { tools: availableTools, tool_choice: 'auto' } : {}),
           temperature: 0.6,
           max_tokens: 4096,
         });
@@ -105,6 +120,13 @@ router.post('/', protect, async (req, res) => {
         const toolResults = await Promise.all(
           assistantMessage.tool_calls.map(async (tc) => {
             const toolName = tc.function.name;
+            if (!allowedTools.has(toolName)) {
+              return {
+                tool_call_id: tc.id,
+                role: 'tool',
+                content: JSON.stringify({ error: `Tool '${toolName}' is unavailable for this user's permissions.` }),
+              };
+            }
             let args = {};
             try { args = JSON.parse(tc.function.arguments || '{}'); } catch (e) {}
             if (args === null || typeof args !== 'object') args = {};
@@ -154,6 +176,7 @@ router.post('/', protect, async (req, res) => {
         providerMetadata,
         nlqVersion: NLQ_VERSION,
         intent: nlq,
+        context: serializeAIContext(aiContext),
       },
     });
   } catch (error) {

@@ -23,6 +23,7 @@
  */
 
 const mongoose = require('mongoose');
+const { Prisma } = require('@prisma/client');
 const { dbClient } = require('../lib/prisma');
 const { toIdString } = require('../utils/objectId');
 const Invoice = require('../models/Invoice');
@@ -1026,22 +1027,29 @@ class MonthlyReportsService {
    */
   static async getSalesByCategory(companyId, year, month) {
     const { start, end } = getMonthRange(year, month);
-    const rows = await dbClient().invoiceLine.groupBy({
-      by: ['category'],
-      where: {
-        companyId: String(companyId),
-        invoice: {
-          invoiceDate: { gte: start, lte: end },
-          status: { in: ['fully_paid', 'partially_paid', 'sent', 'confirmed'] },
-        },
-      },
-      _sum: { lineTotal: true, qty: true },
-    });
+    const rows = await dbClient().$queryRaw`
+      SELECT c.name AS category,
+             COALESCE(SUM(il.line_total), 0)::float AS total_revenue,
+             COALESCE(SUM(il.qty), 0)::float AS total_units,
+             COALESCE(SUM((il.line_total::float) - (il.qty::float * COALESCE(p.average_cost, 0))), 0)::float AS gross_profit
+      FROM invoice_lines il
+      JOIN invoices i ON i.id = il.invoice_id
+      JOIN products p ON p.id = il.product_id
+      LEFT JOIN categories c ON c.id = p.category_id
+      WHERE i.company_id = ${String(companyId)}
+        AND i.invoice_date >= ${start}
+        AND i.invoice_date <= ${end}
+        AND i.status IN (${Prisma.join(REVENUE_STATUSES)})
+      GROUP BY c.name
+      ORDER BY total_revenue DESC
+    `;
+
     const categorySales = rows.map((row) => ({
       _id: row.category || 'Uncategorized',
-      totalRevenue: toNumber(row._sum.lineTotal),
-      totalUnits: toNumber(row._sum.qty),
-      totalCost: 0,
+      totalRevenue: Number(row.total_revenue || 0),
+      totalUnits: Number(row.total_units || 0),
+      totalCost: Number(row.total_revenue || 0) - Number(row.gross_profit || 0),
+      grossProfit: Number(row.gross_profit || 0),
     }));
 
     const categories = categorySales.map(c => ({
@@ -1273,15 +1281,35 @@ class MonthlyReportsService {
    */
   static async getAPAging(companyId, year, month) {
     const { end } = getMonthRange(year, month);
-    const purchases = await dbClient().purchase.findMany({
-      where: {
-        companyId: String(companyId),
-        status: { in: ['received', 'partial'] },
-        balance: { gt: 0 },
-        purchaseDate: { lte: end },
-      },
-      include: { supplier: { select: { id: true, name: true } } },
-    });
+    const [grns, purchaseOrders] = await Promise.all([
+      dbClient().goodsReceivedNote.findMany({
+        where: { companyId: String(companyId), balance: { gt: 0 } },
+        include: { supplier: { select: { id: true, name: true } } },
+      }),
+      dbClient().purchaseOrder.findMany({
+        where: {
+          companyId: String(companyId),
+          balance: { gt: 0 },
+          status: { in: ['approved', 'partially_received', 'received'] },
+        },
+        include: { supplier: { select: { id: true, name: true } } },
+      }),
+    ]);
+
+    const payableItems = [
+      ...grns.map((item) => ({
+        supplierId: item.supplierId,
+        supplierName: item.supplier?.name || 'Unknown',
+        dueDate: new Date(item.paymentDueDate || item.receivedDate),
+        balance: toNumber(item.balance) || toNumber(item.totalAmount),
+      })),
+      ...purchaseOrders.map((item) => ({
+        supplierId: item.supplierId,
+        supplierName: item.supplier?.name || 'Unknown',
+        dueDate: new Date(item.expectedDeliveryDate || item.orderDate),
+        balance: toNumber(item.balance) || toNumber(item.totalAmount),
+      })),
+    ];
 
     const buckets = {
       current: { amount: 0, count: 0 },
@@ -1293,10 +1321,9 @@ class MonthlyReportsService {
 
     const supplierAging = [];
 
-    purchases.forEach(p => {
-      const dueDate = new Date(p.supplierInvoiceDate || p.purchaseDate);
-      const daysOverdue = Math.floor((end - dueDate) / (1000 * 60 * 60 * 24));
-      const balance = toNumber(p.balance) || toNumber(p.totalAmount);
+    payableItems.forEach((item) => {
+      const daysOverdue = Math.floor((end - item.dueDate) / (1000 * 60 * 60 * 24));
+      const balance = item.balance || 0;
 
       let bucket;
       if (daysOverdue <= 0) bucket = 'current';
@@ -1308,20 +1335,20 @@ class MonthlyReportsService {
       buckets[bucket].amount += balance;
       buckets[bucket].count += 1;
 
-      const existing = supplierAging.find(s => s.supplierId === p.supplier?.id);
+      const existing = supplierAging.find(s => s.supplierId === item.supplierId);
       if (existing) {
         existing[bucket] += balance;
         existing.total += balance;
       } else {
         supplierAging.push({
-          supplierId: p.supplier?.id || 'unknown',
-          supplierName: p.supplier?.name || 'Unknown',
+          supplierId: item.supplierId || 'unknown',
+          supplierName: item.supplierName,
           current: bucket === 'current' ? balance : 0,
           days30: bucket === 'days30' ? balance : 0,
           days60: bucket === 'days60' ? balance : 0,
           days90: bucket === 'days90' ? balance : 0,
           days90plus: bucket === 'days90plus' ? balance : 0,
-          total: balance
+          total: balance,
         });
       }
     });
@@ -1336,7 +1363,7 @@ class MonthlyReportsService {
       companyId,
       summary: {
         totalAP,
-        totalBills: purchases.length
+        totalBills: payableItems.length,
       },
       buckets: {
         current: buckets.current,
