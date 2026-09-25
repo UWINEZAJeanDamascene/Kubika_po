@@ -32,13 +32,13 @@ router.route('/')
   .get(getUsers)
   .post(logAction('user'), createUser);
 
+// Invite user to company
+router.post('/invite', logAction('user'), inviteUser);
+
 router.route('/:id')
   .get(getUser)
   .put(logAction('user'), updateUser)
   .delete(logAction('user'), deleteUser);
-
-// Invite user to company
-router.post('/invite', logAction('user'), inviteUser);
 
 // Admin-only special actions
 router.post('/:id/reset-password', logAction('user'), resetPassword);

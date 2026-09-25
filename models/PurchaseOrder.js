@@ -14,6 +14,7 @@ const FIELD_MAP = {
   supplier: { target: 'supplierId', isId: true },
   warehouse: { target: 'warehouseId', isId: true },
   status: { target: 'status' },
+  aiProposalId: { target: 'aiProposalId' },
   orderDate: { target: 'orderDate' },
   expectedDeliveryDate: { target: 'expectedDeliveryDate' },
   totalAmount: { target: 'totalAmount' },

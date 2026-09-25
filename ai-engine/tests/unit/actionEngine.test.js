@@ -9,6 +9,7 @@ const {
   assertCanReject,
   assertCanExecute,
   hasPermission,
+  normalizeProposalType,
 } = require('../../action-engine');
 
 const adminUser = {
@@ -34,7 +35,7 @@ function proposal(overrides = {}) {
     companyId: 'company_1',
     createdBy: 'user_1',
     actionType: 'create_purchase_order',
-    payload: { supplierId: 'supplier_1', items: [] },
+    payload: { supplierId: 'supplier_1', items: [{ productId: 'product_1', quantity: 1 }] },
     evidenceFactIds: ['fact_1'],
     ...overrides,
   });
@@ -60,8 +61,8 @@ describe('AI Action Engine', () => {
     expect(() => proposal({ actionType: 'delete_or_void' })).toThrow('Unsupported AI action proposal type');
     expect(() => proposal({
       actionType: 'adjust_stock',
-      payload: { adjustments: [{ quantity: 'not-a-number' }] },
-    })).toThrow('quantity must be numeric');
+      payload: { adjustments: [{ productId: 'product_1', quantity: 'not-a-number' }] },
+    })).toThrow('non-zero number');
   });
 
   test('approval requires an allowed role or AI approval permission', () => {
@@ -89,5 +90,19 @@ describe('AI Action Engine', () => {
   test('rejecting executed proposals is blocked', () => {
     const executed = proposal({ status: PROPOSAL_STATUSES.EXECUTED });
     expect(() => assertCanReject(executed, adminUser)).toThrow('cannot be rejected');
+  });
+
+  test('rejecting a proposal is terminal and tax reminders do not become supplier tasks', () => {
+    const rejected = proposal({ status: PROPOSAL_STATUSES.REJECTED });
+    expect(() => assertCanReject(rejected, adminUser)).toThrow('cannot be rejected');
+    expect(normalizeProposalType('prepare_tax_payment_reminder')).toBeNull();
+  });
+
+  test('requires actionable, structurally valid payloads for supported proposal types', () => {
+    expect(() => proposal({ payload: {} })).toThrow('supplierId is required');
+    expect(() => proposal({
+      actionType: 'adjust_stock',
+      payload: { adjustments: [{ productId: 'product_1', quantity: 0 }] },
+    })).toThrow('non-zero number');
   });
 });

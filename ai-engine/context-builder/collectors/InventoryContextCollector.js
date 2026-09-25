@@ -6,13 +6,17 @@ const { runTool } = require('../toolRunner');
 
 const REQUIRED_PERMISSIONS = ['products.read', 'inventory.read', 'stock.read', 'reports.read'];
 
-async function collect({ companyId }) {
+async function collect({ companyId, dateRange }) {
   const facts = [];
   const warnings = [];
-  const [{ result: summary }, { result: products }, { result: deadStock }] = await Promise.all([
+  const [{ result: summary }, { result: products }, { result: deadStock }, demandHistory] = await Promise.all([
     runTool(companyId, 'get_stock_summary'),
     runTool(companyId, 'get_products', { limit: 20, lowStock: true }),
     runTool(companyId, 'get_dead_stock_candidates', { days: 60 }),
+    runTool(companyId, 'get_inventory_demand_history', {
+      startDate: dateRange && dateRange.from,
+      endDate: dateRange && dateRange.to,
+    }).then((value) => ({ value })).catch((error) => ({ error })),
   ]);
 
   const productIds = sourceIdsFrom(products.products, 'get_products');
@@ -86,6 +90,21 @@ async function collect({ companyId }) {
       sourceMethod: 'get_products',
       sourceIds: productIds,
       permissions: REQUIRED_PERMISSIONS,
+    }));
+  }
+
+  if (demandHistory.error) {
+    warnings.push(`Inventory demand history unavailable: ${demandHistory.error.message}`);
+  } else {
+    facts.push(createFact({
+      companyId,
+      domain: AI_DOMAINS.INVENTORY,
+      label: 'Inventory demand history',
+      value: demandHistory.value.result,
+      sourceMethod: 'get_inventory_demand_history',
+      sourceIds: (demandHistory.value.result.products || []).map((product) => product.productId).filter(Boolean),
+      permissions: REQUIRED_PERMISSIONS,
+      metadata: { truncated: Boolean(demandHistory.value.result.truncated) },
     }));
   }
 

@@ -451,6 +451,7 @@ function purchaseOrderToApi(row) {
     expectedDeliveryDate: row.expectedDeliveryDate ?? null,
     status: row.status,
     source: row.source,
+    aiProposalId: row.aiProposalId ?? null,
     autoReorderProduct: row.autoReorderProductId ?? null,
     currencyCode: row.currencyCode,
     exchangeRate: qtyNum(row.exchangeRate),
@@ -1349,6 +1350,7 @@ const recurringInvoiceRunTranslateUpdate = genericTranslateUpdate(
 
 const PURCHASE_ORDER_HEADER = {
   referenceNo: 'referenceNo',
+  aiProposalId: 'aiProposalId',
   supplier: 'supplierId',
   warehouse: 'warehouseId',
   status: 'status',

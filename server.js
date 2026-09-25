@@ -386,6 +386,8 @@ async function initializeServer() {
   apiRouter.use('/imports', require('./routes/importsRoutes'));
   apiRouter.use('/audit-trail', require('./routes/auditTrailRoutes'));
   apiRouter.use('/chat', require('./routes/aiChatRoutes'));
+  apiRouter.use('/ai/reports', require('./routes/aiReportRoutes'));
+  apiRouter.use('/ai/forecasts', require('./routes/aiForecastRoutes'));
   apiRouter.use('/ai', require('./routes/aiContextRoutes'));
   apiRouter.use('/journal-entries', require('./routes/journalRoutes'));
   apiRouter.use('/accounting', require('./routes/accountingRoutes'));

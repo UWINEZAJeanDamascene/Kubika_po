@@ -12,8 +12,14 @@ const emailConfig = config.email;
 const MAX_RETRIES = 3;
 const RETRY_BASE_MS = 1000; // exponential: 1s → 2s → 4s
 
-const getSender = () =>
-  `${emailConfig.fromName} <${emailConfig.fromAddress || emailConfig.gmailUser}>`;
+const getSender = () => {
+  // Gmail must send from the authenticated mailbox; using another address here
+  // makes the message look spoofed and increases spam placement.
+  const address = emailConfig.provider === 'gmail'
+    ? emailConfig.gmailUser
+    : (emailConfig.fromAddress || emailConfig.smtpUser || emailConfig.gmailUser);
+  return `${emailConfig.fromName} <${address}>`;
+};
 
 const FRONTEND_URL = config.server.frontendUrl.replace(/\/$/, '');
 
@@ -848,31 +854,47 @@ const sendWeeklySummaryEmail = async (company, stats) => {
 // USER INVITATION
 // ============================================
 
-const sendUserInvitationEmail = async ({ to, name, companyName, inviterName, role }) => {
-  const subject = `You've been invited to join ${companyName} on StockManager`;
+const sendUserInvitationEmail = async ({ to, name, companyName, inviterName, role, temporaryPassword }) => {
+  const safeCompanyName = esc(companyName || 'KUBIKA');
+  const safeInviterName = esc(inviterName || 'Your administrator');
+  const safeRole = esc(role || 'Viewer');
+  const subject = `Invitation to join ${companyName || 'KUBIKA'}`;
+  const loginUrl = `${FRONTEND_URL}/login`;
+  const text = [
+    `Hello ${name || 'there'},`,
+    '',
+    `${inviterName || 'Your administrator'} invited you to join ${companyName || 'KUBIKA'} as ${role || 'Viewer'}.`,
+    temporaryPassword ? `Temporary password: ${temporaryPassword}` : 'Use your existing password to sign in.',
+    `Sign in here: ${loginUrl}`,
+    '',
+    'If you were not expecting this invitation, you can ignore this email.',
+  ].join('\n');
 
   const html = `
-    <div style="font-family:Arial,sans-serif; max-width:600px; margin:0 auto;">
-      <div style="background:linear-gradient(135deg,#6366f1,#8b5cf6); padding:30px; border-radius:10px 10px 0 0;">
-        <h1 style="color:white; margin:0; text-align:center;">👋 You're Invited!</h1>
+    <div style="font-family:Arial,sans-serif; max-width:600px; margin:0 auto; color:#1f2937;">
+      <div style="padding:24px 0; border-bottom:2px solid #2563eb;">
+        <h1 style="color:#1d4ed8; margin:0; font-size:24px;">KUBIKA invitation</h1>
       </div>
-      <div style="background:#f9f9f9; padding:30px; border:1px solid #ddd; border-top:none; border-radius:0 0 10px 10px;">
-        <p>Hi <strong>${esc(name)}</strong>,</p>
-        <p><strong>${inviterName}</strong> has invited you to join <strong>${esc(companyName)}</strong> on StockManager.</p>
-        <div style="background:white; padding:20px; border-radius:8px; margin:20px 0;">
-          <p style="margin:8px 0;"><strong>Your Role:</strong> ${role || 'Viewer'}</p>
+      <div style="padding:24px 0;">
+        <p>Hello <strong>${esc(name || 'there')}</strong>,</p>
+        <p><strong>${safeInviterName}</strong> invited you to join <strong>${safeCompanyName}</strong> on KUBIKA.</p>
+        <p>Your role: <strong>${safeRole}</strong></p>
+        ${temporaryPassword
+          ? `<div style="margin:20px 0; padding:16px; border:1px solid #d1d5db; background:#f9fafb;">
+              <p style="margin:0 0 8px;"><strong>Temporary password</strong></p>
+              <p style="margin:0; font-family:monospace; font-size:16px;">${esc(temporaryPassword)}</p>
+              <p style="margin:10px 0 0; color:#6b7280; font-size:12px;">You will be asked to change this password after signing in.</p>
+            </div>`
+          : '<p>Use your existing password to sign in.</p>'}
+        <div style="margin:28px 0;">
+          <a href="${loginUrl}" style="background:#2563eb; color:white; padding:12px 20px; border-radius:4px; text-decoration:none; display:inline-block;">Open KUBIKA</a>
         </div>
-        <p>StockManager helps businesses manage their inventory, sales, purchases, and accounting all in one place.</p>
-        <div style="text-align:center; margin:30px 0;">
-          <a href="${FRONTEND_URL}/login" style="background:#6366f1; color:white; padding:12px 24px; border-radius:8px; text-decoration:none; display:inline-block;">Login to StockManager</a>
-        </div>
-        <p style="color:#888; font-size:12px;">If you already have an account, you can access the company from your dashboard after logging in.</p>
-        <hr style="border:none; border-top:1px solid #ddd; margin:30px 0;"/>
-        <p style="font-size:12px; color:#888; text-align:center;">StockManager — Manage Your Stock From Supply to Final Sale</p>
+        <p style="color:#6b7280; font-size:13px;">If you were not expecting this invitation, you can ignore this email.</p>
+        <p style="color:#6b7280; font-size:12px; margin-top:28px;">KUBIKA system</p>
       </div>
     </div>`;
 
-  return sendEmail(to, subject, html);
+  return sendEmail(to, subject, html, { text });
 };
 
 // ============================================

@@ -473,11 +473,18 @@ function startScheduler() {
     cron.schedule('0 1 * * *', runAutomaticDepreciation),
   ];
 
-  // Run initial checks
-  sendPaymentReminders();
-  checkLowStock();
-  sendDailySummaryReports();
-  // Don't run depreciation on startup to avoid issues
+  // Do not fan out several database-heavy scans during worker startup. The
+  // worker may be waking a Neon compute at the same time as report and queue
+  // schedulers; the normal cron schedules run these checks shortly afterward.
+  // Operators can opt in to a sequential catch-up run when they specifically
+  // need it, without launching three scans concurrently.
+  if (String(process.env.NOTIFICATION_RUN_CHECKS_ON_STARTUP || '').toLowerCase() === 'true') {
+    (async () => {
+      await sendPaymentReminders();
+      await checkLowStock();
+      await sendDailySummaryReports();
+    })().catch((error) => console.error('Notification startup checks failed:', error.message || error));
+  }
 
   console.log('✅ Notification scheduler started with cron jobs');
 }

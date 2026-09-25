@@ -484,6 +484,17 @@ Acceptance:
 - High-severity findings create notifications.
 - Dismissed or snoozed findings do not keep repeating noisily.
 
+### Phase 9 implementation status (2026-09-25)
+
+- Implemented deterministic tenant-scoped scans for inventory risk, cash/receivables/payables, sales, tax/compliance, and anomaly findings in the dedicated PostgreSQL worker.
+- Implemented daily briefing snapshots with source facts, evidence IDs, findings, recommendations, warnings, and engine metadata.
+- Implemented high/critical finding notifications with per-user severity preferences, an atomic per-day alert cap, and one delivery per repeated finding per user per day.
+- Implemented per-user dismiss, snooze (up to 90 days), restore, and notification preferences. Briefing API responses are filtered to the authenticated user's read permissions.
+- Worker startup no longer launches notification scans or a full report snapshot backfill by default; these can be explicitly enabled with `NOTIFICATION_RUN_CHECKS_ON_STARTUP=true` and `REPORT_SNAPSHOT_RUN_ON_STARTUP=true` when a catch-up run is intended.
+- Added additive persistence migration `20260925000002_add_ai_monitoring_persistence`.
+- The monitoring migration was applied to Neon, Prisma Client was regenerated, and `prisma migrate status` reported the database up to date on 2026-09-25.
+- Validation: Prisma schema validation, AI boundary check, all 82 AI-engine tests, and the six Phase 9 monitoring tests passed.
+
 ## Phase 10: AI Reports
 
 Goal: create auditable AI-enhanced reports.
@@ -515,6 +526,15 @@ Acceptance:
 
 - Reports can be viewed and exported.
 - Every number in a report traces to facts or computed formulas.
+
+### Phase 10 implementation status (2026-09-25)
+
+- Added seven deterministic report types: daily business briefing, inventory risk, cash flow risk, receivables collection, payables pressure, sales performance, and anomaly/fraud review.
+- Each stored report includes its executive summary, permission-scoped findings, evidence facts and source IDs, computed facts and formulas, recommendations, missing-data caveats, and deterministic provider/model/engine version metadata.
+- Added tenant-scoped report listing, viewing, and PDF, XLSX, CSV, and JSON exports. Report generation and retrieval enforce domain read permissions; export uses the same permission-filtered report object.
+- Endpoints: `GET /api/ai/reports/types`, `POST /api/ai/reports`, `GET /api/ai/reports`, `GET /api/ai/reports/:reportId`, and `GET /api/ai/reports/:reportId/export?format=json|csv|xlsx|pdf`.
+- Added additive migration `20260925000003_add_ai_reports`. Apply it and regenerate Prisma Client with `npm run db:migrate:deploy` and `npm run db:generate` before using the new report endpoints.
+- Validation: Prisma schema validation, AI dependency boundary check, and five report generation/persistence tests passed. Migration application and regenerated client remain deployment steps.
 
 ## Phase 11: Predictive Intelligence
 
@@ -549,6 +569,20 @@ Acceptance:
 
 - Forecasts never present as guaranteed outcomes.
 - Forecast output includes confidence intervals and assumptions.
+
+### Phase 11 implementation status (2026-09-25)
+
+Implemented:
+
+- Added a deterministic monthly forecasting engine with a three-period moving average for short histories, linear trend extrapolation for medium histories, and a month-of-year seasonal baseline after 24 observations.
+- Added approximate 95% prediction intervals, explicit short-history scenario bands, and rolling-origin MAE/MAPE metrics when enough observations are available.
+- Added forecasts for invoice revenue, cash balance, per-product stockout dates, receivable balances after projected collections, and payable balances after projected payments.
+- Added historical PostgreSQL-backed collectors for bank cash movements, outbound sales demand, customer collections, and supplier payments. Historical reads use tenant IDs, bounded date windows, row limits, and the existing permission-aware context collectors.
+- Added tenant-scoped create/list/detail API endpoints under `/api/ai/forecasts`, with source fact filtering by caller permissions.
+- Added PostgreSQL persistence through additive migration `20260925000004_add_ai_forecasts`; the forecast records include source facts, assumptions, model version, confidence, interval outputs, and back-test metrics.
+- Forecasts use completed historical months and identify assumptions and uncertainty in each result. Forecasts are estimates and are not guaranteed outcomes.
+
+Database setup remains an operator step: run `npm run db:generate` and `npm run db:migrate:deploy` before using the Phase 10 report and Phase 11 forecast endpoints. The code checks do not apply migrations to the configured database.
 
 ## Phase 12: Frontend Productization
 

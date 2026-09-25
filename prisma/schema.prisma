@@ -78,6 +78,116 @@ model AIFinding {
   @@map("ai_findings")
 }
 
+model AIBriefing {
+  id              String   @id @db.Char(24)
+  companyId       String   @map("company_id") @db.Char(24)
+  briefingDate    DateTime @map("briefing_date") @db.Date
+  summary         String
+  findings        Json     @default("[]")
+  recommendations Json     @default("[]")
+  facts           Json     @default("[]")
+  evidenceFactIds String[] @default([]) @map("evidence_fact_ids")
+  warnings        String[] @default([])
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([companyId, briefingDate])
+  @@index([companyId, briefingDate(sort: Desc)])
+  @@map("ai_briefings")
+}
+
+model AIReport {
+  id                 String   @id @db.Char(24)
+  reportId           String   @map("report_id")
+  companyId          String   @map("company_id") @db.Char(24)
+  createdBy          String   @map("created_by") @db.Char(24)
+  reportType         String   @map("report_type")
+  title              String
+  dateRange          Json     @map("date_range")
+  executiveSummary   String   @map("executive_summary")
+  findings           Json     @default("[]")
+  evidence           Json     @default("[]")
+  calculations       Json     @default("[]")
+  recommendations    Json     @default("[]")
+  missingDataCaveats String[] @default([]) @map("missing_data_caveats")
+  generatedBy        Json     @map("generated_by")
+  metadata           Json     @default("{}")
+  generatedAt        DateTime @default(now()) @map("generated_at") @db.Timestamptz(3)
+  createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([companyId, reportId])
+  @@index([companyId, reportType, generatedAt(sort: Desc)])
+  @@map("ai_reports")
+}
+
+model AIForecast {
+  id              String   @id @db.Char(24)
+  forecastId      String   @map("forecast_id")
+  companyId       String   @map("company_id") @db.Char(24)
+  createdBy       String   @map("created_by") @db.Char(24)
+  forecastType    String   @map("forecast_type")
+  dateRange       Json     @map("date_range")
+  horizon         Int
+  status          String
+  method          String
+  confidence      String
+  forecast        Json
+  assumptions     Json     @default("[]")
+  sourceFacts     Json     @default("[]") @map("source_facts")
+  backtestMetrics Json     @default("{}") @map("backtest_metrics")
+  modelVersion    String   @map("model_version")
+  metadata        Json     @default("{}")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([companyId, forecastId])
+  @@index([companyId, forecastType, createdAt(sort: Desc)])
+  @@map("ai_forecasts")
+}
+
+model AIFindingUserState {
+  id           String    @id @db.Char(24)
+  companyId    String    @map("company_id") @db.Char(24)
+  userId       String    @map("user_id") @db.Char(24)
+  findingId    String    @map("finding_id")
+  state        String    @default("active")
+  snoozedUntil DateTime? @map("snoozed_until") @db.Timestamptz(3)
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([companyId, userId, findingId])
+  @@index([companyId, userId, state, snoozedUntil])
+  @@map("ai_finding_user_states")
+}
+
+model AIAlertDailyUsage {
+  id          String   @id @db.Char(24)
+  companyId   String   @map("company_id") @db.Char(24)
+  userId      String   @map("user_id") @db.Char(24)
+  alertDate   DateTime @map("alert_date") @db.Date
+  alertCount  Int      @default(0) @map("alert_count")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([companyId, userId, alertDate])
+  @@map("ai_alert_daily_usage")
+}
+
+model AIFindingAlertDelivery {
+  id             String   @id @db.Char(24)
+  companyId      String   @map("company_id") @db.Char(24)
+  userId         String   @map("user_id") @db.Char(24)
+  findingId      String   @map("finding_id")
+  alertDate      DateTime @map("alert_date") @db.Date
+  notificationId String?  @map("notification_id") @db.Char(24)
+  suppressed     Boolean  @default(false)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([companyId, userId, findingId, alertDate])
+  @@index([companyId, userId, alertDate])
+  @@map("ai_finding_alert_deliveries")
+}
+
 model AIActionProposal {
   id                      String    @id @db.Char(24)
   proposalId              String    @map("proposal_id")
@@ -2308,6 +2418,7 @@ model PurchaseOrder {
   expectedDeliveryDate DateTime?           @map("expected_delivery_date") @db.Timestamptz(3)
   status               String              @default("draft")
   source               String              @default("MANUAL")
+  aiProposalId         String?             @map("ai_proposal_id")
   autoReorderProductId String?             @map("auto_reorder_product_id") @db.Char(24)
   currencyCode         String              @default("RWF") @map("currency_code")
   exchangeRate         Decimal             @default(1) @map("exchange_rate") @db.Decimal(19, 6)
@@ -2333,6 +2444,7 @@ model PurchaseOrder {
   warehouse            Warehouse?          @relation(fields: [warehouseId], references: [id])
 
   @@unique([companyId, referenceNo])
+  @@unique([companyId, aiProposalId], map: "purchase_orders_company_ai_proposal_id_key")
   @@index([companyId, status, orderDate])
   @@map("purchase_orders")
 }

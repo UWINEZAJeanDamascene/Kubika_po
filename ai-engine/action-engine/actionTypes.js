@@ -28,7 +28,6 @@ const ACTION_TO_PROPOSAL_TYPE = Object.freeze({
 const RECOMMENDATION_ACTION_TO_PROPOSAL_TYPE = Object.freeze({
   create_purchase_order: PROPOSAL_TYPES.PURCHASE_ORDER_DRAFT,
   send_payment_reminder: PROPOSAL_TYPES.PAYMENT_REMINDER_DRAFT,
-  prepare_tax_payment_reminder: PROPOSAL_TYPES.SUPPLIER_FOLLOW_UP_TASK,
 });
 
 const PROPOSAL_POLICY = Object.freeze({

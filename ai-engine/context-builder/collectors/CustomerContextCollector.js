@@ -6,12 +6,16 @@ const { runTool } = require('../toolRunner');
 
 const REQUIRED_PERMISSIONS = ['clients.read', 'customers.read', 'invoices.read', 'reports.read'];
 
-async function collect({ companyId }) {
+async function collect({ companyId, dateRange }) {
   const facts = [];
   const warnings = [];
-  const [{ result: clients }, { result: aging }] = await Promise.all([
+  const [{ result: clients }, { result: aging }, receiptsHistory] = await Promise.all([
     runTool(companyId, 'get_clients', { limit: 20 }),
     runTool(companyId, 'get_receivables_aging'),
+    runTool(companyId, 'get_receivables_collection_history', {
+      startDate: dateRange && dateRange.from,
+      endDate: dateRange && dateRange.to,
+    }).then((value) => ({ value })).catch((error) => ({ error })),
   ]);
 
   addNumericFact(facts, {
@@ -45,6 +49,20 @@ async function collect({ companyId }) {
     permissions: REQUIRED_PERMISSIONS,
   }));
 
+  if (receiptsHistory.error) {
+    warnings.push(`Receivables collection history unavailable: ${receiptsHistory.error.message}`);
+  } else {
+    facts.push(createFact({
+      companyId,
+      domain: AI_DOMAINS.CUSTOMERS,
+      label: 'Receivables collection history',
+      value: receiptsHistory.value.result,
+      sourceMethod: 'get_receivables_collection_history',
+      sourceIds: (receiptsHistory.value.result.monthly || []).map((row) => `ar_receipts:${row.period}`),
+      permissions: REQUIRED_PERMISSIONS,
+    }));
+  }
+
   return { facts, warnings };
 }
 
@@ -53,4 +71,3 @@ module.exports = {
   requiredPermissions: REQUIRED_PERMISSIONS,
   collect,
 };
-

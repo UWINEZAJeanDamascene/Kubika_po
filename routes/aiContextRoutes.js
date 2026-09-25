@@ -11,6 +11,9 @@ const { evaluateContext } = require('../ai-engine/decision-engine');
 const { generateRecommendations } = require('../ai-engine/recommendation-engine');
 const AIFindingService = require('../services/aiFindingService');
 const AIActionProposalService = require('../services/aiActionProposalService');
+const AIMonitoringService = require('../services/aiMonitoringService');
+const { extractUserPermissions, hasPermission } = require('../ai-engine/context-builder/permissionUtils');
+const { filterBriefing } = require('../ai-engine/monitoring/MonitoringEngine');
 
 function entityId(value) {
   if (value == null) return null;
@@ -255,6 +258,99 @@ router.patch('/findings/:findingId/status', protect, async (req, res) => {
   }
 });
 
+router.get('/monitoring/briefings/latest', protect, async (req, res) => {
+  try {
+    const user = await enrichUserWithRoles(req.user);
+    const companyId = entityId(req.company || user.company);
+    const briefing = await AIMonitoringService.getLatestBriefing(companyId, entityId(user));
+    if (!briefing) return res.json({ success: true, briefing: null });
+    return res.json({
+      success: true,
+      briefing: filterBriefing(briefing, extractUserPermissions(user), hasPermission),
+    });
+  } catch (error) {
+    console.error('AI briefing read error:', error.message || String(error));
+    return res.status(error.statusCode || 500).json({ success: false, message: error.statusCode === 403 ? error.message : 'Failed to load the latest AI briefing.' });
+  }
+});
+
+router.get('/monitoring/preferences', protect, async (req, res) => {
+  try {
+    const user = await enrichUserWithRoles(req.user);
+    const companyId = entityId(req.company || user.company);
+    const preferences = await AIMonitoringService.getPreferences(companyId, entityId(user));
+    return res.json({ success: true, preferences });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({ success: false, message: error.message || 'Failed to load AI monitoring preferences.' });
+  }
+});
+
+router.put('/monitoring/preferences', protect, async (req, res) => {
+  try {
+    const user = await enrichUserWithRoles(req.user);
+    const companyId = entityId(req.company || user.company);
+    const input = req.body || {};
+    const allowed = ['enabled', 'maxAlertsPerDay', 'severities'];
+    if (Object.keys(input).some((key) => !allowed.includes(key))) {
+      return res.status(400).json({ success: false, message: 'Only enabled, maxAlertsPerDay, and severities can be changed.' });
+    }
+    if (input.enabled !== undefined && typeof input.enabled !== 'boolean') {
+      return res.status(400).json({ success: false, message: 'enabled must be a boolean.' });
+    }
+    if (input.maxAlertsPerDay !== undefined && (!Number.isInteger(input.maxAlertsPerDay) || input.maxAlertsPerDay < 0 || input.maxAlertsPerDay > 50)) {
+      return res.status(400).json({ success: false, message: 'maxAlertsPerDay must be an integer from 0 to 50.' });
+    }
+    if (input.severities !== undefined && (!Array.isArray(input.severities) || input.severities.some((value) => !['high', 'critical'].includes(value)))) {
+      return res.status(400).json({ success: false, message: 'severities may contain high and/or critical.' });
+    }
+    const preferences = await AIMonitoringService.updatePreferences(companyId, entityId(user), input);
+    return res.json({ success: true, preferences });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({ success: false, message: error.message || 'Failed to update AI monitoring preferences.' });
+  }
+});
+
+router.post('/findings/:findingId/dismiss', protect, async (req, res) => {
+  try {
+    const user = await enrichUserWithRoles(req.user);
+    const companyId = entityId(req.company || user.company);
+    const state = await AIMonitoringService.setFindingState(companyId, entityId(user), req.params.findingId, 'dismissed');
+    if (!state) return res.status(404).json({ success: false, message: 'AI finding not found.' });
+    return res.json({ success: true, state });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({ success: false, message: error.message || 'Failed to dismiss AI finding.' });
+  }
+});
+
+router.post('/findings/:findingId/snooze', protect, async (req, res) => {
+  try {
+    const until = new Date(req.body?.snoozedUntil);
+    const maxSnooze = Date.now() + 90 * 24 * 60 * 60 * 1000;
+    if (!Number.isFinite(until.getTime()) || until.getTime() <= Date.now() || until.getTime() > maxSnooze) {
+      return res.status(400).json({ success: false, message: 'snoozedUntil must be a future date within 90 days.' });
+    }
+    const user = await enrichUserWithRoles(req.user);
+    const companyId = entityId(req.company || user.company);
+    const state = await AIMonitoringService.setFindingState(companyId, entityId(user), req.params.findingId, 'snoozed', until);
+    if (!state) return res.status(404).json({ success: false, message: 'AI finding not found.' });
+    return res.json({ success: true, state });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({ success: false, message: error.message || 'Failed to snooze AI finding.' });
+  }
+});
+
+router.post('/findings/:findingId/restore', protect, async (req, res) => {
+  try {
+    const user = await enrichUserWithRoles(req.user);
+    const companyId = entityId(req.company || user.company);
+    const state = await AIMonitoringService.setFindingState(companyId, entityId(user), req.params.findingId, 'active');
+    if (!state) return res.status(404).json({ success: false, message: 'AI finding not found.' });
+    return res.json({ success: true, state });
+  } catch (error) {
+    return res.status(error.statusCode || 500).json({ success: false, message: error.message || 'Failed to restore AI finding.' });
+  }
+});
+
 router.post('/proposals', protect, async (req, res) => {
   try {
     const user = await enrichUserWithRoles(req.user);
@@ -395,8 +491,9 @@ router.post('/proposals/:id/execute', protect, async (req, res) => {
       });
     }
 
-    return res.status(proposal.status === 'failed' ? 501 : 200).json({
-      success: proposal.status !== 'failed',
+    const executionUnavailable = proposal.executionResult?.ok === false;
+    return res.status(executionUnavailable ? 501 : 200).json({
+      success: !executionUnavailable,
       proposal,
     });
   } catch (error) {

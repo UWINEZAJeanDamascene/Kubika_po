@@ -28,13 +28,17 @@ function periodIsInRange(start, end, current) {
 async function collect({ companyId, dateRange = {} }) {
   const facts = [];
   const warnings = [];
-  const [{ result: purchases }, { result: suppliers }] = await Promise.all([
+  const [{ result: purchases }, { result: suppliers }, paymentHistory] = await Promise.all([
     runTool(companyId, 'get_purchases', {
       limit: 20,
       startDate: dateRange && dateRange.from,
       endDate: dateRange && dateRange.to,
     }),
     runTool(companyId, 'get_suppliers', { limit: 20 }),
+    runTool(companyId, 'get_payables_payment_history', {
+      startDate: dateRange && dateRange.from,
+      endDate: dateRange && dateRange.to,
+    }).then((value) => ({ value })).catch((error) => ({ error })),
   ]);
 
   addNumericFact(facts, {
@@ -68,6 +72,20 @@ async function collect({ companyId, dateRange = {} }) {
       value: suppliers.suppliers.slice(0, 10),
       sourceMethod: 'get_suppliers',
       sourceIds: sourceIdsFrom(suppliers.suppliers, 'get_suppliers'),
+      permissions: REQUIRED_PERMISSIONS,
+    }));
+  }
+
+  if (paymentHistory.error) {
+    warnings.push(`Payables payment history unavailable: ${paymentHistory.error.message}`);
+  } else {
+    facts.push(createFact({
+      companyId,
+      domain: AI_DOMAINS.PURCHASES,
+      label: 'Payables payment history',
+      value: paymentHistory.value.result,
+      sourceMethod: 'get_payables_payment_history',
+      sourceIds: (paymentHistory.value.result.monthly || []).map((row) => `ap_payments:${row.period}`),
       permissions: REQUIRED_PERMISSIONS,
     }));
   }

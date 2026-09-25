@@ -363,6 +363,168 @@ async function getSalesSummary(companyId, opts = {}) {
   };
 }
 
+function normalizeHistoryRange(opts = {}) {
+  const end = opts.endDate ? new Date(opts.endDate) : new Date();
+  const start = opts.startDate ? new Date(opts.startDate) : new Date(end);
+  if (!opts.startDate) start.setUTCMonth(start.getUTCMonth() - 24);
+  if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime()) || start > end) {
+    throw new Error('A valid forecast history date range is required.');
+  }
+  return { start, end };
+}
+
+async function getCashFlowHistory(companyId, opts = {}) {
+  const { start, end } = normalizeHistoryRange(opts);
+  const monthly = await dbClient().$queryRaw`
+    SELECT to_char(date_trunc('month', date), 'YYYY-MM') AS period,
+           COALESCE(SUM(CASE WHEN type IN ('deposit', 'transfer_in') THEN amount ELSE 0 END), 0)::double precision AS cash_in,
+           COALESCE(SUM(CASE WHEN type IN ('withdrawal', 'transfer_out') THEN amount ELSE 0 END), 0)::double precision AS cash_out,
+           COUNT(*)::int AS transaction_count
+    FROM bank_transactions
+    WHERE company_id = ${String(companyId)}
+      AND date >= ${start} AND date <= ${end}
+      AND status NOT IN ('reversed', 'voided', 'cancelled')
+      AND is_reversed = false
+    GROUP BY date_trunc('month', date)
+    ORDER BY date_trunc('month', date) ASC
+    LIMIT 120
+  `;
+  return {
+    from: start.toISOString(),
+    to: end.toISOString(),
+    monthly: monthly.map((row) => ({
+      period: row.period,
+      cashIn: Number(row.cash_in || 0),
+      cashOut: Number(row.cash_out || 0),
+      netChange: Number(row.cash_in || 0) - Number(row.cash_out || 0),
+      transactionCount: Number(row.transaction_count || 0),
+    })),
+  };
+}
+
+async function getInventoryDemandHistory(companyId, opts = {}) {
+  const { start, end } = normalizeHistoryRange(opts);
+  const rows = await dbClient().$queryRaw`
+    WITH monthly_demand AS (
+      SELECT sm.product_id,
+             p.name AS product_name,
+             p.sku,
+             p.current_stock,
+             p.reserved_quantity,
+             p.low_stock_threshold,
+             to_char(date_trunc('month', sm.movement_date), 'YYYY-MM') AS period,
+             SUM(sm.quantity)::double precision AS units
+      FROM stock_movements sm
+      JOIN products p ON p.id = sm.product_id AND p.company_id = sm.company_id
+      WHERE sm.company_id = ${String(companyId)}
+        AND sm.product_id IS NOT NULL
+        AND sm.type = 'out'
+        AND sm.reason = 'sale'
+        AND sm.movement_date >= ${start} AND sm.movement_date <= ${end}
+        AND p.is_archived = false
+      GROUP BY sm.product_id, p.name, p.sku, p.current_stock, p.reserved_quantity, p.low_stock_threshold, date_trunc('month', sm.movement_date)
+    ),
+    product_rank AS (
+      SELECT product_id,
+             MAX(product_name) AS product_name,
+             MAX(sku) AS sku,
+             MAX(current_stock)::double precision AS current_stock,
+             MAX(reserved_quantity)::double precision AS reserved_quantity,
+             MAX(low_stock_threshold)::double precision AS low_stock_threshold,
+             SUM(units)::double precision AS total_units
+      FROM monthly_demand
+      GROUP BY product_id
+    ),
+    selected_products AS (
+      SELECT product_id
+      FROM product_rank
+      WHERE current_stock <= low_stock_threshold
+         OR product_id IN (SELECT product_id FROM product_rank ORDER BY total_units DESC, product_id LIMIT 100)
+    ),
+    bounded AS (
+      SELECT md.*, COUNT(*) OVER()::int AS total_rows
+      FROM monthly_demand md
+      JOIN selected_products sp ON sp.product_id = md.product_id
+      ORDER BY md.period DESC, md.product_id
+      LIMIT 3000
+    )
+    SELECT b.product_id,
+           b.product_name,
+           b.sku,
+           b.current_stock,
+           b.reserved_quantity,
+           b.period,
+           b.units,
+           b.total_rows
+    FROM bounded b
+    ORDER BY b.product_name, b.period
+  `;
+  const productsById = new Map();
+  for (const row of rows) {
+    const id = String(row.product_id);
+    if (!productsById.has(id)) {
+      productsById.set(id, {
+        productId: id,
+        productName: row.product_name,
+        sku: row.sku,
+        currentStock: Number(row.current_stock || 0),
+        reservedQuantity: Number(row.reserved_quantity || 0),
+        monthly: [],
+      });
+    }
+    productsById.get(id).monthly.push({ period: row.period, units: Number(row.units || 0) });
+  }
+  return {
+    from: start.toISOString(),
+    to: end.toISOString(),
+    products: Array.from(productsById.values()),
+    truncated: Number(rows[0]?.total_rows || 0) > rows.length,
+    returnedMonthlyRows: rows.length,
+  };
+}
+
+async function getReceivablesCollectionHistory(companyId, opts = {}) {
+  const { start, end } = normalizeHistoryRange(opts);
+  const monthly = await dbClient().$queryRaw`
+    SELECT to_char(date_trunc('month', receipt_date), 'YYYY-MM') AS period,
+           COALESCE(SUM(amount_received * exchange_rate), 0)::double precision AS collected,
+           COUNT(*)::int AS receipt_count
+    FROM ar_receipts
+    WHERE company_id = ${String(companyId)}
+      AND receipt_date >= ${start} AND receipt_date <= ${end}
+      AND status = 'posted'
+      AND reverse_journal_entry_id IS NULL
+    GROUP BY date_trunc('month', receipt_date)
+    ORDER BY date_trunc('month', receipt_date) ASC
+    LIMIT 120
+  `;
+  return {
+    from: start.toISOString(), to: end.toISOString(),
+    monthly: monthly.map((row) => ({ period: row.period, collected: Number(row.collected || 0), receiptCount: Number(row.receipt_count || 0) })),
+  };
+}
+
+async function getPayablesPaymentHistory(companyId, opts = {}) {
+  const { start, end } = normalizeHistoryRange(opts);
+  const monthly = await dbClient().$queryRaw`
+    SELECT to_char(date_trunc('month', payment_date), 'YYYY-MM') AS period,
+           COALESCE(SUM(amount_paid * exchange_rate), 0)::double precision AS paid,
+           COUNT(*)::int AS payment_count
+    FROM ap_payments
+    WHERE company_id = ${String(companyId)}
+      AND payment_date >= ${start} AND payment_date <= ${end}
+      AND status = 'posted'
+      AND reverse_journal_entry_id IS NULL
+    GROUP BY date_trunc('month', payment_date)
+    ORDER BY date_trunc('month', payment_date) ASC
+    LIMIT 120
+  `;
+  return {
+    from: start.toISOString(), to: end.toISOString(),
+    monthly: monthly.map((row) => ({ period: row.period, paid: Number(row.paid || 0), paymentCount: Number(row.payment_count || 0) })),
+  };
+}
+
 async function getReceivablesAging(companyId) {
   const baseWhere = "i.company_id = $1 AND i.status IN ('confirmed', 'partial') AND i.amount_outstanding > 0";
   const bucketRows = await dbClient().$queryRawUnsafe(`
@@ -1402,6 +1564,10 @@ async function executeTool(companyId, toolName, args = {}) {
     case 'get_ar_receipts': return getARReceipts(companyId, args);
     case 'get_receivables_aging': return getReceivablesAging(companyId);
     case 'get_sales_summary': return getSalesSummary(companyId, args);
+    case 'get_cash_flow_history': return getCashFlowHistory(companyId, args);
+    case 'get_inventory_demand_history': return getInventoryDemandHistory(companyId, args);
+    case 'get_receivables_collection_history': return getReceivablesCollectionHistory(companyId, args);
+    case 'get_payables_payment_history': return getPayablesPaymentHistory(companyId, args);
     // Finance
     case 'get_expenses': return getExpenses(companyId, args);
     case 'get_bank_accounts': return getBankAccounts(companyId);
@@ -1453,6 +1619,10 @@ module.exports = {
   getSalesOrders,
   getARReceipts,
   getAPPayments,
+  getCashFlowHistory,
+  getInventoryDemandHistory,
+  getReceivablesCollectionHistory,
+  getPayablesPaymentHistory,
   getChartOfAccounts,
   getJournalEntries,
   getBudgets,

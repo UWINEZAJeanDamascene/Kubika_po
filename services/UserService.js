@@ -300,14 +300,15 @@ class UserService {
     const roleDoc = await findSystemRole(role);
 
     let isNewUser = false;
+    let temporaryPassword = null;
     if (!user) {
-      const tempPassword = crypto.randomBytes(8).toString('hex');
+      temporaryPassword = crypto.randomBytes(8).toString('hex');
       user = await prisma.user.create({
         data: {
           id: generateObjectId(),
           name: name || emailLower.split('@')[0],
           email: emailLower,
-          password: await passwordUtils.hash(tempPassword),
+          password: await passwordUtils.hash(temporaryPassword),
           companyId: companyIdStr,
           role,
           isActive: true,
@@ -379,6 +380,7 @@ class UserService {
           companyName: company?.name || 'the company',
           inviterName: inviter?.name || 'Admin',
           role,
+          temporaryPassword,
         });
         console.log('[UserInvite] Invitation email sent to:', user.email);
       }

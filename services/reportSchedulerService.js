@@ -188,11 +188,16 @@ const initializeScheduler = (app) => {
   schedulerStarted = true;
   console.log('Initializing report scheduler...');
 
-  // Run immediately on startup (for demo)
-  registerSchedulerTimer(setTimeout(async () => {
-    console.log('Running initial snapshot generation...');
-    await runScheduledTasks();
-  }, 10000)); // Wait 10 seconds after startup
+  // Full history snapshot generation is intentionally not automatic on every
+  // worker boot. It can issue six report jobs per tenant and overload a cold
+  // or pooled database. Enable a sequential startup catch-up explicitly when
+  // needed; recurring period checks below remain scheduled normally.
+  if (String(process.env.REPORT_SNAPSHOT_RUN_ON_STARTUP || '').toLowerCase() === 'true') {
+    registerSchedulerTimer(setTimeout(async () => {
+      console.log('Running opt-in initial snapshot generation...');
+      await runScheduledTasks();
+    }, 30000));
+  }
 
   // Set up periodic runs
   // Daily check at midnight

@@ -20,9 +20,10 @@ async function collect({ companyId, dateRange, user }) {
     runTool(companyId, 'get_bank_accounts'),
     runTool(companyId, 'get_profit_loss_summary', args),
     runTool(companyId, 'get_cash_flow_summary', args),
+    runTool(companyId, 'get_cash_flow_history', args),
   ]);
 
-  const [bankResult, plResult, cashFlowResult] = results;
+  const [bankResult, plResult, cashFlowResult, cashHistoryResult] = results;
 
   if (bankResult.status === 'fulfilled') {
     const bank = bankResult.value.result;
@@ -104,6 +105,20 @@ async function collect({ companyId, dateRange, user }) {
     }));
   } else {
     warnings.push(`Finance collector skipped cash flow: ${cashFlowResult.reason.message}`);
+  }
+
+  if (cashHistoryResult.status === 'fulfilled') {
+    facts.push(createFact({
+      companyId,
+      domain: AI_DOMAINS.FINANCE,
+      label: 'Cash movement history',
+      value: cashHistoryResult.value.result,
+      sourceMethod: 'get_cash_flow_history',
+      sourceIds: (cashHistoryResult.value.result.monthly || []).map((row) => `bank_transactions:${row.period}`),
+      permissions: REQUIRED_PERMISSIONS,
+    }));
+  } else {
+    warnings.push(`Finance collector skipped historical cash movements: ${cashHistoryResult.reason.message}`);
   }
 
   const userPermissions = extractUserPermissions(user);

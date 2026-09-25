@@ -1,7 +1,10 @@
 'use strict';
 
-const AIActionProposal = require('../models/AIActionProposal');
+const { prisma } = require('../lib/prisma');
+const { runWithTx } = require('../lib/txContext');
+const { generateObjectId } = require('../utils/objectId');
 const AuditLogService = require('./AuditLogService');
+const PurchaseOrderService = require('./purchaseOrderService');
 const {
   PROPOSAL_STATUSES,
   buildActionProposalDraft,
@@ -18,32 +21,31 @@ function entityId(value) {
   return String(value);
 }
 
-function serializeProposal(doc) {
-  if (!doc) return null;
-  const plain = typeof doc.toObject === 'function' ? doc.toObject() : doc;
+function serializeProposal(row) {
+  if (!row) return null;
   return {
-    id: plain.proposalId,
-    companyId: String(plain.company),
-    createdBy: plain.createdBy,
-    type: plain.type,
-    status: plain.status,
-    payload: plain.payload || {},
-    evidenceFactIds: plain.evidenceFactIds || [],
-    sourceRecommendationIds: plain.sourceRecommendationIds || [],
-    sourceFindingIds: plain.sourceFindingIds || [],
-    riskLevel: plain.riskLevel,
-    approvalRequiredByRole: plain.approvalRequiredByRole || [],
-    approvedBy: plain.approvedBy || null,
-    approvedAt: plain.approvedAt || null,
-    rejectedBy: plain.rejectedBy || null,
-    rejectedAt: plain.rejectedAt || null,
-    rejectionReason: plain.rejectionReason || null,
-    executedBy: plain.executedBy || null,
-    executedAt: plain.executedAt || null,
-    executionResult: plain.executionResult || null,
-    metadata: plain.metadata || {},
-    createdAt: plain.createdAt,
-    updatedAt: plain.updatedAt,
+    id: row.proposalId,
+    companyId: String(row.company),
+    createdBy: row.createdBy,
+    type: row.type,
+    status: row.status,
+    payload: row.payload || {},
+    evidenceFactIds: row.evidenceFactIds || [],
+    sourceRecommendationIds: row.sourceRecommendationIds || [],
+    sourceFindingIds: row.sourceFindingIds || [],
+    riskLevel: row.riskLevel,
+    approvalRequiredByRole: row.approvalRequiredByRole || [],
+    approvedBy: row.approvedBy || null,
+    approvedAt: row.approvedAt || null,
+    rejectedBy: row.rejectedBy || null,
+    rejectedAt: row.rejectedAt || null,
+    rejectionReason: row.rejectionReason || null,
+    executedBy: row.executedBy || null,
+    executedAt: row.executedAt || null,
+    executionResult: row.executionResult || null,
+    metadata: row.metadata || {},
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
   };
 }
 
@@ -62,10 +64,16 @@ async function audit(event, { companyId, userId, proposal, status = 'success', e
   });
 }
 
+function proposalWhere(companyId, proposalId) {
+  return { company: String(companyId), proposalId: String(proposalId) };
+}
+
 async function createProposal({ companyId, user, input, req = null }) {
+  const tenantId = entityId(companyId);
   const userId = entityId(user);
+  if (!tenantId || !userId) throw new Error('Company and authenticated user are required to create an AI proposal');
   const proposal = buildActionProposalDraft({
-    companyId,
+    companyId: tenantId,
     createdBy: userId,
     type: input.type,
     actionType: input.actionType,
@@ -77,64 +85,74 @@ async function createProposal({ companyId, user, input, req = null }) {
     metadata: input.metadata || {},
   });
 
-  const created = await AIActionProposal.create({
-    proposalId: proposal.id,
-    company: companyId,
-    createdBy: userId,
-    type: proposal.type,
-    status: proposal.status,
-    payload: proposal.payload,
-    evidenceFactIds: proposal.evidenceFactIds,
-    sourceRecommendationIds: proposal.sourceRecommendationIds,
-    sourceFindingIds: proposal.sourceFindingIds,
-    riskLevel: proposal.riskLevel,
-    approvalRequiredByRole: proposal.approvalRequiredByRole,
-    metadata: proposal.metadata,
+  const created = await prisma.aIActionProposal.create({
+    data: {
+      id: generateObjectId(),
+      proposalId: proposal.id,
+      company: tenantId,
+      createdBy: userId,
+      type: proposal.type,
+      status: proposal.status,
+      payload: proposal.payload,
+      evidenceFactIds: proposal.evidenceFactIds,
+      sourceRecommendationIds: proposal.sourceRecommendationIds,
+      sourceFindingIds: proposal.sourceFindingIds,
+      riskLevel: proposal.riskLevel,
+      approvalRequiredByRole: proposal.approvalRequiredByRole,
+      metadata: proposal.metadata,
+    },
   });
 
   const serialized = serializeProposal(created);
-  await audit('create', { companyId, userId, proposal: serialized, req });
+  await audit('create', { companyId: tenantId, userId, proposal: serialized, req });
   return serialized;
 }
 
 async function listProposals(companyId, options = {}) {
-  const query = { company: companyId };
-  if (options.status) query.status = options.status;
-  if (options.type) query.type = options.type;
-  if (options.riskLevel) query.riskLevel = options.riskLevel;
-
-  const limit = Math.min(Number(options.limit) || 50, 200);
-  const docs = await AIActionProposal.find(query)
-    .sort({ updatedAt: -1 })
-    .limit(limit);
-
+  const limitValue = Number.parseInt(options.limit, 10);
+  const limit = Number.isFinite(limitValue) ? Math.max(1, Math.min(limitValue, 200)) : 50;
+  const docs = await prisma.aIActionProposal.findMany({
+    where: {
+      company: String(companyId),
+      ...(options.status ? { status: String(options.status) } : {}),
+      ...(options.type ? { type: String(options.type) } : {}),
+      ...(options.riskLevel ? { riskLevel: String(options.riskLevel) } : {}),
+    },
+    orderBy: { updatedAt: 'desc' },
+    take: limit,
+  });
   return docs.map(serializeProposal);
 }
 
 async function getProposal(companyId, proposalId) {
-  const doc = await AIActionProposal.findOne({ company: companyId, proposalId });
-  return serializeProposal(doc);
+  const row = await prisma.aIActionProposal.findUnique({
+    where: { company_proposalId: proposalWhere(companyId, proposalId) },
+  });
+  return serializeProposal(row);
+}
+
+async function transitionProposal(companyId, proposalId, allowedStatuses, data) {
+  const where = { ...proposalWhere(companyId, proposalId), status: { in: allowedStatuses } };
+  const changed = await prisma.aIActionProposal.updateMany({ where, data });
+  if (changed.count !== 1) {
+    const current = await getProposal(companyId, proposalId);
+    if (!current) return null;
+    throw new Error(`Proposal status changed concurrently or cannot transition from ${current.status}`);
+  }
+  return getProposal(companyId, proposalId);
 }
 
 async function approveProposal(companyId, proposalId, user, req = null) {
   const existing = await getProposal(companyId, proposalId);
   if (!existing) return null;
   assertCanApprove(existing, user);
-
   const userId = entityId(user);
-  const updated = await AIActionProposal.findOneAndUpdate(
-    { company: companyId, proposalId },
-    {
-      $set: {
-        status: PROPOSAL_STATUSES.APPROVED,
-        approvedBy: userId,
-        approvedAt: new Date(),
-      },
-    },
-    { new: true }
-  );
-
-  const serialized = serializeProposal(updated);
+  const serialized = await transitionProposal(companyId, proposalId,
+    [PROPOSAL_STATUSES.DRAFT, PROPOSAL_STATUSES.PENDING_APPROVAL], {
+      status: PROPOSAL_STATUSES.APPROVED,
+      approvedBy: userId,
+      approvedAt: new Date(),
+    });
   await audit('approve', { companyId, userId, proposal: serialized, req });
   return serialized;
 }
@@ -143,22 +161,14 @@ async function rejectProposal(companyId, proposalId, user, reason = null, req = 
   const existing = await getProposal(companyId, proposalId);
   if (!existing) return null;
   assertCanReject(existing, user);
-
   const userId = entityId(user);
-  const updated = await AIActionProposal.findOneAndUpdate(
-    { company: companyId, proposalId },
-    {
-      $set: {
-        status: PROPOSAL_STATUSES.REJECTED,
-        rejectedBy: userId,
-        rejectedAt: new Date(),
-        rejectionReason: reason || null,
-      },
-    },
-    { new: true }
-  );
-
-  const serialized = serializeProposal(updated);
+  const serialized = await transitionProposal(companyId, proposalId,
+    [PROPOSAL_STATUSES.DRAFT, PROPOSAL_STATUSES.PENDING_APPROVAL, PROPOSAL_STATUSES.APPROVED], {
+      status: PROPOSAL_STATUSES.REJECTED,
+      rejectedBy: userId,
+      rejectedAt: new Date(),
+      rejectionReason: reason || null,
+    });
   await audit('reject', { companyId, userId, proposal: serialized, req });
   return serialized;
 }
@@ -166,39 +176,89 @@ async function rejectProposal(companyId, proposalId, user, reason = null, req = 
 async function executeProposal(companyId, proposalId, user, req = null) {
   const existing = await getProposal(companyId, proposalId);
   if (!existing) return null;
+
+  if (existing.status === PROPOSAL_STATUSES.EXECUTED && existing.executionResult?.ok === true) {
+    const { PROPOSAL_POLICY } = require('../ai-engine/action-engine');
+    const { hasPermission } = require('../ai-engine/action-engine');
+    const requiredPermission = PROPOSAL_POLICY[existing.type]?.requiredExecutionPermission;
+    if (!hasPermission(user, requiredPermission) && !hasPermission(user, 'ai.actions.execute')) {
+      throw new Error('User is not allowed to execute this AI action proposal');
+    }
+    await audit('execute_replay', { companyId, userId: entityId(user), proposal: existing, req });
+    return existing;
+  }
   assertCanExecute(existing, user);
 
   const userId = entityId(user);
+  if (existing.type === 'purchase_order_draft') {
+    let executed;
+    try {
+      executed = await prisma.$transaction((tx) => runWithTx(tx, async () => {
+        const current = await tx.aIActionProposal.findUnique({
+          where: { company_proposalId: proposalWhere(companyId, proposalId) },
+        });
+        if (!current || current.status !== PROPOSAL_STATUSES.APPROVED) {
+          throw new Error('AI action proposal must remain approved at execution time');
+        }
+
+        const purchaseOrder = await PurchaseOrderService.createAIDraft({
+          companyId,
+          createdBy: userId,
+          proposalId,
+          payload: current.payload || {},
+        });
+        const executionResult = {
+          ok: true,
+          code: 'PURCHASE_ORDER_DRAFT_CREATED',
+          message: 'A draft purchase order was created. It was not approved or sent to the supplier.',
+          executedBusinessOperation: true,
+          purchaseOrderId: purchaseOrder._id || purchaseOrder.id,
+          purchaseOrderReference: purchaseOrder.referenceNo || null,
+        };
+        const transitioned = await tx.aIActionProposal.updateMany({
+          where: { ...proposalWhere(companyId, proposalId), status: PROPOSAL_STATUSES.APPROVED },
+          data: {
+            status: PROPOSAL_STATUSES.EXECUTED,
+            executedBy: userId,
+            executedAt: new Date(),
+            executionResult,
+          },
+        });
+        if (transitioned.count !== 1) throw new Error('AI proposal was executed or changed concurrently');
+        const saved = await tx.aIActionProposal.findUnique({
+          where: { company_proposalId: proposalWhere(companyId, proposalId) },
+        });
+        return serializeProposal(saved);
+      }));
+    } catch (error) {
+      if (error.code !== 'P2002') throw error;
+      const concurrentResult = await getProposal(companyId, proposalId);
+      if (concurrentResult?.status !== PROPOSAL_STATUSES.EXECUTED || concurrentResult.executionResult?.ok !== true) {
+        throw error;
+      }
+      await audit('execute_replay', { companyId, userId, proposal: concurrentResult, req });
+      return concurrentResult;
+    }
+    await audit('execute', { companyId, userId, proposal: executed, req });
+    return executed;
+  }
+
   const executionResult = {
     ok: false,
     code: 'EXECUTOR_NOT_IMPLEMENTED',
-    message: 'This AI proposal type is approved, but no ERP executor has been connected yet.',
+    message: 'No ERP executor is registered for this AI proposal type. No business operation was performed.',
     executedBusinessOperation: false,
   };
-
-  const updated = await AIActionProposal.findOneAndUpdate(
-    { company: companyId, proposalId },
-    {
-      $set: {
-        status: PROPOSAL_STATUSES.FAILED,
-        executedBy: userId,
-        executedAt: new Date(),
-        executionResult,
-      },
-    },
-    { new: true }
-  );
-
-  const serialized = serializeProposal(updated);
-  await audit('execute_failed', {
+  const blockedAttempt = { ...existing, executionResult };
+  await audit('execute_unavailable', {
     companyId,
     userId,
-    proposal: serialized,
+    proposal: blockedAttempt,
     status: 'failure',
     errorMessage: executionResult.message,
     req,
   });
-  return serialized;
+  return blockedAttempt;
 }
 
 module.exports = {

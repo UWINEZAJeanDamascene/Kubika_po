@@ -78,7 +78,7 @@ function assertCanApprove(proposal, user) {
 }
 
 function assertCanReject(proposal, user) {
-  if ([PROPOSAL_STATUSES.EXECUTED, PROPOSAL_STATUSES.FAILED].includes(proposal.status)) {
+  if (![PROPOSAL_STATUSES.DRAFT, PROPOSAL_STATUSES.PENDING_APPROVAL, PROPOSAL_STATUSES.APPROVED].includes(proposal.status)) {
     throw new Error(`Proposal cannot be rejected from status ${proposal.status}`);
   }
   if (!hasPermission(user, 'ai.actions.reject') && !hasAnyRole(user, proposal.approvalRequiredByRole || [])) {
