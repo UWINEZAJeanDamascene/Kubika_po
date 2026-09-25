@@ -143,8 +143,8 @@ describe('Phase 14 AI rollout and observability', () => {
     expect(summary.guardrailRejectionRate).toBe(0.1);
     expect(summary.providerFailureRate).toBe(0.2);
     expect(summary.providerQuotaEvents).toBe(1);
-    expect(summary.findingFeedback).toEqual({ accepted: 3, dismissed: 1 });
-    expect(summary.proposalTransitions).toEqual({ approved: 2, rejected: 1 });
+    expect(summary.findingFeedback).toEqual({ accepted: 3, dismissed: 1, acceptanceRate: 0.75, dismissalRate: 0.25 });
+    expect(summary.proposalTransitions).toEqual({ approved: 2, rejected: 1, approvalRate: 2 / 3, rejectionRate: 1 / 3 });
     expect(summary.forecastBacktest).toEqual(expect.objectContaining({ samples: 2, averageMae: 5, averageMape: 15 }));
   });
 });

@@ -104,6 +104,10 @@ async function getSummary({ days = 30, companyId = null } = {}) {
     by: ['outcome'], where: { ...where, eventType: 'proposal_transition' }, _count: { _all: true },
   });
   const outcomeCounts = (rows) => Object.fromEntries(rows.map((row) => [row.outcome || 'unknown', row._count._all]));
+  const findingFeedbackCounts = outcomeCounts(feedback);
+  const proposalTransitionCounts = outcomeCounts(proposalTransitions);
+  const findingFeedbackTotal = (findingFeedbackCounts.accepted || 0) + (findingFeedbackCounts.dismissed || 0);
+  const proposalDecisionTotal = (proposalTransitionCounts.approved || 0) + (proposalTransitionCounts.rejected || 0);
   const forecastMetadata = forecastRows.map((row) => row.metadata || {});
   const mapes = forecastMetadata.map((item) => Number(item.meanAbsolutePercentageError)).filter(Number.isFinite);
   const maes = forecastMetadata.map((item) => Number(item.meanAbsoluteError)).filter(Number.isFinite);
@@ -125,8 +129,16 @@ async function getSummary({ days = 30, companyId = null } = {}) {
     providerOutcomes: providerRows.map((row) => ({
       eventType: row.eventType, provider: row.provider, count: row._count._all,
     })),
-    findingFeedback: outcomeCounts(feedback),
-    proposalTransitions: outcomeCounts(proposalTransitions),
+    findingFeedback: {
+      ...findingFeedbackCounts,
+      acceptanceRate: findingFeedbackTotal ? (findingFeedbackCounts.accepted || 0) / findingFeedbackTotal : null,
+      dismissalRate: findingFeedbackTotal ? (findingFeedbackCounts.dismissed || 0) / findingFeedbackTotal : null,
+    },
+    proposalTransitions: {
+      ...proposalTransitionCounts,
+      approvalRate: proposalDecisionTotal ? (proposalTransitionCounts.approved || 0) / proposalDecisionTotal : null,
+      rejectionRate: proposalDecisionTotal ? (proposalTransitionCounts.rejected || 0) / proposalDecisionTotal : null,
+    },
     forecastBacktest: {
       samples: forecastRows.length,
       averageMae: mean(maes),
