@@ -2,6 +2,8 @@ const express = require('express');
 const crypto = require('crypto');
 const router = express.Router();
 const { protect } = require('../middleware/auth');
+const { requireAIFeature } = require('../services/aiFeatureFlags');
+const { recordEvent } = require('../services/aiOperationalMetricsService');
 const { TOOL_DEFINITIONS, executeTool } = require('../services/aiToolService');
 const { buildContext } = require('../ai-engine/context-builder/ContextBuilder');
 const { filterToolsForUser, allowedToolNames, TOOL_PERMISSIONS } = require('../ai-engine/context-builder/toolPermissions');
@@ -29,7 +31,18 @@ const {
   getProviderStatus,
 } = require('../services/aiProviderService');
 
-router.post('/', protect, async (req, res) => {
+router.post('/', protect, requireAIFeature('aiChatV2'), (req, res, next) => {
+  const startedAt = Date.now();
+  res.once('finish', () => {
+    void recordEvent({
+      eventType: 'chat_request',
+      companyId: req.company || req.user && req.user.company,
+      durationMs: Date.now() - startedAt,
+      outcome: res.statusCode < 400 ? 'success' : 'error',
+    });
+  });
+  next();
+}, async (req, res) => {
   try {
     const { message, history = [] } = req.body;
     if (!message || typeof message !== 'string' || !message.trim()) {
@@ -113,13 +126,21 @@ router.post('/', protect, async (req, res) => {
     const userName = req.user.name || 'there';
     const companyName = req.user.companyName || 'your company';
     const requestId = req.headers['x-request-id'] || crypto.randomUUID();
-    const aiContext = await buildContext({
-      user: req.user,
-      company: req.company || req.user.company,
-      query: message.trim(),
-      domains: nlq.domains,
-      requestId,
-    });
+    const contextStartedAt = Date.now();
+    let aiContext;
+    try {
+      aiContext = await buildContext({
+        user: req.user,
+        company: req.company || req.user.company,
+        query: message.trim(),
+        domains: nlq.domains,
+        requestId,
+      });
+      void recordEvent({ eventType: 'context_build', companyId, durationMs: Date.now() - contextStartedAt, outcome: 'success' });
+    } catch (contextError) {
+      void recordEvent({ eventType: 'context_build', companyId, durationMs: Date.now() - contextStartedAt, outcome: 'error' });
+      throw contextError;
+    }
     const availableTools = filterToolsForUser(TOOL_DEFINITIONS, req.user);
     const allowedTools = allowedToolNames(req.user);
 
@@ -254,6 +275,7 @@ router.post('/', protect, async (req, res) => {
       version: structured.version,
     };
     if (!guardrail.ok) {
+      void recordEvent({ eventType: 'guardrail_rejection', companyId, outcome: 'rejected' });
       finalReply = guardedFallback(guardrail.errors);
     } else {
       finalReply = structured.parsed.answer;
@@ -279,6 +301,14 @@ router.post('/', protect, async (req, res) => {
     });
   } catch (error) {
     console.error('AI chat error:', error.message || String(error));
+
+    if (error.code === 'AI_PROVIDER_CALLS_DISABLED') {
+      return res.status(503).json({
+        success: false,
+        code: error.code,
+        message: 'AI chat is temporarily unavailable. Core ERP services remain available.',
+      });
+    }
 
     const isQuotaError =
       error.status === 429 ||

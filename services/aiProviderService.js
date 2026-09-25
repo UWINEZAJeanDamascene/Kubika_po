@@ -11,6 +11,7 @@ const OpenAI = require('openai');
 const env = require('../src/config/environment');
 const config = env.getConfig();
 const { redisClient, isRedisConfigured } = require('../config/redis');
+const { recordEvent } = require('./aiOperationalMetricsService');
 
 const CACHE_TTL_SECONDS = config.ai.cacheTtlSeconds || 30;
 const TIMEOUT_MS = config.ai.timeoutMs || 10000;
@@ -532,6 +533,7 @@ async function runProviderChain(activeProviders, providerParams, routerOptions =
         const validationError = new Error(`Guardrail rejected provider output: ${(validation.errors || []).join('; ') || 'invalid output'}`);
         markProviderFailure(provider.name, validationError, { guardrailRejected: true });
         attempt.result = 'guardrail_rejected';
+        void recordEvent({ eventType: 'provider_failure', provider: provider.name, outcome: 'guardrail_rejected' });
         lastError = validationError;
         console.warn(`AI provider ${provider.name} output failed guardrail. Trying next...`);
         continue;
@@ -540,6 +542,7 @@ async function runProviderChain(activeProviders, providerParams, routerOptions =
       markProviderSuccess(provider.name, elapsed);
       attempt.result = 'success';
       attempt.latencyMs = elapsed;
+      void recordEvent({ eventType: 'provider_success', provider: provider.name, durationMs: elapsed, outcome: 'success' });
       if (elapsed > 8000) console.warn(`Provider ${provider.name} responded slowly (${elapsed}ms)`);
       return {
         ...response,
@@ -555,6 +558,20 @@ async function runProviderChain(activeProviders, providerParams, routerOptions =
       lastError = err;
       attempt.result = 'provider_error';
       attempt.status = err.status || err.statusCode || null;
+      const statusCodeNumber = Number(err.status || err.statusCode);
+      void recordEvent({ eventType: 'provider_failure', provider: provider.name, outcome: statusCodeNumber === 429 ? 'rate_limited' : 'error' });
+      if (statusCodeNumber === 429 || /rate limit|quota/i.test(err.message || '')) {
+        const headers = err.headers || err.response && err.response.headers || {};
+        const readHeader = (name) => typeof headers.get === 'function' ? headers.get(name) : headers[name] || headers[name.toLowerCase()];
+        void recordEvent({
+          eventType: 'provider_quota', provider: provider.name, outcome: 'quota',
+          metadata: {
+            retryAfter: readHeader('retry-after'),
+            remainingRequests: readHeader('x-ratelimit-remaining-requests'),
+            remainingTokens: readHeader('x-ratelimit-remaining-tokens'),
+          },
+        });
+      }
       const reason = err.name === 'AbortError' ? 'timeout' : (err.message || 'unknown');
       const status = err.status || err.statusCode || 'no-status';
       console.warn(`AI provider ${provider.name} failed (status=${status}, reason=${reason}, type=${err.type || 'n/a'}). Trying next...`);
@@ -569,6 +586,12 @@ async function runProviderChain(activeProviders, providerParams, routerOptions =
 }
 
 async function createCompletion(params) {
+  if (config.ai.killSwitches.providerCalls) {
+    const error = new Error('AI provider calls are temporarily disabled by the system kill switch.');
+    error.code = 'AI_PROVIDER_CALLS_DISABLED';
+    error.statusCode = 503;
+    throw error;
+  }
   const { providerParams, routerOptions } = splitRouterOptions(params);
   const allConfigured = createProviders();
   const activeProviders = getProviders();

@@ -3,6 +3,8 @@
 const cron = require('node-cron');
 const { AI_DOMAINS } = require('../ai-engine/shared/interfaces');
 const MonitoringService = require('./aiMonitoringService');
+const config = require('../src/config/environment').getConfig();
+const { isTenantFeatureEnabled } = require('./aiFeatureFlags');
 
 const TIME_ZONE = 'Africa/Kigali';
 const tasks = [];
@@ -29,6 +31,10 @@ function schedule(label, expression, options = {}) {
 
 function startMonitoringScheduler() {
   if (tasks.length) return;
+  if (config.ai.killSwitches.scheduledMonitoring || !config.ai.featureFlags.proactiveFindings) {
+    console.log('[ai-monitoring] Scheduler disabled by AI monitoring kill switch or feature flag.');
+    return false;
+  }
   schedule('inventory-risk', '0 */2 * * *', { domains: [AI_DOMAINS.INVENTORY] });
   schedule('cash-receivables-payables', '0 7 * * *', {
     domains: [AI_DOMAINS.FINANCE, AI_DOMAINS.CUSTOMERS, AI_DOMAINS.PURCHASES, AI_DOMAINS.SUPPLIERS],
@@ -38,6 +44,7 @@ function startMonitoringScheduler() {
   schedule('anomaly-fraud', '30 7 * * *', { domains: [AI_DOMAINS.FINANCE, AI_DOMAINS.PURCHASES] });
   schedule('daily-briefing', '45 7 * * *', { createBriefing: true });
   console.log(`[ai-monitoring] Scheduled tenant scans using ${TIME_ZONE}.`);
+  return true;
 }
 
 function stopMonitoringScheduler() {

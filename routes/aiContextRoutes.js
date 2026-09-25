@@ -4,6 +4,7 @@ const express = require('express');
 const crypto = require('crypto');
 const router = express.Router();
 const { protect } = require('../middleware/auth');
+const { requireAIFeature } = require('../services/aiFeatureFlags');
 const authData = require('../services/authDataService');
 const { buildContext } = require('../ai-engine/context-builder/ContextBuilder');
 const { classifyQuery } = require('../ai-engine/nlq');
@@ -71,7 +72,7 @@ router.post('/context', protect, async (req, res) => {
   }
 });
 
-router.post('/findings/run', protect, async (req, res) => {
+router.post('/findings/run', protect, requireAIFeature('proactiveFindings'), async (req, res) => {
   try {
     const {
       query = '',
@@ -351,7 +352,7 @@ router.post('/findings/:findingId/restore', protect, async (req, res) => {
   }
 });
 
-router.post('/proposals', protect, async (req, res) => {
+router.post('/proposals', protect, requireAIFeature('proposals'), async (req, res) => {
   try {
     const user = await enrichUserWithRoles(req.user);
     const companyId = entityId(req.company || user.company);
@@ -375,7 +376,7 @@ router.post('/proposals', protect, async (req, res) => {
   }
 });
 
-router.get('/proposals', protect, async (req, res) => {
+router.get('/proposals', protect, requireAIFeature('proposals'), async (req, res) => {
   try {
     const user = await enrichUserWithRoles(req.user);
     const companyId = entityId(req.company || user.company);
@@ -394,7 +395,7 @@ router.get('/proposals', protect, async (req, res) => {
   }
 });
 
-router.get('/proposals/:id', protect, async (req, res) => {
+router.get('/proposals/:id', protect, requireAIFeature('proposals'), async (req, res) => {
   try {
     const user = await enrichUserWithRoles(req.user);
     const companyId = entityId(req.company || user.company);
@@ -420,7 +421,7 @@ router.get('/proposals/:id', protect, async (req, res) => {
   }
 });
 
-router.post('/proposals/:id/approve', protect, async (req, res) => {
+router.post('/proposals/:id/approve', protect, requireAIFeature('proposals'), async (req, res) => {
   try {
     const user = await enrichUserWithRoles(req.user);
     const companyId = entityId(req.company || user.company);
@@ -446,7 +447,7 @@ router.post('/proposals/:id/approve', protect, async (req, res) => {
   }
 });
 
-router.post('/proposals/:id/reject', protect, async (req, res) => {
+router.post('/proposals/:id/reject', protect, requireAIFeature('proposals'), async (req, res) => {
   try {
     const user = await enrichUserWithRoles(req.user);
     const companyId = entityId(req.company || user.company);
@@ -478,7 +479,7 @@ router.post('/proposals/:id/reject', protect, async (req, res) => {
   }
 });
 
-router.post('/proposals/:id/execute', protect, async (req, res) => {
+router.post('/proposals/:id/execute', protect, requireAIFeature('proposals'), async (req, res) => {
   try {
     const user = await enrichUserWithRoles(req.user);
     const companyId = entityId(req.company || user.company);
@@ -498,7 +499,7 @@ router.post('/proposals/:id/execute', protect, async (req, res) => {
     });
   } catch (error) {
     console.error('AI proposal execute error:', error.message || String(error));
-    res.status(403).json({
+    res.status(error.statusCode || 403).json({
       success: false,
       message: `Failed to execute AI proposal: ${(error.message || 'Unknown error').slice(0, 500)}`,
     });

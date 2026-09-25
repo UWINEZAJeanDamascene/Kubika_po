@@ -252,11 +252,28 @@ function buildConfig() {
       togetherModel: process.env.TOGETHER_MODEL || 'meta-llama/Llama-3.2-3B-Instruct-Turbo',
       cacheTtlSeconds: number(process.env.AI_CACHE_TTL_SECONDS, 30),
       timeoutMs: number(process.env.AI_TIMEOUT_MS, 10000),
+      metricsRetentionDays: Math.max(30, Math.min(365, number(process.env.AI_METRICS_RETENTION_DAYS, 90))),
       providerOrder: array(process.env.AI_PROVIDER_ORDER, ['groq', 'gemini', 'mistral', 'openrouter', 'deepseek', 'together', 'ollama'])
         .map((provider) => provider.toLowerCase())
         .filter((provider, index, providers) => ['groq', 'gemini', 'mistral', 'openrouter', 'deepseek', 'together', 'ollama'].includes(provider) && providers.indexOf(provider) === index),
       ollamaBaseUrl: process.env.OLLAMA_BASE_URL || null,
       ollamaModel: process.env.OLLAMA_MODEL || 'llama3.2',
+      rolloutStage: String(process.env.AI_ROLLOUT_STAGE || (nodeEnv === 'production' ? 'internal' : 'all')).toLowerCase(),
+      rolloutInternalTenantIds: array(process.env.AI_ROLLOUT_INTERNAL_TENANT_IDS),
+      rolloutTestCompanyId: process.env.AI_ROLLOUT_TEST_COMPANY_ID || null,
+      rolloutBetaTenantIds: array(process.env.AI_ROLLOUT_BETA_TENANT_IDS),
+      killSwitches: {
+        providerCalls: bool(process.env.AI_KILL_PROVIDER_CALLS, false),
+        scheduledMonitoring: bool(process.env.AI_KILL_SCHEDULED_MONITORING, false),
+        proposalExecution: bool(process.env.AI_KILL_PROPOSAL_EXECUTION, false),
+      },
+      featureFlags: {
+        aiChatV2: bool(process.env.AI_FEATURE_CHAT_V2_ENABLED, true),
+        proactiveFindings: bool(process.env.AI_FEATURE_FINDINGS_ENABLED, true),
+        proposals: bool(process.env.AI_FEATURE_PROPOSALS_ENABLED, true),
+        forecasts: bool(process.env.AI_FEATURE_FORECASTS_ENABLED, true),
+        reports: bool(process.env.AI_FEATURE_REPORTS_ENABLED, true),
+      },
     },
     
     // =====================
@@ -300,6 +317,8 @@ Object.freeze(config.sms);
 Object.freeze(config.notifications);
 Object.freeze(config.storage);
 Object.freeze(config.ai);
+Object.freeze(config.ai.killSwitches);
+Object.freeze(config.ai.featureFlags);
 Object.freeze(config.logging);
 Object.freeze(config.features);
 

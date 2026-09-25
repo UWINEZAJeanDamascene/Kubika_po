@@ -4,6 +4,7 @@ const express = require('express');
 const ExcelJS = require('exceljs');
 const PDFDocument = require('pdfkit');
 const { protect } = require('../middleware/auth');
+const { requireAIFeature } = require('../services/aiFeatureFlags');
 const authData = require('../services/authDataService');
 const { extractUserPermissions, hasPermission } = require('../ai-engine/context-builder/permissionUtils');
 const { REPORTS } = require('../ai-engine/reports/ReportBuilder');
@@ -104,7 +105,7 @@ async function exportPdf(report) {
   return Buffer.concat(chunks);
 }
 
-router.use(protect);
+router.use(protect, requireAIFeature('reports'));
 
 router.get('/types', async (req, res) => {
   try {

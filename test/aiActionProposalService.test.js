@@ -14,6 +14,7 @@ jest.mock('../lib/prisma', () => ({
 
 jest.mock('../services/AuditLogService', () => ({ log: jest.fn().mockResolvedValue(null) }));
 jest.mock('../services/purchaseOrderService', () => ({ createAIDraft: jest.fn() }));
+jest.mock('../services/aiOperationalMetricsService', () => ({ recordEvent: jest.fn().mockResolvedValue(true) }));
 
 const { prisma } = require('../lib/prisma');
 const AuditLogService = require('../services/AuditLogService');

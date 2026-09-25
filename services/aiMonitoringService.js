@@ -10,6 +10,9 @@ const { AI_DOMAINS } = require('../ai-engine/shared/interfaces');
 const { dateKey, dateColumn, isHighSeverity } = require('../ai-engine/monitoring/MonitoringEngine');
 const AIFindingService = require('./aiFindingService');
 const notificationHelper = require('./notificationHelper');
+const config = require('../src/config/environment').getConfig();
+const { isTenantFeatureEnabled } = require('./aiFeatureFlags');
+const { recordEvent } = require('./aiOperationalMetricsService');
 
 const ALL_DOMAINS = Object.values(AI_DOMAINS).filter((domain) => !['general', 'security', 'payroll'].includes(domain));
 const SYSTEM_PERMISSIONS = ['*'];
@@ -118,6 +121,9 @@ function briefingSummary(findings, recommendations, facts) {
 
 async function runCompanyScan({ companyId, domains = ALL_DOMAINS, now = new Date(), createBriefing = false }) {
   const tenantId = String(companyId);
+  if (config.ai.killSwitches.scheduledMonitoring || !isTenantFeatureEnabled('proactiveFindings', tenantId)) {
+    return { companyId: tenantId, skipped: true, reason: 'AI monitoring is disabled for this tenant.' };
+  }
   const user = systemUser(tenantId);
   const from = new Date(now);
   from.setUTCFullYear(from.getUTCFullYear() - 1);
@@ -216,11 +222,16 @@ async function setFindingState(companyId, userId, findingId, state, snoozedUntil
   if (!membership || membership.status !== 'active') throw Object.assign(new Error('Active company membership required.'), { statusCode: 403 });
   const finding = await prisma.aIFinding.findUnique({ where: { company_findingId: { company: tenantId, findingId: String(findingId) } }, select: { id: true } });
   if (!finding) return null;
-  return prisma.aIFindingUserState.upsert({
+  const saved = await prisma.aIFindingUserState.upsert({
     where: { companyId_userId_findingId: { companyId: tenantId, userId: personId, findingId: String(findingId) } },
     create: { id: generateObjectId(), companyId: tenantId, userId: personId, findingId: String(findingId), state, snoozedUntil },
     update: { state, snoozedUntil },
   });
+  void recordEvent({
+    eventType: 'finding_feedback', companyId: tenantId,
+    outcome: ['accepted', 'acknowledged'].includes(state) ? 'accepted' : state === 'dismissed' ? 'dismissed' : state,
+  });
+  return saved;
 }
 
 module.exports = {

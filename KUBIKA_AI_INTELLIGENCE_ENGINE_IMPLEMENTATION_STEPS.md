@@ -702,6 +702,14 @@ Acceptance:
 - AI can be disabled without affecting core ERP.
 - Production rollout has measurable quality and safety signals.
 
+### Phase 14 implementation status
+
+Implemented on 2026-09-25. Added tenant rollout stages (`internal`, `test_company`, `beta`, `all`) and independent flags for chat v2, findings, proposals, forecasts, and reports. Production defaults to the internal stage; deployments can expand the allowlists and stage through environment configuration. Provider calls, scheduled monitoring, and proposal execution each have an emergency switch. These switches are read at process startup, so restart API and worker processes after changing them.
+
+Added privacy-minimized AI operational events in PostgreSQL for chat/context latency, guardrail rejections, provider success/failure/quota, finding feedback, proposal transitions, and forecast back-test errors. Events are pruned after 90 days by default (configurable from 30 to 365 days). Platform administrators can review the aggregate signals at `GET /api/ai/observability/summary?days=30`; optional `companyId` filters one tenant. The additive migration is `prisma/migrations/20260925000005_add_ai_operational_events/migration.sql`; apply it with `npm run db:migrate:deploy` after generating the Prisma client before relying on persisted metrics.
+
+Focused AI verification passes with `npm run test:ai`. The test suite covers staged tenant access, feature-off behavior, all three emergency switches, telemetry privacy filtering, and summary calculations. No production rollout stage or tenant allowlist was changed in the deployed environment by this code change.
+
 ## Suggested MVP
 
 The minimum useful version should include only:

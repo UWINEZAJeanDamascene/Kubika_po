@@ -4,6 +4,7 @@ jest.mock('../lib/prisma', () => ({
   prisma: { aIForecast: { create: jest.fn(), findMany: jest.fn(), findUnique: jest.fn() } },
 }));
 jest.mock('../ai-engine/context-builder/ContextBuilder', () => ({ buildContext: jest.fn() }));
+jest.mock('../services/aiOperationalMetricsService', () => ({ recordEvent: jest.fn().mockResolvedValue(true) }));
 
 const { prisma } = require('../lib/prisma');
 const { buildContext } = require('../ai-engine/context-builder/ContextBuilder');

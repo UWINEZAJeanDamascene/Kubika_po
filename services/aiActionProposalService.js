@@ -5,6 +5,8 @@ const { runWithTx } = require('../lib/txContext');
 const { generateObjectId } = require('../utils/objectId');
 const AuditLogService = require('./AuditLogService');
 const PurchaseOrderService = require('./purchaseOrderService');
+const config = require('../src/config/environment').getConfig();
+const { recordEvent } = require('./aiOperationalMetricsService');
 const {
   PROPOSAL_STATUSES,
   buildActionProposalDraft,
@@ -154,6 +156,7 @@ async function approveProposal(companyId, proposalId, user, req = null) {
       approvedAt: new Date(),
     });
   await audit('approve', { companyId, userId, proposal: serialized, req });
+  void recordEvent({ eventType: 'proposal_transition', companyId, outcome: 'approved' });
   return serialized;
 }
 
@@ -170,12 +173,18 @@ async function rejectProposal(companyId, proposalId, user, reason = null, req = 
       rejectionReason: reason || null,
     });
   await audit('reject', { companyId, userId, proposal: serialized, req });
+  void recordEvent({ eventType: 'proposal_transition', companyId, outcome: 'rejected' });
   return serialized;
 }
 
 async function executeProposal(companyId, proposalId, user, req = null) {
   const existing = await getProposal(companyId, proposalId);
   if (!existing) return null;
+  if (config.ai.killSwitches.proposalExecution) {
+    const error = new Error('AI proposal execution is temporarily disabled by the system kill switch.');
+    error.statusCode = 503;
+    throw error;
+  }
 
   if (existing.status === PROPOSAL_STATUSES.EXECUTED && existing.executionResult?.ok === true) {
     const { PROPOSAL_POLICY } = require('../ai-engine/action-engine');
@@ -240,6 +249,7 @@ async function executeProposal(companyId, proposalId, user, req = null) {
       return concurrentResult;
     }
     await audit('execute', { companyId, userId, proposal: executed, req });
+    void recordEvent({ eventType: 'proposal_transition', companyId, outcome: 'executed' });
     return executed;
   }
 

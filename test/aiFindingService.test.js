@@ -1,5 +1,7 @@
 'use strict';
 
+jest.mock('../services/aiOperationalMetricsService', () => ({ recordEvent: jest.fn().mockResolvedValue(true) }));
+
 jest.mock('../lib/prisma', () => ({
   prisma: {
     aIFinding: {

@@ -3,6 +3,7 @@
 const crypto = require('crypto');
 const { prisma } = require('../lib/prisma');
 const { generateObjectId } = require('../utils/objectId');
+const { recordEvent } = require('./aiOperationalMetricsService');
 const { buildContext } = require('../ai-engine/context-builder/ContextBuilder');
 const { extractUserPermissions, hasPermission } = require('../ai-engine/context-builder/permissionUtils');
 const { DOMAIN_PERMISSIONS } = require('../ai-engine/monitoring/MonitoringEngine');
@@ -361,6 +362,18 @@ async function generateForecast({ companyId, user, forecastType, horizon, histor
     },
   };
   const saved = await prisma.aIForecast.create({ data: { id: generateObjectId(), ...payload } });
+  const backtest = forecast.backtestMetrics || {};
+  if (backtest.available) {
+    void recordEvent({
+      eventType: 'forecast_backtest', companyId, outcome: 'available',
+      metadata: {
+        available: true,
+        method: backtest.method,
+        meanAbsoluteError: backtest.meanAbsoluteError,
+        meanAbsolutePercentageError: backtest.meanAbsolutePercentageError,
+      },
+    });
+  }
   return visibleForecast({ ...saved, forecastId: saved.forecastId }, permissions);
 }
 

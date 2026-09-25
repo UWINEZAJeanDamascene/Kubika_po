@@ -2,6 +2,7 @@
 
 const express = require('express');
 const { protect } = require('../middleware/auth');
+const { requireAIFeature } = require('../services/aiFeatureFlags');
 const authData = require('../services/authDataService');
 const { extractUserPermissions, hasPermission } = require('../ai-engine/context-builder/permissionUtils');
 const { DOMAIN_PERMISSIONS } = require('../ai-engine/monitoring/MonitoringEngine');
@@ -30,7 +31,7 @@ function requireCompany(companyId) {
   if (!companyId) throw Object.assign(new Error('Company context is required.'), { statusCode: 400 });
 }
 
-router.use(protect);
+router.use(protect, requireAIFeature('forecasts'));
 
 router.get('/types', async (req, res) => {
   try {

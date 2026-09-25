@@ -18,6 +18,7 @@ jest.mock('../../../services/aiToolService', () => ({
   TOOL_DEFINITIONS: [],
   executeTool: jest.fn(),
 }));
+jest.mock('../../../services/aiOperationalMetricsService', () => ({ recordEvent: jest.fn().mockResolvedValue(true) }));
 
 jest.mock('../../../ai-engine/context-builder/ContextBuilder', () => ({
   buildContext: jest.fn(async ({ user, company }) => ({

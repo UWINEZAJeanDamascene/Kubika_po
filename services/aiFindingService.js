@@ -3,6 +3,7 @@
 const { prisma } = require('../lib/prisma');
 const { generateObjectId } = require('../utils/objectId');
 const { FINDING_STATUSES } = require('../ai-engine/decision-engine');
+const { recordEvent } = require('./aiOperationalMetricsService');
 
 const SEVERITY_ORDER = Object.freeze({ critical: 5, high: 4, medium: 3, low: 2, info: 1 });
 
@@ -101,6 +102,12 @@ async function updateFindingStatus(companyId, findingId, status) {
     where: { id: existing.id },
     data: { status },
   });
+  if (status === FINDING_STATUSES.ACKNOWLEDGED || status === FINDING_STATUSES.DISMISSED) {
+    void recordEvent({
+      eventType: 'finding_feedback', companyId: String(companyId),
+      outcome: status === FINDING_STATUSES.ACKNOWLEDGED ? 'accepted' : 'dismissed',
+    });
+  }
   return serializeFinding(updated);
 }
 

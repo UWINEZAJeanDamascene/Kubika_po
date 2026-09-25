@@ -1,5 +1,7 @@
 'use strict';
 
+jest.mock('../../../services/aiOperationalMetricsService', () => ({ recordEvent: jest.fn().mockResolvedValue(true) }));
+
 const {
   CIRCUIT_STATES,
   _internal,

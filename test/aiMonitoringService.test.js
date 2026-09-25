@@ -31,6 +31,7 @@ jest.doMock('../ai-engine/decision-engine', () => ({ evaluateContext: (...args) 
 jest.doMock('../ai-engine/recommendation-engine', () => ({ generateRecommendations: jest.fn(() => []) }));
 jest.doMock('../services/aiFindingService', () => ({ upsertFindings: (...args) => upsertFindings(...args) }));
 jest.doMock('../services/notificationHelper', () => ({ createNotification: (...args) => createNotification(...args) }));
+jest.doMock('../services/aiOperationalMetricsService', () => ({ recordEvent: jest.fn().mockResolvedValue(true) }));
 
 const { runCompanyScan } = require('../services/aiMonitoringService');
 

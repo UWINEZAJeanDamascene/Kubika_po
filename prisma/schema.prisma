@@ -97,6 +97,21 @@ model AIBriefing {
   @@map("ai_briefings")
 }
 
+model AIOperationalEvent {
+  id         String   @id @db.Char(24)
+  eventType  String   @map("event_type")
+  companyId  String?  @map("company_id") @db.Char(24)
+  occurredAt DateTime @default(now()) @map("occurred_at") @db.Timestamptz(3)
+  durationMs Int?     @map("duration_ms")
+  provider   String?
+  outcome    String?
+  metadata   Json     @default("{}")
+
+  @@index([eventType, occurredAt(sort: Desc)])
+  @@index([companyId, eventType, occurredAt(sort: Desc)])
+  @@map("ai_operational_events")
+}
+
 model AIReport {
   id                 String   @id @db.Char(24)
   reportId           String   @map("report_id")
