@@ -27,6 +27,9 @@ jobs:
         # Run Jest with coverage (do not fail the job on coverage thresholds)
         npm test -- --coverage
 
+    - name: Run AI security and dependency-boundary checks
+      run: npm run test:ai
+
     - name: Upload coverage artifact
       uses: actions/upload-artifact@v4
       with:

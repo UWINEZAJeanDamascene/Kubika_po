@@ -611,6 +611,20 @@ Acceptance:
 - Users can approve/reject proposals from the UI.
 - Chat and Intelligence pages share the same backend facts.
 
+### Phase 12 implementation status (2026-09-25)
+
+Implemented in `Stock_tenancy_bnd`:
+
+- Added the Intelligence workspace at `/intelligence`, linked from the Reports & Insights navigation and gated by authentication, frontend permissions, and the AI subscription feature.
+- Added workspace tabs for the latest briefing, findings, recommendations, forecasts, reports, proposals, and provider health. Provider health is only shown to administrators.
+- Connected the workspace to the existing backend context, monitoring preferences, finding, recommendation, forecast, report, proposal, and provider endpoints.
+- Added expandable source facts for chat responses and findings, and evidence displays for briefings, forecasts, and reports.
+- Added run-scan, dismiss, snooze, notification preference, report generation/export, forecast generation, proposal approve/reject, and supported purchase-order execution controls.
+- Removed browser-built ERP context injection from Stacy chat. The chat now sends the user message and conversation history to the backend AI Gateway and displays the permission-filtered facts returned with the answer.
+- Added English, French, and Kinyarwanda navigation labels.
+
+Verification: `npm run build` succeeds. The repository-wide `npm run typecheck` still reports existing TypeScript errors across unrelated frontend components; the output contained no errors in the Phase 12 Intelligence page or AI service files. Live endpoint verification still depends on successful Prisma Client generation and applying the pending Phase 10 and 11 database migrations.
+
 ## Phase 13: Security And Adversarial Tests
 
 Goal: prove the AI layer cannot bypass core ERP controls.
@@ -643,6 +657,10 @@ Acceptance:
 - Security tests run in CI.
 - A failed guardrail blocks the response.
 - A malicious prompt cannot trigger a mutating ERP operation.
+
+### Phase 13 implementation status
+
+Completed on 2026-09-25. Added adversarial chat API coverage for prompt injection, permission bypass attempts, create-without-approval requests, cross-tenant evidence, unsupported numeric claims, fabricated fact IDs, PII fields/email addresses, and guardrail rejection. The API test verifies rejected provider output is replaced with a safe response and no ERP tool is called. Existing AI tests cover permission filtering, proposal approval and audit logging, and provider fallback; the AI test target runs those with the new adversarial suite and static boundary checks. A Stacy system prompt snapshot is committed with the adversarial tests. CI now runs `npm run test:ai`; the adversarial script fails when its test directory is empty.
 
 ## Phase 14: Observability And Rollout
 

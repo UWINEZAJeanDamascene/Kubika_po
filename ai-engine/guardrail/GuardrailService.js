@@ -10,7 +10,8 @@ const ACTION_CLAIM_PATTERNS = [
   /\b(i|we|stacy)\s+(have\s+)?(now\s+)?(posted|submitted|approved|deleted|voided|cancelled|sent|filed|paid)\b/i,
 ];
 
-const SENSITIVE_KEYS = /^(password|passwd|secret|token|accessToken|refreshToken|apiKey|ssn|socialSecurityNumber|privateKey)$/i;
+const SENSITIVE_KEYS = /^(password|passwd|secret|token|accessToken|refreshToken|apiKey|ssn|socialSecurityNumber|privateKey|email|phone|mobile|telephone|national[_-]?id|tax[_-]?id|tin|passport(?:Number)?|dateOfBirth|dob|homeAddress|personalAddress|bankAccount(?:Number)?)$/i;
+const EMAIL_ADDRESS = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i;
 
 function numericValues(value, output = new Set()) {
   if (typeof value === 'number' && Number.isFinite(value)) output.add(String(value));
@@ -154,6 +155,7 @@ function validateStructuredResponse(response, facts = [], { expectedCompanyId } 
   }
 
   const allText = [response.answer, ...(response.claimLabels || []).map((claim) => claim && claim.text), ...(response.recommendedActions || []).filter((item) => typeof item === 'string')].join('\n');
+  if (EMAIL_ADDRESS.test(allText)) errors.push('Response contains a personal email address');
   errors.push(...validateNoUnsafeActionClaims(allText));
 
   const availableValues = new Set();
