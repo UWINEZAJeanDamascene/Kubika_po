@@ -3,6 +3,7 @@
 const { AI_DOMAINS } = require('../../shared/interfaces');
 const { createFact } = require('../factFactory');
 const MonthlyReportsService = require('../../../services/monthlyReportsService');
+const AIComplianceCalendarService = require('../../../services/aiComplianceCalendarService');
 
 const REQUIRED_PERMISSIONS = ['tax.read', 'reports.read', 'finance.read'];
 const MAX_MONTHS = 24;
@@ -74,7 +75,25 @@ async function collect({ companyId, dateRange = {} }) {
   if (includesPeriod(start, end, period)) {
     warnings.push(`Tax context is limited to the most recent ${MAX_MONTHS} requested months.`);
   }
-  if (!monthlyFacts.length) return { facts: [], warnings };
+  const calendarFacts = [];
+  try {
+    const entries = await AIComplianceCalendarService.getComplianceCalendar(companyId);
+    if (entries.length) {
+      calendarFacts.push(createFact({
+        companyId,
+        domain: AI_DOMAINS.TAX,
+        label: 'Tax compliance calendar',
+        value: entries,
+        sourceService: 'AIComplianceCalendarService',
+        sourceMethod: 'getComplianceCalendar',
+        sourceIds: entries.map((entry) => entry.id),
+        permissions: REQUIRED_PERMISSIONS,
+      }));
+    }
+  } catch (error) {
+    warnings.push(`Tax compliance calendar lookup failed: ${error.message}`);
+  }
+  if (!monthlyFacts.length) return { facts: calendarFacts, warnings };
 
   const isPartialCalendarMonth = (dateValue, boundary) => {
     if (!dateValue) return false;
@@ -113,7 +132,7 @@ async function collect({ companyId, dateRange = {} }) {
     }));
   }
 
-  return { facts: [...monthlyFacts, ...facts], warnings };
+  return { facts: [...monthlyFacts, ...facts, ...calendarFacts], warnings };
 }
 
 module.exports = {

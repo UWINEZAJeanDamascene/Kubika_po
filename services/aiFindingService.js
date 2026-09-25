@@ -1,93 +1,106 @@
 'use strict';
 
-const AIFinding = require('../models/AIFinding');
+const { prisma } = require('../lib/prisma');
+const { generateObjectId } = require('../utils/objectId');
 const { FINDING_STATUSES } = require('../ai-engine/decision-engine');
 
-function serializeFinding(doc) {
-  if (!doc) return null;
-  const plain = typeof doc.toObject === 'function' ? doc.toObject() : doc;
+const SEVERITY_ORDER = Object.freeze({ critical: 5, high: 4, medium: 3, low: 2, info: 1 });
+
+function serializeFinding(row) {
+  if (!row) return null;
   return {
-    id: plain.findingId,
-    companyId: String(plain.company),
-    domain: plain.domain,
-    ruleId: plain.ruleId,
-    title: plain.title,
-    summary: plain.summary,
-    severity: plain.severity,
-    confidence: plain.confidence,
-    evidenceFactIds: plain.evidenceFactIds || [],
-    recommendedNextStep: plain.recommendedNextStep,
-    status: plain.status,
-    firstDetectedAt: plain.firstDetectedAt,
-    lastDetectedAt: plain.lastDetectedAt,
-    occurrenceCount: plain.occurrenceCount,
-    metadata: plain.metadata || {},
+    id: row.findingId,
+    companyId: String(row.company),
+    domain: row.domain,
+    ruleId: row.ruleId,
+    title: row.title,
+    summary: row.summary,
+    severity: row.severity,
+    confidence: row.confidence,
+    evidenceFactIds: row.evidenceFactIds || [],
+    recommendedNextStep: row.recommendedNextStep,
+    status: row.status,
+    firstDetectedAt: row.firstDetectedAt,
+    lastDetectedAt: row.lastDetectedAt,
+    occurrenceCount: row.occurrenceCount,
+    metadata: row.metadata || {},
   };
 }
 
 async function upsertFindings(companyId, findings = []) {
+  const tenantId = String(companyId);
   const persisted = [];
-
   for (const finding of findings) {
-    const updated = await AIFinding.findOneAndUpdate(
-      { company: companyId, findingId: finding.id },
-      {
-        $set: {
-          company: companyId,
-          findingId: finding.id,
-          domain: finding.domain,
-          ruleId: finding.ruleId,
-          title: finding.title,
-          summary: finding.summary,
-          severity: finding.severity,
-          confidence: finding.confidence,
-          evidenceFactIds: finding.evidenceFactIds || [],
-          recommendedNextStep: finding.recommendedNextStep,
-          metadata: finding.metadata || {},
-          lastDetectedAt: new Date(),
-        },
-        $setOnInsert: {
-          status: FINDING_STATUSES.OPEN,
-          firstDetectedAt: new Date(),
-        },
-        $inc: {
-          occurrenceCount: 1,
-        },
+    const now = new Date();
+    const saved = await prisma.aIFinding.upsert({
+      where: { company_findingId: { company: tenantId, findingId: finding.id } },
+      create: {
+        id: generateObjectId(),
+        company: tenantId,
+        findingId: finding.id,
+        domain: finding.domain,
+        ruleId: finding.ruleId,
+        title: finding.title,
+        summary: finding.summary,
+        severity: finding.severity,
+        confidence: finding.confidence,
+        evidenceFactIds: finding.evidenceFactIds || [],
+        recommendedNextStep: finding.recommendedNextStep || null,
+        status: finding.status || FINDING_STATUSES.OPEN,
+        metadata: finding.metadata || {},
+        firstDetectedAt: now,
+        lastDetectedAt: now,
+        occurrenceCount: 1,
       },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
-    );
-    persisted.push(serializeFinding(updated));
+      update: {
+        domain: finding.domain,
+        ruleId: finding.ruleId,
+        title: finding.title,
+        summary: finding.summary,
+        severity: finding.severity,
+        confidence: finding.confidence,
+        evidenceFactIds: finding.evidenceFactIds || [],
+        recommendedNextStep: finding.recommendedNextStep || null,
+        metadata: finding.metadata || {},
+        lastDetectedAt: now,
+        occurrenceCount: { increment: 1 },
+      },
+    });
+    persisted.push(serializeFinding(saved));
   }
-
   return persisted;
 }
 
 async function listFindings(companyId, options = {}) {
-  const query = { company: companyId };
-  if (options.status) query.status = options.status;
-  if (options.domain) query.domain = options.domain;
-  if (options.severity) query.severity = options.severity;
-
-  const limit = Math.min(Number(options.limit) || 50, 200);
-  const docs = await AIFinding.find(query)
-    .sort({ severity: -1, lastDetectedAt: -1 })
-    .limit(limit);
-
-  return docs.map(serializeFinding);
+  const where = { company: String(companyId) };
+  if (options.status) where.status = String(options.status);
+  if (options.domain) where.domain = String(options.domain);
+  if (options.severity) where.severity = String(options.severity);
+  const parsedLimit = Number(options.limit);
+  const take = Number.isFinite(parsedLimit) && parsedLimit > 0 ? Math.min(Math.floor(parsedLimit), 200) : 50;
+  const rows = await prisma.aIFinding.findMany({
+    where,
+    orderBy: { lastDetectedAt: 'desc' },
+    take,
+  });
+  return rows
+    .sort((a, b) => (SEVERITY_ORDER[b.severity] || 0) - (SEVERITY_ORDER[a.severity] || 0)
+      || new Date(b.lastDetectedAt) - new Date(a.lastDetectedAt))
+    .map(serializeFinding);
 }
 
 async function updateFindingStatus(companyId, findingId, status) {
   if (!Object.values(FINDING_STATUSES).includes(status)) {
-    const allowed = Object.values(FINDING_STATUSES).join(', ');
-    throw new Error(`Invalid finding status. Expected one of: ${allowed}`);
+    throw new Error(`Invalid finding status. Expected one of: ${Object.values(FINDING_STATUSES).join(', ')}`);
   }
-
-  const updated = await AIFinding.findOneAndUpdate(
-    { company: companyId, findingId },
-    { $set: { status } },
-    { new: true }
-  );
-
+  const existing = await prisma.aIFinding.findUnique({
+    where: { company_findingId: { company: String(companyId), findingId: String(findingId) } },
+  });
+  if (!existing) return null;
+  const updated = await prisma.aIFinding.update({
+    where: { id: existing.id },
+    data: { status },
+  });
   return serializeFinding(updated);
 }
 

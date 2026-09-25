@@ -102,4 +102,68 @@ describe('AI Decision Engine', () => {
       { rulePackId: 'broken_rule', message: 'fixture failure' },
     ]);
   });
+
+  test('flags negative cash flow and negative gross margin with source evidence', () => {
+    const decision = evaluateContext(context([
+      fact('Cash flow summary', { cashIn: 800, cashOut: 1000, netCashFlow: -200 }, AI_DOMAINS.FINANCE),
+      fact('Cash and bank account balance', -25, AI_DOMAINS.FINANCE),
+      fact('Profit and loss revenue', 900, AI_DOMAINS.FINANCE),
+      fact('Cost of goods sold', 1000, AI_DOMAINS.FINANCE),
+    ]));
+
+    expect(decision.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ ruleId: 'finance.negative_net_cash_flow', severity: 'critical', evidenceFactIds: expect.any(Array) }),
+      expect.objectContaining({ ruleId: 'finance.negative_gross_margin', severity: 'high', evidenceFactIds: expect.any(Array) }),
+    ]));
+  });
+
+  test('flags material sales decline and overdue payables', () => {
+    const decision = evaluateContext(context([
+      fact('Sales timeline for selected period', [
+        { period: '2026-01', revenue: 1000 },
+        { period: '2026-02', revenue: 700 },
+      ], AI_DOMAINS.SALES),
+      fact('Payables aging', {
+        summary: { totalAP: 900 },
+        buckets: { current: { amount: 100 }, days30: { amount: 200 }, days60: { amount: 300 }, days90: { amount: 100 }, days90plus: { amount: 200 } },
+      }, AI_DOMAINS.PURCHASES),
+    ]));
+
+    expect(decision.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ ruleId: 'sales.material_revenue_decline', severity: 'medium' }),
+      expect.objectContaining({ ruleId: 'payables.overdue_balance', severity: 'high' }),
+    ]));
+  });
+
+  test('flags possible duplicate supplier payments and recorded overdue tax deadlines', () => {
+    const decision = evaluateContext(context([
+      fact('Accounts payable payment sample', [
+        { paymentNumber: 'AP-1', paymentDate: '2026-01-02', supplier: 'Supplier A', amountPaid: 500 },
+        { paymentNumber: 'AP-2', paymentDate: '2026-01-02', supplier: 'Supplier A', amountPaid: 500 },
+      ], AI_DOMAINS.FINANCE),
+      fact('Tax compliance calendar', [
+        { id: 'tax-entry-1', taxType: 'vat', dueDate: '2020-01-15', status: 'upcoming' },
+      ], AI_DOMAINS.TAX),
+    ]));
+
+    expect(decision.findings).toEqual(expect.arrayContaining([
+      expect.objectContaining({ ruleId: 'finance.possible_duplicate_supplier_payment' }),
+      expect.objectContaining({ ruleId: 'tax.compliance_deadline_overdue' }),
+    ]));
+  });
+
+  test('includes freshness and historical consistency in confidence factors', () => {
+    const decision = evaluateContext(context([
+      fact('Low stock product count', 2, AI_DOMAINS.INVENTORY),
+      fact('Out of stock product count', 1, AI_DOMAINS.INVENTORY),
+      fact('Stockout risk count', 3, AI_DOMAINS.INVENTORY),
+    ]));
+    const finding = decision.findings.find((item) => item.ruleId === 'inventory.stockout_risk');
+
+    expect(finding.metadata.confidenceFactors).toEqual(expect.objectContaining({
+      dataFreshness: expect.any(Number),
+      historicalConsistency: expect.any(Number),
+      evidenceCompleteness: expect.any(Number),
+    }));
+  });
 });

@@ -2,7 +2,7 @@
 
 const crypto = require('crypto');
 const { FINDING_SEVERITIES } = require('../shared/interfaces');
-const { scoreConfidence } = require('./confidence');
+const { scoreConfidence, freshnessFromFacts } = require('./confidence');
 
 const FINDING_STATUSES = Object.freeze({
   OPEN: 'open',
@@ -33,8 +33,26 @@ function createFinding({
   metadata = {},
 }) {
   const evidenceFactIds = evidenceFacts.map((fact) => fact && fact.id).filter(Boolean);
+  const confidenceFactors = {
+    evidenceCount: evidenceFactIds.length,
+    evidenceCompleteness: metadata.evidenceCompleteness == null
+      ? (metadata.expectedEvidenceCount ? Math.min(1, evidenceFactIds.length / metadata.expectedEvidenceCount) : (evidenceFactIds.length ? 0.75 : 0.25))
+      : metadata.evidenceCompleteness,
+    dataFreshness: metadata.dataFreshness == null ? freshnessFromFacts(evidenceFacts) : metadata.dataFreshness,
+    ruleCertainty: metadata.ruleCertainty == null ? 0.8 : metadata.ruleCertainty,
+    historicalConsistency: metadata.historicalConsistency == null ? 0.65 : metadata.historicalConsistency,
+    modelUncertainty: metadata.modelUncertainty == null ? 0 : metadata.modelUncertainty,
+  };
   const computedConfidence = confidence == null
-    ? scoreConfidence({ evidenceCount: evidenceFactIds.length, ruleCertainty: metadata.ruleCertainty || 0.8 })
+    ? scoreConfidence({
+      evidenceCount: evidenceFactIds.length,
+      evidenceFacts,
+      ruleCertainty: confidenceFactors.ruleCertainty,
+      completeness: confidenceFactors.evidenceCompleteness,
+      dataFreshness: confidenceFactors.dataFreshness,
+      historicalConsistency: confidenceFactors.historicalConsistency,
+      modelUncertainty: confidenceFactors.modelUncertainty,
+    })
     : confidence;
 
   return {
@@ -50,7 +68,7 @@ function createFinding({
     recommendedNextStep,
     status,
     createdAt: new Date().toISOString(),
-    metadata,
+    metadata: { ...metadata, confidenceFactors },
   };
 }
 
@@ -58,4 +76,3 @@ module.exports = {
   FINDING_STATUSES,
   createFinding,
 };
-

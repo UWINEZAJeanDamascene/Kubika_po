@@ -55,7 +55,7 @@ describe('Prompt Builder and Guardrail', () => {
       userMessage: 'What are sales?',
     });
 
-    expect(PROMPT_TEMPLATE_VERSION).toBe('stacy-system-v1');
+    expect(PROMPT_TEMPLATE_VERSION).toBe('stacy-system-v2');
     expect(messages[0].role).toBe('system');
     expect(messages[0].content).toContain('Address Alice');
     expect(messages[messages.length - 1]).toEqual({ role: 'user', content: 'What are sales?' });

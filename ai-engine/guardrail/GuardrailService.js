@@ -2,15 +2,59 @@
 
 const { FACT_TYPES } = require('../shared/interfaces');
 
-const GUARDRAIL_VERSION = 'guardrail-v1';
+const GUARDRAIL_VERSION = 'guardrail-v2';
 
 const ACTION_CLAIM_PATTERNS = [
-  /\b(i|we|stacy)\s+(created|posted|submitted|approved|deleted|voided|cancelled|sent|filed|paid|executed)\b/i,
+  /\b(i|we|stacy)\s+(have\s+)?(created|posted|submitted|approved|deleted|voided|cancelled|sent|filed|paid|executed)\b/i,
   /\b(invoice|purchase order|payment|journal entry|stock adjustment|payroll run|tax return)\s+(has been|was)\s+(created|posted|submitted|approved|deleted|voided|cancelled|sent|filed|paid|executed)\b/i,
+  /\b(i|we|stacy)\s+(have\s+)?(now\s+)?(posted|submitted|approved|deleted|voided|cancelled|sent|filed|paid)\b/i,
 ];
 
-function factIdSet(facts = []) {
-  return new Set((facts || []).map((fact) => fact && fact.id).filter(Boolean));
+const SENSITIVE_KEYS = /^(password|passwd|secret|token|accessToken|refreshToken|apiKey|ssn|socialSecurityNumber|privateKey)$/i;
+
+function numericValues(value, output = new Set()) {
+  if (typeof value === 'number' && Number.isFinite(value)) output.add(String(value));
+  else if (typeof value === 'string') {
+    for (const match of value.matchAll(/(?:^|[^\w])(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:%|\b)/g)) {
+      const number = Number(match[1].replace(/,/g, ''));
+      if (Number.isFinite(number)) output.add(String(number));
+    }
+  } else if (Array.isArray(value)) value.forEach((item) => numericValues(item, output));
+  else if (value && typeof value === 'object') Object.values(value).forEach((item) => numericValues(item, output));
+  return output;
+}
+
+function responseNumbers(text) {
+  const values = [];
+  for (const match of String(text || '').matchAll(/(?:^|[^\w])(-?\d+(?:,\d{3})*(?:\.\d+)?)(?:%|\b)/g)) {
+    const number = Number(match[1].replace(/,/g, ''));
+    if (Number.isFinite(number)) values.push(String(number));
+  }
+  return values;
+}
+
+function factNumericValues(fact, output = new Set()) {
+  numericValues([fact && fact.value, fact && fact.unit, fact && fact.formula, fact && fact.metadata], output);
+  if (fact && typeof fact.value === 'number' && /%|percent/i.test(String(fact.unit || ''))) {
+    output.add(String(fact.value * 100));
+  }
+  return output;
+}
+
+function inspectSensitiveKeys(value, path = '$', errors = []) {
+  if (!value || typeof value !== 'object') return errors;
+  for (const [key, child] of Object.entries(value)) {
+    if (SENSITIVE_KEYS.test(key)) errors.push(`Sensitive field '${path}.${key}' is not allowed in the response`);
+    inspectSensitiveKeys(child, `${path}.${key}`, errors);
+  }
+  return errors;
+}
+
+function factIdSet(facts = [], expectedCompanyId) {
+  return new Set((facts || [])
+    .filter((fact) => expectedCompanyId == null || String(fact.companyId) === String(expectedCompanyId))
+    .map((fact) => fact && fact.id)
+    .filter(Boolean));
 }
 
 function extractJsonObject(raw) {
@@ -36,13 +80,30 @@ function extractJsonObject(raw) {
   return null;
 }
 
-function validateStructuredResponse(response, facts = []) {
+function validateStructuredResponse(response, facts = [], { expectedCompanyId } = {}) {
   const errors = [];
   const warnings = [];
-  const availableFactIds = factIdSet(facts);
+  const availableFactIds = factIdSet(facts, expectedCompanyId);
+  if (expectedCompanyId != null && (facts || []).some((fact) => String(fact.companyId) !== String(expectedCompanyId))) {
+    errors.push('Evidence contains facts from a different company');
+  }
 
   if (!response || typeof response !== 'object' || Array.isArray(response)) {
     return { ok: false, errors: ['Response must be a JSON object.'], warnings };
+  }
+
+  inspectSensitiveKeys(response, '$', errors);
+  if (expectedCompanyId != null) {
+    const expected = String(expectedCompanyId);
+    const inspectCompanyIds = (value) => {
+      if (!value || typeof value !== 'object') return;
+      for (const [key, child] of Object.entries(value)) {
+        if (/^(companyId|tenantId)$/i.test(key) && String(child) !== expected) {
+          errors.push(`Response ${key} does not match the active company`);
+        } else inspectCompanyIds(child);
+      }
+    };
+    inspectCompanyIds(response);
   }
 
   if (typeof response.answer !== 'string' || !response.answer.trim()) {
@@ -74,15 +135,37 @@ function validateStructuredResponse(response, facts = []) {
           errors.push(`claimLabels[${index}] references unknown factId '${factId}'`);
         }
       }
+      if (typeof claim.text === 'string' && !response.answer.toLowerCase().includes(claim.text.trim().toLowerCase())) {
+        errors.push(`claimLabels[${index}].text is not present in answer`);
+      }
     });
   }
 
   if (!Array.isArray(response.missingData)) {
     errors.push('missingData must be an array');
+  } else if (response.missingData.some((item) => typeof item !== 'string')) {
+    errors.push('missingData entries must be strings');
   }
 
   if (!Array.isArray(response.recommendedActions)) {
     errors.push('recommendedActions must be an array');
+  } else if (response.recommendedActions.some((item) => typeof item !== 'string')) {
+    errors.push('recommendedActions entries must be strings');
+  }
+
+  const allText = [response.answer, ...(response.claimLabels || []).map((claim) => claim && claim.text), ...(response.recommendedActions || []).filter((item) => typeof item === 'string')].join('\n');
+  errors.push(...validateNoUnsafeActionClaims(allText));
+
+  const availableValues = new Set();
+  facts.forEach((fact) => factNumericValues(fact, availableValues));
+  for (const number of responseNumbers(response.answer)) {
+    const supportedByClaim = (response.claimLabels || []).some((claim) => {
+      if (!claim || typeof claim.text !== 'string' || !responseNumbers(claim.text).includes(number)) return false;
+      const citedValues = new Set();
+      facts.filter((fact) => (claim.factIds || []).includes(fact.id)).forEach((fact) => factNumericValues(fact, citedValues));
+      return citedValues.has(number);
+    });
+    if (!availableValues.has(number) || !supportedByClaim) errors.push(`Answer contains unsupported or uncited number '${number}'`);
   }
 
   return {
@@ -116,7 +199,7 @@ function validateFreeTextResponse(text, options = {}) {
   };
 }
 
-function parseAndValidateStructuredText(rawText, facts = []) {
+function parseAndValidateStructuredText(rawText, facts = [], options = {}) {
   const parsed = extractJsonObject(rawText);
   if (!parsed) {
     return {
@@ -128,7 +211,7 @@ function parseAndValidateStructuredText(rawText, facts = []) {
     };
   }
 
-  const validation = validateStructuredResponse(parsed, facts);
+  const validation = validateStructuredResponse(parsed, facts, options);
   return {
     ...validation,
     parsed,
@@ -152,4 +235,3 @@ module.exports = {
   parseAndValidateStructuredText,
   guardedFallback,
 };
-

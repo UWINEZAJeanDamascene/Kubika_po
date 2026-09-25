@@ -1,7 +1,7 @@
 'use strict';
 
 const { AI_DOMAINS, FINDING_SEVERITIES } = require('../../shared/interfaces');
-const { numberFact } = require('../factAccess');
+const { numberFact, objectFact } = require('../factAccess');
 const { createFinding } = require('../findingFactory');
 
 function evaluateCashBalance(context) {
@@ -50,12 +50,60 @@ function evaluateProfitability(context) {
   })];
 }
 
+function evaluateCashFlow(context) {
+  const cashFlow = objectFact(context, 'Cash flow summary');
+  const netCashFlow = Number(cashFlow.value?.netCashFlow);
+  if (!cashFlow.fact || !Number.isFinite(netCashFlow) || netCashFlow >= 0) return [];
+  const bankBalance = numberFact(context, 'Cash and bank account balance');
+  const severity = bankBalance.value != null && bankBalance.value < 0
+    ? FINDING_SEVERITIES.CRITICAL
+    : FINDING_SEVERITIES.HIGH;
+  return [createFinding({
+    companyId: context.companyId,
+    ruleId: 'finance.negative_net_cash_flow',
+    domain: AI_DOMAINS.FINANCE,
+    title: 'Net cash flow is negative',
+    summary: `Net cash flow for the selected period was ${netCashFlow}.`,
+    severity,
+    evidenceFacts: [cashFlow.fact, bankBalance.fact].filter(Boolean),
+    recommendedNextStep: 'Review cash outflows, upcoming obligations, and collection timing before committing additional spend.',
+    metadata: { netCashFlow, bankBalance: bankBalance.value, ruleCertainty: 0.86, expectedEvidenceCount: 2 },
+  })];
+}
+
+function evaluateGrossMargin(context) {
+  const revenue = numberFact(context, 'Profit and loss revenue');
+  const cogs = numberFact(context, 'Cost of goods sold');
+  if (revenue.value == null || revenue.value <= 0 || cogs.value == null || cogs.value <= revenue.value) return [];
+  const marginPercent = Number((((revenue.value - cogs.value) / revenue.value) * 100).toFixed(2));
+  return [createFinding({
+    companyId: context.companyId,
+    ruleId: 'finance.negative_gross_margin',
+    domain: AI_DOMAINS.FINANCE,
+    title: 'Cost of goods sold exceeds revenue',
+    summary: `Gross margin is ${marginPercent}% because reported cost of goods sold exceeds revenue.`,
+    severity: FINDING_SEVERITIES.HIGH,
+    evidenceFacts: [revenue.fact, cogs.fact],
+    recommendedNextStep: 'Verify product costs, selling prices, discounts, and the reporting period used for the P&L.',
+    metadata: {
+      revenue: revenue.value,
+      costOfGoodsSold: cogs.value,
+      grossMarginPercent: marginPercent,
+      ruleCertainty: cogs.fact.computed ? 0.62 : 0.88,
+      expectedEvidenceCount: 2,
+      modelUncertainty: cogs.fact.computed ? 0.35 : 0,
+    },
+  })];
+}
+
 module.exports = {
   rulePackId: 'finance',
   evaluate(context) {
     return [
       ...evaluateCashBalance(context),
+      ...evaluateCashFlow(context),
       ...evaluateProfitability(context),
+      ...evaluateGrossMargin(context),
     ];
   },
 };

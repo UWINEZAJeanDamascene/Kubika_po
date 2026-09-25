@@ -252,6 +252,11 @@ function buildConfig() {
       togetherModel: process.env.TOGETHER_MODEL || 'meta-llama/Llama-3.2-3B-Instruct-Turbo',
       cacheTtlSeconds: number(process.env.AI_CACHE_TTL_SECONDS, 30),
       timeoutMs: number(process.env.AI_TIMEOUT_MS, 10000),
+      providerOrder: array(process.env.AI_PROVIDER_ORDER, ['groq', 'gemini', 'mistral', 'openrouter', 'deepseek', 'together', 'ollama'])
+        .map((provider) => provider.toLowerCase())
+        .filter((provider, index, providers) => ['groq', 'gemini', 'mistral', 'openrouter', 'deepseek', 'together', 'ollama'].includes(provider) && providers.indexOf(provider) === index),
+      ollamaBaseUrl: process.env.OLLAMA_BASE_URL || null,
+      ollamaModel: process.env.OLLAMA_MODEL || 'llama3.2',
     },
     
     // =====================

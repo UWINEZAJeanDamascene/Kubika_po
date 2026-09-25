@@ -3,10 +3,12 @@
 const { AI_DOMAINS } = require('../../shared/interfaces');
 const { addNumericFact, createFact, sourceIdsFrom } = require('../factFactory');
 const { runTool } = require('../toolRunner');
+const { extractUserPermissions, hasPermission } = require('../permissionUtils');
 
 const REQUIRED_PERMISSIONS = ['finance.read', 'bank_accounts.read', 'reports.read'];
+const AP_PAYMENT_PERMISSIONS = ['payables.read', 'finance.read', 'purchases.read'];
 
-async function collect({ companyId, dateRange }) {
+async function collect({ companyId, dateRange, user }) {
   const facts = [];
   const warnings = [];
   const args = {
@@ -102,6 +104,31 @@ async function collect({ companyId, dateRange }) {
     }));
   } else {
     warnings.push(`Finance collector skipped cash flow: ${cashFlowResult.reason.message}`);
+  }
+
+  const userPermissions = extractUserPermissions(user);
+  if (hasPermission(userPermissions, AP_PAYMENT_PERMISSIONS)) {
+    try {
+      const { result: apPayments } = await runTool(companyId, 'get_ap_payments', { limit: 100, ...args });
+      const payments = Array.isArray(apPayments.payments) ? apPayments.payments : [];
+      if (payments.length) {
+        const grantedPermissions = userPermissions.includes('*')
+          ? AP_PAYMENT_PERMISSIONS
+          : AP_PAYMENT_PERMISSIONS.filter((permission) => hasPermission(userPermissions, [permission]));
+        facts.push(createFact({
+          companyId,
+          domain: AI_DOMAINS.FINANCE,
+          label: 'Accounts payable payment sample',
+          value: payments,
+          sourceMethod: 'get_ap_payments',
+          sourceIds: payments.map((payment) => payment.paymentNumber).filter(Boolean).map(String).slice(0, 100),
+          permissions: grantedPermissions,
+          metadata: { sampleCount: payments.length, limited: payments.length >= 100 },
+        }));
+      }
+    } catch (error) {
+      warnings.push(`Finance collector skipped AP payment sample: ${error.message}`);
+    }
   }
 
   return { facts, warnings };

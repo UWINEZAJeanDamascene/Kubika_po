@@ -18,6 +18,7 @@ const HEALTHY_RETRY_MS = 60000;
 const HEALTH_CHECK_TIMEOUT_MS = 3000;
 const MAX_MEMORY_CACHE_SIZE = 500;
 const MAX_LATENCY_SAMPLES = 25;
+const CIRCUIT_FAILURE_THRESHOLD = 3;
 
 const CIRCUIT_STATES = Object.freeze({
   CLOSED: 'closed',
@@ -41,12 +42,15 @@ function createCircuit(name) {
     lastHalfOpenAt: null,
     lastClosedAt: nowIso(),
     failures: 0,
+    consecutiveFailures: 0,
     successes: 0,
+    rateLimits: 0,
     guardrailRejections: 0,
     lastError: null,
     lastLatencyMs: null,
     latencySamples: [],
     quota: null,
+    probeInFlight: false,
   };
 }
 
@@ -72,7 +76,9 @@ function getCircuitSnapshot(name) {
     lastHalfOpenAt: circuit.lastHalfOpenAt,
     lastClosedAt: circuit.lastClosedAt,
     failures: circuit.failures,
+    consecutiveFailures: circuit.consecutiveFailures,
     successes: circuit.successes,
+    rateLimits: circuit.rateLimits,
     guardrailRejections: circuit.guardrailRejections,
     lastError: circuit.lastError,
     lastLatencyMs: circuit.lastLatencyMs,
@@ -87,6 +93,7 @@ function openCircuit(name, untilTimestampMs, reason) {
   circuit.openedUntil = untilTimestampMs || (Date.now() + HEALTHY_RETRY_MS);
   circuit.lastOpenedAt = nowIso();
   circuit.lastError = reason || circuit.lastError;
+  circuit.probeInFlight = false;
 }
 
 function closeCircuit(name) {
@@ -95,6 +102,8 @@ function closeCircuit(name) {
   circuit.openedUntil = null;
   circuit.lastClosedAt = nowIso();
   circuit.lastError = null;
+  circuit.consecutiveFailures = 0;
+  circuit.probeInFlight = false;
 }
 
 function markProviderSuccess(name, latencyMs) {
@@ -108,17 +117,49 @@ function markProviderSuccess(name, latencyMs) {
   closeCircuit(name);
 }
 
+function acquireProvider(name) {
+  const circuit = getCircuit(name);
+  if (circuit.state === CIRCUIT_STATES.OPEN) return false;
+  if (circuit.state === CIRCUIT_STATES.HALF_OPEN) {
+    if (circuit.probeInFlight) return false;
+    circuit.probeInFlight = true;
+  }
+  return true;
+}
+
 function markProviderFailure(name, err, opts = {}) {
   const circuit = getCircuit(name);
+  const failedHalfOpenProbe = circuit.state === CIRCUIT_STATES.HALF_OPEN;
   circuit.failures += 1;
+  circuit.consecutiveFailures += 1;
   circuit.lastError = err?.message || String(err || 'unknown error');
   if (opts.guardrailRejected) circuit.guardrailRejections += 1;
 
-  const status = err?.status || err?.statusCode;
-  const shouldOpen = opts.openCircuit || status === 429 || err?.name === 'AbortError' || /timeout|rate limit|quota/i.test(circuit.lastError);
+  const status = Number(err?.status || err?.statusCode);
+  if (status === 429 || /rate limit|quota/i.test(circuit.lastError)) {
+    circuit.rateLimits += 1;
+    circuit.quota = extractQuotaMetadata(err);
+  }
+  circuit.probeInFlight = false;
+  const shouldOpen = failedHalfOpenProbe || opts.openCircuit || status === 429 || err?.name === 'AbortError' || /timeout|rate limit|quota/i.test(circuit.lastError) || circuit.consecutiveFailures >= CIRCUIT_FAILURE_THRESHOLD;
   if (shouldOpen) {
     openCircuit(name, opts.until || parseRetryAfterFromError(err) || (Date.now() + HEALTHY_RETRY_MS), circuit.lastError);
   }
+}
+
+function extractQuotaMetadata(err) {
+  const headers = err?.headers || err?.response?.headers || {};
+  const metadata = {};
+  const keys = [
+    'retry-after',
+    'x-ratelimit-limit-requests', 'x-ratelimit-remaining-requests', 'x-ratelimit-reset-requests',
+    'x-ratelimit-limit-tokens', 'x-ratelimit-remaining-tokens', 'x-ratelimit-reset-tokens',
+  ];
+  for (const key of keys) {
+    const value = typeof headers.get === 'function' ? headers.get(key) : (headers[key] || headers[key.toLowerCase()]);
+    if (value != null) metadata[key] = String(value);
+  }
+  return Object.keys(metadata).length ? metadata : { message: String(err?.message || 'rate limit or quota reached').slice(0, 240) };
 }
 
 function isProviderHealthy(name) {
@@ -237,26 +278,24 @@ function createProviders() {
     missing.push('together');
   }
 
-  if (config.ai.ollamaBaseUrl) {
+  if (config.ai.ollamaBaseUrl && process.env.NODE_ENV !== 'production') {
     const ollamaBase = config.ai.ollamaBaseUrl;
-    const isLocalhost = /(^https?:\/\/)?(localhost|127\.0\.0\.1|::1)/i.test(ollamaBase);
-    if (isLocalhost && process.env.NODE_ENV === 'production') {
-      console.warn('[AI] OLLAMA_BASE_URL points to localhost but running in production - skipping Ollama provider.');
-    } else {
-      providers.push(providerMeta('ollama', 'Ollama', new OpenAI({
-        apiKey: 'ollama',
-        baseURL: config.ai.ollamaBaseUrl,
-      }), config.ai.ollamaModel || 'llama3.2', Math.max(TIMEOUT_MS, 30000), {
-        supportsJsonMode: false,
-        hosted: false,
-      }));
-    }
+    providers.push(providerMeta('ollama', 'Ollama', new OpenAI({
+      apiKey: 'ollama',
+      baseURL: ollamaBase,
+    }), config.ai.ollamaModel || 'llama3.2', Math.max(TIMEOUT_MS, 30000), {
+      supportsJsonMode: false,
+      hosted: false,
+    }));
+  } else if (config.ai.ollamaBaseUrl) {
+    console.warn('[AI] Ollama is available only outside production; skipping local provider.');
   }
 
-  console.log(`[AI Providers] Configured: ${configured.join(', ') || 'none'}`);
+  const orderedProviders = orderProviders(providers);
+  console.log(`[AI Providers] Configured: ${orderedProviders.map((provider) => provider.name).join(', ') || 'none'}`);
   if (missing.length) console.log(`[AI Providers] Missing API keys: ${missing.join(', ')}`);
 
-  return providers;
+  return orderedProviders;
 }
 
 async function checkProviderHealth(provider) {
@@ -283,7 +322,17 @@ async function checkProviderHealth(provider) {
 }
 
 function getProviders() {
-  return createProviders().filter((p) => isProviderHealthy(p.name));
+  return createProviders().filter((provider) => {
+    const circuit = getCircuit(provider.name);
+    return circuit.state !== CIRCUIT_STATES.OPEN && !(circuit.state === CIRCUIT_STATES.HALF_OPEN && circuit.probeInFlight);
+  });
+}
+
+function orderProviders(providers) {
+  const configuredOrder = Array.isArray(config.ai.providerOrder) ? config.ai.providerOrder : [];
+  const order = [...configuredOrder, 'groq', 'gemini', 'mistral', 'openrouter', 'deepseek', 'together', 'ollama'];
+  const rank = new Map(order.map((name, index) => [name, index]));
+  return providers.sort((left, right) => (rank.get(left.name) ?? Number.MAX_SAFE_INTEGER) - (rank.get(right.name) ?? Number.MAX_SAFE_INTEGER));
 }
 
 function cleanupMemoryCache(force = false) {
@@ -367,7 +416,7 @@ function splitRouterOptions(requestParams = {}) {
 
 function applyStructuredOutputParams(provider, requestParams, routerOptions) {
   const payload = { ...requestParams };
-  if (routerOptions.strictJson && provider.supportsJsonMode && !payload.response_format) {
+  if (routerOptions.strictJson && provider.supportsJsonMode && !payload.response_format && !payload.tools?.length) {
     payload.response_format = { type: 'json_object' };
   }
   return payload;
@@ -439,11 +488,16 @@ async function callProviderWithRetry(provider, requestParams, opts = {}) {
 
 function validateRouterResponse(response, routerOptions, provider) {
   if (typeof routerOptions.validateResponse !== 'function') return { ok: true };
-  const validation = routerOptions.validateResponse(response.result, {
-    provider: provider.name,
-    model: provider.model,
-    displayName: provider.displayName,
-  });
+  let validation;
+  try {
+    validation = routerOptions.validateResponse(response.result, {
+      provider: provider.name,
+      model: provider.model,
+      displayName: provider.displayName,
+    });
+  } catch (error) {
+    validation = { ok: false, errors: [error.message || 'Response validation failed'] };
+  }
   if (validation && validation.ok === false) return validation;
   return { ok: true, ...(validation || {}) };
 }
@@ -462,26 +516,13 @@ function getConfiguredProviders() {
   }));
 }
 
-async function createCompletion(params) {
+async function runProviderChain(activeProviders, providerParams, routerOptions = {}) {
   let lastError = null;
-  const { providerParams, routerOptions } = splitRouterOptions(params);
-  const allConfigured = createProviders();
-  const activeProviders = getProviders();
-
-  if (allConfigured.length === 0) {
-    throw new Error('No AI providers are configured. Set GROQ_API_KEY, GEMINI_API_KEY, or OLLAMA_BASE_URL environment variables.');
-  }
-
-  if (activeProviders.length === 0) {
-    const error = new Error('All configured AI providers are temporarily unhealthy. Please try again in a minute.');
-    error.allProvidersFailed = true;
-    throw error;
-  }
-
-  console.log(`[createCompletion] Starting with ${activeProviders.length} active providers: ${activeProviders.map(p => p.name).join(', ')}`);
-
+  const attempts = [];
   for (const provider of activeProviders) {
-    console.log(`[createCompletion] Trying provider: ${provider.name}`);
+    if (!acquireProvider(provider.name)) continue;
+    const attempt = { provider: provider.name, model: provider.model };
+    attempts.push(attempt);
     try {
       const start = Date.now();
       const response = await callProviderWithRetry(provider, providerParams, { maxRetries: 2, routerOptions });
@@ -490,12 +531,15 @@ async function createCompletion(params) {
       if (!validation.ok) {
         const validationError = new Error(`Guardrail rejected provider output: ${(validation.errors || []).join('; ') || 'invalid output'}`);
         markProviderFailure(provider.name, validationError, { guardrailRejected: true });
+        attempt.result = 'guardrail_rejected';
         lastError = validationError;
         console.warn(`AI provider ${provider.name} output failed guardrail. Trying next...`);
         continue;
       }
 
       markProviderSuccess(provider.name, elapsed);
+      attempt.result = 'success';
+      attempt.latencyMs = elapsed;
       if (elapsed > 8000) console.warn(`Provider ${provider.name} responded slowly (${elapsed}ms)`);
       return {
         ...response,
@@ -509,6 +553,8 @@ async function createCompletion(params) {
       };
     } catch (err) {
       lastError = err;
+      attempt.result = 'provider_error';
+      attempt.status = err.status || err.statusCode || null;
       const reason = err.name === 'AbortError' ? 'timeout' : (err.message || 'unknown');
       const status = err.status || err.statusCode || 'no-status';
       console.warn(`AI provider ${provider.name} failed (status=${status}, reason=${reason}, type=${err.type || 'n/a'}). Trying next...`);
@@ -517,7 +563,30 @@ async function createCompletion(params) {
 
   const error = new Error(`All AI providers failed. Last error: ${lastError?.message || 'Unknown error'}`);
   error.allProvidersFailed = true;
+  error.code = 'AI_PROVIDERS_EXHAUSTED';
+  error.providerAttempts = attempts;
   throw error;
+}
+
+async function createCompletion(params) {
+  const { providerParams, routerOptions } = splitRouterOptions(params);
+  const allConfigured = createProviders();
+  const activeProviders = getProviders();
+
+  if (allConfigured.length === 0) {
+    throw new Error('No AI providers are configured. Set GROQ_API_KEY, GEMINI_API_KEY, or OLLAMA_BASE_URL environment variables.');
+  }
+
+  if (activeProviders.length === 0) {
+    const error = new Error('All configured AI providers are temporarily unhealthy. Please try again in a minute.');
+    error.allProvidersFailed = true;
+    error.code = 'AI_PROVIDERS_UNHEALTHY';
+    error.providerAttempts = [];
+    throw error;
+  }
+
+  console.log(`[createCompletion] Starting with ${activeProviders.length} active providers: ${activeProviders.map(p => p.name).join(', ')}`);
+  return runProviderChain(activeProviders, providerParams, routerOptions);
 }
 
 async function cachedChatCompletion(systemPrompt, messages, completionParams) {
@@ -581,6 +650,9 @@ module.exports = {
     getCircuitSnapshot,
     markProviderFailure,
     markProviderSuccess,
+    acquireProvider,
+    orderProviders,
+    runProviderChain,
     resetProviderCircuitState,
     parseRetryAfterFromError,
   },

@@ -4,14 +4,24 @@ const router = express.Router();
 const { protect } = require('../middleware/auth');
 const { TOOL_DEFINITIONS, executeTool } = require('../services/aiToolService');
 const { buildContext } = require('../ai-engine/context-builder/ContextBuilder');
-const { filterToolsForUser, allowedToolNames } = require('../ai-engine/context-builder/toolPermissions');
+const { filterToolsForUser, allowedToolNames, TOOL_PERMISSIONS } = require('../ai-engine/context-builder/toolPermissions');
+const { createFact } = require('../ai-engine/shared/factFactory');
 const {
   buildChatMessages,
+  buildContextPrompt,
   serializeAIContext,
   PROMPT_TEMPLATE_VERSION,
 } = require('../ai-engine/prompt-builder');
-const { validateFreeTextResponse, guardedFallback, GUARDRAIL_VERSION } = require('../ai-engine/guardrail');
-const { classifyQuery, actionProposalReply, clarificationReply, NLQ_VERSION } = require('../ai-engine/nlq');
+const { parseAndValidateStructuredText, extractJsonObject, guardedFallback, GUARDRAIL_VERSION } = require('../ai-engine/guardrail');
+const {
+  classifyQuery,
+  buildLLMClassificationMessages,
+  parseLLMClassification,
+  applyLLMClassification,
+  actionProposalReply,
+  clarificationReply,
+  NLQ_VERSION,
+} = require('../ai-engine/nlq');
 const {
   isConfigured,
   createCompletion,
@@ -26,7 +36,44 @@ router.post('/', protect, async (req, res) => {
       return res.status(400).json({ success: false, reply: 'Message is required.' });
     }
 
-    const nlq = classifyQuery(message, { history });
+    let nlq = classifyQuery(message, { history });
+    let aiConfigured = null;
+    const hasAIProviders = () => {
+      if (aiConfigured === null) aiConfigured = isConfigured();
+      return aiConfigured;
+    };
+    let intentClassifierMetadata = { attempted: false, provider: null, model: null };
+
+    if (nlq.requiresClarification && hasAIProviders()) {
+      intentClassifierMetadata.attempted = true;
+      try {
+        const classificationResult = await createCompletion({
+          messages: buildLLMClassificationMessages(message, history),
+          temperature: 0,
+          max_tokens: 256,
+          strictJson: true,
+          validateResponse: (providerResult) => {
+            const raw = providerResult?.choices?.[0]?.message?.content || '';
+            return parseLLMClassification(extractJsonObject(raw))
+              ? { ok: true }
+              : { ok: false, errors: ['Invalid NLQ classification response'] };
+          },
+        });
+        const rawClassification = classificationResult.result?.choices?.[0]?.message?.content || '';
+        const candidate = parseLLMClassification(extractJsonObject(rawClassification));
+        nlq = applyLLMClassification(nlq, candidate);
+        intentClassifierMetadata = {
+          attempted: true,
+          provider: classificationResult.provider || null,
+          model: classificationResult.model || classificationResult.metadata?.model || null,
+          confidence: candidate?.confidence ?? null,
+          applied: Boolean(candidate && candidate.confidence >= 0.65),
+        };
+      } catch (classificationError) {
+        intentClassifierMetadata.error = classificationError.code || 'classification_unavailable';
+      }
+    }
+
     if (nlq.routesToActionEngine) {
       return res.status(200).json({
         success: true,
@@ -35,6 +82,7 @@ router.post('/', protect, async (req, res) => {
         ai: {
           nlqVersion: NLQ_VERSION,
           intent: nlq,
+          intentClassifier: intentClassifierMetadata,
           routed: 'action_proposal_required',
         },
       });
@@ -48,11 +96,12 @@ router.post('/', protect, async (req, res) => {
         ai: {
           nlqVersion: NLQ_VERSION,
           intent: nlq,
+          intentClassifier: intentClassifierMetadata,
           routed: 'clarification_required',
         },
       });
     }
-    if (!isConfigured()) {
+    if (!hasAIProviders()) {
       const providers = getConfiguredProviders();
       return res.status(200).json({
         success: true,
@@ -82,6 +131,8 @@ router.post('/', protect, async (req, res) => {
       history,
       userMessage: message,
       aiContext,
+      requireStructuredOutput: true,
+      allowedActionIntents: [],
     });
 
     // Tool calling loop (max 5 iterations to prevent runaway)
@@ -98,6 +149,15 @@ router.post('/', protect, async (req, res) => {
           ...(availableTools.length ? { tools: availableTools, tool_choice: 'auto' } : {}),
           temperature: 0.6,
           max_tokens: 4096,
+          strictJson: availableTools.length === 0,
+          validateResponse: (providerResult) => {
+            const providerMessage = providerResult?.choices?.[0]?.message;
+            if (providerMessage?.tool_calls?.length) return { ok: true, toolCall: true };
+            const validation = parseAndValidateStructuredText(providerMessage?.content || '', aiContext.facts, {
+              expectedCompanyId: companyId,
+            });
+            return validation.ok ? { ok: true } : { ok: false, errors: validation.errors };
+          },
         });
       } catch (providerErr) {
         // All providers failed inside the loop — break and let outer catch handle it
@@ -139,15 +199,39 @@ router.post('/', protect, async (req, res) => {
                 retryable: false,
               };
             }
+            // Preserve the permission-checked tool result as citeable evidence for
+            // the final structured answer, including data not covered by collectors.
+            const toolFact = createFact({
+              companyId,
+              label: `AI tool result: ${toolName}`,
+              value: result,
+              sourceService: 'AIToolService',
+              sourceMethod: toolName,
+              permissions: TOOL_PERMISSIONS[toolName] || [],
+              metadata: { toolName },
+            });
             return {
               tool_call_id: tc.id,
               role: 'tool',
               content: JSON.stringify(result).slice(0, 8000), // truncate to avoid token limit
+              toolFact,
             };
           })
         );
 
-        messages.push(...toolResults);
+        messages.push(...toolResults.map(({ toolFact, ...message }) => message));
+        const newFacts = toolResults.map((item) => item.toolFact).filter(Boolean);
+        aiContext.facts.push(...newFacts);
+        messages.push({
+          role: 'user',
+          content: `[BACKEND TOOL EVIDENCE - cite these exact fact IDs in the final response]\n${buildContextPrompt({
+            companyId,
+            userId: req.user.id,
+            facts: newFacts,
+            warnings: [],
+            metadata: { requestId, source: 'permission-checked-tool' },
+          })}`,
+        });
         continue;
       }
 
@@ -160,9 +244,19 @@ router.post('/', protect, async (req, res) => {
       finalReply = 'I apologize, but I was unable to complete the analysis after several attempts. Please try rephrasing your question.';
     }
 
-    const guardrail = validateFreeTextResponse(finalReply);
+    const structured = parseAndValidateStructuredText(finalReply, aiContext.facts, {
+      expectedCompanyId: companyId,
+    });
+    const guardrail = {
+      ok: structured.ok,
+      errors: structured.errors,
+      warnings: structured.warnings,
+      version: structured.version,
+    };
     if (!guardrail.ok) {
       finalReply = guardedFallback(guardrail.errors);
+    } else {
+      finalReply = structured.parsed.answer;
     }
 
     res.json({
@@ -173,9 +267,13 @@ router.post('/', protect, async (req, res) => {
         promptTemplateVersion: PROMPT_TEMPLATE_VERSION,
         guardrailVersion: GUARDRAIL_VERSION,
         guardrail,
+        claimLabels: structured.ok ? structured.parsed.claimLabels : [],
+        missingData: structured.ok ? structured.parsed.missingData : [],
+        recommendedActions: structured.ok ? structured.parsed.recommendedActions : [],
         providerMetadata,
         nlqVersion: NLQ_VERSION,
         intent: nlq,
+        intentClassifier: intentClassifierMetadata,
         context: serializeAIContext(aiContext),
       },
     });
@@ -198,7 +296,17 @@ router.post('/', protect, async (req, res) => {
     if (isQuotaError || allFailed) {
       return res.status(200).json({
         success: true,
-        reply: `The AI assistant is temporarily unavailable because all providers are rate-limited. Please try again later, or contact your administrator to check API key quotas.`,
+        reply: isQuotaError
+          ? 'The AI assistant is temporarily unavailable because configured providers are rate-limited. Please try again later.'
+          : 'The AI assistant could not obtain a safe response from the configured providers. Please try again later.',
+        provider: 'router',
+        ai: {
+          guardrailVersion: GUARDRAIL_VERSION,
+          providerMetadata: {
+            exhausted: true,
+            attempts: error.providerAttempts || [],
+          },
+        },
       });
     }
 

@@ -74,6 +74,7 @@ function buildChatMessages({
   userMessage,
   aiContext = null,
   requireStructuredOutput = false,
+  allowedActionIntents = [],
 } = {}) {
   const messages = [
     {
@@ -92,7 +93,7 @@ function buildChatMessages({
   if (requireStructuredOutput) {
     messages.push({
       role: 'user',
-      content: 'For this response, return only the JSON response contract defined in the system prompt.',
+      content: `For this response, return only the JSON response contract defined in the system prompt. Allowed action intents: ${JSON.stringify(allowedActionIntents)}. Do not claim any action was executed.`,
     });
   }
 

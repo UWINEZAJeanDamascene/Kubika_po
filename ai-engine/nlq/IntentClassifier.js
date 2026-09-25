@@ -6,7 +6,7 @@ const {
   resolveBusinessQuestions,
 } = require('../knowledge-model');
 
-const NLQ_VERSION = 'nlq-v1';
+const NLQ_VERSION = 'nlq-v2';
 
 const INTENTS = Object.freeze({
   FACTUAL_QUERY: 'factual_query',
@@ -35,7 +35,7 @@ const ACTION_TYPES = Object.freeze({
 
 const ACTION_VERBS = [
   'create', 'generate', 'make', 'draft', 'send', 'email', 'post', 'submit', 'approve',
-  'reject', 'record', 'pay', 'delete', 'void', 'cancel', 'adjust', 'transfer', 'file',
+  'reject', 'record', 'pay', 'delete', 'void', 'cancel', 'adjust', 'transfer', 'file', 'update', 'process', 'allocate',
 ];
 
 const ACTION_PATTERNS = [
@@ -51,6 +51,7 @@ const ACTION_PATTERNS = [
 ];
 
 const INTENT_PATTERNS = [
+  { intent: INTENTS.HELP_QUERY, pattern: /\b(how do i|how can i|how to|steps to|guide me to|explain how)\b/i, confidence: 0.9 },
   { intent: INTENTS.CAUSAL_QUERY, pattern: /\b(why|what caused|reason|cause|explain why|because of what)\b/i, confidence: 0.9 },
   { intent: INTENTS.FORECAST_QUERY, pattern: /\b(predict|forecast|projection|next month|next quarter|future|will we|expected)\b/i, confidence: 0.88 },
   { intent: INTENTS.REPORT_REQUEST, pattern: /\b(report|export|download|pdf|excel|csv|statement|summary)\b/i, confidence: 0.84 },
@@ -71,6 +72,16 @@ function normalize(text) {
 
 function detectAction(text) {
   const normalized = normalize(text);
+  if (/\b(don't|do not|never|shouldn't|should not|without)\b/i.test(normalized)) return null;
+  const reportRequest = /\b(report|export|download|excel|spreadsheet|pdf|csv|statement|summary|chart)\b/i.test(normalized);
+  if (reportRequest) return null;
+  const verbs = ACTION_VERBS.join('|');
+  const commandPrefix = new RegExp(`^(please\\s+)?(${verbs})\\b`, 'i');
+  const addressedRequest = new RegExp(`\\b(can|could|would) you\\s+(please\\s+)?(${verbs})\\b|\\b(i need|i want) you to\\s+(${verbs})\\b`, 'i');
+  const isCommand = commandPrefix.test(normalized);
+  const isAddressedRequest = addressedRequest.test(normalized);
+  if (!isCommand && !isAddressedRequest) return null;
+
   for (const entry of ACTION_PATTERNS) {
     if (entry.pattern.test(normalized)) {
       return {
@@ -81,8 +92,7 @@ function detectAction(text) {
     }
   }
 
-  const lower = normalized.toLowerCase();
-  if (ACTION_VERBS.some((verb) => lower.startsWith(`${verb} `))) {
+  if (isCommand || isAddressedRequest) {
     return {
       actionType: ACTION_TYPES.GENERIC_ACTION,
       confidence: 0.78,
@@ -111,6 +121,15 @@ function detectIntent(text) {
     };
   }
 
+  const helpIntent = INTENT_PATTERNS.find((entry) => entry.intent === INTENTS.HELP_QUERY && entry.pattern.test(normalized));
+  if (helpIntent) {
+    return {
+      intent: helpIntent.intent,
+      confidence: helpIntent.confidence,
+      reason: `Matched ${helpIntent.intent} pattern.`,
+    };
+  }
+
   const action = detectAction(normalized);
   if (action) {
     return {
@@ -132,9 +151,9 @@ function detectIntent(text) {
   }
 
   return {
-    intent: INTENTS.FACTUAL_QUERY,
+    intent: INTENTS.AMBIGUOUS_QUERY,
     confidence: 0.55,
-    reason: 'Defaulted to factual query.',
+    reason: 'No deterministic intent pattern matched; clarification or LLM fallback is needed.',
   };
 }
 
@@ -170,6 +189,54 @@ function classifyQuery(text, options = {}) {
   };
 }
 
+function buildLLMClassificationMessages(query, history = []) {
+  const { normalizeHistory } = require('../prompt-builder');
+  return [
+    {
+      role: 'system',
+      content: `Classify the user's current request. Return only JSON with {"intent":"${Object.values(INTENTS).join('|')}","actionType":"${Object.values(ACTION_TYPES).join('|')} or null","confidence":0.0,"reason":"short explanation"}. Use ambiguous_query if history and message do not make the intent clear. Use action_intent only when the user is asking to perform a business action. Help/how-to questions about performing actions are help_query. Never claim or perform an action.`,
+    },
+    ...normalizeHistory(history, 8),
+    { role: 'user', content: normalize(query).slice(0, 2000) },
+  ];
+}
+
+function parseLLMClassification(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (!Object.values(INTENTS).includes(value.intent)) return null;
+  const confidence = Number(value.confidence);
+  if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) return null;
+  const actionType = value.actionType == null ? null : value.actionType;
+  if (actionType != null && !Object.values(ACTION_TYPES).includes(actionType)) return null;
+  if (value.intent === INTENTS.ACTION_INTENT && !actionType) return null;
+  if (value.intent !== INTENTS.ACTION_INTENT && actionType) return null;
+  return {
+    intent: value.intent,
+    actionType,
+    confidence,
+    reason: typeof value.reason === 'string' ? value.reason.slice(0, 240) : 'Classified from conversation context.',
+  };
+}
+
+function applyLLMClassification(deterministic, candidate) {
+  if (!deterministic || !candidate || candidate.confidence < 0.65) return deterministic;
+  const requiresClarification = candidate.intent === INTENTS.AMBIGUOUS_QUERY;
+  return {
+    ...deterministic,
+    intent: candidate.intent,
+    confidence: candidate.confidence,
+    actionType: candidate.actionType,
+    requiresClarification,
+    routesToActionEngine: candidate.intent === INTENTS.ACTION_INTENT,
+    reason: candidate.reason,
+    metadata: {
+      ...deterministic.metadata,
+      deterministic: false,
+      classifier: 'llm-fallback',
+    },
+  };
+}
+
 function actionProposalReply(classification) {
   const action = classification.actionType || ACTION_TYPES.GENERIC_ACTION;
   return [
@@ -188,6 +255,9 @@ module.exports = {
   INTENTS,
   ACTION_TYPES,
   classifyQuery,
+  buildLLMClassificationMessages,
+  parseLLMClassification,
+  applyLLMClassification,
   actionProposalReply,
   clarificationReply,
 };

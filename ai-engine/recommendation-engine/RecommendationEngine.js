@@ -21,24 +21,47 @@ function titleForFinding(finding, kind) {
   return `Investigate ${finding.domain || 'business'} anomaly`;
 }
 
+const RULE_RECOMMENDATION_KINDS = Object.freeze({
+  'inventory.stockout_risk': RECOMMENDATION_KINDS.REORDER_STOCK,
+  'inventory.slow_moving_inventory': RECOMMENDATION_KINDS.REDUCE_SLOW_MOVING_INVENTORY,
+  'receivables.overdue_balance': RECOMMENDATION_KINDS.FOLLOW_UP_OVERDUE_RECEIVABLE,
+  'receivables.severely_overdue_balance': RECOMMENDATION_KINDS.FOLLOW_UP_OVERDUE_RECEIVABLE,
+  'tax.vat_collected_estimate': RECOMMENDATION_KINDS.PREPARE_TAX_PAYMENT_REMINDER,
+  'tax.compliance_deadline_overdue': RECOMMENDATION_KINDS.PREPARE_TAX_PAYMENT_REMINDER,
+  'tax.compliance_deadline_approaching': RECOMMENDATION_KINDS.PREPARE_TAX_PAYMENT_REMINDER,
+  'finance.cash_balance_non_positive': RECOMMENDATION_KINDS.REVIEW_CASH_SHORTAGE_RISK,
+  'finance.negative_net_cash_flow': RECOMMENDATION_KINDS.REVIEW_CASH_SHORTAGE_RISK,
+  'finance.negative_profitability': RECOMMENDATION_KINDS.INVESTIGATE_ANOMALY,
+  'finance.negative_gross_margin': RECOMMENDATION_KINDS.INVESTIGATE_ANOMALY,
+  'finance.possible_duplicate_supplier_payment': RECOMMENDATION_KINDS.INVESTIGATE_ANOMALY,
+  'sales.material_revenue_decline': RECOMMENDATION_KINDS.INVESTIGATE_ANOMALY,
+  'sales.no_invoice_activity': RECOMMENDATION_KINDS.INVESTIGATE_ANOMALY,
+  'sales.invoice_without_revenue': RECOMMENDATION_KINDS.INVESTIGATE_ANOMALY,
+  'payables.overdue_balance': RECOMMENDATION_KINDS.INVESTIGATE_ANOMALY,
+  'suppliers.pricing_increase': RECOMMENDATION_KINDS.REVIEW_SUPPLIER_PRICING,
+});
+
 function recommendationKindForFinding(finding) {
-  if (finding.ruleId === 'inventory.stockout_risk') return RECOMMENDATION_KINDS.REORDER_STOCK;
-  if (finding.ruleId === 'receivables.overdue_balance') return RECOMMENDATION_KINDS.FOLLOW_UP_OVERDUE_RECEIVABLE;
-  if (finding.ruleId === 'tax.vat_collected_estimate') return RECOMMENDATION_KINDS.PREPARE_TAX_PAYMENT_REMINDER;
-  if (finding.ruleId === 'finance.cash_balance_non_positive') return RECOMMENDATION_KINDS.REVIEW_CASH_SHORTAGE_RISK;
-  if (finding.ruleId && finding.ruleId.includes('supplier')) return RECOMMENDATION_KINDS.REVIEW_SUPPLIER_PRICING;
-  if (finding.ruleId && finding.ruleId.includes('slow_moving')) return RECOMMENDATION_KINDS.REDUCE_SLOW_MOVING_INVENTORY;
+  if (RULE_RECOMMENDATION_KINDS[finding.ruleId]) return RULE_RECOMMENDATION_KINDS[finding.ruleId];
+  if (finding.domain === AI_DOMAINS.INVENTORY && /slow.?moving/i.test(String(finding.ruleId || finding.title || ''))) {
+    return RECOMMENDATION_KINDS.REDUCE_SLOW_MOVING_INVENTORY;
+  }
+  if ([AI_DOMAINS.PURCHASES, AI_DOMAINS.SUPPLIERS].includes(finding.domain)
+    && /pricing|price.?increase/i.test(String(finding.ruleId || finding.title || ''))) {
+    return RECOMMENDATION_KINDS.REVIEW_SUPPLIER_PRICING;
+  }
   return RECOMMENDATION_KINDS.INVESTIGATE_ANOMALY;
 }
 
-function recommendationTypeForKind(kind) {
+function recommendationTypeForFinding(finding, kind) {
   if ([
     RECOMMENDATION_KINDS.REORDER_STOCK,
     RECOMMENDATION_KINDS.FOLLOW_UP_OVERDUE_RECEIVABLE,
-    RECOMMENDATION_KINDS.PREPARE_TAX_PAYMENT_REMINDER,
   ].includes(kind)) {
     return RECOMMENDATION_TYPES.ACTION_CANDIDATE;
   }
+  if (kind === RECOMMENDATION_KINDS.PREPARE_TAX_PAYMENT_REMINDER
+    && finding.ruleId !== 'tax.vat_collected_estimate') return RECOMMENDATION_TYPES.ACTION_CANDIDATE;
   return RECOMMENDATION_TYPES.INFORMATIONAL;
 }
 
@@ -63,7 +86,7 @@ function recommendationFromFinding(finding, options = {}) {
   return createRecommendation({
     companyId: finding.companyId,
     kind,
-    type: recommendationTypeForKind(kind),
+    type: recommendationTypeForFinding(finding, kind),
     title: titleForFinding(finding, kind),
     rationale: buildRationale(finding, score),
     priorityScore: score.priorityScore,
@@ -86,7 +109,11 @@ function sortRecommendations(recommendations) {
     if (priorityDelta) return priorityDelta;
     const confidenceDelta = Number(b.confidence || 0) - Number(a.confidence || 0);
     if (confidenceDelta) return confidenceDelta;
-    return String(a.kind).localeCompare(String(b.kind));
+    const kindDelta = String(a.kind).localeCompare(String(b.kind));
+    if (kindDelta) return kindDelta;
+    const findingDelta = String(a.sourceFindingIds?.[0] || '').localeCompare(String(b.sourceFindingIds?.[0] || ''));
+    if (findingDelta) return findingDelta;
+    return String(a.id).localeCompare(String(b.id));
   });
 }
 

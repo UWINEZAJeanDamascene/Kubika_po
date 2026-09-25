@@ -16,7 +16,7 @@ const DOMAIN_PERMISSION_HINTS = Object.freeze({
   [AI_DOMAINS.CUSTOMERS]: ['customer', 'client', 'receivable', 'invoice', 'sales'],
   [AI_DOMAINS.SALES]: ['sales', 'invoice', 'client', 'customer'],
   [AI_DOMAINS.FINANCE]: ['finance', 'account', 'report', 'journal', 'payment'],
-  [AI_DOMAINS.TAX]: ['tax', 'vat', 'ebm', 'report'],
+  [AI_DOMAINS.TAX]: ['tax', 'vat', 'ebm', 'report', 'accountant', 'finance'],
 });
 
 function clamp(value, min = 0, max = 1) {
@@ -33,10 +33,15 @@ function estimateFinancialImpact(finding) {
     metadata.overdueBalance,
     metadata.totalOutstandingBalance,
     metadata.cashBalance == null ? null : Math.abs(Number(metadata.cashBalance)),
+    metadata.netCashFlow == null ? null : Math.abs(Number(metadata.netCashFlow)),
     metadata.netProfit == null ? null : Math.abs(Number(metadata.netProfit)),
     metadata.revenue,
+    metadata.previousRevenue,
+    metadata.costOfGoodsSold,
     metadata.vatCollectedEstimate,
-    metadata.riskCount == null ? null : Number(metadata.riskCount) * 100,
+    metadata.days90plus,
+    metadata.riskCount == null ? null : Number(metadata.riskCount) * 1000,
+    metadata.candidateGroups == null ? null : Number(metadata.candidateGroups) * 1000,
   ]
     .map(Number)
     .filter((value) => Number.isFinite(value) && value > 0);
@@ -63,20 +68,32 @@ function roleRelevance(finding, options = {}) {
 }
 
 function recurrenceScore(finding) {
-  const count = Number(finding.occurrenceCount || finding.metadata && finding.metadata.occurrenceCount || 1);
+  const count = Number(finding.occurrenceCount ?? finding.metadata?.occurrenceCount ?? 1);
   return clamp(count / 5, 0.2, 1);
 }
 
+function deadlineUrgency(finding, defaultUrgency) {
+  const days = Number(finding.metadata?.daysUntilDue);
+  if (!Number.isFinite(days)) return defaultUrgency;
+  if (days <= 0) return 1;
+  if (days <= 1) return 0.98;
+  if (days <= 3) return 0.92;
+  if (days <= 7) return 0.82;
+  return defaultUrgency;
+}
+
 function complianceRisk(finding) {
-  if (finding.domain === AI_DOMAINS.TAX) return 1;
-  if (finding.ruleId && finding.ruleId.includes('cash')) return 0.72;
-  if (finding.ruleId && finding.ruleId.includes('receivables')) return 0.45;
+  const ruleId = String(finding.ruleId || '');
+  if (finding.domain === AI_DOMAINS.TAX || ruleId.startsWith('tax.')) return 1;
+  if (ruleId.includes('duplicate_supplier_payment')) return 0.9;
+  if (ruleId.includes('cash')) return 0.8;
+  if (ruleId.includes('receivables') || ruleId.includes('payables')) return 0.65;
   return 0.2;
 }
 
 function scoreRecommendation(finding, options = {}) {
   const financialImpact = estimateFinancialImpact(finding);
-  const urgency = SEVERITY_URGENCY[finding.severity] || 0.2;
+  const urgency = deadlineUrgency(finding, SEVERITY_URGENCY[finding.severity] || 0.2);
   const confidence = clamp(Number(finding.confidence || 0));
   const relevance = roleRelevance(finding, options);
   const recurrence = recurrenceScore(finding);

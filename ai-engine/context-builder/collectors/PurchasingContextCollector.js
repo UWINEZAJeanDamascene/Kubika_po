@@ -154,6 +154,17 @@ async function collect({ companyId, dateRange = {} }) {
         metadata: { asOfPeriod: monthKey(asOfPeriod) },
       }));
     }
+    facts.push(createFact({
+      companyId,
+      domain: AI_DOMAINS.PURCHASES,
+      label: 'Payables aging',
+      value: aging,
+      sourceService: 'MonthlyReportsService',
+      sourceMethod: 'getAPAging',
+      sourceIds: [`ap_aging:${monthKey(asOfPeriod)}`],
+      permissions: REQUIRED_PERMISSIONS,
+      metadata: { asOfPeriod: monthKey(asOfPeriod) },
+    }));
   } catch (error) {
     warnings.push(`Payables aging report failed: ${error.message}`);
   }

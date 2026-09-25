@@ -115,4 +115,56 @@ describe('AI Recommendation Engine', () => {
     expect(result.recommendations).toHaveLength(1);
     expect(result.recommendations[0].sourceFindingIds).toEqual(['open']);
   });
+
+  test('maps every current decision-rule family to the intended recommendation', () => {
+    const cases = [
+      ['finance.negative_net_cash_flow', AI_DOMAINS.FINANCE, RECOMMENDATION_KINDS.REVIEW_CASH_SHORTAGE_RISK],
+      ['finance.negative_profitability', AI_DOMAINS.FINANCE, RECOMMENDATION_KINDS.INVESTIGATE_ANOMALY],
+      ['finance.negative_gross_margin', AI_DOMAINS.FINANCE, RECOMMENDATION_KINDS.INVESTIGATE_ANOMALY],
+      ['finance.possible_duplicate_supplier_payment', AI_DOMAINS.FINANCE, RECOMMENDATION_KINDS.INVESTIGATE_ANOMALY],
+      ['sales.material_revenue_decline', AI_DOMAINS.SALES, RECOMMENDATION_KINDS.INVESTIGATE_ANOMALY],
+      ['sales.no_invoice_activity', AI_DOMAINS.SALES, RECOMMENDATION_KINDS.INVESTIGATE_ANOMALY],
+      ['sales.invoice_without_revenue', AI_DOMAINS.SALES, RECOMMENDATION_KINDS.INVESTIGATE_ANOMALY],
+      ['receivables.severely_overdue_balance', AI_DOMAINS.CUSTOMERS, RECOMMENDATION_KINDS.FOLLOW_UP_OVERDUE_RECEIVABLE],
+      ['payables.overdue_balance', AI_DOMAINS.PURCHASES, RECOMMENDATION_KINDS.INVESTIGATE_ANOMALY],
+      ['tax.compliance_deadline_overdue', AI_DOMAINS.TAX, RECOMMENDATION_KINDS.PREPARE_TAX_PAYMENT_REMINDER],
+      ['tax.compliance_deadline_approaching', AI_DOMAINS.TAX, RECOMMENDATION_KINDS.PREPARE_TAX_PAYMENT_REMINDER],
+    ];
+
+    for (const [ruleId, domain, kind] of cases) {
+      const result = generateRecommendations({ findings: [finding({ id: ruleId, ruleId, domain })] });
+      expect(result.recommendations[0].kind).toBe(kind);
+    }
+  });
+
+  test('uses role, recurrence, financial exposure, and deadline proximity in score factors', () => {
+    const result = generateRecommendations({
+      findings: [finding({
+        id: 'urgent-tax',
+        ruleId: 'tax.compliance_deadline_approaching',
+        domain: AI_DOMAINS.TAX,
+        severity: 'high',
+        occurrenceCount: 5,
+        metadata: { daysUntilDue: 1, overdueBalance: 300000 },
+      })],
+      userRoles: ['accountant'],
+    });
+    const recommendation = result.recommendations[0];
+    expect(recommendation.metadata.scoringFactors).toEqual(expect.objectContaining({
+      financialImpact: 0.82,
+      urgency: 0.98,
+      roleRelevance: 1,
+      recurrence: 1,
+      complianceRisk: 1,
+    }));
+    expect(recommendation.type).toBe(RECOMMENDATION_TYPES.ACTION_CANDIDATE);
+    expect(recommendation.actionIntent).toBe('prepare_tax_payment_reminder');
+  });
+
+  test('breaks exact score ties by finding id for stable order', () => {
+    const result = generateRecommendations({
+      findings: [finding({ id: 'finding_z' }), finding({ id: 'finding_a' })],
+    });
+    expect(result.recommendations.map((item) => item.sourceFindingIds[0])).toEqual(['finding_a', 'finding_z']);
+  });
 });
