@@ -15,18 +15,6 @@
  * 8. Daily Tax Collected
  */
 
-const Invoice = require('../models/Invoice');
-const Purchase = require('../models/Purchase');
-const GoodsReceivedNote = require('../models/GoodsReceivedNote');
-const Supplier = require('../models/Supplier');
-const { BankAccount, BankTransaction } = require('../models/BankAccount');
-const JournalEntry = require('../models/JournalEntry');
-const StockMovement = require('../models/StockMovement');
-const ARReceipt = require('../models/ARReceipt');
-const CreditNote = require('../models/CreditNote');
-const APPayment = require('../models/APPayment');
-const PurchaseReturn = require('../models/PurchaseReturn');
-const Expense = require('../models/Expense');
 const { dbClient } = require('../lib/prisma');
 const { toIdString } = require('../utils/objectId');
 const journalAgg = require('./journalAggregationService');
@@ -249,9 +237,11 @@ class DailyReportsService {
     });
 
     // Get supplier names
-    const supplierIds = Array.from(supplierTotals.keys()).map(id => toObjectId(id));
-    const suppliers = await Supplier.find({ _id: { $in: supplierIds } }, 'name');
-    const supplierMap = new Map(suppliers.map(s => [s._id.toString(), s.name]));
+    const supplierIds = Array.from(supplierTotals.keys());
+    const suppliers = supplierIds.length
+      ? await dbClient().supplier.findMany({ where: { id: { in: supplierIds } }, select: { id: true, name: true } })
+      : [];
+    const supplierMap = new Map(suppliers.map((supplier) => [supplier.id, supplier.name]));
 
     // Convert to array, sort by amount, and take top 5
     const topSuppliers = Array.from(supplierTotals.values())
@@ -307,50 +297,47 @@ class DailyReportsService {
     const { start, end } = getDateRange(dateStr);
     
     // Get all bank accounts for the company
-    const accounts = await BankAccount.find({ company: companyId, isActive: true });
+    const accounts = await dbClient().bankAccount.findMany({
+      where: { companyId: String(companyId), isActive: true },
+    });
     
     const accountPositions = await Promise.all(
       accounts.map(async (account) => {
         // Get opening balance (balance at start of day)
-        const lastTransactionBefore = await BankTransaction.findOne({
-          company: toObjectId(companyId),
-          account: toObjectId(account._id),
-          date: { $lt: new Date(start) }
-        }).sort({ date: -1 });
+        const lastTransactionBefore = await dbClient().bankTransaction.findFirst({
+          where: {
+            companyId: String(companyId),
+            bankAccountId: account.id,
+            date: { lt: new Date(start) },
+          },
+          orderBy: { date: 'desc' },
+        });
         
         const openingBalance = lastTransactionBefore
           ? toNumber(lastTransactionBefore.balanceAfter)
           : toNumber(account.openingBalance);
         
         // Get today's transactions
-        const transactions = await BankTransaction.aggregate([
-          {
-            $match: {
-              company: toObjectId(companyId),
-              account: toObjectId(account._id),
-              date: { $gte: new Date(start), $lte: new Date(end) }
-            }
+        const transactions = await dbClient().bankTransaction.findMany({
+          where: {
+            companyId: String(companyId),
+            bankAccountId: account.id,
+            date: { gte: new Date(start), lte: new Date(end) },
           },
-          {
-            $group: {
-              _id: '$type',
-              total: { $sum: { $toDouble: { $ifNull: ['$amount', 0] } } },
-              count: { $sum: 1 }
-            }
-          }
-        ]);
+          select: { type: true, amount: true },
+        });
         
         const receipts = transactions
-          .filter(t => ['deposit', 'transfer_in', 'opening'].includes(t._id))
-          .reduce((sum, t) => sum + toNumber(t.total), 0);
+          .filter((t) => ['deposit', 'transfer_in', 'opening'].includes(t.type))
+          .reduce((sum, t) => sum + toNumber(t.amount), 0);
         const payments = transactions
-          .filter(t => ['withdrawal', 'transfer_out', 'closing'].includes(t._id))
-          .reduce((sum, t) => sum + toNumber(t.total), 0);
+          .filter((t) => ['withdrawal', 'transfer_out', 'closing'].includes(t.type))
+          .reduce((sum, t) => sum + toNumber(t.amount), 0);
         const adjustments = transactions
-          .filter(t => t._id === 'adjustment')
-          .reduce((sum, t) => sum + toNumber(t.total), 0);
+          .filter((t) => t.type === 'adjustment')
+          .reduce((sum, t) => sum + toNumber(t.amount), 0);
         
-        const ledgerAccountId = account.ledgerAccountId || account.chartAccount || null;
+        const ledgerAccountId = account.ledgerAccountId || null;
         // NUMBER CHANGE: this returned nothing before. The leading $match
         // filtered on 'lines.accountCode', a path into the lines *array*, which
         // the shim's getPath cannot walk — so every entry was discarded before
@@ -370,7 +357,7 @@ class DailyReportsService {
           : 0;
         
         return {
-          accountId: account._id,
+          accountId: account.id,
           accountName: account.name,
           accountNumber: account.accountNumber,
           bankName: account.bankName,
@@ -410,13 +397,17 @@ class DailyReportsService {
     const { start, end } = getDateRange(dateStr);
     
     // Get all movements for the day
-    const movements = await StockMovement.find({
-      company: toObjectId(companyId),
-      movementDate: { $gte: new Date(start), $lte: new Date(end) }
-    })
-    .populate('product', 'name sku')
-    .populate('warehouse', 'name')
-    .sort({ movementDate: 1 });
+    const movements = await dbClient().stockMovement.findMany({
+      where: {
+        companyId: String(companyId),
+        movementDate: { gte: new Date(start), lte: new Date(end) },
+      },
+      include: {
+        product: { select: { id: true, name: true, sku: true } },
+        warehouse: { select: { name: true } },
+      },
+      orderBy: { movementDate: 'asc' },
+    });
     
     // Group by type (type field is 'in'/'out', reason field has the specific reason)
     const stockIn = movements.filter(m => m.type === 'in' || ['purchase', 'return', 'transfer_in', 'initial_stock', 'audit_surplus'].includes(m.reason));
@@ -451,8 +442,8 @@ class DailyReportsService {
         netMovement: totalIn - totalOut
       },
       movements: movements.map(m => ({
-        movementId: m._id,
-        productId: m.product?._id,
+        movementId: m.id,
+        productId: m.product?.id,
         productName: m.product?.name || 'Unknown',
         sku: m.product?.sku,
         warehouse: m.warehouse?.name || 'Unknown',
@@ -463,7 +454,7 @@ class DailyReportsService {
         totalValue: movementValue(m),
         reference: m.referenceNumber,
         notes: m.notes,
-        runningBalance: toNumber(m.newStock) || balanceMap.get(m.product?._id?.toString()) || 0,
+        runningBalance: toNumber(m.newStock) || balanceMap.get(m.product?.id?.toString()) || 0,
         date: m.movementDate
       })),
       generatedAt: new Date().toISOString()
@@ -479,42 +470,43 @@ class DailyReportsService {
     
     // Fetch all data in parallel with optimized projections and lean()
     const [newInvoices, paymentsReceived, creditNotes, invoiceTotals] = await Promise.all([
-      // New invoices - only fetch needed fields
-      Invoice.find({
-        company: toObjectId(companyId),
-        invoiceDate: { $gte: new Date(start), $lte: new Date(end) },
-        status: { $in: ['confirmed', 'partially_paid', 'fully_paid'] }
-      }, { 
-        referenceNo: 1, invoiceDate: 1, totalAmount: 1, total: 1,
-        status: 1, client: 1 
-      })
-      .populate('client', 'name')
-      .lean(),
+        dbClient().invoice.findMany({
+          where: {
+            companyId: String(companyId),
+            invoiceDate: { gte: new Date(start), lte: new Date(end) },
+            status: { in: ['confirmed', 'partially_paid', 'fully_paid'] },
+          },
+          select: {
+            id: true, referenceNo: true, invoiceDate: true, totalAmount: true,
+            status: true, client: { select: { name: true } },
+          },
+        }),
       
       // Payments received
-      ARReceipt.find({
-        company: toObjectId(companyId),
-        receiptDate: { $gte: new Date(start), $lte: new Date(end) },
-        status: 'posted'
-      }, {
-        referenceNo: 1, receiptDate: 1, amountReceived: 1,
-        paymentMethod: 1, client: 1
-      })
-      .populate('client', 'name')
-      .lean(),
+        dbClient().aRReceipt.findMany({
+          where: {
+            companyId: String(companyId),
+            receiptDate: { gte: new Date(start), lte: new Date(end) },
+            status: 'posted',
+          },
+          select: {
+            id: true, referenceNo: true, receiptDate: true, amountReceived: true,
+            paymentMethod: true, client: { select: { name: true } },
+          },
+        }),
       
       // Credit notes
-      CreditNote.find({
-        company: toObjectId(companyId),
-        creditDate: { $gte: new Date(start), $lte: new Date(end) },
-        status: { $in: ['confirmed', 'issued', 'applied', 'partially_refunded', 'refunded'] }
-      }, {
-        referenceNo: 1, creditNoteNumber: 1, creditDate: 1, totalAmount: 1, total: 1,
-        reason: 1, status: 1, client: 1, invoice: 1
-      })
-      .populate('client', 'name')
-      .populate('invoice', 'referenceNo')
-      .lean(),
+        dbClient().creditNote.findMany({
+          where: {
+            companyId: String(companyId),
+            creditDate: { gte: new Date(start), lte: new Date(end) },
+            status: { in: ['confirmed', 'issued', 'applied', 'partially_refunded', 'refunded'] },
+          },
+          select: {
+            id: true, referenceNo: true, creditDate: true, totalAmount: true,
+            reason: true, client: { select: { name: true } }, invoice: { select: { referenceNo: true } },
+          },
+        }),
       
       dbClient().invoice.aggregate({
         where: {
@@ -584,41 +576,43 @@ class DailyReportsService {
     // Fetch all data in parallel with optimized projections and lean()
     const [newBills, paymentsMade, purchaseReturns, purchaseTotals] = await Promise.all([
       // New bills (purchases) - only fetch needed fields
-      Purchase.find({
-        company: toObjectId(companyId),
-        purchaseDate: { $gte: new Date(start), $lte: new Date(end) },
-        status: { $in: ['received', 'partial', 'paid'] }
-      }, {
-        purchaseNumber: 1, purchaseDate: 1, grandTotal: 1, total: 1,
-        status: 1, supplier: 1
-      })
-      .populate('supplier', 'name')
-      .lean(),
+      dbClient().purchase.findMany({
+        where: {
+          companyId: String(companyId),
+          purchaseDate: { gte: new Date(start), lte: new Date(end) },
+          status: { in: ['received', 'partial', 'paid'] },
+        },
+        select: {
+          id: true, purchaseNumber: true, purchaseDate: true, totalAmount: true,
+          status: true, supplier: { select: { name: true } },
+        },
+      }),
       
       // Payments made
-      APPayment.find({
-        company: toObjectId(companyId),
-        paymentDate: { $gte: new Date(start), $lte: new Date(end) },
-        status: 'posted'
-      }, {
-        referenceNo: 1, paymentDate: 1, amountPaid: 1,
-        paymentMethod: 1, supplier: 1
-      })
-      .populate('supplier', 'name')
-      .lean(),
+      dbClient().aPPayment.findMany({
+        where: {
+          companyId: String(companyId),
+          paymentDate: { gte: new Date(start), lte: new Date(end) },
+          status: 'posted',
+        },
+        select: {
+          id: true, referenceNo: true, paymentDate: true, amountPaid: true,
+          paymentMethod: true, supplier: { select: { name: true } },
+        },
+      }),
       
       // Purchase returns (debit notes)
-      PurchaseReturn.find({
-        company: toObjectId(companyId),
-        returnDate: { $gte: new Date(start), $lte: new Date(end) },
-        status: 'confirmed'
-      }, {
-        referenceNo: 1, returnDate: 1, totalAmount: 1,
-        reason: 1, supplier: 1, grn: 1
-      })
-      .populate('supplier', 'name')
-      .populate('grn', 'referenceNo')
-      .lean(),
+      dbClient().purchaseReturn.findMany({
+        where: {
+          companyId: String(companyId),
+          returnDate: { gte: new Date(start), lte: new Date(end) },
+          status: 'confirmed',
+        },
+        select: {
+          id: true, referenceNo: true, returnDate: true, totalAmount: true,
+          reason: true, supplier: { select: { name: true } }, grn: { select: { referenceNo: true } },
+        },
+      }),
       
       dbClient().purchase.aggregate({
         where: {
@@ -649,15 +643,15 @@ class DailyReportsService {
         netAPChange: newBillsTotal - paymentsTotal - returnsTotal
       },
       newBills: newBills.map(bill => ({
-        purchaseId: bill._id,
+        purchaseId: bill.id,
         purchaseNumber: bill.purchaseNumber,
         supplierName: bill.supplier?.name || 'Unknown',
         date: bill.purchaseDate,
-        total: toNumber(bill.grandTotal) || toNumber(bill.total),
+        total: toNumber(bill.totalAmount),
         status: bill.status
       })),
       paymentsMade: paymentsMade.map(p => ({
-        paymentId: p._id,
+        paymentId: p.id,
         paymentNumber: p.referenceNo,
         supplierName: p.supplier?.name || 'Unknown',
         purchaseNumber: '',
@@ -666,7 +660,7 @@ class DailyReportsService {
         paymentMethod: p.paymentMethod
       })),
       purchaseReturns: purchaseReturns.map(pr => ({
-        returnId: pr._id,
+        returnId: pr.id,
         returnNumber: pr.referenceNo,
         supplierName: pr.supplier?.name || 'Unknown',
         purchaseNumber: pr.grn?.referenceNo || '',
@@ -685,13 +679,20 @@ class DailyReportsService {
   static async getDailyJournalEntries(companyId, dateStr) {
     const { start, end } = getDateRange(dateStr);
     
-    const entries = await JournalEntry.find({
-      company: toObjectId(companyId),
-      date: { $gte: new Date(start), $lte: new Date(end) },
-      status: 'posted'
-    })
-    .populate('createdBy', 'firstName lastName')
-    .sort({ createdAt: 1 });
+    const entries = await dbClient().journalEntry.findMany({
+      where: {
+        companyId: String(companyId),
+        date: { gte: new Date(start), lte: new Date(end) },
+        status: 'posted',
+      },
+      include: { lines: true },
+      orderBy: { createdAt: 'asc' },
+    });
+    const creatorIds = [...new Set(entries.map((entry) => entry.createdById).filter(Boolean))];
+    const creators = creatorIds.length
+      ? await dbClient().user.findMany({ where: { id: { in: creatorIds } }, select: { id: true, name: true } })
+      : [];
+    const creatorMap = new Map(creators.map((creator) => [creator.id, creator.name]));
     
     return {
       reportName: 'Daily Journal Entries Log',
@@ -707,12 +708,12 @@ class DailyReportsService {
         }, 0), 0)
       },
       entries: entries.map(entry => ({
-        entryId: entry._id,
+        entryId: entry.id,
         entryNumber: entry.entryNumber,
         date: entry.date,
         description: entry.description,
         reference: entry.reference,
-        postedBy: entry.createdBy ? `${entry.createdBy.firstName} ${entry.createdBy.lastName}` : 'System',
+        postedBy: creatorMap.get(entry.createdById) || 'System',
         totalDebit: toNumber(entry.totalDebit) || entry.lines.reduce((sum, l) => sum + toNumber(l.debit), 0),
         totalCredit: toNumber(entry.totalCredit) || entry.lines.reduce((sum, l) => sum + toNumber(l.credit), 0),
         lines: entry.lines.map(line => ({

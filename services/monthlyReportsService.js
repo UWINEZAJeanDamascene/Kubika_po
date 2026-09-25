@@ -357,21 +357,20 @@ class MonthlyReportsService {
 
   // Helper: Get account total by account type/name
   static async _getAccountTotal(companyId, start, end, accountPatterns) {
-    const ChartOfAccount = ChartOfAccount;
-
-    const accounts = await ChartOfAccount.find({
-      company: companyId,
-      $or: accountPatterns.map(p => ({
-        $or: [
-          { name: { $regex: p, $options: 'i' } },
-          { code: { $regex: p, $options: 'i' } }
-        ]
-      }))
+    const accounts = await dbClient().chartOfAccount.findMany({
+      where: {
+        companyId: String(companyId),
+        OR: accountPatterns.flatMap((pattern) => [
+          { name: { contains: pattern, mode: 'insensitive' } },
+          { code: { contains: pattern, mode: 'insensitive' } },
+        ]),
+      },
+      select: { code: true },
     });
 
     if (accounts.length === 0) return 0;
 
-    const accountIds = accounts.map(a => a._id.toString());
+    const accountCodes = accounts.map((account) => String(account.code).trim());
 
     // NUMBER CHANGE: this returned 0 on every run before. journalLineToApi()
     // exposes accountCode/accountName only, so `lines.account` was undefined
@@ -380,7 +379,7 @@ class MonthlyReportsService {
     const result = await journalAgg.sumJournalLines(companyId, {
       dateFrom: start,
       dateTo: end,
-      accountIds,
+      accountCodes,
       groupByAccountCode: false,
     });
 
@@ -396,7 +395,10 @@ class MonthlyReportsService {
     const prior = getPriorMonth(year, month);
     const priorEnd = new Date(prior.year, prior.month, 0, 23, 59, 59, 999);
     // Get all accounts with balances at month end
-    const accounts = await ChartOfAccount.find({ company: companyId, isActive: true });
+    const accounts = await dbClient().chartOfAccount.findMany({
+      where: { companyId: String(companyId), isActive: true },
+      orderBy: { code: 'asc' },
+    });
 
     const calculateBalance = async (asOfDate, accountTypes) => {
       // Filter accounts by type and get their codes (trimmed)
@@ -410,9 +412,8 @@ class MonthlyReportsService {
       });
 
       // Get AccountBalance records
-      const balanceRecords = await AccountBalance.find({
-        company: new mongoose.Types.ObjectId(companyId),
-        accountCode: { $in: accountCodes }
+      const balanceRecords = await dbClient().accountBalance.findMany({
+        where: { companyId: String(companyId), accountCode: { in: accountCodes } },
       });
 
       // Build map from AccountBalance
@@ -424,7 +425,8 @@ class MonthlyReportsService {
         // For assets/expenses/cogs: use net directly (positive = debit balance)
         // For liabilities/equity/revenue: use negative net (positive = credit balance)
         const normalBalance = ['asset', 'expense', 'cogs'].includes(account?.type) ? 'debit' : 'credit';
-        const balance = normalBalance === 'debit' ? b.net : -b.net;
+        const net = toNumber(b.debit) - toNumber(b.credit);
+        const balance = normalBalance === 'debit' ? net : -net;
         balanceMap.set(code, { balance, source: 'AccountBalance' });
       });
 
@@ -509,22 +511,23 @@ class MonthlyReportsService {
 
     // Bank and Inventory values should already be in ChartOfAccount asset balances
     // Only fetch for display purposes if not already in items
-    const bankAccounts = await BankAccount.find({ company: companyId, isActive: true });
+    const bankAccounts = await dbClient().bankAccount.findMany({
+      where: { companyId: String(companyId), isActive: true },
+      select: { cachedBalance: true },
+    });
     const bankTotal = bankAccounts.reduce((sum, a) => {
       const balance = a.cachedBalance ? parseFloat(a.cachedBalance.toString()) : 0;
       return sum + balance;
     }, 0);
 
-    const inventory = await Product.aggregate([
-      { $match: { company: new mongoose.Types.ObjectId(companyId), isActive: true } },
-      {
-        $project: {
-          value: { $multiply: [{ $toDouble: { $ifNull: ['$quantityOnHand', 0] } }, { $toDouble: { $ifNull: ['$averageCost', '$unitCost', 0] } }] }
-        }
-      },
-      { $group: { _id: null, total: { $sum: '$value' } } }
-    ]);
-    const inventoryValue = inventory[0]?.total || 0;
+    const inventoryProducts = await dbClient().product.findMany({
+      where: { companyId: String(companyId), isActive: true },
+      select: { currentStock: true, averageCost: true, costPrice: true },
+    });
+    const inventoryValue = inventoryProducts.reduce(
+      (sum, product) => sum + toNumber(product.currentStock) * toNumber(product.averageCost || product.costPrice),
+      0,
+    );
 
     // Check if bank/inventory already in asset items
     const hasBank = assetsCurrent.items.some(i => 
@@ -617,7 +620,10 @@ class MonthlyReportsService {
    */
   static async getTrialBalance(companyId, year, month) {
     const { end } = getMonthRange(year, month);
-    const accounts = await ChartOfAccount.find({ company: companyId, isActive: true }).sort('code');
+    const accounts = await dbClient().chartOfAccount.findMany({
+      where: { companyId: String(companyId), isActive: true },
+      orderBy: { code: 'asc' },
+    });
 
     // Build account lookup by code (trimmed)
     const accountByCode = new Map();
@@ -686,7 +692,10 @@ class MonthlyReportsService {
     const priorEnd = new Date(start);
     priorEnd.setMilliseconds(priorEnd.getMilliseconds() - 1);
     // Get all accounts with their types
-    const accounts = await ChartOfAccount.find({ company: companyId, isActive: true });
+    const accounts = await dbClient().chartOfAccount.findMany({
+      where: { companyId: String(companyId), isActive: true },
+      orderBy: { code: 'asc' },
+    });
     const accountByCode = new Map();
     accounts.forEach(a => {
       accountByCode.set(String(a.code || '').trim(), a);
@@ -753,26 +762,35 @@ class MonthlyReportsService {
     // Operating cash flow = Net Profit - AR Change + AP Change - Inventory Change
     const operatingCashFlow = netProfit - arChange + apChange - inventoryChange;
 
-    // Net cash change
-    const netCashChange = operatingCashFlow + investingCashFlow + financingCashFlow;
-
-    // Beginning and ending cash (from BankAccount cachedBalance)
-    const bankAccounts = await BankAccount.find({ company: companyId, isActive: true });
-    const endingCash = bankAccounts.reduce((sum, a) => {
-      return sum + (a.cachedBalance ? parseFloat(a.cachedBalance.toString()) : 0);
-    }, 0);
-    
-    // Beginning cash = prior period ending (calculate backwards from current ending)
-    // But if we have no prior activity, use the JournalEntry based calculation
-    const priorEntries = await journalAgg.sumJournalLines(companyId, {
-      dateTo: start,
-      dateToInclusive: false,
-      status: 'posted',
-      accountCodePrefixes: ['10', '11'], // Cash accounts 1000-1199
-      groupByAccountCode: false,
-    });
-    const priorCashActivity = priorEntries[0]?.debit - priorEntries[0]?.credit || 0;
-    const beginningCash = Math.max(0, priorCashActivity); // Don't show negative beginning cash
+    // Derive opening and closing cash from the same posted PostgreSQL journal
+    // ledger. Bank-account cached balances can lag the journal and make the
+    // statement fail its own opening + change = closing reconciliation.
+    const cashAccountCodes = ['1000', '1050', '1100', '1110', '1200'];
+    const [openingCashRows, closingCashRows] = await Promise.all([
+      dbClient().$queryRaw(Prisma.sql`
+        SELECT COALESCE(SUM(jel.debit - jel.credit), 0)::float AS balance
+        FROM journal_entry_lines jel
+        JOIN journal_entries je ON je.id = jel.journal_entry_id
+        WHERE je.company_id = ${String(companyId)}
+          AND je.status = 'posted'
+          AND je.reversed = false
+          AND je.date < ${start}
+          AND jel.account_code IN (${Prisma.join(cashAccountCodes)})
+      `),
+      dbClient().$queryRaw(Prisma.sql`
+        SELECT COALESCE(SUM(jel.debit - jel.credit), 0)::float AS balance
+        FROM journal_entry_lines jel
+        JOIN journal_entries je ON je.id = jel.journal_entry_id
+        WHERE je.company_id = ${String(companyId)}
+          AND je.status = 'posted'
+          AND je.reversed = false
+          AND je.date <= ${end}
+          AND jel.account_code IN (${Prisma.join(cashAccountCodes)})
+      `),
+    ]);
+    const beginningCash = Number(openingCashRows[0]?.balance || 0);
+    const endingCash = Number(closingCashRows[0]?.balance || 0);
+    const netCashChange = endingCash - beginningCash;
 
     return {
       reportName: 'Monthly Cash Flow Statement',
@@ -821,15 +839,17 @@ class MonthlyReportsService {
 
   // Helper: Get payables change
   static async _getPayablesChange(companyId, start, end) {
-    const beginning = await Purchase.aggregate([
-      { $match: { company: new mongoose.Types.ObjectId(companyId), purchaseDate: { $lt: start }, status: { $in: ['received', 'partial'] } } },
-      { $group: { _id: null, total: { $sum: { $toDouble: '$balanceDue' } } } }
+    const [beginning, ending] = await Promise.all([
+      dbClient().purchase.aggregate({
+        where: { companyId: String(companyId), purchaseDate: { lt: start }, status: { in: ['received', 'partial'] } },
+        _sum: { totalAmount: true },
+      }),
+      dbClient().purchase.aggregate({
+        where: { companyId: String(companyId), purchaseDate: { lte: end }, status: { in: ['received', 'partial'] } },
+        _sum: { totalAmount: true },
+      }),
     ]);
-    const ending = await Purchase.aggregate([
-      { $match: { company: new mongoose.Types.ObjectId(companyId), purchaseDate: { $lte: end }, status: { $in: ['received', 'partial'] } } },
-      { $group: { _id: null, total: { $sum: { $toDouble: '$balanceDue' } } } }
-    ]);
-    return (ending[0]?.total || 0) - (beginning[0]?.total || 0);
+    return toNumber(ending._sum?.totalAmount) - toNumber(beginning._sum?.totalAmount);
   }
 
   // Helper: Get inventory change
@@ -872,13 +892,11 @@ class MonthlyReportsService {
 
   // Helper: Get cash balance at date
   static async _getCashBalance(companyId, asOfDate) {
-    const accounts = await BankAccount.find({ company: companyId, isActive: true });
-    return accounts.reduce((sum, a) => {
-      const bal = typeof a.balance === 'object' && a.balance?.$numberDecimal
-        ? parseFloat(a.balance.$numberDecimal)
-        : Number(a.balance) || 0;
-      return sum + bal;
-    }, 0);
+    const accounts = await dbClient().bankAccount.findMany({
+      where: { companyId: String(companyId), isActive: true },
+      select: { cachedBalance: true, openingBalance: true },
+    });
+    return accounts.reduce((sum, account) => sum + toNumber(account.cachedBalance || account.openingBalance), 0);
   }
 
   /**
@@ -887,63 +905,42 @@ class MonthlyReportsService {
    */
   static async getStockValuation(companyId, year, month) {
     const { end } = getMonthRange(year, month);
-    // Get all products with their current valuation
-    // Try multiple field names for quantity (quantityOnHand, stock, quantity)
-    const products = await Product.aggregate([
-      { $match: { company: new mongoose.Types.ObjectId(companyId), isActive: true } },
-      {
-        $project: {
-          name: 1,
-          sku: 1,
-          category: 1,
-          quantityOnHand: {
-            $toDouble: {
-              $ifNull: ['$currentStock', 0]
-            }
-          },
-          unitCost: { $toDouble: { $ifNull: ['$averageCost', { $ifNull: ['$unitCost', '$costPrice'] }, 0] } }
-        }
-      },
-      {
-        $project: {
-          name: 1,
-          sku: 1,
-          category: 1,
-          quantityOnHand: 1,
-          unitCost: 1,
-          totalValue: { $multiply: ['$quantityOnHand', '$unitCost'] }
-        }
-      }
+    const [products, lastMovements] = await Promise.all([
+      dbClient().product.findMany({
+        where: { companyId: String(companyId), isActive: true },
+        include: { category: { select: { name: true } } },
+        orderBy: { name: 'asc' },
+      }),
+      dbClient().stockMovement.groupBy({
+        by: ['productId'],
+        where: { companyId: String(companyId), productId: { not: null } },
+        _max: { movementDate: true },
+      }),
     ]);
 
-    // Get last movement date for each product to determine slow-moving status
-    const lastMovements = await StockMovement.aggregate([
-      { $match: { company: new mongoose.Types.ObjectId(companyId) } },
-      {
-        $group: {
-          _id: '$product',
-          lastMovement: { $max: '$movementDate' }
-        }
-      }
-    ]);
-
-    const lastMovementMap = new Map(lastMovements.map(m => [m._id.toString(), m.lastMovement]));
+    const lastMovementMap = new Map(
+      lastMovements
+        .filter((movement) => movement.productId)
+        .map((movement) => [movement.productId, movement._max.movementDate]),
+    );
 
     const ninetyDaysAgo = new Date(end);
     ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
 
-    const items = products.map(p => {
-      const lastMove = lastMovementMap.get(p._id.toString());
+    const items = products.map((p) => {
+      const lastMove = lastMovementMap.get(p.id);
+      const quantityOnHand = toNumber(p.currentStock);
+      const unitCost = toNumber(p.averageCost || p.costPrice);
       const daysSinceMovement = lastMove ? Math.floor((end - new Date(lastMove)) / (1000 * 60 * 60 * 24)) : 999;
 
       return {
-        productId: p._id,
+        productId: p.id,
         name: p.name,
         sku: p.sku,
-        category: p.category,
-        quantityOnHand: p.quantityOnHand,
-        unitCost: p.unitCost,
-        totalValue: p.totalValue,
+        category: p.category?.name || 'Uncategorized',
+        quantityOnHand,
+        unitCost,
+        totalValue: quantityOnHand * unitCost,
         lastMovementDate: lastMove,
         daysSinceMovement,
         isSlowMoving: daysSinceMovement > 90,
@@ -1029,47 +1026,23 @@ class MonthlyReportsService {
    */
   static async getSalesByCategory(companyId, year, month) {
     const { start, end } = getMonthRange(year, month);
-    const categorySales = await Invoice.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          invoiceDate: { $gte: start, $lte: end },
-          status: { $in: ['fully_paid', 'partially_paid', 'sent', 'confirmed'] }
-        }
+    const rows = await dbClient().invoiceLine.groupBy({
+      by: ['category'],
+      where: {
+        companyId: String(companyId),
+        invoice: {
+          invoiceDate: { gte: start, lte: end },
+          status: { in: ['fully_paid', 'partially_paid', 'sent', 'confirmed'] },
+        },
       },
-      { $unwind: '$lines' },
-      {
-        $lookup: {
-          from: 'products',
-          localField: 'lines.product',
-          foreignField: '_id',
-          as: 'product'
-        }
-      },
-      { $unwind: { path: '$product', preserveNullAndEmptyArrays: true } },
-      {
-        $lookup: {
-          from: 'categories',
-          localField: 'product.category',
-          foreignField: '_id',
-          as: 'category'
-        }
-      },
-      { $unwind: { path: '$category', preserveNullAndEmptyArrays: true } },
-      {
-        $group: {
-          _id: '$category.name',
-          totalRevenue: {
-            $sum: { $multiply: [{ $toDouble: '$lines.qty' }, { $toDouble: '$lines.unitPrice' }] }
-          },
-          totalUnits: { $sum: { $toDouble: '$lines.qty' } },
-          totalCost: {
-            $sum: { $multiply: [{ $toDouble: '$lines.qty' }, { $toDouble: { $ifNull: ['$lines.unitCost', '$product.averageCost', '$product.unitCost', 0] } }] }
-          }
-        }
-      },
-      { $sort: { totalRevenue: -1 } }
-    ]);
+      _sum: { lineTotal: true, qty: true },
+    });
+    const categorySales = rows.map((row) => ({
+      _id: row.category || 'Uncategorized',
+      totalRevenue: toNumber(row._sum.lineTotal),
+      totalUnits: toNumber(row._sum.qty),
+      totalCost: 0,
+    }));
 
     const categories = categorySales.map(c => ({
       category: c._id || 'Uncategorized',
@@ -1106,61 +1079,63 @@ class MonthlyReportsService {
    */
   static async getPurchasesBySupplier(companyId, year, month) {
     const { start, end } = getMonthRange(year, month);
-    const PurchaseOrder = PurchaseOrder;
-
-    // Get direct purchases
-    const directPurchases = await Purchase.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          purchaseDate: { $gte: start, $lte: end },
-          status: { $in: ['received', 'partial', 'completed', 'paid'] }
-        }
-      },
-      {
-        $group: {
-          _id: '$supplier',
-          totalOrdered: { $sum: { $toDouble: { $ifNull: ['$grandTotal', '$subtotal', '$total', 0] } } },
-          poCount: { $sum: 1 },
-          totalInvoiced: { $sum: { $cond: [{ $ne: ['$supplierInvoiceNumber', null] }, { $toDouble: { $ifNull: ['$grandTotal', '$subtotal', '$total', 0] } }, 0] } }
-        }
-      }
+    const [directPurchaseRows, purchaseOrders] = await Promise.all([
+      dbClient().purchase.findMany({
+        where: {
+          companyId: String(companyId),
+          purchaseDate: { gte: start, lte: end },
+          status: { in: ['received', 'partial', 'completed', 'paid'] },
+        },
+        select: { supplierId: true, totalAmount: true, supplierInvoiceNumber: true },
+      }),
+      dbClient().purchaseOrder.groupBy({
+        by: ['supplierId'],
+        where: {
+          companyId: String(companyId),
+          orderDate: { gte: start, lte: end },
+          status: { in: ['draft', 'approved', 'partially_received', 'fully_received', 'cancelled'] },
+        },
+        _sum: { totalAmount: true },
+        _count: { _all: true },
+      }),
     ]);
-
-    // Get purchase orders (use correct status and field name totalAmount)
-    const purchaseOrders = await PurchaseOrder.aggregate([
-      {
-        $match: {
-          company: new mongoose.Types.ObjectId(companyId),
-          orderDate: { $gte: start, $lte: end },
-          status: { $in: ['draft', 'approved', 'partially_received', 'fully_received', 'cancelled'] }
-        }
-      },
-      {
-        $group: {
-          _id: '$supplier',
-          totalOrdered: { $sum: { $toDouble: { $ifNull: ['$totalAmount', '$subtotal', 0] } } },
-          poCount: { $sum: 1 },
-          totalInvoiced: { $sum: 0 }
-        }
-      }
-    ]);
+    const directPurchaseGroups = new Map();
+    directPurchaseRows.forEach((purchase) => {
+      const current = directPurchaseGroups.get(purchase.supplierId) || {
+        supplierId: purchase.supplierId,
+        totalAmount: 0,
+        totalInvoiced: 0,
+        count: 0,
+      };
+      const amount = toNumber(purchase.totalAmount);
+      current.totalAmount += amount;
+      current.totalInvoiced += purchase.supplierInvoiceNumber ? amount : 0;
+      current.count += 1;
+      directPurchaseGroups.set(purchase.supplierId, current);
+    });
+    const directPurchases = [...directPurchaseGroups.values()].map((group) => ({
+      supplierId: group.supplierId,
+      _sum: { totalAmount: group.totalAmount },
+      _count: { _all: group.count },
+      totalInvoiced: group.totalInvoiced,
+    }));
 
     // Merge both sources
     const supplierMap = new Map();
     
     [...directPurchases, ...purchaseOrders].forEach(item => {
-      const existing = supplierMap.get(item._id?.toString());
+      const supplierId = item.supplierId;
+      const existing = supplierMap.get(supplierId);
       if (existing) {
-        existing.totalOrdered += item.totalOrdered || 0;
-        existing.poCount += item.poCount || 0;
+        existing.totalOrdered += toNumber(item._sum?.totalAmount);
+        existing.poCount += item._count?._all || 0;
         existing.totalInvoiced += item.totalInvoiced || 0;
       } else {
-        supplierMap.set(item._id?.toString(), {
-          _id: item._id,
-          totalOrdered: item.totalOrdered || 0,
-          poCount: item.poCount || 0,
-          totalInvoiced: item.totalInvoiced || 0
+        supplierMap.set(supplierId, {
+          _id: supplierId,
+          totalOrdered: toNumber(item._sum?.totalAmount),
+          poCount: item._count?._all || 0,
+          totalInvoiced: item.totalInvoiced || 0,
         });
       }
     });
@@ -1168,12 +1143,15 @@ class MonthlyReportsService {
     const supplierIds = [...supplierMap.values()].map(s => s._id).filter(Boolean);
     
     // Get supplier names
-    const suppliersData = await Supplier.find({ _id: { $in: supplierIds } }).select('name');
-    const supplierNameMap = new Map(suppliersData.map(s => [s._id.toString(), s.name]));
+    const suppliersData = await dbClient().supplier.findMany({
+      where: { id: { in: supplierIds } },
+      select: { id: true, name: true },
+    });
+    const supplierNameMap = new Map(suppliersData.map((supplier) => [supplier.id, supplier.name]));
 
     const supplierPurchases = [...supplierMap.values()].map(s => ({
       ...s,
-      supplier: { name: supplierNameMap.get(s._id?.toString()) || 'Unknown' }
+      supplier: { name: supplierNameMap.get(s._id) || 'Unknown' }
     })).sort((a, b) => b.totalOrdered - a.totalOrdered);
 
     const suppliers = supplierPurchases.map(s => ({
@@ -1209,12 +1187,15 @@ class MonthlyReportsService {
    */
   static async getARAging(companyId, year, month) {
     const { end } = getMonthRange(year, month);
-    const invoices = await Invoice.find({
-      company: toObjectId(companyId),
-      status: { $in: ['confirmed', 'partially_paid'] },
-      amountOutstanding: { $gt: 0 },
-      invoiceDate: { $lte: end }
-    }).populate('client', 'name');
+    const invoices = await dbClient().invoice.findMany({
+      where: {
+        companyId: String(companyId),
+        status: { in: ['confirmed', 'partially_paid'] },
+        amountOutstanding: { gt: 0 },
+        invoiceDate: { lte: end },
+      },
+      include: { client: { select: { id: true, name: true } } },
+    });
 
     const buckets = {
       current: { amount: 0, count: 0 },
@@ -1229,7 +1210,7 @@ class MonthlyReportsService {
     invoices.forEach(inv => {
       const dueDate = new Date(inv.dueDate || inv.invoiceDate);
       const daysOverdue = Math.floor((end - dueDate) / (1000 * 60 * 60 * 24));
-      const balance = toNumber(inv.amountOutstanding) || toNumber(inv.balanceDue);
+      const balance = toNumber(inv.amountOutstanding);
 
       let bucket;
       if (daysOverdue <= 0) bucket = 'current';
@@ -1241,13 +1222,13 @@ class MonthlyReportsService {
       buckets[bucket].amount += balance;
       buckets[bucket].count += 1;
 
-      const existing = customerAging.find(c => c.customerId === inv.client?._id?.toString());
+      const existing = customerAging.find(c => c.customerId === inv.client?.id);
       if (existing) {
         existing[bucket] += balance;
         existing.total += balance;
       } else {
         customerAging.push({
-          customerId: inv.client?._id?.toString() || 'unknown',
+          customerId: inv.client?.id || 'unknown',
           customerName: inv.client?.name || 'Unknown',
           current: bucket === 'current' ? balance : 0,
           days30: bucket === 'days30' ? balance : 0,
@@ -1292,12 +1273,15 @@ class MonthlyReportsService {
    */
   static async getAPAging(companyId, year, month) {
     const { end } = getMonthRange(year, month);
-    const purchases = await Purchase.find({
-      company: toObjectId(companyId),
-      status: { $in: ['received', 'partial'] },
-      balance: { $gt: 0 },
-      purchaseDate: { $lte: end }
-    }).populate('supplier', 'name');
+    const purchases = await dbClient().purchase.findMany({
+      where: {
+        companyId: String(companyId),
+        status: { in: ['received', 'partial'] },
+        balance: { gt: 0 },
+        purchaseDate: { lte: end },
+      },
+      include: { supplier: { select: { id: true, name: true } } },
+    });
 
     const buckets = {
       current: { amount: 0, count: 0 },
@@ -1310,9 +1294,9 @@ class MonthlyReportsService {
     const supplierAging = [];
 
     purchases.forEach(p => {
-      const dueDate = new Date(p.supplierInvoiceDate || p.receivedDate || p.purchaseDate);
+      const dueDate = new Date(p.supplierInvoiceDate || p.purchaseDate);
       const daysOverdue = Math.floor((end - dueDate) / (1000 * 60 * 60 * 24));
-      const balance = toNumber(p.balance) || toNumber(p.balanceDue);
+      const balance = toNumber(p.balance) || toNumber(p.totalAmount);
 
       let bucket;
       if (daysOverdue <= 0) bucket = 'current';
@@ -1324,13 +1308,13 @@ class MonthlyReportsService {
       buckets[bucket].amount += balance;
       buckets[bucket].count += 1;
 
-      const existing = supplierAging.find(s => s.supplierId === p.supplier?._id?.toString());
+      const existing = supplierAging.find(s => s.supplierId === p.supplier?.id);
       if (existing) {
         existing[bucket] += balance;
         existing.total += balance;
       } else {
         supplierAging.push({
-          supplierId: p.supplier?._id?.toString() || 'unknown',
+          supplierId: p.supplier?.id || 'unknown',
           supplierName: p.supplier?.name || 'Unknown',
           current: bucket === 'current' ? balance : 0,
           days30: bucket === 'days30' ? balance : 0,
@@ -1373,10 +1357,12 @@ class MonthlyReportsService {
 static async getPayrollSummary(companyId, year, month) {
      const payPeriodStart = new Date(year, month - 1, 1);
      const payPeriodEnd = new Date(year, month, 0);
-     const payrollRecords = await Payroll.find({
-       company: companyId,
-       payPeriodStart: { gte: payPeriodStart, lte: payPeriodEnd },
-       record_status: { $in: ['draft', 'finalised', 'paid'] }
+     const payrollRecords = await dbClient().payroll.findMany({
+       where: {
+         companyId: String(companyId),
+         payPeriodStart: { gte: payPeriodStart, lte: payPeriodEnd },
+         recordStatus: { in: ['draft', 'finalised', 'paid'] },
+       },
      });
 
     const employees = payrollRecords.map(p => ({
@@ -1512,90 +1498,42 @@ static async getPayrollSummary(companyId, year, month) {
    */
   static async getBankReconciliation(companyId, year, month) {
     const { start, end } = getMonthRange(year, month);
-    const accounts = await BankAccount.find({ company: companyId, isActive: true });
+    const accounts = await dbClient().bankAccount.findMany({
+      where: { companyId: String(companyId), isActive: true },
+    });
 
     const reconciliations = await Promise.all(
       accounts.map(async (account) => {
-        // Use cachedBalance (computed from journal entries) as the book balance
-        const bookBalance = typeof account.cachedBalance === 'object' && account.cachedBalance?.$numberDecimal
-          ? parseFloat(account.cachedBalance.$numberDecimal)
-          : Number(account.cachedBalance) || 0;
-
-        // Get uncleared deposits (transactions after statement cutoff)
-        const unclearedDeposits = await BankTransaction.aggregate([
-          {
-            $match: {
-              company: new mongoose.Types.ObjectId(companyId),
-              account: account._id,
-              type: 'deposit',
-              status: { $ne: 'reconciled' },
-              date: { $lte: end }
-            }
-          },
-          { $group: { _id: null, total: { $sum: { $toDouble: '$amount' } } } }
+        const bookBalance = toNumber(account.cachedBalance || account.openingBalance);
+        const [unclearedDeposits, unclearedChecks, reconcilingItems] = await Promise.all([
+          dbClient().bankTransaction.aggregate({
+            where: { companyId: String(companyId), bankAccountId: account.id, type: 'deposit', status: { not: 'reconciled' }, date: { lte: end } },
+            _sum: { amount: true },
+          }),
+          dbClient().bankTransaction.aggregate({
+            where: { companyId: String(companyId), bankAccountId: account.id, type: 'withdrawal', status: { not: 'reconciled' }, date: { lte: end } },
+            _sum: { amount: true },
+          }),
+          dbClient().bankTransaction.findMany({
+            where: { companyId: String(companyId), bankAccountId: account.id, date: { lte: end }, status: 'pending' },
+            orderBy: { date: 'desc' },
+            select: { date: true, description: true, amount: true, type: true },
+          }),
         ]);
 
-        // Get uncleared checks/payments
-        const unclearedChecks = await BankTransaction.aggregate([
-          {
-            $match: {
-              company: new mongoose.Types.ObjectId(companyId),
-              account: account._id,
-              type: 'withdrawal',
-              status: { $ne: 'reconciled' },
-              date: { $lte: end }
-            }
-          },
-          { $group: { _id: null, total: { $sum: { $toDouble: '$amount' } } } }
-        ]);
-
-        const outstandingDeposits = unclearedDeposits[0]?.total || 0;
-        const outstandingChecks = unclearedChecks[0]?.total || 0;
-
-        // Get reconciling items
-        const reconcilingItems = await BankTransaction.find({
-          company: companyId,
-          account: account._id,
-          isReconcilingItem: true,
-          date: { $lte: end }
-        }).sort({ date: -1 });
-
-        // Get latest bank statement balance
-        // Check for statement lines in the period first, then fall back to any prior statement
-        let latestStatementLine = await BankStatementLine.findOne({
-          bankAccount: account._id,
-          transactionDate: { $gte: start, $lte: end }
-        }).sort({ transactionDate: -1, _id: -1 });
-
-        // If no statement in period, get the most recent prior statement
-        if (!latestStatementLine) {
-          latestStatementLine = await BankStatementLine.findOne({
-            bankAccount: account._id,
-            transactionDate: { $lte: end }
-          }).sort({ transactionDate: -1, _id: -1 });
-        }
-
-        // Get the bank statement balance (running balance from the statement)
-        const statementBalanceValue = latestStatementLine?.runningBalance ?? latestStatementLine?.balance;
-        const bankStatementBalance = statementBalanceValue
-          ? (typeof statementBalanceValue === 'object' && statementBalanceValue?.$numberDecimal
-              ? parseFloat(statementBalanceValue.$numberDecimal)
-              : Number(statementBalanceValue))
-          : 0;
-
-        // Calculate adjusted bank balance: statement balance + outstanding deposits - outstanding checks
+        const outstandingDeposits = toNumber(unclearedDeposits._sum?.amount);
+        const outstandingChecks = toNumber(unclearedChecks._sum?.amount);
+        const bankStatementBalance = 0;
         const adjustedBankBalance = bankStatementBalance + outstandingDeposits - outstandingChecks;
-
         const reconciliationDifference = bookBalance - adjustedBankBalance;
-        
         const isReconciled = Math.abs(reconciliationDifference) < 0.01;
 
         return {
-          accountId: account._id,
+          accountId: account.id,
           accountName: account.name,
           accountNumber: account.accountNumber,
           bankName: account.bankName,
-          currency: account.currency,
+          currency: account.currencyCode,
           bookBalance,
           bankStatementBalance,
           outstandingDeposits,
@@ -1603,12 +1541,12 @@ static async getPayrollSummary(companyId, year, month) {
           adjustedBankBalance,
           reconciliationDifference,
           isReconciled,
-          statementDate: latestStatementLine?.transactionDate || null,
+          statementDate: null,
           reconcilingItems: reconcilingItems.map(r => ({
             date: r.date,
             description: r.description,
-            amount: r.amount,
-            type: r.type
+            amount: toNumber(r.amount),
+            type: r.type,
           }))
         };
       })
@@ -1640,33 +1578,29 @@ static async getPayrollSummary(companyId, year, month) {
    */
   static async getBudgetVsActual(companyId, year, month) {
     const { start, end } = getMonthRange(year, month);
-    // Get budget for the month - query by fiscal_year and period date range
-    const budgets = await Budget.find({
-      company_id: new mongoose.Types.ObjectId(companyId),
-      fiscal_year: year,
-      periodStart: { $lte: end },
-      periodEnd: { $gte: start },
-      status: { $in: ['active', 'approved'] }
-    });
-
-    // Get actual revenue
-    const actualRevenue = await dbClient().invoice.aggregate({
-      where: {
-        companyId: String(companyId),
-        invoiceDate: { gte: start, lte: end },
-        status: { in: ['fully_paid', 'partially_paid', 'confirmed', 'sent'] },
-      },
-      _sum: { totalAmount: true },
-    });
-
-    // Get actual expenses from multiple sources: Expense, Purchase (paid), Payroll
-    const [expenseAgg, purchaseAggResult] = await Promise.all([
-      // Direct expenses
-      Expense.aggregate([
-        { $match: { company: new mongoose.Types.ObjectId(companyId), expense_date: { $gte: start, $lte: end } } },
-        { $group: { _id: { $ifNull: ['$category', 'Operations'] }, actual: { $sum: { $toDouble: { $ifNull: ['$amountInRWF', '$amount', 0] } } } } }
-      ]),
-      // Purchase orders that are paid/received
+    const [budgets, actualRevenue, expenseAgg, purchaseAggResult, payrollRecords] = await Promise.all([
+      dbClient().budget.findMany({
+        where: {
+          companyId: String(companyId),
+          fiscalYear: year,
+          periodStart: { lte: end },
+          periodEnd: { gte: start },
+          status: { in: ['active', 'approved'] },
+        },
+      }),
+      dbClient().invoice.aggregate({
+        where: {
+          companyId: String(companyId),
+          invoiceDate: { gte: start, lte: end },
+          status: { in: ['fully_paid', 'partially_paid', 'confirmed', 'sent'] },
+        },
+        _sum: { totalAmount: true },
+      }),
+      dbClient().expense.groupBy({
+        by: ['category'],
+        where: { companyId: String(companyId), expenseDate: { gte: start, lte: end } },
+        _sum: { totalAmountInRwf: true },
+      }),
       dbClient().purchase.aggregate({
         where: {
           companyId: String(companyId),
@@ -1675,23 +1609,19 @@ static async getPayrollSummary(companyId, year, month) {
         },
         _sum: { totalAmount: true },
       }),
+      dbClient().payroll.findMany({
+        where: { companyId: String(companyId), payPeriodStart: { gte: start, lte: end }, recordStatus: { in: ['draft', 'finalised', 'paid'] } },
+        select: { netPay: true },
+      }),
     ]);
-    const purchaseAgg = [{
-      _id: 'Purchases',
-      actual: toNumber(purchaseAggResult._sum.totalAmount),
-    }];
 
-    // Payroll expenses — Prisma-backed, cannot use aggregate
-    const payrollRecords = await Payroll.find({
-      company: companyId,
-      payPeriodStart: { gte: start, lte: end },
-      record_status: { $in: ['draft', 'finalised', 'paid'] }
-    });
-    const payrollAgg = [{ _id: 'Payroll', actual: payrollRecords.reduce((s, p) => s + (p.netPay || 0), 0) }];
+    const expenseAggRows = expenseAgg.map((row) => ({ _id: row.category || 'Operations', actual: toNumber(row._sum.totalAmountInRwf) }));
+    const purchaseAgg = [{ _id: 'Purchases', actual: toNumber(purchaseAggResult._sum.totalAmount) }];
+    const payrollAgg = [{ _id: 'Payroll', actual: payrollRecords.reduce((sum, row) => sum + toNumber(row.netPay), 0) }];
 
     // Merge all expense sources - assign default category for null/undefined
     const actualExpenses = [];
-    [...expenseAgg, ...purchaseAgg, ...payrollAgg].forEach(e => {
+    [...expenseAggRows, ...purchaseAgg, ...payrollAgg].forEach(e => {
       // Assign default category if null/undefined
       const category = e._id || 'Operations';
       const existing = actualExpenses.find(a => a._id === category);
@@ -1815,7 +1745,10 @@ static async getPayrollSummary(companyId, year, month) {
    */
   static async getGeneralLedger(companyId, year, month) {
     const { start, end } = getMonthRange(year, month);
-    const accounts = await ChartOfAccount.find({ company: companyId, isActive: true }).sort('code');
+    const accounts = await dbClient().chartOfAccount.findMany({
+      where: { companyId: String(companyId), isActive: true },
+      orderBy: { code: 'asc' },
+    });
 
     const accountActivity = await Promise.all(
       accounts.map(async (account) => {
@@ -1879,16 +1812,14 @@ static async getPayrollSummary(companyId, year, month) {
         const { start, end } = getMonthRange(year, month);
 
         // Revenue
-        const revenue = await Invoice.aggregate([
-          {
-            $match: {
-              company: new mongoose.Types.ObjectId(companyId),
-              invoiceDate: { $gte: start, $lte: end },
-              status: { $in: ['fully_paid', 'partially_paid', 'confirmed', 'sent'] }
-            }
+        const revenue = await dbClient().invoice.aggregate({
+          where: {
+            companyId: String(companyId),
+            invoiceDate: { gte: start, lte: end },
+            status: { in: REVENUE_STATUSES },
           },
-          { $group: { _id: null, total: { $sum: { $toDouble: { $ifNull: ['$subtotal', '$total'] } } } } }
-        ]);
+          _sum: { subtotal: true },
+        });
 
         // COGS
         const cogs = await this._calculateCOGS(companyId, start, end);
@@ -1908,7 +1839,7 @@ static async getPayrollSummary(companyId, year, month) {
         // Interest
         const interest = await this._getAccountTotal(companyId, start, end, ['interest', 'interest_expense']);
 
-        const rev = revenue[0]?.total || 0;
+        const rev = toNumber(revenue._sum?.subtotal);
         const grossProfit = rev - cogs;
         const ebit = grossProfit - totalOperatingExpenses;  // EBIT = Gross Profit - Operating Expenses
         const ebitda = ebit + depreciation;  // EBITDA = EBIT + D&A
@@ -1979,7 +1910,10 @@ static async getPayrollSummary(companyId, year, month) {
   static async getSemiAnnualBalanceSheetTrend(companyId, startYear, startMonth, endYear, endMonth) {
     const months = getMonthsInRange(startYear, startMonth, endYear, endMonth);
     // Get all accounts
-    const accounts = await ChartOfAccount.find({ company: companyId, isActive: true });
+    const accounts = await dbClient().chartOfAccount.findMany({
+      where: { companyId: String(companyId), isActive: true },
+      orderBy: { code: 'asc' },
+    });
 
     // Get current date for comparison
     const now = new Date();

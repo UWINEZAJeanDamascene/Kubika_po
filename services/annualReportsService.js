@@ -1320,20 +1320,14 @@ class AnnualReportsService {
 
   static async _calculateAnnualCOGS(companyId, start, end) {
     const cid = toIdString(companyId);
-    const [stockOut, purchases] = await Promise.all([
-      dbClient().$queryRaw`
-        SELECT COALESCE(SUM(quantity * unit_cost), 0)::float AS total
-        FROM stock_movements
-        WHERE company_id = ${cid}
-          AND movement_date >= ${start} AND movement_date <= ${end}
-          AND type = 'out' AND reason IN ('sale', 'dispatch')
-      `,
-      dbClient().purchase.aggregate({
-        where: { companyId: cid, purchaseDate: { gte: start, lte: end }, status: { in: PURCHASE_STATUSES } },
-        _sum: { subtotal: true },
-      }),
-    ]);
-    return toNumber(stockOut[0]?.total) + toNumber(purchases._sum?.subtotal) * 0.7;
+    const stockOut = await dbClient().$queryRaw`
+      SELECT COALESCE(SUM(quantity * unit_cost), 0)::float AS total
+      FROM stock_movements
+      WHERE company_id = ${cid}
+        AND movement_date >= ${start} AND movement_date <= ${end}
+        AND type = 'out' AND reason IN ('sale', 'dispatch')
+    `;
+    return toNumber(stockOut[0]?.total);
   }
 
   static async _getAnnualExpensesByCategory(companyId, start, end) {

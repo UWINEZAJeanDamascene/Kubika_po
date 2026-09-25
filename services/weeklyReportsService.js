@@ -234,21 +234,14 @@ class WeeklyReportsService {
    */
   static async getWeeklyInventoryReorder(companyId) {
     // Get all products and filter in JS to handle Decimal128 properly
-    const allProducts = await Product.find({
-      company: toIdString(companyId),
-      status: { $ne: 'discontinued' }
-    }, {
-      name: 1,
-      sku: 1,
-      currentStock: 1,
-      reorderPoint: 1,
-      lowStockThreshold: 1,
-      reorderQuantity: 1,
-      unit: 1,
-      preferredSupplier: 1
-    })
-    .populate('preferredSupplier', 'name')
-    .lean();
+    const allProducts = await dbClient().product.findMany({
+      where: { companyId: toIdString(companyId), isArchived: false },
+      select: {
+        id: true, name: true, sku: true, currentStock: true, reorderPoint: true,
+        lowStockThreshold: true, reorderQuantity: true, unit: true,
+        preferredSupplier: { select: { name: true } },
+      },
+    });
     
     // Filter products where currentStock < reorderPoint
     const productsNeedingReorder = allProducts.filter(p => {
@@ -266,7 +259,7 @@ class WeeklyReportsService {
       const reorderPoint = toNumber(p.reorderPoint) || toNumber(p.lowStockThreshold);
       const deficit = reorderPoint - stock;
       const item = {
-        productId: p._id,
+        productId: p.id,
         name: p.name,
         sku: p.sku,
         currentStock: stock,
@@ -301,9 +294,10 @@ class WeeklyReportsService {
     const { start, end } = this.getWeekRange(weekStart);
     
     // Get all suppliers
-    const suppliers = await Supplier.find({
-      company: toIdString(companyId)
-    }, { name: 1 }).lean();
+    const suppliers = await dbClient().supplier.findMany({
+      where: { companyId: toIdString(companyId) },
+      select: { id: true, name: true },
+    });
     
     // Get POs raised this week
     const posRaised = await purchaseOrderSupplierMetrics(companyId, { orderDate: { gte: start, lte: end } });
@@ -325,8 +319,8 @@ class WeeklyReportsService {
     const performanceMap = new Map();
     
     suppliers.forEach(s => {
-      performanceMap.set(s._id.toString(), {
-        supplierId: s._id,
+      performanceMap.set(s.id, {
+        supplierId: s.id,
         supplierName: s.name,
         posRaised: { count: 0, value: 0 },
         deliveriesReceived: { count: 0, value: 0 },
@@ -336,29 +330,29 @@ class WeeklyReportsService {
     });
     
     posRaised.forEach(p => {
-      if (p._id && performanceMap.has(p._id.toString())) {
-        const s = performanceMap.get(p._id.toString());
+      if (p._id && performanceMap.has(String(p._id))) {
+        const s = performanceMap.get(String(p._id));
         s.posRaised = { count: p.count, value: p.totalValue };
       }
     });
     
     grnsReceived.forEach(g => {
-      if (g._id && performanceMap.has(g._id.toString())) {
-        const s = performanceMap.get(g._id.toString());
+      if (g._id && performanceMap.has(String(g._id))) {
+        const s = performanceMap.get(String(g._id));
         s.deliveriesReceived = { count: g.count, value: g.totalValue };
       }
     });
     
     pendingOrders.forEach(p => {
-      if (p._id && performanceMap.has(p._id.toString())) {
-        const s = performanceMap.get(p._id.toString());
+      if (p._id && performanceMap.has(String(p._id))) {
+        const s = performanceMap.get(String(p._id));
         s.pendingOrders = { count: p.count, value: p.totalValue };
       }
     });
     
     overdueOrders.forEach(o => {
-      if (o._id && performanceMap.has(o._id.toString())) {
-        const s = performanceMap.get(o._id.toString());
+      if (o._id && performanceMap.has(String(o._id))) {
+        const s = performanceMap.get(String(o._id));
         s.overdueDeliveries = { count: o.count, value: o.totalValue };
       }
     });
@@ -392,22 +386,17 @@ class WeeklyReportsService {
     const today = new Date();
     
     // Get all outstanding invoices
-    const outstandingInvoices = await Invoice.find({
-      company: toIdString(companyId),
-      status: { $in: ['partially_paid', 'confirmed', 'sent'] },
-      amountOutstanding: { $gt: 0 }
-    }, {
-      referenceNo: 1,
-      invoiceDate: 1,
-      dueDate: 1,
-      client: 1,
-      totalAmount: 1,
-      total: 1,
-      amountOutstanding: 1,
-      amountPaid: 1
-    })
-    .populate('client', 'name')
-    .lean();
+    const outstandingInvoices = await dbClient().invoice.findMany({
+      where: {
+        companyId: toIdString(companyId),
+        status: { in: ['partially_paid', 'confirmed', 'sent'] },
+        amountOutstanding: { gt: 0 },
+      },
+      select: {
+        id: true, referenceNo: true, invoiceDate: true, dueDate: true,
+        client: { select: { name: true } }, totalAmount: true, amountOutstanding: true,
+      },
+    });
     
     // Age buckets
     const buckets = {
@@ -427,13 +416,13 @@ class WeeklyReportsService {
       totalOutstanding += balance;
       
       const invoiceData = {
-        invoiceId: inv._id,
+        invoiceId: inv.id,
         invoiceNumber: inv.referenceNo,
         clientName: inv.client?.name || 'Unknown',
         invoiceDate: inv.invoiceDate,
         dueDate: inv.dueDate,
         daysOverdue: daysOverdue > 0 ? daysOverdue : 0,
-        totalAmount: toNumber(inv.totalAmount) || toNumber(inv.total),
+        totalAmount: toNumber(inv.totalAmount),
         balance: balance
       };
       
@@ -477,20 +466,13 @@ class WeeklyReportsService {
     const today = new Date();
 
     const [unpaidGrns, unpaidOrders] = await Promise.all([
-      GoodsReceivedNote.find({
-        company: toIdString(companyId),
-        status: 'confirmed',
-        balance: { $gt: 0 }
-      }, {
-        referenceNo: 1,
-        receivedDate: 1,
-        supplier: 1,
-        totalAmount: 1,
-        balance: 1,
-        supplierInvoiceNo: 1
-      })
-        .populate('supplier', 'name')
-        .lean(),
+      dbClient().goodsReceivedNote.findMany({
+        where: { companyId: toIdString(companyId), status: 'confirmed', balance: { gt: 0 } },
+        select: {
+          id: true, referenceNo: true, receivedDate: true, totalAmount: true, balance: true,
+          supplier: { select: { name: true } },
+        },
+      }),
       dbClient().purchaseOrder.findMany({
         where: {
           companyId: toIdString(companyId),
@@ -511,7 +493,7 @@ class WeeklyReportsService {
 
     const payableItems = [
       ...unpaidGrns.map((grn) => ({
-        purchaseId: grn._id,
+        purchaseId: grn.id,
         purchaseNumber: grn.referenceNo,
         supplierName: grn.supplier?.name || 'Unknown',
         purchaseDate: grn.receivedDate,
@@ -621,13 +603,17 @@ class WeeklyReportsService {
     }));
     
     // Get Cash/Bank account codes
-    const cashBankAccounts = await ChartOfAccount.find({
-      company: toIdString(companyId),
-      $or: [
-        { subtype: { $in: ['Cash', 'Bank', 'cash', 'bank'] } },
-        { name: { $regex: /cash|bank/i } }
-      ]
-    }, { code: 1, name: 1 }).lean();
+    const cashBankAccounts = await dbClient().chartOfAccount.findMany({
+      where: {
+        companyId: toIdString(companyId),
+        OR: [
+          { subtype: { in: ['Cash', 'Bank', 'cash', 'bank'] } },
+          { name: { contains: 'cash', mode: 'insensitive' } },
+          { name: { contains: 'bank', mode: 'insensitive' } },
+        ],
+      },
+      select: { code: true, name: true },
+    });
     
     const cashBankCodes = cashBankAccounts.map(a => a.code);
     
@@ -717,7 +703,7 @@ class WeeklyReportsService {
     const inProgressStatuses = ['draft', 'calculated', 'review', 'pending_approval'];
 
     const buildEmployeeRows = (records) => records.map((p) => {
-      const emp = p.employee && typeof p.employee === 'object' ? p.employee : {};
+      const emp = p.employeeMaster || (p.employee && typeof p.employee === 'object' ? p.employee : {});
       const salary = p.salary && typeof p.salary === 'object' ? p.salary : {};
       const deductions = p.deductions && typeof p.deductions === 'object' ? p.deductions : {};
       const contributions = p.contributions && typeof p.contributions === 'object' ? p.contributions : {};
@@ -729,7 +715,7 @@ class WeeklyReportsService {
       const netPay = toNumber(p.netPay);
 
       return {
-        employeeId: emp.employeeId || p.employee_id || p._id,
+        employeeId: emp.employeeId || p.employeeRefId || p.id,
         name: `${emp.firstName || ''} ${emp.lastName || ''}`.trim() || 'Unknown',
         employeeNumber: emp.employeeNumber || emp.employeeId || '',
         department: emp.department || 'N/A',
@@ -742,37 +728,36 @@ class WeeklyReportsService {
       };
     });
 
-    let currentPayrollRun = await PayrollRun.findOne({
-      company: toIdString(companyId),
-      status: { $in: inProgressStatuses },
-      pay_period_start: { $lte: today },
-      pay_period_end: { $gte: today }
-    })
-      .sort({ pay_period_start: -1 })
-      .lean();
+    let currentPayrollRun = await dbClient().payrollRun.findFirst({
+      where: {
+        companyId: toIdString(companyId),
+        status: { in: inProgressStatuses },
+        payPeriodStart: { lte: today },
+        payPeriodEnd: { gte: today },
+      },
+      orderBy: { payPeriodStart: 'desc' },
+    });
 
     if (!currentPayrollRun) {
-      currentPayrollRun = await PayrollRun.findOne({
-        company: toIdString(companyId),
-        status: { $in: inProgressStatuses }
-      })
-        .sort({ updatedAt: -1 })
-        .lean();
+      currentPayrollRun = await dbClient().payrollRun.findFirst({
+        where: { companyId: toIdString(companyId), status: { in: inProgressStatuses } },
+        orderBy: { updatedAt: 'desc' },
+      });
     }
 
     if (currentPayrollRun) {
-      const payrollRecords = await Payroll.find({
-        company: toIdString(companyId),
-        payroll_run_id: currentPayrollRun._id
-      }).lean();
+      const payrollRecords = await dbClient().payroll.findMany({
+        where: { companyId: toIdString(companyId), payrollRunId: currentPayrollRun.id },
+        include: { employeeMaster: true },
+      });
 
       if (payrollRecords.length > 0) {
         const employees = buildEmployeeRows(payrollRecords);
         return {
           reportName: 'Weekly Payroll Preview',
           payrollInProgress: true,
-          periodStart: formatLocalDate(currentPayrollRun.pay_period_start),
-          periodEnd: formatLocalDate(currentPayrollRun.pay_period_end),
+          periodStart: formatLocalDate(currentPayrollRun.payPeriodStart),
+          periodEnd: formatLocalDate(currentPayrollRun.payPeriodEnd),
           employeeCount: employees.length,
           estimatedGrossPay: employees.reduce((sum, e) => sum + e.grossPay, 0),
           summary: {
@@ -791,24 +776,18 @@ class WeeklyReportsService {
       return {
         reportName: 'Weekly Payroll Preview',
         payrollInProgress: true,
-        periodStart: formatLocalDate(currentPayrollRun.pay_period_start),
-        periodEnd: formatLocalDate(currentPayrollRun.pay_period_end),
+        periodStart: formatLocalDate(currentPayrollRun.payPeriodStart),
+        periodEnd: formatLocalDate(currentPayrollRun.payPeriodEnd),
         message: 'Payroll run in progress with no calculated employee lines yet',
-        employeeCount: toNumber(currentPayrollRun.employee_count),
-        estimatedGrossPay: toNumber(currentPayrollRun.total_gross)
+        employeeCount: toNumber(currentPayrollRun.employeeCount),
+        estimatedGrossPay: toNumber(currentPayrollRun.totalGross)
       };
     }
 
-    const activeEmployees = await Employee.find({
-      company: toIdString(companyId),
-      status: 'active'
-    }, {
-      employeeId: 1,
-      firstName: 1,
-      lastName: 1,
-      department: 1,
-      currentSalary: 1
-    }).lean();
+    const activeEmployees = await dbClient().employee.findMany({
+      where: { companyId: toIdString(companyId), status: 'active' },
+      select: { employeeId: true, firstName: true, lastName: true, department: true, currentSalary: true },
+    });
 
     const estimatedGrossPay = activeEmployees.reduce((sum, employee) => {
       const salary = employee.currentSalary;
