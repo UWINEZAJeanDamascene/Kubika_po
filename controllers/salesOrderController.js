@@ -157,10 +157,11 @@ exports.getSalesOrders = async (req, res, next) => {
     const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 25));
     const skip = (pageNum - 1) * limitNum;
     
-    // List path: headers + client + line count only (no product rows).
+    // List path: headers, totals, currency, and line count. Product rows remain
+    // omitted to keep the list response lightweight.
     const [salesOrders, totalCount] = await Promise.all([
       SalesOrder.find(filter)
-        .select({ client: 1, createdBy: 1, referenceNo: 1, status: 1, orderDate: 1, expectedDate: 1, fulfillmentStatus: 1, createdAt: 1 })
+        .select({ client: 1, createdBy: 1, referenceNo: 1, status: 1, orderDate: 1, expectedDate: 1, fulfillmentStatus: 1, subtotal: 1, taxAmount: 1, totalAmount: 1, currencyCode: 1, exchangeRate: 1, createdAt: 1 })
         .populate('-lines')
         .sort({ createdAt: -1, _id: -1 })
         .skip(skip)
@@ -197,7 +198,7 @@ exports.getSalesOrder = async (req, res, next) => {
     const companyId = req.user.company._id;
     
     const salesOrder = await SalesOrder.findOne({ _id: req.params.id, company: companyId })
-      .select({ client: 1, lines: 1, createdBy: 1, quotation: 1, referenceNo: 1, status: 1, orderDate: 1, expectedDate: 1, fulfillmentStatus: 1 })
+      .select({ client: 1, lines: 1, createdBy: 1, quotation: 1, referenceNo: 1, status: 1, orderDate: 1, expectedDate: 1, fulfillmentStatus: 1, subtotal: 1, taxAmount: 1, totalAmount: 1, currencyCode: 1, exchangeRate: 1 })
       .lean();
     const hydratedSalesOrder = await hydrateSalesOrderRelations(salesOrder);
     

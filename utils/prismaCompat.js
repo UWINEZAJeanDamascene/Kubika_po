@@ -18,6 +18,7 @@
  */
 
 const { Prisma } = require('@prisma/client');
+const { isDeepStrictEqual } = require('node:util');
 const { prisma } = require('../lib/prisma');
 const { getCompanyId } = require('./prismaTenant');
 const { createAggregateMethod } = require('./prismaAggregate');
@@ -673,6 +674,12 @@ function wrapMutableDoc(apiDoc, config) {
     enumerable: false,
     configurable: true,
   });
+  Object.defineProperty(doc, '__loadedLinesSnapshot', {
+    value: snapshotLines(doc.lines),
+    writable: true,
+    enumerable: false,
+    configurable: true,
+  });
   Object.defineProperty(doc, '__loadedStatus', {
     value: doc.status,
     writable: true,
@@ -731,6 +738,7 @@ function wrapMutableDoc(apiDoc, config) {
     // wrapResult, not wrapMutableDoc: .save() must not strip .populate() off the doc.
     Object.assign(doc, wrapResult(next, config));
     doc.__loadedLines = doc.lines;
+    doc.__loadedLinesSnapshot = snapshotLines(doc.lines);
     doc.__loadedStatus = doc.status;
     if (typeof config.afterSave === 'function') {
       await config.afterSave(doc, { prevStatus });
@@ -748,13 +756,17 @@ function wrapMutableDoc(apiDoc, config) {
   return doc;
 }
 
+function snapshotLines(lines) {
+  return Array.isArray(lines) ? JSON.parse(JSON.stringify(lines)) : null;
+}
+
 /**
  * Line payloads for a doc whose `lines` were replaced since it was loaded, in
  * the shape the model's own create mapper produces. Returns null when the lines
  * are untouched, so ordinary header saves leave the child rows alone.
  */
 async function rewrittenLines(doc, config) {
-  if (!Array.isArray(doc.lines) || doc.lines === doc.__loadedLines) return null;
+  if (!Array.isArray(doc.lines)) return null;
   const delegate = config.delegate();
   const relations = MODEL_RELATION_TARGETS.get(delegate && delegate.name);
   if (!relations || !relations.has('lines') || !config.translateCreate) return null;
@@ -763,6 +775,19 @@ async function rewrittenLines(doc, config) {
   const created = await config.translateCreate(doc.toObject());
   const nested = created && created.lines;
   const create = nested && Array.isArray(nested.create) ? nested.create : [];
+
+  if (Array.isArray(doc.__loadedLinesSnapshot)) {
+    const previous = await config.translateCreate({
+      ...doc.toObject(),
+      lines: doc.__loadedLinesSnapshot,
+    });
+    const previousLines = previous && previous.lines && Array.isArray(previous.lines.create)
+      ? previous.lines.create
+      : [];
+    if (isDeepStrictEqual(create, previousLines)) return null;
+  } else if (doc.lines === doc.__loadedLines) {
+    return null;
+  }
 
   // Never wipe existing child rows with an empty rewrite (e.g. bad toObject / mapper).
   const hadLines = Array.isArray(doc.__loadedLines) && doc.__loadedLines.length > 0;
