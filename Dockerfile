@@ -50,6 +50,7 @@ RUN npm ci --legacy-peer-deps --omit=dev
 
 # Copy built application
 COPY --from=builder /app/server.js ./
+COPY --from=builder /app/worker.js ./
 COPY --from=builder /app/config ./config
 COPY --from=builder /app/controllers ./controllers
 COPY --from=builder /app/middleware ./middleware
