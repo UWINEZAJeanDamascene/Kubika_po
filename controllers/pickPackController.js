@@ -372,8 +372,10 @@ exports.pickItems = async (req, res, next) => {
     const companyId = req.user.company._id;
     const { lineId, qtyPicked, serialNumbers, batchId, notes } = req.body;
     
-    const pickPack = await PickPack.findOne({ _id: req.params.id, company: companyId }).select({ lines: 1, status: 1 }).lean();
-    const hydratedPickPack = await hydratePickPackRelations(pickPack);
+    // This handler edits a line and persists the document below. Do not use
+    // `.lean()` here: the PostgreSQL compatibility model returns a plain object
+    // from lean queries, which has no `.save()` method.
+    const pickPack = await PickPack.findOne({ _id: req.params.id, company: companyId });
     
     if (!pickPack) {
       return res.status(404).json({
@@ -383,7 +385,7 @@ exports.pickItems = async (req, res, next) => {
       });
     }
     
-    if (!['picking', 'draft'].includes(hydratedPickPack.status)) {
+    if (!['picking', 'draft'].includes(pickPack.status)) {
       return res.status(400).json({
         success: false,
         error: ERR_INVALID_STATUS,
