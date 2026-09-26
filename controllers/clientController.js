@@ -631,16 +631,31 @@ exports.getClientInvoices = async (req, res, next) => {
 
     // Calculate totals
     const allInvoices = await Invoice.find(query);
-    const getVal = (inv, field) => {
-      const raw = inv._doc[field];
-      if (raw && typeof raw === 'object' && raw.toString) {
-        return parseFloat(raw.toString()) || 0;
+    const getVal = (value) => {
+      if (value && typeof value === 'object' && value.toString) {
+        return parseFloat(value.toString()) || 0;
       }
-      return raw || 0;
+      return Number(value) || 0;
     };
-    const totalAmount = allInvoices.reduce((sum, inv) => sum + getVal(inv, 'totalAmount'), 0);
-    const totalPaid = allInvoices.reduce((sum, inv) => sum + getVal(inv, 'amountPaid'), 0);
-    const totalBalance = allInvoices.reduce((sum, inv) => sum + getVal(inv, 'amountOutstanding'), 0);
+    const invoiceAmounts = allInvoices.map((inv) => {
+      const raw = inv._doc || inv;
+      const lines = Array.isArray(raw.lines) ? raw.lines : [];
+      const lineTotal = lines.reduce((sum, line) => {
+        const quantity = getVal(line.qty || line.quantity);
+        const subtotal = getVal(line.lineSubtotal || line.subtotal) || quantity * getVal(line.unitPrice);
+        const tax = getVal(line.lineTax || line.taxAmount);
+        return sum + (getVal(line.lineTotal || line.totalWithTax) || subtotal + tax);
+      }, 0);
+      const total = getVal(raw.totalAmount) || getVal(raw.grandTotal) || lineTotal;
+      const paid = getVal(raw.amountPaid) || (Array.isArray(raw.payments)
+        ? raw.payments.reduce((sum, payment) => sum + getVal(payment.amount), 0)
+        : 0);
+      const balance = getVal(raw.amountOutstanding) || Math.max(0, total - paid);
+      return { total, paid, balance };
+    });
+    const totalAmount = invoiceAmounts.reduce((sum, amounts) => sum + amounts.total, 0);
+    const totalPaid = invoiceAmounts.reduce((sum, amounts) => sum + amounts.paid, 0);
+    const totalBalance = invoiceAmounts.reduce((sum, amounts) => sum + amounts.balance, 0);
 
     res.json({
       success: true,
@@ -670,13 +685,18 @@ exports.getClientReceipts = async (req, res, next) => {
     const query = { 
       company: companyId
     };
+    const getVal = (value) => {
+      if (value && typeof value === 'object' && value.toString) {
+        return parseFloat(value.toString()) || 0;
+      }
+      return Number(value) || 0;
+    };
 
     // Find receipts that have allocations to this client's invoices
     const receipts = await ARReceipt.find(query)
       .populate('createdBy', 'name email')
       .sort({ receiptDate: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit);
+      .limit(1000);
 
     // Filter receipts that have allocations to this client
     const ARReceiptAllocation = require('../models/ARReceiptAllocation');
@@ -694,17 +714,34 @@ exports.getClientReceipts = async (req, res, next) => {
       }
     }
 
-    const total = clientReceipts.length;
-    const totalAmount = clientReceipts.reduce((sum, r) => sum + r.amount, 0);
+    const clientInvoices = await Invoice.find({ client: req.params.id, company: companyId });
+    const invoicePayments = clientInvoices.flatMap((invoice) => {
+      const rawInvoice = invoice._doc || invoice;
+      return (Array.isArray(rawInvoice.payments) ? rawInvoice.payments : []).map((payment, index) => ({
+        _id: payment._id || `${rawInvoice._id}-payment-${index}`,
+        referenceNo: payment.reference || rawInvoice.referenceNo || rawInvoice.invoiceNumber,
+        receiptDate: payment.paidDate || payment.recordedAt || rawInvoice.invoiceDate,
+        amount: getVal(payment.amount),
+        paymentMethod: payment.paymentMethod || 'unknown',
+        status: 'posted',
+      }));
+    });
+    const allClientReceipts = [...clientReceipts, ...invoicePayments]
+      .filter((receipt, index, values) => values.findIndex((candidate) => String(candidate._id) === String(receipt._id)) === index)
+      .sort((a, b) => new Date(b.receiptDate || 0) - new Date(a.receiptDate || 0));
+    const total = allClientReceipts.length;
+    const offset = (Number(page) - 1) * Number(limit);
+    const pagedReceipts = allClientReceipts.slice(offset, offset + Number(limit));
+    const totalAmount = allClientReceipts.reduce((sum, r) => sum + getVal(r.amount), 0);
 
     res.json({
       success: true,
-      count: clientReceipts.length,
+      count: pagedReceipts.length,
       total,
       summary: {
         totalAmount
       },
-      data: clientReceipts
+      data: pagedReceipts
     });
   } catch (error) {
     next(error);
