@@ -186,30 +186,69 @@ async function runScanForAllCompanies(options = {}) {
 }
 
 async function getLatestBriefing(companyId, userId) {
-  const membership = await prisma.companyUser.findUnique({
-    where: { userId_companyId: { userId: String(userId), companyId: String(companyId) } },
-    select: { status: true },
-  });
-  if (!membership || membership.status !== 'active') throw Object.assign(new Error('Active company membership required.'), { statusCode: 403 });
+  await requireActiveCompanyMembership(companyId, userId);
   return prisma.aIBriefing.findFirst({ where: { companyId: String(companyId) }, orderBy: { briefingDate: 'desc' } });
 }
 
+async function requireActiveCompanyMembership(companyId, userId) {
+  const tenantId = String(companyId);
+  const personId = String(userId);
+  const membership = await prisma.companyUser.findUnique({
+    where: { userId_companyId: { userId: personId, companyId: tenantId } },
+    select: { status: true },
+  });
+  if (membership) {
+    if (membership.status === 'active') return membership;
+    throw Object.assign(new Error('Active company membership required.'), { statusCode: 403 });
+  }
+
+  // Company creators and newly invited accounts are linked directly through
+  // users.company_id; the CompanyUser join row is only created when an existing
+  // user is linked to an additional company. Honor that canonical primary link
+  // when no explicit membership row exists, while keeping the tenant match exact.
+  const primaryCompanyUser = await prisma.user.findFirst({
+    where: { id: personId, companyId: tenantId, isActive: true },
+    select: { id: true, role: true },
+  });
+  if (primaryCompanyUser) return { status: 'active', primaryCompany: true, role: primaryCompanyUser.role };
+  throw Object.assign(new Error('Active company membership required.'), { statusCode: 403 });
+}
+
 async function getPreferences(companyId, userId) {
-  const row = await prisma.companyUser.findUnique({ where: { userId_companyId: { userId: String(userId), companyId: String(companyId) } } });
-  if (!row || row.status !== 'active') throw Object.assign(new Error('Active company membership required.'), { statusCode: 403 });
-  return safePreferences(row.preferences);
+  const tenantId = String(companyId);
+  const personId = String(userId);
+  const row = await prisma.companyUser.findUnique({ where: { userId_companyId: { userId: personId, companyId: tenantId } } });
+  if (row) {
+    if (row.status !== 'active') throw Object.assign(new Error('Active company membership required.'), { statusCode: 403 });
+    return safePreferences(row.preferences);
+  }
+  await requireActiveCompanyMembership(tenantId, personId);
+  return safePreferences({});
 }
 
 async function updatePreferences(companyId, userId, input = {}) {
-  const row = await prisma.companyUser.findUnique({ where: { userId_companyId: { userId: String(userId), companyId: String(companyId) } } });
-  if (!row || row.status !== 'active') throw Object.assign(new Error('Active company membership required.'), { statusCode: 403 });
-  const current = safePreferences(row.preferences);
+  const tenantId = String(companyId);
+  const personId = String(userId);
+  const row = await prisma.companyUser.findUnique({ where: { userId_companyId: { userId: personId, companyId: tenantId } } });
+  if (row && row.status !== 'active') throw Object.assign(new Error('Active company membership required.'), { statusCode: 403 });
+  const primaryMembership = row ? null : await requireActiveCompanyMembership(tenantId, personId);
+  const current = safePreferences(row && row.preferences);
   const next = safePreferences({ aiMonitoring: { ...current, ...input } });
-  const previous = row.preferences && typeof row.preferences === 'object' && !Array.isArray(row.preferences) ? row.preferences : {};
-  await prisma.companyUser.update({
-    where: { userId_companyId: { userId: String(userId), companyId: String(companyId) } },
-    data: { preferences: { ...previous, aiMonitoring: next } },
-  });
+  const previous = row && row.preferences && typeof row.preferences === 'object' && !Array.isArray(row.preferences) ? row.preferences : {};
+  if (row) {
+    await prisma.companyUser.update({
+      where: { userId_companyId: { userId: personId, companyId: tenantId } },
+      data: { preferences: { ...previous, aiMonitoring: next } },
+    });
+  } else {
+    await prisma.companyUser.create({
+      data: {
+        id: generateObjectId(), userId: personId, companyId: tenantId,
+        role: primaryMembership.role || 'viewer', status: 'active',
+        preferences: { aiMonitoring: next },
+      },
+    });
+  }
   return next;
 }
 
@@ -219,7 +258,11 @@ async function setFindingState(companyId, userId, findingId, state, snoozedUntil
   const membership = await prisma.companyUser.findUnique({
     where: { userId_companyId: { userId: personId, companyId: tenantId } }, select: { status: true },
   });
-  if (!membership || membership.status !== 'active') throw Object.assign(new Error('Active company membership required.'), { statusCode: 403 });
+  if (membership) {
+    if (membership.status !== 'active') throw Object.assign(new Error('Active company membership required.'), { statusCode: 403 });
+  } else {
+    await requireActiveCompanyMembership(tenantId, personId);
+  }
   const finding = await prisma.aIFinding.findUnique({ where: { company_findingId: { company: tenantId, findingId: String(findingId) } }, select: { id: true } });
   if (!finding) return null;
   const saved = await prisma.aIFindingUserState.upsert({

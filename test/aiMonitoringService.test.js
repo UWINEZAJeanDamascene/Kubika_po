@@ -16,7 +16,8 @@ const prismaMock = {
   companyUser: { findMany: jest.fn(), findUnique: jest.fn(), update: jest.fn() },
   aIFindingUserState: { findUnique: jest.fn() },
   aIFinding: { findUnique: jest.fn() },
-  aIBriefing: { upsert: jest.fn(async ({ create }) => create) },
+  aIBriefing: { upsert: jest.fn(async ({ create }) => create), findFirst: jest.fn() },
+  user: { findFirst: jest.fn() },
   company: { findMany: jest.fn() },
   aIFindingAlertDelivery: tx.aIFindingAlertDelivery,
 };
@@ -33,7 +34,7 @@ jest.doMock('../services/aiFindingService', () => ({ upsertFindings: (...args) =
 jest.doMock('../services/notificationHelper', () => ({ createNotification: (...args) => createNotification(...args) }));
 jest.doMock('../services/aiOperationalMetricsService', () => ({ recordEvent: jest.fn().mockResolvedValue(true) }));
 
-const { runCompanyScan } = require('../services/aiMonitoringService');
+const { runCompanyScan, getLatestBriefing } = require('../services/aiMonitoringService');
 
 describe('AI monitoring scans', () => {
   beforeEach(() => {
@@ -50,6 +51,44 @@ describe('AI monitoring scans', () => {
       version: 'decision-v1', warnings: [],
       findings: [{ id: 'finding-1', domain: 'inventory', ruleId: 'inventory.stockout_risk', title: 'Stock risk', summary: 'Low stock', severity: 'high', confidence: 0.9, evidenceFactIds: ['fact-1'] }],
     });
+  });
+
+  test('allows a primary company user to read a briefing when no join row exists', async () => {
+    prismaMock.companyUser.findUnique.mockResolvedValue(null);
+    prismaMock.user.findFirst.mockResolvedValue({ id: 'primary-user', role: 'admin' });
+    prismaMock.aIBriefing.findFirst.mockResolvedValue({ id: 'briefing-1', companyId: 'company-1' });
+
+    const briefing = await getLatestBriefing('company-1', 'primary-user');
+
+    expect(briefing.id).toBe('briefing-1');
+    expect(prismaMock.companyUser.findUnique).toHaveBeenCalledWith(expect.objectContaining({
+      where: { userId_companyId: { userId: 'primary-user', companyId: 'company-1' } },
+    }));
+    expect(prismaMock.user.findFirst).toHaveBeenCalledWith({
+      where: { id: 'primary-user', companyId: 'company-1', isActive: true }, select: { id: true, role: true },
+    });
+    expect(prismaMock.aIBriefing.findFirst).toHaveBeenCalledWith({
+      where: { companyId: 'company-1' }, orderBy: { briefingDate: 'desc' },
+    });
+  });
+
+  test('does not treat an inactive explicit membership as a primary company membership', async () => {
+    prismaMock.companyUser.findUnique.mockResolvedValue({ status: 'suspended' });
+
+    await expect(getLatestBriefing('company-1', 'suspended-user')).rejects.toMatchObject({ statusCode: 403 });
+    expect(prismaMock.user.findFirst).not.toHaveBeenCalled();
+    expect(prismaMock.aIBriefing.findFirst).not.toHaveBeenCalled();
+  });
+
+  test('does not accept a primary user linked to a different company', async () => {
+    prismaMock.companyUser.findUnique.mockResolvedValue(null);
+    prismaMock.user.findFirst.mockResolvedValue(null);
+
+    await expect(getLatestBriefing('company-2', 'primary-user')).rejects.toMatchObject({ statusCode: 403 });
+    expect(prismaMock.user.findFirst).toHaveBeenCalledWith({
+      where: { id: 'primary-user', companyId: 'company-2', isActive: true }, select: { id: true, role: true },
+    });
+    expect(prismaMock.aIBriefing.findFirst).not.toHaveBeenCalled();
   });
 
   test('persists a real-fact daily briefing and sends a high severity finding once', async () => {

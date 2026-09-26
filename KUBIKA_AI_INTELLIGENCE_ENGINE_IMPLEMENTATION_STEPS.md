@@ -662,6 +662,10 @@ Acceptance:
 
 Completed on 2026-09-25. Added adversarial chat API coverage for prompt injection, permission bypass attempts, create-without-approval requests, cross-tenant evidence, unsupported numeric claims, fabricated fact IDs, PII fields/email addresses, and guardrail rejection. The API test verifies rejected provider output is replaced with a safe response and no ERP tool is called. Existing AI tests cover permission filtering, proposal approval and audit logging, and provider fallback; the AI test target runs those with the new adversarial suite and static boundary checks. A Stacy system prompt snapshot is committed with the adversarial tests. CI now runs `npm run test:ai`; the adversarial script fails when its test directory is empty.
 
+### Production follow-up (2026-09-26)
+
+Fixed primary-company users being denied AI briefings when their account has a `users.company_id` link but no `company_users` join row. Briefing/preferences/finding-state access now accepts that exact active primary-company link, while suspended memberships and cross-company requests remain denied. Added an idempotent backfill migration for existing primary users. Changed the Docker default start command to `npm start`, which applies pending Prisma migrations before starting the API. Production AI rollout remains controlled: set `AI_ROLLOUT_STAGE` and the matching tenant allowlist/test company in the hosting environment, then restart the API and worker.
+
 ## Phase 14: Observability And Rollout
 
 Goal: launch safely and improve from measured behavior.
