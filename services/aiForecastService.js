@@ -7,6 +7,7 @@ const { recordEvent } = require('./aiOperationalMetricsService');
 const { buildContext } = require('../ai-engine/context-builder/ContextBuilder');
 const { extractUserPermissions, hasPermission } = require('../ai-engine/context-builder/permissionUtils');
 const { DOMAIN_PERMISSIONS } = require('../ai-engine/monitoring/MonitoringEngine');
+const { userFacingWarning } = require('../ai-engine/shared/userFacingWarning');
 const {
   FORECAST_MODEL_VERSION,
   makeMonthlySeries,
@@ -306,6 +307,7 @@ function visibleForecast(forecast, permissions) {
   return {
     ...forecast,
     sourceFacts,
+    assumptions: (forecast.assumptions || []).map(userFacingWarning).filter(Boolean),
     forecast: { ...prediction, predictions },
     metadata: { ...(forecast.metadata || {}), sourceFactIds: Array.from(visibleIds) },
   };

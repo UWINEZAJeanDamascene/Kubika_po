@@ -9,6 +9,7 @@ const { evaluateContext } = require('../ai-engine/decision-engine');
 const { generateRecommendations } = require('../ai-engine/recommendation-engine');
 const { REPORTS, buildReport } = require('../ai-engine/reports/ReportBuilder');
 const { DOMAIN_PERMISSIONS } = require('../ai-engine/monitoring/MonitoringEngine');
+const { userFacingWarning } = require('../ai-engine/shared/userFacingWarning');
 
 function normalizeDateRange(input = {}) {
   const now = new Date();
@@ -58,6 +59,7 @@ function visibleReport(report, permissions) {
     findings,
     recommendations,
     calculations,
+    missingDataCaveats: (report.missingDataCaveats || []).map(userFacingWarning).filter(Boolean),
     metadata: {
       ...(report.metadata || {}),
       factCount: facts.length,

@@ -48,6 +48,46 @@ function csvCell(value) {
   return `"${text.replace(/"/g, '""')}"`;
 }
 
+const INTERNAL_VALUE_KEY = /^(id|.*_id|.*id|source.*|evidence.*|permissions?|metadata|company.*|tenant.*|created.*|updated.*|request.*|generated.*)$/i;
+
+function readableLabel(value) {
+  return String(value || '')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/[_-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/^\w/, (letter) => letter.toUpperCase());
+}
+
+function readablePdfValue(value, depth = 0) {
+  if (value == null) return 'Not available';
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number') return Number.isFinite(value) ? new Intl.NumberFormat('en-RW', { maximumFractionDigits: 2 }).format(value) : 'Not available';
+  if (typeof value === 'boolean') return value ? 'Yes' : 'No';
+  if (Array.isArray(value)) {
+    if (!value.length) return 'None recorded';
+    const entries = value.slice(0, 8).map((item, index) => `${index + 1}) ${readablePdfValue(item, depth + 1)}`);
+    if (value.length > 8) entries.push(`${value.length - 8} more items`);
+    return entries.join('; ');
+  }
+  if (typeof value === 'object') {
+    if (depth >= 2) return 'Additional details available';
+    const entries = Object.entries(value)
+      .filter(([key]) => !INTERNAL_VALUE_KEY.test(key))
+      .slice(0, 8)
+      .map(([key, item]) => `${readableLabel(key)}: ${readablePdfValue(item, depth + 1)}`);
+    return entries.length ? entries.join('; ') : 'Details recorded';
+  }
+  return String(value);
+}
+
+function displayDate(value) {
+  const date = new Date(value);
+  return Number.isFinite(date.getTime())
+    ? date.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' })
+    : 'Not available';
+}
+
 async function exportXlsx(report) {
   const workbook = new ExcelJS.Workbook();
   workbook.creator = 'Kubika AI Report Engine';
@@ -83,23 +123,27 @@ async function exportPdf(report) {
     doc.on('end', resolve);
     doc.on('error', reject);
   });
-  doc.fontSize(19).text(report.title);
-  doc.moveDown(0.5).fontSize(9).text(`Report ID: ${report.id}`);
-  doc.text(`Generated: ${report.generatedAt}`);
-  doc.text(`Period: ${report.dateRange.from} to ${report.dateRange.to}`);
-  doc.moveDown().fontSize(12).text('Executive summary');
-  doc.fontSize(10).text(report.executiveSummary);
+  doc.fillColor('#0f172a').font('Helvetica-Bold').fontSize(20).text(report.title);
+  doc.moveDown(0.35).fillColor('#475569').font('Helvetica').fontSize(9)
+    .text(`Generated ${displayDate(report.generatedAt)}  |  Period: ${displayDate(report.dateRange?.from)} – ${displayDate(report.dateRange?.to)}`);
+  doc.moveDown().fillColor('#0f172a').font('Helvetica-Bold').fontSize(13).text('Executive summary');
+  doc.moveDown(0.25).fillColor('#1e293b').font('Helvetica').fontSize(10).text(report.executiveSummary || 'No summary is available.');
   const section = (title, rows, render) => {
-    doc.moveDown().fontSize(13).text(title);
-    doc.moveDown(0.3).fontSize(9);
-    if (!rows.length) doc.text('None recorded.');
-    for (const row of rows) doc.text(render(row), { paragraphGap: 4 });
+    doc.moveDown().fillColor('#0f172a').font('Helvetica-Bold').fontSize(13).text(title);
+    doc.moveDown(0.25);
+    if (!rows.length) {
+      doc.fillColor('#64748b').font('Helvetica').fontSize(9).text('None recorded.');
+      return;
+    }
+    for (const row of rows) {
+      doc.fillColor('#1e293b').font('Helvetica').fontSize(9).text(render(row), { paragraphGap: 6 });
+    }
   };
-  section('Findings', report.findings, (item) => `${item.severity.toUpperCase()}: ${item.title} — ${item.summary} [evidence: ${(item.evidenceFactIds || []).join(', ') || 'none'}]`);
-  section('Evidence and source data', report.evidence, (item) => `${item.label}: ${JSON.stringify(item.value)}${item.unit ? ` ${item.unit}` : ''} [fact: ${item.id}; source: ${item.sourceService}.${item.sourceMethod}; source IDs: ${(item.sourceIds || []).join(', ') || 'none'}]`);
-  section('Calculations', report.calculations, (item) => `${item.label}: ${item.value}${item.unit ? ` ${item.unit}` : ''}; formula: ${item.formula || 'source fact'}; evidence: ${(item.evidenceFactIds || []).join(', ')}`);
-  section('Recommendations', report.recommendations, (item) => `${item.title}: ${item.rationale} [evidence: ${(item.evidenceFactIds || []).join(', ') || 'none'}]`);
-  section('Missing data caveats', report.missingDataCaveats, (item) => item);
+  section('Findings', report.findings, (item) => `${String(item.severity || 'info').toUpperCase()} - ${item.title}. ${item.summary}${item.recommendedNextStep ? ` Next step: ${item.recommendedNextStep}` : ''}`);
+  section('Business data', report.evidence, (item) => `${item.label}: ${readablePdfValue(item.value)}${item.unit ? ` ${item.unit}` : ''}`);
+  section('Calculations', report.calculations, (item) => `${item.label}: ${readablePdfValue(item.value)}${item.unit ? ` ${item.unit}` : ''}${item.formula ? `. Calculation: ${item.formula}` : ''}`);
+  section('Recommended next steps', report.recommendations, (item) => `${item.title}: ${item.rationale || item.description || 'Review this recommendation.'}`);
+  section('Data coverage notes', report.missingDataCaveats, (item) => item);
   doc.end();
   await complete;
   return Buffer.concat(chunks);

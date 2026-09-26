@@ -101,10 +101,10 @@ module.exports = buildDocumentModel({
   translateCreate: pickPackTranslateCreate,
   translateUpdate: pickPackTranslateUpdate,
   include: buildLineInclude(),
-  beforeSave: async (doc) => {
+  beforeSave: async (doc, { prevStatus } = {}) => {
     deriveLineStatuses(doc);
-    // Only rewrite lines when we still have them — never force an empty rewrite.
-    if (Array.isArray(doc.lines) && doc.lines.length > 0) {
+    // Header-only workflow transitions should not delete and recreate line rows.
+    if (doc.status === prevStatus && Array.isArray(doc.lines) && doc.lines.length > 0) {
       markLinesDirty(doc);
     }
   },
