@@ -7,7 +7,8 @@ const { buildContext } = require('../ai-engine/context-builder/ContextBuilder');
 const { evaluateContext } = require('../ai-engine/decision-engine');
 const { generateRecommendations } = require('../ai-engine/recommendation-engine');
 const { AI_DOMAINS } = require('../ai-engine/shared/interfaces');
-const { dateKey, dateColumn, isHighSeverity } = require('../ai-engine/monitoring/MonitoringEngine');
+const { dateKey, dateColumn, isHighSeverity, DOMAIN_PERMISSIONS } = require('../ai-engine/monitoring/MonitoringEngine');
+const { extractUserPermissions, hasPermission } = require('../ai-engine/context-builder/permissionUtils');
 const AIFindingService = require('./aiFindingService');
 const notificationHelper = require('./notificationHelper');
 const config = require('../src/config/environment').getConfig();
@@ -116,12 +117,15 @@ function briefingSummary(findings, recommendations, facts) {
   const top = findings.slice().sort((a, b) => ({ critical: 4, high: 3, medium: 2, low: 1 }[b.severity] || 0)
     - ({ critical: 4, high: 3, medium: 2, low: 1 }[a.severity] || 0)).slice(0, 3);
   const highlights = top.map((finding) => finding.title).join('; ');
-  return `Daily business briefing: ${facts.length} verified facts, ${findings.length} findings (${highCount} high or critical), and ${recommendations.length} recommendations.${highlights ? ` Priority items: ${highlights}.` : ' No decision-rule risks were detected in the scanned data.'}`;
+  if (!facts.length) {
+    return `This briefing could not assess business risks because no source facts were available. It recorded ${findings.length} findings and ${recommendations.length} recommendations. Check the data coverage notes below.`;
+  }
+  return `Daily business briefing: ${facts.length} verified facts, ${findings.length} findings (${highCount} high or critical), and ${recommendations.length} recommendations.${highlights ? ` Priority items: ${highlights}.` : ' No decision-rule risks were detected in the available data.'}`;
 }
 
-async function runCompanyScan({ companyId, domains = ALL_DOMAINS, now = new Date(), createBriefing = false }) {
+async function runCompanyScan({ companyId, domains = ALL_DOMAINS, now = new Date(), createBriefing = false, sendAlerts = true, scheduled = true }) {
   const tenantId = String(companyId);
-  if (config.ai.killSwitches.scheduledMonitoring || !isTenantFeatureEnabled('proactiveFindings', tenantId)) {
+  if ((scheduled && config.ai.killSwitches.scheduledMonitoring) || !isTenantFeatureEnabled('proactiveFindings', tenantId)) {
     return { companyId: tenantId, skipped: true, reason: 'AI monitoring is disabled for this tenant.' };
   }
   const user = systemUser(tenantId);
@@ -137,7 +141,7 @@ async function runCompanyScan({ companyId, domains = ALL_DOMAINS, now = new Date
   });
   const decision = evaluateContext(context);
   const findings = await AIFindingService.upsertFindings(tenantId, decision.findings);
-  const alertCount = await notifyHighSeverity(tenantId, decision.findings, now);
+  const alertCount = sendAlerts ? await notifyHighSeverity(tenantId, decision.findings, now) : 0;
   let briefing = null;
   if (createBriefing) {
     const recommendations = generateRecommendations({ findings: decision.findings, context, user });
@@ -188,6 +192,38 @@ async function runScanForAllCompanies(options = {}) {
 async function getLatestBriefing(companyId, userId) {
   await requireActiveCompanyMembership(companyId, userId);
   return prisma.aIBriefing.findFirst({ where: { companyId: String(companyId) }, orderBy: { briefingDate: 'desc' } });
+}
+
+async function generateBriefingForUser(companyId, user, userId, now = new Date()) {
+  const tenantId = String(companyId);
+  await requireActiveCompanyMembership(tenantId, userId);
+  if (!isTenantFeatureEnabled('proactiveFindings', tenantId)) {
+    throw Object.assign(new Error('AI monitoring is disabled for this company.'), { statusCode: 503 });
+  }
+
+  const permissions = extractUserPermissions(user);
+  const domains = ALL_DOMAINS.filter((domain) =>
+    DOMAIN_PERMISSIONS[domain] && hasPermission(permissions, DOMAIN_PERMISSIONS[domain]));
+  if (!domains.length) {
+    throw Object.assign(new Error('Your role does not have permission to generate a business briefing.'), { statusCode: 403 });
+  }
+
+  const scan = await runCompanyScan({
+    companyId: tenantId,
+    domains,
+    now,
+    createBriefing: true,
+    sendAlerts: false,
+    scheduled: false,
+  });
+  if (scan.skipped) {
+    throw Object.assign(new Error(scan.reason || 'AI monitoring is disabled for this company.'), { statusCode: 503 });
+  }
+  const briefing = await prisma.aIBriefing.findFirst({
+    where: { companyId: tenantId },
+    orderBy: { briefingDate: 'desc' },
+  });
+  return { scan, briefing };
 }
 
 async function requireActiveCompanyMembership(companyId, userId) {
@@ -283,6 +319,7 @@ module.exports = {
   runCompanyScan,
   runScanForAllCompanies,
   getLatestBriefing,
+  generateBriefingForUser,
   getPreferences,
   updatePreferences,
   setFindingState,

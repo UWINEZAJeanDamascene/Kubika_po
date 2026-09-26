@@ -259,6 +259,30 @@ router.patch('/findings/:findingId/status', protect, async (req, res) => {
   }
 });
 
+router.post('/monitoring/briefings/generate', protect, requireAIFeature('proactiveFindings'), async (req, res) => {
+  try {
+    const user = await enrichUserWithRoles(req.user);
+    const companyId = entityId(req.company || user.company);
+    const generated = await AIMonitoringService.generateBriefingForUser(companyId, user, entityId(user));
+    return res.json({
+      success: true,
+      briefing: generated.briefing
+        ? filterBriefing(generated.briefing, extractUserPermissions(user), hasPermission)
+        : null,
+      scan: {
+        findingCount: generated.scan.findings,
+        warningCount: generated.scan.warnings?.length || 0,
+      },
+    });
+  } catch (error) {
+    console.error('AI briefing generation error:', error.message || String(error));
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message: error.message || 'Failed to generate an AI briefing.',
+    });
+  }
+});
+
 router.get('/monitoring/briefings/latest', protect, async (req, res) => {
   try {
     const user = await enrichUserWithRoles(req.user);
