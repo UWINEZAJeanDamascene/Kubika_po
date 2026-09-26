@@ -41,7 +41,14 @@ function readableDomains(permissions, hasPermission) {
 function filterBriefing(briefing, permissions, hasPermission) {
   const allowed = readableDomains(permissions, hasPermission);
   const findings = (briefing.findings || []).filter((finding) => allowed.has(finding.domain));
-  const recommendations = (briefing.recommendations || []).filter((recommendation) =>
+  // Older briefing rows may contain the full recommendation engine envelope
+  // ({ recommendations: [...] }) instead of the array expected by the API.
+  const recommendationRows = Array.isArray(briefing.recommendations)
+    ? briefing.recommendations
+    : Array.isArray(briefing.recommendations?.recommendations)
+      ? briefing.recommendations.recommendations
+      : [];
+  const recommendations = recommendationRows.filter((recommendation) =>
     !(recommendation.domain || recommendation.metadata?.sourceDomain)
       || allowed.has(recommendation.domain || recommendation.metadata.sourceDomain));
   const facts = (briefing.facts || []).filter((fact) => {
