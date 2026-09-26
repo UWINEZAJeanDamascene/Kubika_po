@@ -327,6 +327,13 @@ exports.createBankAccount = async (req, res, next) => {
       data: account,
     });
   } catch (error) {
+    // Production responses intentionally hide internal database details, so
+    // keep the actionable cause in the service logs for failed account creates.
+    console.error('[bank-account:create] Failed to create bank account:', {
+      name: error.name,
+      code: error.code,
+      message: error.message,
+    });
     next(error);
   }
 };

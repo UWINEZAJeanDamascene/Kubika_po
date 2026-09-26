@@ -57,6 +57,14 @@ const BANK_ACCOUNT_FIELD_MAP = {
   notes: { target: 'notes' },
   color: { target: 'color' },
   icon: { target: 'icon' },
+  interestAccountType: { target: 'interestAccountType' },
+  interestRate: { target: 'interestRate' },
+  interestCalculationMethod: { target: 'interestCalculationMethod' },
+  interestCreditFrequency: { target: 'interestCreditFrequency' },
+  interestIncomeAccount: { target: 'interestIncomeAccount' },
+  interestAccrualAccount: { target: 'interestAccrualAccount' },
+  bankStatementReference: { target: 'bankStatementReference' },
+  interestStartDate: { target: 'interestStartDate' },
   customFields: { target: 'customFields' },
 };
 
