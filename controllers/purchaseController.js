@@ -83,7 +83,6 @@ exports.getPurchases = async (req, res, next) => {
       .populate("supplier", "name code contact")
       .populate("createdBy", "name email")
       .populate("-items")
-      .select({ supplier: 1, warehouse: 1, purchaseNumber: 1, supplierInvoiceNumber: 1, status: 1, currency: 1, subtotal: 1, taxAmount: 1, totalAmount: 1, payments: 1, purchaseDate: 1, stockAdded: 1, ebm: 1, createdBy: 1, createdAt: 1, updatedAt: 1 })
       .sort({ createdAt: -1, _id: -1 })
       .limit(limit)
       .skip(skip);
@@ -770,11 +769,14 @@ exports.recordPayment = async (req, res, next) => {
     }
 
     // Add payment
+    const paymentDate = new Date();
     purchase.payments.push({
       amount,
       paymentMethod,
       reference,
       notes,
+      paidDate: paymentDate,
+      date: paymentDate,
       recordedBy: req.user.id,
     });
 
