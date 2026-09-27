@@ -127,6 +127,16 @@ function dateFilter(start, end) {
   return Object.keys(q).length ? q : undefined;
 }
 
+// Mongoose-compatible queries use `$gte`/`$lte`; Prisma filters use `gte`/`lte`.
+function prismaDateFilter(start, end) {
+  const range = dateFilter(start, end);
+  if (!range) return undefined;
+  return {
+    ...(range.$gte ? { gte: range.$gte } : {}),
+    ...(range.$lte ? { lte: range.$lte } : {}),
+  };
+}
+
 function addDatePredicates(clauses, params, column, start, end) {
   const range = dateFilter(start, end);
   if (range?.$gte) {
@@ -180,12 +190,13 @@ async function getInvoices(companyId, opts = {}) {
   const q = { company: companyId };
   if (status) q.status = status;
   const df = dateFilter(startDate, endDate);
+  const prismaDf = prismaDateFilter(startDate, endDate);
   if (df) q.invoiceDate = df;
   const boundedLimit = safeAiLimit(limit);
   const invoices = await Invoice.find(q).sort({ invoiceDate: -1 }).limit(boundedLimit).populate('client', 'name').lean();
   const stats = await dbClient().invoice.groupBy({
     by: ['status'],
-    where: { companyId: String(companyId), ...(df ? { invoiceDate: df } : {}) },
+    where: { companyId: String(companyId), ...(prismaDf ? { invoiceDate: prismaDf } : {}) },
     _count: { _all: true },
     _sum: { totalAmount: true },
   });
@@ -249,12 +260,13 @@ async function getExpenses(companyId, opts = {}) {
   const q = { company: companyId };
   if (type) q.type = type;
   const df = dateFilter(startDate, endDate);
+  const prismaDf = prismaDateFilter(startDate, endDate);
   if (df) q.expenseDate = df;
   const boundedLimit = safeAiLimit(limit);
   const expenses = await Expense.find(q).sort({ expenseDate: -1 }).limit(boundedLimit).lean();
   const byType = await dbClient().expense.groupBy({
     by: ['type'],
-    where: { companyId: String(companyId), ...(df ? { expenseDate: df } : {}) },
+    where: { companyId: String(companyId), ...(prismaDf ? { expenseDate: prismaDf } : {}) },
     _sum: { amount: true },
     orderBy: { _sum: { amount: 'desc' } },
   });
@@ -326,7 +338,7 @@ async function getSalesSummary(companyId, opts = {}) {
       where: {
         companyId: String(companyId),
         status: { in: ['confirmed', 'partial', 'paid'] },
-        ...(dateFilter(startDate, endDate) ? { invoiceDate: dateFilter(startDate, endDate) } : {}),
+        ...(prismaDateFilter(startDate, endDate) ? { invoiceDate: prismaDateFilter(startDate, endDate) } : {}),
       },
       _count: { _all: true },
       _sum: { totalAmount: true, amountPaid: true, amountOutstanding: true },
@@ -700,14 +712,16 @@ async function generateChartData(companyId, opts = {}) {
 
 async function getProfitLossSummary(companyId, opts = {}) {
   const { startDate, endDate } = opts;
+  const invoiceDateRange = prismaDateFilter(startDate, endDate);
+  const expenseDateRange = prismaDateFilter(startDate, endDate);
   const invoiceWhere = {
     companyId: String(companyId),
     status: { in: ['confirmed', 'partial', 'paid'] },
-    ...(dateFilter(startDate, endDate) ? { invoiceDate: dateFilter(startDate, endDate) } : {}),
+    ...(invoiceDateRange ? { invoiceDate: invoiceDateRange } : {}),
   };
   const expenseWhere = {
     companyId: String(companyId),
-    ...(dateFilter(startDate, endDate) ? { expenseDate: dateFilter(startDate, endDate) } : {}),
+    ...(expenseDateRange ? { expenseDate: expenseDateRange } : {}),
   };
   const [invoiceTotals, expenseTotals, lineTotals] = await Promise.all([
     dbClient().invoice.aggregate({ where: invoiceWhere, _sum: { totalAmount: true }, _count: { _all: true } }),

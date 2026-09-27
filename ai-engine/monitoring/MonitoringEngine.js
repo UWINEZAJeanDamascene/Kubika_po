@@ -1,6 +1,7 @@
 'use strict';
 
 const { AI_DOMAINS } = require('../shared/interfaces');
+const { userFacingWarning } = require('../shared/userFacingWarning');
 
 const DOMAIN_PERMISSIONS = Object.freeze({
   [AI_DOMAINS.SALES]: ['sales.read', 'invoices.read'],
@@ -57,7 +58,10 @@ function filterBriefing(briefing, permissions, hasPermission) {
     }
     return !fact.domain || allowed.has(fact.domain);
   });
-  return { ...briefing, findings, recommendations, facts };
+  const warnings = Array.isArray(briefing.warnings)
+    ? briefing.warnings.map(userFacingWarning).filter(Boolean)
+    : [];
+  return { ...briefing, findings, recommendations, facts, warnings };
 }
 
 module.exports = { DOMAIN_PERMISSIONS, isHighSeverity, dateKey, dateColumn, filterBriefing };
