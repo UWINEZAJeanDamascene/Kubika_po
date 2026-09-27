@@ -136,7 +136,27 @@ exports.getPickPack = async (req, res, next) => {
     const companyId = req.user.company._id;
     
     const pickPack = await PickPack.findOne({ _id: req.params.id, company: companyId })
-      .select({ salesOrder: 1, client: 1, warehouse: 1, assignedTo: 1, createdBy: 1, lines: 1, status: 1, priority: 1, notes: 1 })
+      .select({
+        salesOrder: 1,
+        client: 1,
+        warehouse: 1,
+        assignedTo: 1,
+        createdBy: 1,
+        deliveryNote: 1,
+        lines: 1,
+        status: 1,
+        priority: 1,
+        notes: 1,
+        createdAt: 1,
+        pickingStartedAt: 1,
+        pickingCompletedAt: 1,
+        packingStartedAt: 1,
+        packingCompletedAt: 1,
+        packageCount: 1,
+        totalWeight: 1,
+        shippingMethod: 1,
+        trackingNumber: 1,
+      })
       .lean();
 
     const hydratedPickPack = await hydratePickPackRelations(pickPack);
@@ -372,8 +392,10 @@ exports.pickItems = async (req, res, next) => {
     const companyId = req.user.company._id;
     const { lineId, qtyPicked, serialNumbers, batchId, notes } = req.body;
     
-    const pickPack = await PickPack.findOne({ _id: req.params.id, company: companyId }).select({ lines: 1, status: 1 }).lean();
-    const hydratedPickPack = await hydratePickPackRelations(pickPack);
+    // This handler edits a line and persists the document below. Do not use
+    // `.lean()` here: the PostgreSQL compatibility model returns a plain object
+    // from lean queries, which has no `.save()` method.
+    const pickPack = await PickPack.findOne({ _id: req.params.id, company: companyId });
     
     if (!pickPack) {
       return res.status(404).json({
@@ -383,7 +405,7 @@ exports.pickItems = async (req, res, next) => {
       });
     }
     
-    if (!['picking', 'draft'].includes(hydratedPickPack.status)) {
+    if (!['picking', 'draft'].includes(pickPack.status)) {
       return res.status(400).json({
         success: false,
         error: ERR_INVALID_STATUS,
@@ -596,7 +618,10 @@ exports.completePacking = async (req, res, next) => {
     const companyId = req.user.company._id;
     const { packageCount, packageType, totalWeight, trackingNumber } = req.body;
     
-    const pickPack = await PickPack.findOne({ _id: req.params.id, company: companyId }).select({ salesOrder: 1, client: 1, warehouse: 1, lines: 1, status: 1, notes: 1 }).lean();
+    // This workflow creates a delivery note and then updates the pick-pack
+    // task. Keep the mutable compatibility document so `.save()` persists the
+    // completion state to PostgreSQL.
+    const pickPack = await PickPack.findOne({ _id: req.params.id, company: companyId });
     const hydratedPickPack = await hydratePickPackRelations(pickPack);
     
     if (!pickPack) {
@@ -685,18 +710,23 @@ exports.completePacking = async (req, res, next) => {
         });
       }
       
-      deliveryNote = await DeliveryNote.create({
-        company: companyId,
-        salesOrder: salesOrderId,
-        pickPack: pickPack._id,
-        client: clientId,
-        warehouse: warehouseId,
-        sourceType: 'pick_pack',
-        lines: deliveryLines,
-        status: 'draft',
-        notes: pickPack.notes || null,
-        createdBy: req.user.id
-      });
+      // A previous completion attempt may have created the note before an
+      // error interrupted the pick-pack status update. Reuse it on retry.
+      deliveryNote = await DeliveryNote.findOne({ company: companyId, pickPack: pickPack._id });
+      if (!deliveryNote) {
+        deliveryNote = await DeliveryNote.create({
+          company: companyId,
+          salesOrder: salesOrderId,
+          pickPack: pickPack._id,
+          client: clientId,
+          warehouse: warehouseId,
+          sourceType: 'pick_pack',
+          lines: deliveryLines,
+          status: 'draft',
+          notes: pickPack.notes || null,
+          createdBy: req.user.id
+        });
+      }
       
       console.log('Delivery Note created:', deliveryNote._id, 'lines:', deliveryLines.length);
     } catch (dnError) {

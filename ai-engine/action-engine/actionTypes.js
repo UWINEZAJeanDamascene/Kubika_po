@@ -10,6 +10,7 @@ const PROPOSAL_TYPES = Object.freeze({
   STOCK_ADJUSTMENT_REVIEW: "stock_adjustment_review_request",
   SUPPLIER_FOLLOW_UP_TASK: "supplier_follow_up_task",
   CUSTOMER_FOLLOW_UP_TASK: "customer_follow_up_task",
+  BUSINESS_REVIEW_TASK: "business_review_task",
 });
 
 const RISK_LEVELS = Object.freeze({
@@ -55,6 +56,11 @@ const PROPOSAL_POLICY = Object.freeze({
     riskLevel: RISK_LEVELS.LOW,
     approvalRequiredByRole: ["admin", "manager", "accountant"],
     requiredExecutionPermission: "customers.update",
+  },
+  [PROPOSAL_TYPES.BUSINESS_REVIEW_TASK]: {
+    riskLevel: RISK_LEVELS.LOW,
+    approvalRequiredByRole: ["admin", "manager"],
+    requiredExecutionPermission: null,
   },
 });
 

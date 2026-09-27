@@ -16,6 +16,7 @@ const FIELD_MAP = {
   invoice: { target: 'invoiceId', isId: true },
   warehouse: { target: 'warehouseId', isId: true },
   quotation: { target: 'quotationId', isId: true },
+  pickPack: { target: 'pickPackId', isId: true },
   status: { target: 'status' },
   deliveryDate: { target: 'deliveryDate' },
 };

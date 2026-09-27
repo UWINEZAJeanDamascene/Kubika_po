@@ -1520,6 +1520,7 @@ exports.recordPayment = async (req, res, next) => {
       amountOutstanding: 1,
       balance: 1,
       payments: 1,
+      salesOrder: 1,
     }).lean();
 
     if (Array.isArray(invoice?.lines)) {
@@ -1667,6 +1668,16 @@ exports.recordPayment = async (req, res, next) => {
     }
 
     await invoice.save();
+
+    const salesOrderId = invoice.salesOrder?._id || invoice.salesOrder?.id || invoice.salesOrder;
+    if (salesOrderId) {
+      try {
+        const { syncSalesOrderLifecycle } = require("../services/salesOrderLifecycleService");
+        await syncSalesOrderLifecycle(salesOrderId, companyId);
+      } catch (lifecycleError) {
+        console.error("Failed to sync Sales Order after invoice payment:", lifecycleError);
+      }
+    }
 
     // Create journal entry for payment (Cash/Bank Debit, Accounts Receivable Credit)
     let journalEntry = null;

@@ -14,6 +14,27 @@ const REQUIRED_ENV_VARS = [];
 
 const REQUIRED_IN_PRODUCTION = [];
 
+const RETIRED_AI_MODELS = Object.freeze({
+  groq: Object.freeze({
+    'llama-3.1-8b-instant': 'openai/gpt-oss-20b',
+    'llama-3.3-70b-versatile': 'openai/gpt-oss-120b',
+  }),
+  gemini: Object.freeze({
+    'gemini-2.0-flash': 'gemini-3.5-flash-lite',
+    'gemini-2.0-flash-lite': 'gemini-3.5-flash-lite',
+  }),
+});
+
+function resolveAIModel(provider, configuredModel, fallbackModel) {
+  const model = String(configuredModel || fallbackModel).trim();
+  const replacement = RETIRED_AI_MODELS[provider]?.[model];
+  if (replacement) {
+    console.warn(`[AI] ${provider} model "${model}" is retired; using "${replacement}". Update its model environment variable.`);
+    return replacement;
+  }
+  return model;
+}
+
 function normalizeNodeEnv() {
   const raw = String(process.env.NODE_ENV || '').trim();
   const nodeEnv = raw && raw !== 'undefined' && raw !== 'null' ? raw : 'development';
@@ -238,10 +259,10 @@ function buildConfig() {
     // =====================
     ai: {
       geminiApiKey: process.env.GEMINI_API_KEY || null,
-      geminiModel: process.env.GEMINI_MODEL || 'gemini-2.0-flash',
+      geminiModel: resolveAIModel('gemini', process.env.GEMINI_MODEL, 'gemini-3.5-flash-lite'),
       groqApiKey: process.env.GROQ_API_KEY || null,
       groqBaseUrl: process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1',
-      groqModel: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
+      groqModel: resolveAIModel('groq', process.env.GROQ_MODEL, 'openai/gpt-oss-20b'),
       mistralApiKey: process.env.MISTRAL_API_KEY || null,
       mistralModel: process.env.MISTRAL_MODEL || 'mistral-small-latest',
       openRouterApiKey: process.env.OPENROUTER_API_KEY || null,
@@ -326,6 +347,7 @@ Object.freeze(config.features);
 // Use a wrapper object to avoid issues with frozen config
 const configExporter = {
   ...config,
+  resolveAIModel,
   getConfig: () => config
 };
 module.exports = configExporter;

@@ -210,6 +210,55 @@ describe('document reference numbers', () => {
   });
 });
 
+describe('PickPack workflow persistence', () => {
+  test('status-only transitions do not rewrite picking lines', async () => {
+    const { prisma } = require('../lib/prisma');
+    const PickPack = require('../models/PickPack');
+    const packRow = {
+      id: 'pick-pack-1',
+      companyId: 'company-1',
+      referenceNo: 'PK-2026-00001',
+      salesOrderId: 'sales-order-1',
+      clientId: 'client-1',
+      warehouseId: 'warehouse-1',
+      status: 'picking',
+      lines: [{
+        id: 'pick-line-1',
+        salesOrderLineId: 'sales-order-line-1',
+        productId: 'product-1',
+        qtyToPick: 7,
+        qtyPicked: 7,
+        qtyPacked: 0,
+        serialNumbers: [],
+        status: 'picked',
+        issues: [],
+      }],
+    };
+    const findFirst = jest.spyOn(prisma.pickPack, 'findFirst').mockResolvedValue(packRow);
+    const update = jest.spyOn(prisma.pickPack, 'update').mockImplementation(async ({ data }) => ({
+      ...packRow,
+      ...data,
+      status: data.status,
+      lines: packRow.lines,
+    }));
+    const findSalesOrder = jest.spyOn(prisma.salesOrder, 'findUnique').mockResolvedValue(null);
+
+    try {
+      const pickPack = await PickPack.findOne({ _id: packRow.id, company: packRow.companyId });
+      pickPack.status = 'picked';
+      pickPack.pickingCompletedAt = new Date();
+      await pickPack.save();
+
+      expect(update).toHaveBeenCalledTimes(1);
+      expect(update.mock.calls[0][0].data).not.toHaveProperty('lines');
+    } finally {
+      findFirst.mockRestore();
+      update.mockRestore();
+      findSalesOrder.mockRestore();
+    }
+  });
+});
+
 describe('Phase 5+6 Neon integration', () => {
   const hasDb = Boolean(process.env.DATABASE_URL);
 

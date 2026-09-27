@@ -50,6 +50,19 @@ function validatePayload(type, payload = {}) {
   if (type === PROPOSAL_TYPES.SUPPLIER_FOLLOW_UP_TASK
     && (typeof payload.supplierId !== 'string' || !payload.supplierId.trim())) errors.push('supplierId is required');
 
+  if (type === PROPOSAL_TYPES.BUSINESS_REVIEW_TASK) {
+    if (typeof payload.title !== 'string' || !payload.title.trim() || payload.title.length > 200) {
+      errors.push('title must be a non-empty string of 200 characters or less');
+    }
+    if (payload.summary != null && (typeof payload.summary !== 'string' || payload.summary.length > 2000)) {
+      errors.push('summary must be 2000 characters or less');
+    }
+    if (payload.recommendedNextStep != null
+      && (typeof payload.recommendedNextStep !== 'string' || payload.recommendedNextStep.length > 2000)) {
+      errors.push('recommendedNextStep must be 2000 characters or less');
+    }
+  }
+
   if ([PROPOSAL_TYPES.SUPPLIER_FOLLOW_UP_TASK, PROPOSAL_TYPES.CUSTOMER_FOLLOW_UP_TASK].includes(type)
     && payload.title != null && (typeof payload.title !== 'string' || payload.title.trim().length === 0 || payload.title.length > 200)) {
     errors.push('title must be a non-empty string of 200 characters or less');

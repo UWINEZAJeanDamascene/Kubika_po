@@ -144,7 +144,14 @@ async function runCompanyScan({ companyId, domains = ALL_DOMAINS, now = new Date
   const alertCount = sendAlerts ? await notifyHighSeverity(tenantId, decision.findings, now) : 0;
   let briefing = null;
   if (createBriefing) {
-    const recommendations = generateRecommendations({ findings: decision.findings, context, user });
+    const recommendationResult = generateRecommendations({ findings: decision.findings, context, user });
+    // The engine returns a metadata envelope; the briefing schema/API expects
+    // its recommendations field to be the actual array of recommendation rows.
+    const recommendations = Array.isArray(recommendationResult)
+      ? recommendationResult
+      : Array.isArray(recommendationResult?.recommendations)
+        ? recommendationResult.recommendations
+        : [];
     const briefingDate = dateColumn(dateKey(now));
     const data = {
       summary: briefingSummary(decision.findings, recommendations, context.facts),

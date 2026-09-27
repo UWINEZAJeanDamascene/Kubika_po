@@ -837,7 +837,7 @@ exports.getTaxDashboard = async (req, res) => {
              COALESCE(SUM(COALESCE((salary->>'grossSalary')::numeric, 0)), 0) AS "totalGross",
              COALESCE(SUM(COALESCE((deductions->>'rssbEmployeePension')::numeric, 0) + COALESCE((deductions->>'rssbEmployeeMaternity')::numeric, 0)), 0) AS "totalRssbEmployee",
              COALESCE(SUM(COALESCE((contributions->>'rssbEmployerPension')::numeric, 0) + COALESCE((contributions->>'rssbEmployerMaternity')::numeric, 0) + COALESCE((contributions->>'occupationalHazard')::numeric, 0)), 0) AS "totalRssbEmployer",
-             COUNT(DISTINCT COALESCE(employee->>'employeeId', employee_ref_id))::int AS "employeeCount"
+             COUNT(DISTINCT COALESCE(employee->>'employeeId', employee_id))::int AS "employeeCount"
       FROM payrolls
       WHERE company_id = ${String(companyId)} AND record_status IN ('finalised', 'paid')
         ${dateFilter.$gte ? Prisma.sql`AND pay_period_start >= ${dateFilter.$gte}` : Prisma.empty}

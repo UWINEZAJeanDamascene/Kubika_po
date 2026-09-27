@@ -230,7 +230,7 @@ class ExecutiveDashboardService {
 
     const rows = await journalAgg.sumLinesByAccountCode(companyId, {
       accountCodes: cashAccountCodes,
-      excludeSourceType: 'opening_balance',
+      excludeSourceTypes: ['opening_balance', 'bank_account_opening'],
     })
 
     const journalBalance = rows.reduce(

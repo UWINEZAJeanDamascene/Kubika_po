@@ -1,6 +1,7 @@
 'use strict';
 
 const { AI_DOMAINS } = require('../shared/interfaces');
+const { userFacingWarning } = require('../shared/userFacingWarning');
 
 const DOMAIN_PERMISSIONS = Object.freeze({
   [AI_DOMAINS.SALES]: ['sales.read', 'invoices.read'],
@@ -41,7 +42,14 @@ function readableDomains(permissions, hasPermission) {
 function filterBriefing(briefing, permissions, hasPermission) {
   const allowed = readableDomains(permissions, hasPermission);
   const findings = (briefing.findings || []).filter((finding) => allowed.has(finding.domain));
-  const recommendations = (briefing.recommendations || []).filter((recommendation) =>
+  // Older briefing rows may contain the full recommendation engine envelope
+  // ({ recommendations: [...] }) instead of the array expected by the API.
+  const recommendationRows = Array.isArray(briefing.recommendations)
+    ? briefing.recommendations
+    : Array.isArray(briefing.recommendations?.recommendations)
+      ? briefing.recommendations.recommendations
+      : [];
+  const recommendations = recommendationRows.filter((recommendation) =>
     !(recommendation.domain || recommendation.metadata?.sourceDomain)
       || allowed.has(recommendation.domain || recommendation.metadata.sourceDomain));
   const facts = (briefing.facts || []).filter((fact) => {
@@ -50,7 +58,10 @@ function filterBriefing(briefing, permissions, hasPermission) {
     }
     return !fact.domain || allowed.has(fact.domain);
   });
-  return { ...briefing, findings, recommendations, facts };
+  const warnings = Array.isArray(briefing.warnings)
+    ? briefing.warnings.map(userFacingWarning).filter(Boolean)
+    : [];
+  return { ...briefing, findings, recommendations, facts, warnings };
 }
 
 module.exports = { DOMAIN_PERMISSIONS, isHighSeverity, dateKey, dateColumn, filterBriefing };
