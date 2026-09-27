@@ -31,6 +31,34 @@ const {
   getProviderStatus,
 } = require('../services/aiProviderService');
 
+function localWorkflowGuide(message) {
+  const text = String(message || '').toLowerCase();
+  if (!/\binvoices?\b/.test(text) || !/\b(create|confirm|draft|issue|make)\b/.test(text)) return null;
+  return [
+    'To create and confirm a sales invoice:',
+    '1. Open Sales → Invoices and choose New Invoice.',
+    '2. Select the customer, set the invoice and due dates, add products or services with quantities, and save the invoice as a draft.',
+    '3. Open the draft, check the customer, totals, tax, and line items, then choose Confirm. You need invoice approval permission; confirmation also checks stock for stockable products.',
+    '4. After confirmation, use Record Payment to enter a full or partial receipt when the customer pays.',
+    'If Confirm is blocked, check that the invoice has at least one line, the products are active, and enough stock is available.',
+  ].join('\n');
+}
+
+function providerIssueSummary(attempts = []) {
+  const issues = new Map();
+  for (const attempt of attempts) {
+    const provider = String(attempt.provider || 'AI provider');
+    const status = Number(attempt.status);
+    let issue = 'is currently unavailable';
+    if (status === 401 || status === 403) issue = 'has an authentication or access problem';
+    else if (status === 402) issue = 'needs an active plan or credits';
+    else if (status === 404) issue = 'has an unavailable model configured';
+    else if (status === 429) issue = 'has reached its rate or usage limit';
+    issues.set(provider, `${provider} ${issue}`);
+  }
+  return [...issues.values()];
+}
+
 router.post('/', protect, requireAIFeature('aiChatV2'), (req, res, next) => {
   const startedAt = Date.now();
   res.once('finish', () => {
@@ -114,6 +142,17 @@ router.post('/', protect, requireAIFeature('aiChatV2'), (req, res, next) => {
         },
       });
     }
+
+    const guideReply = nlq.intent === 'help_query' ? localWorkflowGuide(message) : null;
+    if (guideReply) {
+      return res.status(200).json({
+        success: true,
+        reply: guideReply,
+        provider: 'built-in-guide',
+        ai: { nlqVersion: NLQ_VERSION, intent: nlq, routed: 'local_workflow_guide' },
+      });
+    }
+
     if (!hasAIProviders()) {
       const providers = getConfiguredProviders();
       return res.status(200).json({
@@ -324,11 +363,15 @@ router.post('/', protect, requireAIFeature('aiChatV2'), (req, res, next) => {
     const allFailed = error.allProvidersFailed === true || (error.message && error.message.includes('All AI providers failed'));
 
     if (isQuotaError || allFailed) {
+      const providerIssues = providerIssueSummary(error.providerAttempts);
+      const availabilityMessage = providerIssues.length
+        ? `Stacy could not reach a working AI provider. ${providerIssues.join('; ')}. Check AI Provider Health and update the affected provider settings.`
+        : isQuotaError
+          ? 'Stacy is temporarily unavailable because AI providers are rate-limited. Please try again later.'
+          : 'Stacy could not get a safe response from the configured AI providers. Check AI Provider Health and try again after resolving the provider issues.';
       return res.status(200).json({
         success: true,
-        reply: isQuotaError
-          ? 'The AI assistant is temporarily unavailable because configured providers are rate-limited. Please try again later.'
-          : 'The AI assistant could not obtain a safe response from the configured providers. Please try again later.',
+        reply: availabilityMessage,
         provider: 'router',
         ai: {
           guardrailVersion: GUARDRAIL_VERSION,

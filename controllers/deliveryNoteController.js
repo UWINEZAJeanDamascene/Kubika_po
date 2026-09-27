@@ -17,6 +17,7 @@ const StockLevel = require("../models/StockLevel");
 const emailService = require("../services/emailService");
 const Client = require("../models/Client");
 const { emitDataChanged } = require("../lib/realtimeEvents");
+const { syncSalesOrderLifecycle } = require("../services/salesOrderLifecycleService");
 
 const ERR_DELIVERY_NOT_FOUND = "ERR_DELIVERY_NOT_FOUND";
 const ERR_DELIVERY_CONFIRMED = "ERR_DELIVERY_CONFIRMED";
@@ -1444,6 +1445,7 @@ exports.markDelivered = async (req, res, next) => {
     deliveryNote.status = 'delivered';
 
     await deliveryNote.save();
+    await syncSalesOrderLifecycle(deliveryNote.salesOrder, companyId);
 
     res.status(200).json({
       success: true,
@@ -1859,10 +1861,11 @@ exports.createInvoiceFromDeliveryNote = async (req, res, next) => {
     // Update Sales Order with invoice reference
     if (deliveryNote.salesOrder) {
       const SalesOrder = require("../models/SalesOrder");
-      await SalesOrder.findByIdAndUpdate(deliveryNote.salesOrder._id, {
+      const salesOrderId = deliveryNote.salesOrder._id || deliveryNote.salesOrder;
+      await SalesOrder.findByIdAndUpdate(salesOrderId, {
         $addToSet: { invoices: invoice._id },
-        status: "invoiced",
       });
+      await syncSalesOrderLifecycle(salesOrderId, companyId);
     }
 
     const hydratedInvoice = await Invoice.findById(invoice._id).lean();
