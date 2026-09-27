@@ -6,6 +6,8 @@ const {
   invoiceLineToApi,
   quotationToApi,
   purchaseOrderToApi,
+  purchaseToApi,
+  purchaseTranslateUpdate,
   grnToApi,
   arReceiptAllocationToApi,
 } = require('../utils/salesApMappers');
@@ -105,6 +107,41 @@ describe('Phase 5+6 sales/AP mappers', () => {
       updatedAt: new Date(),
     });
     expect(api.lines[0].qtyOrdered).toBe(10);
+  });
+
+  test('purchaseToApi derives paid amount and balance from payment JSON with formatted strings', () => {
+    const api = purchaseToApi({
+      id: 'p1',
+      companyId: 'c1',
+      purchaseNumber: 'PO-2026-0001',
+      supplierId: 's1',
+      status: 'received',
+      currency: 'RWF',
+      subtotal: 55000,
+      taxAmount: 9000,
+      totalAmount: 64000,
+      payments: [
+        { amount: 15000 },
+        { amount: '25000.00' },
+        { amount: 'RWF 11,000' },
+      ],
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    expect(api.amountPaid).toBe(51000);
+    expect(api.balance).toBe(13000);
+    expect(api.grandTotal).toBe(64000);
+  });
+
+  test('purchaseTranslateUpdate preserves payment array writes', () => {
+    const update = purchaseTranslateUpdate({
+      $set: {
+        status: 'partial',
+        payments: [{ amount: 5000, paymentMethod: 'cash', reference: 'cash-001' }],
+      },
+    });
+    expect(update.status).toBe('partial');
+    expect(update.payments).toEqual([{ amount: 5000, paymentMethod: 'cash', reference: 'cash-001' }]);
   });
 
   test('grnToApi AP fields as money strings', () => {
