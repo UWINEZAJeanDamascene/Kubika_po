@@ -136,7 +136,27 @@ exports.getPickPack = async (req, res, next) => {
     const companyId = req.user.company._id;
     
     const pickPack = await PickPack.findOne({ _id: req.params.id, company: companyId })
-      .select({ salesOrder: 1, client: 1, warehouse: 1, assignedTo: 1, createdBy: 1, lines: 1, status: 1, priority: 1, notes: 1 })
+      .select({
+        salesOrder: 1,
+        client: 1,
+        warehouse: 1,
+        assignedTo: 1,
+        createdBy: 1,
+        deliveryNote: 1,
+        lines: 1,
+        status: 1,
+        priority: 1,
+        notes: 1,
+        createdAt: 1,
+        pickingStartedAt: 1,
+        pickingCompletedAt: 1,
+        packingStartedAt: 1,
+        packingCompletedAt: 1,
+        packageCount: 1,
+        totalWeight: 1,
+        shippingMethod: 1,
+        trackingNumber: 1,
+      })
       .lean();
 
     const hydratedPickPack = await hydratePickPackRelations(pickPack);

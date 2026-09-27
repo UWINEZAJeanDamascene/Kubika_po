@@ -287,7 +287,16 @@ async function sumLinesByAccountCode(companyId, options = {}) {
     dateTo = null,
     accountCodes = null,
     excludeSourceType = null,
+    excludeSourceTypes = null,
   } = options;
+
+  const excludedSourceTypes = [...new Set([
+    ...(Array.isArray(excludeSourceTypes) ? excludeSourceTypes : []),
+    ...(excludeSourceType ? [excludeSourceType] : []),
+  ].filter(Boolean).map(String))];
+  const sourceTypeFilter = excludedSourceTypes.length
+    ? Prisma.sql`AND (je.source_type IS NULL OR je.source_type <> ALL(${excludedSourceTypes}::text[]))`
+    : Prisma.empty;
 
   const codes = accountCodes
     ? [...new Set(accountCodes.filter(Boolean).map(String))]
@@ -297,24 +306,6 @@ async function sumLinesByAccountCode(companyId, options = {}) {
 
   if (codes) {
     if (dateFrom && dateTo) {
-      if (excludeSourceType) {
-        return prisma.$queryRaw`
-          SELECT jel.account_code AS "accountCode",
-           jel.account_code AS "_id",
-                 COALESCE(SUM(jel.debit), 0)::float AS "totalDebit",
-                 COALESCE(SUM(jel.credit), 0)::float AS "totalCredit"
-          FROM journal_entry_lines jel
-          INNER JOIN journal_entries je ON je.id = jel.journal_entry_id
-          WHERE je.company_id = ${cid}
-            AND je.status = 'posted'
-            AND je.reversed = false
-            AND je.date >= ${dateFrom}
-            AND je.date <= ${dateTo}
-            AND (je.source_type IS NULL OR je.source_type <> ${excludeSourceType})
-            AND jel.account_code = ANY(${codes}::text[])
-          GROUP BY jel.account_code
-        `;
-      }
       return prisma.$queryRaw`
         SELECT jel.account_code AS "accountCode",
            jel.account_code AS "_id",
@@ -327,6 +318,7 @@ async function sumLinesByAccountCode(companyId, options = {}) {
           AND je.reversed = false
           AND je.date >= ${dateFrom}
           AND je.date <= ${dateTo}
+          ${sourceTypeFilter}
           AND jel.account_code = ANY(${codes}::text[])
         GROUP BY jel.account_code
       `;
@@ -346,23 +338,7 @@ async function sumLinesByAccountCode(companyId, options = {}) {
           AND je.status = 'posted'
           AND je.reversed = false
           AND je.date <= ${dateTo}
-          AND jel.account_code = ANY(${codes}::text[])
-        GROUP BY jel.account_code
-      `;
-    }
-
-    if (excludeSourceType) {
-      return prisma.$queryRaw`
-        SELECT jel.account_code AS "accountCode",
-           jel.account_code AS "_id",
-               COALESCE(SUM(jel.debit), 0)::float AS "totalDebit",
-               COALESCE(SUM(jel.credit), 0)::float AS "totalCredit"
-        FROM journal_entry_lines jel
-        INNER JOIN journal_entries je ON je.id = jel.journal_entry_id
-        WHERE je.company_id = ${cid}
-          AND je.status = 'posted'
-          AND je.reversed = false
-          AND (je.source_type IS NULL OR je.source_type <> ${excludeSourceType})
+          ${sourceTypeFilter}
           AND jel.account_code = ANY(${codes}::text[])
         GROUP BY jel.account_code
       `;
@@ -378,6 +354,7 @@ async function sumLinesByAccountCode(companyId, options = {}) {
       WHERE je.company_id = ${cid}
         AND je.status = 'posted'
         AND je.reversed = false
+        ${sourceTypeFilter}
         AND jel.account_code = ANY(${codes}::text[])
       GROUP BY jel.account_code
     `;
