@@ -2494,6 +2494,7 @@ model Purchase {
   warehouseId           String?        @map("warehouse_id") @db.Char(24)
   status                String         @default("draft")
   currency              String         @default("RWF")
+  exchangeRate          Decimal?       @map("exchange_rate") @db.Decimal(19, 6)
   paymentTerms          String?        @map("payment_terms")
   subtotal              Decimal        @default(0) @db.Decimal(19, 2)
   taxAmount             Decimal        @default(0) @map("tax_amount") @db.Decimal(19, 2)
