@@ -162,7 +162,7 @@ exports.getProducts = async (req, res, next) => {
       '_id', 'company', 'name', 'sku', 'barcode', 'unit', 'currentStock',
       'isActive', 'isArchived', 'trackingType', 'trackBatch',
       'trackSerialNumbers', 'defaultWarehouse', 'sellingPrice', 'costPrice',
-      'averageCost', 'createdAt', 'updatedAt'
+      'preferredSupplier', 'averageCost', 'taxCode', 'taxRate', 'createdAt', 'updatedAt'
     ] : isStockLevels ? [
       '_id', 'company', 'name', 'sku', 'category', 'unit', 'currentStock',
       'reservedQuantity', 'averageCost', 'costPrice', 'lowStockThreshold',
