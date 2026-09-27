@@ -545,7 +545,7 @@ ${recentExpenses.length > 0
 `;
 
     const model = genAI.getGenerativeModel({
-      model: 'gemini-2.0-flash',
+      model: config.ai.geminiModel,
       systemInstruction: systemPrompt,
       generationConfig: {
         temperature: 0.75,

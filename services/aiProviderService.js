@@ -16,6 +16,7 @@ const { recordEvent } = require('./aiOperationalMetricsService');
 const CACHE_TTL_SECONDS = config.ai.cacheTtlSeconds || 30;
 const TIMEOUT_MS = config.ai.timeoutMs || 10000;
 const HEALTHY_RETRY_MS = 60000;
+const PROVIDER_CONFIG_RETRY_MS = 15 * 60 * 1000;
 const HEALTH_CHECK_TIMEOUT_MS = 3000;
 const MAX_MEMORY_CACHE_SIZE = 500;
 const MAX_LATENCY_SAMPLES = 25;
@@ -48,6 +49,7 @@ function createCircuit(name) {
     rateLimits: 0,
     guardrailRejections: 0,
     lastError: null,
+    lastStatus: null,
     lastLatencyMs: null,
     latencySamples: [],
     quota: null,
@@ -82,6 +84,7 @@ function getCircuitSnapshot(name) {
     rateLimits: circuit.rateLimits,
     guardrailRejections: circuit.guardrailRejections,
     lastError: circuit.lastError,
+    lastStatus: circuit.lastStatus,
     lastLatencyMs: circuit.lastLatencyMs,
     avgLatencyMs,
     quota: circuit.quota,
@@ -111,6 +114,7 @@ function markProviderSuccess(name, latencyMs) {
   const circuit = getCircuit(name);
   circuit.successes += 1;
   circuit.lastLatencyMs = latencyMs;
+  circuit.lastStatus = null;
   if (typeof latencyMs === 'number') {
     circuit.latencySamples.push(latencyMs);
     if (circuit.latencySamples.length > MAX_LATENCY_SAMPLES) circuit.latencySamples.shift();
@@ -134,17 +138,20 @@ function markProviderFailure(name, err, opts = {}) {
   circuit.failures += 1;
   circuit.consecutiveFailures += 1;
   circuit.lastError = err?.message || String(err || 'unknown error');
+  const status = Number(err?.status || err?.statusCode);
+  circuit.lastStatus = Number.isFinite(status) ? status : null;
   if (opts.guardrailRejected) circuit.guardrailRejections += 1;
 
-  const status = Number(err?.status || err?.statusCode);
+  const configurationError = [401, 402, 403, 404].includes(status);
   if (status === 429 || /rate limit|quota/i.test(circuit.lastError)) {
     circuit.rateLimits += 1;
     circuit.quota = extractQuotaMetadata(err);
   }
   circuit.probeInFlight = false;
-  const shouldOpen = failedHalfOpenProbe || opts.openCircuit || status === 429 || err?.name === 'AbortError' || /timeout|rate limit|quota/i.test(circuit.lastError) || circuit.consecutiveFailures >= CIRCUIT_FAILURE_THRESHOLD;
+  const shouldOpen = failedHalfOpenProbe || opts.openCircuit || configurationError || status === 429 || err?.name === 'AbortError' || /timeout|rate limit|quota/i.test(circuit.lastError) || circuit.consecutiveFailures >= CIRCUIT_FAILURE_THRESHOLD;
   if (shouldOpen) {
-    openCircuit(name, opts.until || parseRetryAfterFromError(err) || (Date.now() + HEALTHY_RETRY_MS), circuit.lastError);
+    const retryWindow = configurationError ? PROVIDER_CONFIG_RETRY_MS : HEALTHY_RETRY_MS;
+    openCircuit(name, opts.until || parseRetryAfterFromError(err) || (Date.now() + retryWindow), circuit.lastError);
   }
 }
 
@@ -179,10 +186,14 @@ function parseRetryAfterFromError(err) {
   try {
     const headers = err?.headers || err?.response?.headers || err?.rawHeaders;
     if (headers) {
-      const raw = headers['retry-after'] || headers['Retry-After'] || headers['retry_after'];
+      const raw = typeof headers.get === 'function'
+        ? headers.get('retry-after')
+        : headers['retry-after'] || headers['Retry-After'] || headers['retry_after'];
       if (raw) {
         const secs = parseFloat(raw);
         if (!Number.isNaN(secs)) return Date.now() + Math.round(secs * 1000);
+        const date = Date.parse(raw);
+        if (Number.isFinite(date)) return date;
       }
     }
 
@@ -223,7 +234,7 @@ function createProviders() {
     providers.push(providerMeta('groq', 'Groq', new OpenAI({
       apiKey: config.ai.groqApiKey,
       baseURL: config.ai.groqBaseUrl || 'https://api.groq.com/openai/v1',
-    }), config.ai.groqModel || 'llama-3.1-8b-instant', Math.min(TIMEOUT_MS, 15000)));
+    }), config.ai.groqModel || 'openai/gpt-oss-20b', Math.min(TIMEOUT_MS, 15000)));
     configured.push('groq');
   } else {
     missing.push('groq');
@@ -233,7 +244,7 @@ function createProviders() {
     providers.push(providerMeta('gemini', 'Gemini', new OpenAI({
       apiKey: config.ai.geminiApiKey,
       baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
-    }), config.ai.geminiModel || 'gemini-2.0-flash', Math.min(TIMEOUT_MS, 20000)));
+    }), config.ai.geminiModel || 'gemini-3.5-flash-lite', Math.min(TIMEOUT_MS, 20000)));
     configured.push('gemini');
   } else {
     missing.push('gemini');
@@ -604,7 +615,14 @@ async function createCompletion(params) {
     const error = new Error('All configured AI providers are temporarily unhealthy. Please try again in a minute.');
     error.allProvidersFailed = true;
     error.code = 'AI_PROVIDERS_UNHEALTHY';
-    error.providerAttempts = [];
+    error.providerAttempts = allConfigured
+      .map((provider) => {
+        const circuit = getCircuitSnapshot(provider.name);
+        return circuit.state === CIRCUIT_STATES.OPEN
+          ? { provider: provider.name, status: circuit.lastStatus, result: 'circuit_open' }
+          : null;
+      })
+      .filter(Boolean);
     throw error;
   }
 
@@ -631,8 +649,10 @@ async function getProviderStatus() {
   const all = createProviders();
   const statuses = await Promise.all(
     all.map(async (p) => {
-      const healthy = await checkProviderHealth(p);
-      if (!healthy && isProviderHealthy(p.name)) markProviderUnhealthy(p.name);
+      const transportHealthy = await checkProviderHealth(p);
+      if (!transportHealthy && isProviderHealthy(p.name)) markProviderUnhealthy(p.name);
+      const circuit = getCircuitSnapshot(p.name);
+      const healthy = transportHealthy && circuit.state !== CIRCUIT_STATES.OPEN;
       return {
         name: p.name,
         displayName: p.displayName,
@@ -643,7 +663,7 @@ async function getProviderStatus() {
         supportsJsonMode: p.supportsJsonMode,
         supportsToolCalling: p.supportsToolCalling,
         hosted: p.hosted,
-        circuit: getCircuitSnapshot(p.name),
+        circuit,
       };
     })
   );
