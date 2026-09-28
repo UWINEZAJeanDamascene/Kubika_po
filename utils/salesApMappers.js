@@ -1361,6 +1361,10 @@ const PURCHASE_ORDER_HEADER = {
   subtotal: 'subtotal',
   taxAmount: 'taxAmount',
   totalAmount: 'totalAmount',
+  amountPaid: 'amountPaid',
+  balance: 'balance',
+  paymentStatus: 'paymentStatus',
+  payments: 'payments',
   notes: 'notes',
 };
 

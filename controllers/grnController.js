@@ -62,8 +62,13 @@ function normalizeGrnRefs(grn) {
 
 function computeGrnTotal(grn) {
   let totalAmount = (grn.lines || []).reduce(
-    (sum, line) =>
-      sum + Number(line.qtyReceived || 0) * Number(line.unitCost || 0),
+    (sum, line) => {
+      const lineSubtotal = Number(line.qtyReceived || 0) * Number(line.unitCost || 0);
+      const lineTax = line.taxAmount != null
+        ? Number(line.taxAmount) || 0
+        : lineSubtotal * (Number(line.taxRate || 0) / 100);
+      return sum + lineSubtotal + lineTax;
+    },
     0,
   );
   const freightAmt = Number(grn.freight?.actualAmount) || 0;
@@ -259,7 +264,10 @@ exports.createGRN = async (req, res, next) => {
         enrichedLines.push({
           ...line,
           product: resolveLineProductId(line),
-          taxRate: line.taxRate != null ? line.taxRate : poLine.taxRate || 0,
+          // PO prices and tax are authoritative; the client submits quantities,
+          // while prices must remain consistent with the approved order.
+          unitCost: Number(poLine.unitCost) || 0,
+          taxRate: Number(poLine.taxRate) || 0,
           manufactureDate: mfgDate,
           expiryDate: expDate,
         });
@@ -955,16 +963,10 @@ exports.confirmGRN = async (req, res, next) => {
     grn.confirmedBy = req.user.id;
     grn.confirmedAt = new Date();
 
-    // Calculate and set totalAmount from lines (includes freight when absorbed into unitCost)
-    const grnTotal = grn.lines.reduce(
-      (sum, line) =>
-        sum + Number(line.qtyReceived) * Number(line.unitCost || 0),
-      0,
-    );
-    // Ensure total includes freight even when not absorbed (separate line scenario)
-    const totalWithFreight = grnTotal + (includeFreightInCost ? 0 : freightAmount);
-    grn.totalAmount = totalWithFreight;
-    grn.balance = totalWithFreight;
+    // Keep the confirmed document value consistent with the displayed line tax
+    // and freight treatment used by GRN reads and creation.
+    grn.totalAmount = computeGrnTotal(grn);
+    grn.balance = grn.totalAmount;
     grn.paymentStatus = "pending";
 
     await grn.save(useSession ? { session: sess } : {});
