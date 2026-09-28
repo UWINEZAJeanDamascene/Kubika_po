@@ -224,7 +224,7 @@ exports.getPurchaseOrders = async (req, res, next) => {
       .populate('supplier', 'name code contact email')
       .populate('warehouse', 'name code')
       .populate('-lines')
-      .select({ supplier: 1, warehouse: 1, referenceNo: 1, orderDate: 1, expectedDeliveryDate: 1, status: 1, source: 1, currencyCode: 1, exchangeRate: 1, subtotal: 1, taxAmount: 1, totalAmount: 1, amountPaid: 1, balance: 1, paymentStatus: 1, freight: 1, ebm: 1, notes: 1, approvedBy: 1, approvedAt: 1, createdBy: 1, createdAt: 1, updatedAt: 1 })
+      .select({ supplier: 1, warehouse: 1, referenceNo: 1, orderDate: 1, expectedDeliveryDate: 1, status: 1, source: 1, currencyCode: 1, exchangeRate: 1, subtotal: 1, taxAmount: 1, totalAmount: 1, amountPaid: 1, balance: 1, paymentStatus: 1, freight: 1, ebm: 1, notes: 1, approvedBy: 1, approvedAt: 1, createdBy: 1, createdAt: 1, updatedAt: 1, linesCount: 1 })
       .sort({ orderDate: -1, _id: -1 })
       .skip(skip)
       .limit(limit);
