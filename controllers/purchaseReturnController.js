@@ -221,11 +221,6 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
           availableQuantity: { $gt: 0 },
         }).sort({ receivedDate: 1 }).session(sess);
         const requestedQuantity = Number(line.qtyReturned) || 0;
-        const availableQuantity = batches.reduce((sum, item) => sum + (Number(item.availableQuantity) || 0), 0);
-        if (availableQuantity + 1e-9 < requestedQuantity) {
-          throw Object.assign(new Error('INSUFFICIENT_STOCK_LOT'), { status: 409 });
-        }
-
         let remainingQuantity = requestedQuantity;
         for (const batch of batches) {
           if (remainingQuantity <= 1e-9) break;
@@ -236,6 +231,11 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
           await batch.save(opts);
           remainingQuantity -= quantityFromBatch;
         }
+        // Product.currentStock is the authoritative quantity check above.
+        // Some older/adjusted stock has no matching InventoryBatch layer, so
+        // do not reject a valid return solely because this legacy cost-layer
+        // mirror is short. Consume any layers that are present without making
+        // them negative, and let the product stock movement record the return.
       }
 
       // Reduce stock_levels qty_on_hand after validating and consuming the lots.
