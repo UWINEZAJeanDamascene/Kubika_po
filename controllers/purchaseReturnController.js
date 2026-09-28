@@ -209,23 +209,38 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
         throw Object.assign(new Error('INSUFFICIENT_STOCK'), { status: 409 });
       }
 
-      // Reduce stock_levels qty_on_hand
+      // Reduce the matching FIFO lots. A return quantity may span multiple
+      // receipts, so do not require one individual batch to cover the full line.
+      if (product.costingMethod === 'fifo') {
+        const batches = await InventoryBatch.find({
+          company: companyId,
+          product: line.product,
+          warehouse: pr.warehouse,
+          unitCost: line.unitCost,
+          availableQuantity: { $gt: 0 },
+        }).sort({ receivedDate: 1 }).session(sess);
+        const requestedQuantity = Number(line.qtyReturned) || 0;
+        const availableQuantity = batches.reduce((sum, item) => sum + (Number(item.availableQuantity) || 0), 0);
+        if (availableQuantity + 1e-9 < requestedQuantity) {
+          throw Object.assign(new Error('INSUFFICIENT_STOCK_LOT'), { status: 409 });
+        }
+
+        let remainingQuantity = requestedQuantity;
+        for (const batch of batches) {
+          if (remainingQuantity <= 1e-9) break;
+          const previousAvailable = Number(batch.availableQuantity) || 0;
+          const quantityFromBatch = Math.min(previousAvailable, remainingQuantity);
+          modifiedBatches.push({ id: batch._id, prevAvailable: previousAvailable });
+          batch.availableQuantity = previousAvailable - quantityFromBatch;
+          await batch.save(opts);
+          remainingQuantity -= quantityFromBatch;
+        }
+      }
+
+      // Reduce stock_levels qty_on_hand after validating and consuming the lots.
       if (!modifiedProducts.has(String(product._id))) modifiedProducts.set(String(product._id), { prevStock: product.currentStock, prevAvg: product.averageCost });
       product.currentStock = (product.currentStock || 0) - line.qtyReturned;
       await product.save(opts);
-
-      // FIFO: reduce matching lot's qty_remaining (find batch matching grn line by unitCost/product/warehouse)
-      if (product.costingMethod === 'fifo') {
-        const batch = await InventoryBatch.findOne({ company: companyId, product: line.product, warehouse: pr.warehouse, unitCost: line.unitCost, availableQuantity: { $gte: line.qtyReturned } }).sort({ receivedDate: -1 }).session(sess);
-        if (batch) {
-          modifiedBatches.push({ id: batch._id, prevAvailable: batch.availableQuantity });
-          batch.availableQuantity = batch.availableQuantity - line.qtyReturned;
-          await batch.save(opts);
-        } else {
-          // no matching batch with enough quantity - insufficient stock at lot level
-          throw Object.assign(new Error('INSUFFICIENT_STOCK_LOT'), { status: 409 });
-        }
-      }
 
       // Create return_out stock movement
       const movement = new StockMovement({

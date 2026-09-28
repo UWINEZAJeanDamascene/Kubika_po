@@ -498,6 +498,7 @@ const DOC_POPULATE_REFS = {
   invoice: 'Invoice',
   salesOrder: 'SalesOrder',
   purchaseOrder: 'PurchaseOrder',
+  grn: 'GoodsReceivedNote',
   deliveryNote: 'DeliveryNote',
   pickPack: 'PickPack',
   assignedTo: 'User',
