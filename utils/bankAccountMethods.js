@@ -307,7 +307,7 @@ function buildConstructorModel({
   }
 
   Doc.prototype.save = async function save() {
-    const delegate = () => prisma[delegateName];
+    const delegate = () => dbClient()[delegateName];
     if (this.isNew || !this._id) {
       const createData = await translateCreate(this);
       const row = await delegate().create({ data: createData });
