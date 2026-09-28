@@ -20,6 +20,7 @@ const {
 const PeriodService = require("../services/periodService");
 const { BankAccount } = require("../models/BankAccount");
 const JournalService = require("../services/journalService");
+const { runInPrismaTransaction } = require("../services/transactionService");
 
 function parseMoney(value) {
   if (value == null || value === "") return 0;
@@ -1140,6 +1141,7 @@ exports.updateAsset = async (req, res) => {
     const {
       name,
       description,
+      purchaseCost,
       usefulLifeMonths,
       depreciationMethod,
       decliningRate,
@@ -1173,30 +1175,149 @@ exports.updateAsset = async (req, res) => {
       });
     }
 
-    // Update fields
-    if (name) asset.name = name;
-    if (description !== undefined) asset.description = description;
-    if (usefulLifeMonths) asset.usefulLifeMonths = usefulLifeMonths;
-    if (depreciationMethod) asset.depreciationMethod = depreciationMethod;
-    if (decliningRate)
-      asset.decliningRate = mongoose.Types.Decimal128.fromString(
-        String(decliningRate),
-      );
-    
-    // Update new fields
-    if (serialNumber !== undefined) asset.serialNumber = serialNumber || null;
-    if (location !== undefined) asset.location = location || null;
-    if (departmentId !== undefined) asset.departmentId = departmentId || null;
-    if (warrantyStartDate !== undefined) 
-      asset.warrantyStartDate = warrantyStartDate ? new Date(warrantyStartDate) : null;
-    if (warrantyEndDate !== undefined)
-      asset.warrantyEndDate = warrantyEndDate ? new Date(warrantyEndDate) : null;
-    if (insuredValue !== undefined)
-      asset.insuredValue = insuredValue
-        ? mongoose.Types.Decimal128.fromString(String(insuredValue))
-        : null;
+    let costAdjustment = null;
+    if (purchaseCost !== undefined) {
+      const nextPurchaseCost = Number(purchaseCost);
+      const currentPurchaseCost = parseMoney(asset.purchaseCost);
+      const salvageValue = parseMoney(asset.salvageValue);
+      const accumulatedDepreciation = parseMoney(asset.accumulatedDepreciation);
 
-    await asset.save();
+      if (!Number.isFinite(nextPurchaseCost) || nextPurchaseCost <= 0) {
+        return res.status(400).json({
+          success: false,
+          error: "Purchase cost must be a positive amount",
+        });
+      }
+      if (nextPurchaseCost < salvageValue + accumulatedDepreciation) {
+        return res.status(400).json({
+          success: false,
+          error: "Purchase cost cannot be below salvage value plus accumulated depreciation",
+        });
+      }
+
+      const roundedNextCost = Math.round((nextPurchaseCost + Number.EPSILON) * 100) / 100;
+      const roundedCurrentCost = Math.round((currentPurchaseCost + Number.EPSILON) * 100) / 100;
+      const difference = Math.round((roundedNextCost - roundedCurrentCost + Number.EPSILON) * 100) / 100;
+
+      if (difference !== 0) {
+        const assetAccountCode = String(asset.assetAccountCode || "");
+        const purchaseEntry = await JournalEntry.findOne({
+          company: companyId,
+          sourceType: "asset_purchase",
+          sourceId: `${asset._id}-purchase`,
+        });
+        const originalLines = Array.isArray(purchaseEntry?.lines)
+          ? purchaseEntry.lines
+          : [];
+        const originalAssetLine = originalLines.find(
+          (line) =>
+            String(line.accountCode) === assetAccountCode &&
+            parseMoney(line.debit) > 0,
+        );
+        const offsetLine = originalLines.find(
+          (line) =>
+            String(line.accountCode) !== assetAccountCode &&
+            parseMoney(line.credit) > 0,
+        );
+
+        if (
+          !purchaseEntry ||
+          purchaseEntry.status !== "posted" ||
+          purchaseEntry.reversed ||
+          !assetAccountCode ||
+          !originalAssetLine ||
+          !offsetLine
+        ) {
+          return res.status(409).json({
+            success: false,
+            error: "Cannot adjust purchase cost because the original posted asset-purchase journal entry is unavailable",
+          });
+        }
+
+        costAdjustment = {
+          oldCost: roundedCurrentCost,
+          newCost: roundedNextCost,
+          difference,
+          assetAccountCode,
+          assetAccountName:
+            originalAssetLine.accountName ||
+            CHART_OF_ACCOUNTS[assetAccountCode]?.name ||
+            "Fixed Asset",
+          offsetAccountCode: String(offsetLine.accountCode),
+          offsetAccountName: offsetLine.accountName || "Purchase payment account",
+        };
+      }
+    }
+
+    const updateAsset = async () => {
+      if (costAdjustment) {
+        const amount = Math.abs(costAdjustment.difference);
+        const costIncrease = costAdjustment.difference > 0;
+        const adjustmentSourceId = `${asset._id}-purchase-cost-${costAdjustment.oldCost.toFixed(2)}-${costAdjustment.newCost.toFixed(2)}`;
+
+        await JournalService.createEntry(companyId, req.user._id, {
+          date: new Date(),
+          description: `Fixed asset purchase cost adjustment - ${asset.name} - AST#${asset.referenceNo}`,
+          sourceType: "asset_purchase_adjustment",
+          sourceId: adjustmentSourceId,
+          sourceReference: asset.referenceNo,
+          isAutoGenerated: true,
+          notes: `Purchase cost adjusted from ${costAdjustment.oldCost.toFixed(2)} to ${costAdjustment.newCost.toFixed(2)} RWF.`,
+          lines: [
+            {
+              accountCode: costAdjustment.assetAccountCode,
+              accountName: costAdjustment.assetAccountName,
+              debit: costIncrease ? amount : 0,
+              credit: costIncrease ? 0 : amount,
+              description: `Purchase cost adjustment: ${asset.referenceNo}`,
+            },
+            {
+              accountCode: costAdjustment.offsetAccountCode,
+              accountName: costAdjustment.offsetAccountName,
+              debit: costIncrease ? 0 : amount,
+              credit: costIncrease ? amount : 0,
+              description: `Purchase cost adjustment: ${asset.referenceNo}`,
+            },
+          ],
+        });
+
+        asset.purchaseCost = mongoose.Types.Decimal128.fromString(
+          costAdjustment.newCost.toFixed(2),
+        );
+        asset.netBookValue = mongoose.Types.Decimal128.fromString(
+          (costAdjustment.newCost - parseMoney(asset.accumulatedDepreciation)).toFixed(2),
+        );
+      }
+
+      if (name) asset.name = name;
+      if (description !== undefined) asset.description = description;
+      if (usefulLifeMonths) asset.usefulLifeMonths = usefulLifeMonths;
+      if (depreciationMethod) asset.depreciationMethod = depreciationMethod;
+      if (decliningRate)
+        asset.decliningRate = mongoose.Types.Decimal128.fromString(
+          String(decliningRate),
+        );
+
+      if (serialNumber !== undefined) asset.serialNumber = serialNumber || null;
+      if (location !== undefined) asset.location = location || null;
+      if (departmentId !== undefined) asset.departmentId = departmentId || null;
+      if (warrantyStartDate !== undefined)
+        asset.warrantyStartDate = warrantyStartDate ? new Date(warrantyStartDate) : null;
+      if (warrantyEndDate !== undefined)
+        asset.warrantyEndDate = warrantyEndDate ? new Date(warrantyEndDate) : null;
+      if (insuredValue !== undefined)
+        asset.insuredValue = insuredValue
+          ? mongoose.Types.Decimal128.fromString(String(insuredValue))
+          : null;
+
+      await asset.save();
+    };
+
+    if (costAdjustment) {
+      await runInPrismaTransaction(updateAsset);
+    } else {
+      await updateAsset();
+    }
 
     res.json({
       success: true,
