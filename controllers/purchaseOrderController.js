@@ -328,17 +328,64 @@ exports.recordPOPayment = async (req, res, next) => {
     if (po.status === 'cancelled') return res.status(409).json({ success: false, message: 'Cannot pay a cancelled PO' });
 
     const { amount, paymentMethod, reference, notes, bankAccountId } = req.body;
-    const payAmount = parseFloat(amount);
-    if (!payAmount || payAmount <= 0) return res.status(400).json({ success: false, message: 'Amount must be greater than 0' });
+    const resolvedPaymentMethod = paymentMethod || 'bank_transfer';
+    const paymentCurrency = String(req.body.currencyCode || po.currencyCode || 'RWF').toUpperCase();
+    const enteredAmount = Number(amount);
+    if (!Number.isFinite(enteredAmount) || enteredAmount <= 0) {
+      return res.status(400).json({ success: false, message: 'Amount must be greater than 0' });
+    }
+
+    // The UI accepts payment amounts in the selected display currency. PO
+    // balances are stored in the PO currency, while journals use company base
+    // currency and bank transactions use the bank account currency.
+    const CurrencyService = require('../services/CurrencyService');
+    const baseCurrency = await CurrencyService.getCompanyBase(companyId);
+    const poCurrency = String(po.currencyCode || baseCurrency).toUpperCase();
+    let poRate = Number(po.exchangeRate);
+    if (!Number.isFinite(poRate) || poRate <= 0 || (poCurrency !== baseCurrency && poRate === 1)) {
+      poRate = await CurrencyService.getRate(companyId, poCurrency, baseCurrency, po.orderDate || new Date());
+    }
+    const amountInBase = paymentCurrency === poCurrency
+      ? Math.round(enteredAmount * poRate * 100) / 100
+      : await CurrencyService.convert(companyId, enteredAmount, paymentCurrency, new Date());
+    const payAmount = paymentCurrency === poCurrency
+      ? Math.round(enteredAmount * 100) / 100
+      : Math.round((amountInBase / poRate) * 100) / 100;
 
     const remaining = (po.totalAmount || 0) - (po.amountPaid || 0);
     if (payAmount > remaining) return res.status(400).json({ success: false, message: `Amount exceeds remaining balance (${remaining})` });
 
     const bankPaymentMethods = ['bank_transfer', 'cheque', 'mobile_money'];
+    let selectedBankAccount = null;
+    let bankAmount = amountInBase;
+    let bankCurrency = baseCurrency;
+    if (bankPaymentMethods.includes(resolvedPaymentMethod) && bankAccountId) {
+      const { BankAccount } = require('../models/BankAccount');
+      selectedBankAccount = await BankAccount.findOne({
+        _id: bankAccountId,
+        company: companyId,
+        isActive: true,
+      });
+      if (!selectedBankAccount) {
+        return res.status(400).json({ success: false, message: 'Select an active bank account' });
+      }
+      bankCurrency = String(selectedBankAccount.currencyCode || baseCurrency).toUpperCase();
+      const bankRate = bankCurrency === baseCurrency
+        ? 1
+        : await CurrencyService.getRate(companyId, bankCurrency, baseCurrency, new Date());
+      bankAmount = paymentCurrency === bankCurrency
+        ? Math.round(enteredAmount * 100) / 100
+        : Math.round((amountInBase / bankRate) * 100) / 100;
+    }
 
     po.payments.push({
       amount: payAmount,
-      paymentMethod: paymentMethod || 'bank_transfer',
+      currencyCode: poCurrency,
+      amountInBase,
+      baseCurrency,
+      bankAmount: bankPaymentMethods.includes(resolvedPaymentMethod) && bankAccountId ? bankAmount : null,
+      bankCurrencyCode: bankPaymentMethods.includes(resolvedPaymentMethod) && bankAccountId ? bankCurrency : null,
+      paymentMethod: resolvedPaymentMethod,
       reference: reference || null,
       notes: notes || null,
       bankAccountId: bankAccountId || null,
@@ -355,25 +402,20 @@ exports.recordPOPayment = async (req, res, next) => {
     // Create journal entry: Dr AP, Cr Cash/Bank
     try {
       const JournalService = require('../services/journalService');
-      const { BankAccount } = require('../models/BankAccount');
-      
       let bankAccountCode;
       // Use specific bank account if provided
-      if (bankAccountId) {
-        const bankAccount = await BankAccount.findOne({ _id: bankAccountId, company: companyId });
-        if (bankAccount && bankAccount.ledgerAccountId) {
-          bankAccountCode = bankAccount.ledgerAccountId;
-        }
+      if (selectedBankAccount?.ledgerAccountId) {
+        bankAccountCode = selectedBankAccount.ledgerAccountId;
       }
 
       await JournalService.createPurchasePaymentEntry(companyId, req.user.id, {
         purchaseNumber: po.referenceNo,
         date: new Date(),
-        amount: payAmount,
-        paymentMethod: paymentMethod,
+        amount: amountInBase,
+        paymentMethod: resolvedPaymentMethod,
         bankAccountCode: bankAccountCode,
-        vatAmount: po.vatAmount || 0,
-        netAmount: po.subtotal || (payAmount - (po.vatAmount || 0)),
+        vatAmount: (Number(po.taxAmount) || 0) * poRate,
+        netAmount: (Number(po.subtotal) || 0) * poRate || (amountInBase - ((Number(po.taxAmount) || 0) * poRate)),
       });
     } catch (jeErr) {
       console.error('Failed to create journal entry for PO payment:', jeErr);
@@ -381,34 +423,24 @@ exports.recordPOPayment = async (req, res, next) => {
     }
 
     // Create bank transaction for bank-based payment methods (withdrawal reduces balance)
-    if (bankPaymentMethods.includes(paymentMethod) && bankAccountId) {
-      console.log('[PO Payment] Creating bank transaction - bankAccountId:', bankAccountId, 'amount:', payAmount);
+    if (bankPaymentMethods.includes(resolvedPaymentMethod) && bankAccountId && selectedBankAccount) {
+      console.log('[PO Payment] Creating bank transaction - bankAccountId:', bankAccountId, 'amount:', bankAmount);
       try {
-        const { BankAccount } = require('../models/BankAccount');
-        const bankAccount = await BankAccount.findOne({
-          _id: bankAccountId,
-          company: companyId,
-          isActive: true,
-        });
-        
-        console.log('[PO Payment] Found bank account:', bankAccount ? bankAccount.name : 'NOT FOUND');
-
-        if (bankAccount) {
-          const tx = await bankAccount.addTransaction({
+        const tx = await selectedBankAccount.addTransaction({
             type: 'withdrawal',
-            amount: payAmount,
+            amount: bankAmount,
+            currencyCode: bankCurrency,
             description: `Payment for PO ${po.referenceNo}`,
             date: new Date(),
             referenceNumber: reference || po.referenceNo,
-            paymentMethod,
+            paymentMethod: resolvedPaymentMethod,
             status: 'completed',
             reference: po._id,
             referenceType: 'PurchaseOrder',
             createdBy: req.user.id,
             notes: notes || `Payment for purchase order ${po.referenceNo}`,
           });
-          console.log('[PO Payment] Bank transaction created:', tx._id);
-        }
+        console.log('[PO Payment] Bank transaction created:', tx._id);
       } catch (bankErr) {
         console.error('[PO Payment] Error creating bank transaction:', bankErr);
         // Non-fatal — journal entry already posted
