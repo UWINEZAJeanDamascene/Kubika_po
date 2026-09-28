@@ -1021,6 +1021,8 @@ function purchaseReturnLineToApi(row) {
 function purchaseReturnToApi(row) {
   if (!row) return null;
   const lines = mapLines(row, purchaseReturnLineToApi);
+  const subtotal = lines.reduce((sum, line) => sum + (line.qtyReturned * line.unitCost), 0);
+  const totalAmount = qtyNum(row.totalAmount);
   return {
     _id: row.id,
     company: row.companyId,
@@ -1031,7 +1033,9 @@ function purchaseReturnToApi(row) {
     returnDate: row.returnDate,
     reason: row.reason ?? null,
     status: row.status,
-    totalAmount: moneyStr(row.totalAmount),
+    subtotal: moneyStr(subtotal),
+    taxAmount: moneyStr(Math.max(0, totalAmount - subtotal)),
+    totalAmount: moneyStr(totalAmount),
     journalEntry: row.journalEntryId ?? null,
     refundMethod: row.refundMethod ?? null,
     bankAccountId: row.bankAccountId ?? null,

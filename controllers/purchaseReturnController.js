@@ -404,6 +404,23 @@ exports.getPurchaseReturn = async (req, res, next) => {
   } catch (err) { next(err); }
 };
 
+// Draft returns have no stock or accounting impact, so they can be safely removed.
+exports.deletePurchaseReturn = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const purchaseReturn = await PurchaseReturn.findOne({ _id: req.params.id, company: companyId });
+    if (!purchaseReturn) {
+      return res.status(404).json({ success: false, message: 'Purchase return not found' });
+    }
+    if (purchaseReturn.status !== 'draft') {
+      return res.status(409).json({ success: false, message: 'Only draft purchase returns can be deleted' });
+    }
+
+    await PurchaseReturn.findOneAndDelete({ _id: req.params.id, company: companyId });
+    res.json({ success: true, message: 'Draft purchase return deleted successfully' });
+  } catch (err) { next(err); }
+};
+
 // Get summary of purchase returns
 exports.getPurchaseReturnSummary = async (req, res, next) => {
   try {

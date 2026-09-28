@@ -91,6 +91,7 @@ const {
   confirmPurchaseReturn,
   listPurchaseReturns,
   getPurchaseReturn,
+  deletePurchaseReturn,
   processRefund
 } = require('../controllers/purchaseReturnController');
 
@@ -235,7 +236,8 @@ router.route('/purchase-returns')
 
 router.route('/purchase-returns/:id')
   .get(requirePermission('purchase_returns', 'read'), getPurchaseReturn)
-  .put(requirePermission('purchase_returns', 'update'), logAction('stock'), updatePurchaseReturn);
+  .put(requirePermission('purchase_returns', 'update'), logAction('stock'), updatePurchaseReturn)
+  .delete(requirePermission('purchase_returns', 'update'), logAction('stock'), deletePurchaseReturn);
 
 router.route('/purchase-returns/:id/confirm')
   .post(requirePermission('purchase_returns', 'confirm'), logAction('stock'), confirmPurchaseReturn)
