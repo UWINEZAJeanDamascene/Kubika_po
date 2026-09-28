@@ -1430,7 +1430,8 @@ exports.getFunds = async (req, res, next) => {
 // @access  Private
 exports.createFund = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
+    const companyId = req.user?.company?._id || req.user?.company?.id || req.user?.companyId;
+    const currentUserId = req.user?._id || req.user?.id;
     const {
       name,
       ledgerAccountId,
@@ -1446,6 +1447,13 @@ exports.createFund = async (req, res, next) => {
       return res
         .status(400)
         .json({ success: false, message: "Name is required" });
+    }
+    if (!companyId || !currentUserId) {
+      return res.status(401).json({
+        success: false,
+        code: "PETTY_CASH_CONTEXT_REQUIRED",
+        message: "Your company or user session could not be verified. Please sign in again.",
+      });
     }
     if (!floatAmount && floatAmount !== 0) {
       return res
@@ -1468,7 +1476,7 @@ exports.createFund = async (req, res, next) => {
       company: companyId,
       name,
       ledgerAccountId: ledgerAccountId || "1050",
-      custodian: custodianId || req.user._id,
+      custodian: custodianId || currentUserId,
       openingBalance: openingBalance || 0,
       floatAmount: floatAmount,
       currentBalance: openingBalance || 0,
