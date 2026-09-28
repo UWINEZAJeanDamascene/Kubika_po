@@ -518,13 +518,10 @@ exports.getBankAccountBalance = async (req, res, next) => {
     const account = await BankAccount.findOne({ _id: req.params.id, company: companyId });
     if (!account) return res.status(404).json({ success: false, message: "Bank account not found" });
 
-    const latest = await BankTransaction.findOne({
-      $and: [
-        { $or: [{ companyId }, { company: companyId }] },
-        { $or: [{ bankAccountId: req.params.id }, { account: req.params.id }] },
-      ],
-    }).sort({ date: -1, createdAt: -1, _id: -1 }).lean();
-    const bankTransactionBalance = Number(latest?.balance ?? latest?.balanceAfter ?? account.openingBalance ?? 0);
+    const bankTransactionBalance = await BankAccount.computeBalanceFromTransactions(
+      account._id,
+      account.openingBalance,
+    );
     const ledgerAccountId = String(account.ledgerAccountId || "1100");
     const rows = await journalAgg.sumJournalLines(companyId, {
       status: "posted",

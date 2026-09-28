@@ -258,16 +258,6 @@ function attachBankAccountStatics(BankAccount) {
     openingBalance,
   ) {
     const bankAccountId = String(accountId);
-    const latest = await dbClient().bankTransaction.findFirst({
-      where: { bankAccountId },
-      orderBy: [{ date: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
-      select: { balanceAfter: true, balance: true },
-    });
-
-    if (latest) {
-      return decimalToNumber(latest.balanceAfter ?? latest.balance, 0);
-    }
-
     const rows = await dbClient().bankTransaction.groupBy({
       by: ['type'],
       where: { bankAccountId },
@@ -280,6 +270,19 @@ function attachBankAccountStatics(BankAccount) {
       const sum = decimalToNumber(row._sum.amount, 0);
       if (IN_TYPES.includes(row.type)) totalIn += sum;
       if (OUT_TYPES.includes(row.type)) totalOut += sum;
+    }
+
+    // Adjustment transactions store an absolute balance snapshot rather than
+    // a signed movement. Keep that snapshot behavior for accounts containing
+    // adjustments; ordinary bank movements are summed so a midnight-dated
+    // transaction cannot be hidden by a later opening snapshot on the same day.
+    if (rows.some((row) => row.type === 'adjustment')) {
+      const latest = await dbClient().bankTransaction.findFirst({
+        where: { bankAccountId },
+        orderBy: [{ date: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
+        select: { balanceAfter: true, balance: true },
+      });
+      if (latest) return decimalToNumber(latest.balanceAfter ?? latest.balance, 0);
     }
 
     const ob = decimalToNumber(openingBalance, 0);
