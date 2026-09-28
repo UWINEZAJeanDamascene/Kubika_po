@@ -83,7 +83,6 @@ exports.getPurchases = async (req, res, next) => {
       .populate("supplier", "name code contact")
       .populate("createdBy", "name email")
       .populate("-items")
-      .select({ supplier: 1, warehouse: 1, purchaseNumber: 1, supplierInvoiceNumber: 1, status: 1, currency: 1, subtotal: 1, taxAmount: 1, totalAmount: 1, payments: 1, purchaseDate: 1, stockAdded: 1, ebm: 1, createdBy: 1, createdAt: 1, updatedAt: 1 })
       .sort({ createdAt: -1, _id: -1 })
       .limit(limit)
       .skip(skip);
@@ -770,11 +769,14 @@ exports.recordPayment = async (req, res, next) => {
     }
 
     // Add payment
+    const paymentDate = new Date();
     purchase.payments.push({
       amount,
       paymentMethod,
       reference,
       notes,
+      paidDate: paymentDate,
+      date: paymentDate,
       recordedBy: req.user.id,
     });
 
@@ -909,6 +911,7 @@ exports.recordPayment = async (req, res, next) => {
         amount: amount,
         paymentMethod: paymentMethod,
         bankAccountCode: bankAccountCode,
+        bankAccountId: bankAccountId || null,
         vatAmount: purchase.totalTax || 0,
         netAmount: purchase.subtotal || (amount - (purchase.totalTax || 0)),
       });
@@ -918,43 +921,6 @@ exports.recordPayment = async (req, res, next) => {
         journalError,
       );
       // Don't fail the payment if journal entry fails
-    }
-
-    // Create BankTransaction using addTransaction() so cachedBalance is correctly reduced
-    let bankTransaction = null;
-    if (
-      (paymentMethod === "bank_transfer" ||
-        paymentMethod === "cheque" ||
-        paymentMethod === "mobile_money") &&
-      bankAccountId
-    ) {
-      try {
-        const bankAcctDoc = await BankAccount.findOne({
-          _id: bankAccountId,
-          company: companyId,
-          isActive: true,
-        });
-        if (bankAcctDoc) {
-          await bankAcctDoc.addTransaction({
-            type: "withdrawal",
-            amount,
-            description: `Purchase payment: ${purchase.purchaseNumber}`,
-            date: new Date(),
-            referenceNumber: reference || purchase.purchaseNumber,
-            paymentMethod,
-            status: "completed",
-            reference: purchase._id,
-            referenceType: "Purchase",
-            createdBy: req.user.id,
-            notes: notes || `Payment for purchase ${purchase.purchaseNumber}`,
-          });
-        }
-      } catch (bankErr) {
-        console.error(
-          "Error creating bank transaction for purchase payment:",
-          bankErr,
-        );
-      }
     }
 
     // Liquidate encumbrances and update budget actuals for paid items
@@ -1044,7 +1010,6 @@ exports.recordPayment = async (req, res, next) => {
       success: true,
       message: "Payment recorded successfully",
       data: purchase,
-      bankTransaction: bankTransaction,
     });
   } catch (error) {
     next(error);

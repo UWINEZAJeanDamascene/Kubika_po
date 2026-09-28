@@ -11,6 +11,21 @@ const { withReferenceNo } = require('./referenceNumbers');
 const moneyStr = (v) => decimalToString(v, 2);
 const qtyNum = (v) => decimalToNumber(v, 0);
 
+function amountFromPaymentValue(value) {
+  if (value == null || value === '') return 0;
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const normalized = value.replace(/[^0-9,.-]+/g, '').replace(/,/g, '');
+    const parsed = Number(normalized);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  if (typeof value === 'object') {
+    const parsed = Number(value.toString());
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  return 0;
+}
+
 function mapLines(row, mapper, key = 'lines') {
   return (row[key] || []).sort((a, b) => (a.lineOrder ?? 0) - (b.lineOrder ?? 0)).map(mapper);
 }
@@ -803,6 +818,12 @@ function purchaseToApi(row) {
   const subtotal = qtyNum(row.subtotal);
   const taxAmount = qtyNum(row.taxAmount);
   const totalAmount = qtyNum(row.totalAmount) || (subtotal + taxAmount);
+  const payments = Array.isArray(row.payments) ? row.payments : [];
+  const amountPaid = payments.reduce(
+    (sum, p) => sum + amountFromPaymentValue(p?.amount ?? p?.amountPaid ?? p?.total ?? 0),
+    0,
+  );
+  const balance = row.balance != null ? qtyNum(row.balance) : Math.max(totalAmount - amountPaid, 0);
   const lineCount = row._count?.lines != null ? Number(row._count.lines) : lines.length;
   return {
     _id: row.id,
@@ -813,6 +834,7 @@ function purchaseToApi(row) {
     warehouse: relationRef(row.warehouse, row.warehouseId),
     status: row.status,
     currency: row.currency,
+    exchangeRate: row.exchangeRate == null ? null : qtyNum(row.exchangeRate),
     subtotal,
     taxAmount,
     totalTax: taxAmount,
@@ -820,11 +842,9 @@ function purchaseToApi(row) {
     // Legacy aliases used by journal/email/receive flows
     roundedAmount: totalAmount,
     grandTotal: totalAmount,
-    payments: row.payments ?? [],
-    amountPaid: Array.isArray(row.payments)
-      ? row.payments.reduce((s, p) => s + qtyNum(p.amount), 0)
-      : 0,
-    balance: totalAmount,
+    payments,
+    amountPaid,
+    balance,
     purchaseDate: row.purchaseDate,
     stockAdded: row.stockAdded,
     ebm: row.ebm ?? {},
@@ -1440,9 +1460,11 @@ const PURCHASE_HEADER = {
   warehouse: 'warehouseId',
   status: 'status',
   currency: 'currency',
+  exchangeRate: 'exchangeRate',
   subtotal: 'subtotal',
   taxAmount: 'taxAmount',
   totalAmount: 'totalAmount',
+  payments: 'payments',
   purchaseDate: 'purchaseDate',
 };
 

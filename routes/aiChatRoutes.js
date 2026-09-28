@@ -353,7 +353,7 @@ router.post('/', protect, requireAIFeature('aiChatV2'), (req, res, next) => {
     if (isQuotaError || allFailed) {
       const providerIssues = providerIssueSummary(error.providerAttempts);
       const availabilityMessage = providerIssues.length
-        ? `Stacy could not reach a working AI provider. ${providerIssues.join('; ')}. Check AI Provider Health and update the affected provider settings.`
+        ? `Stacy could not use this deployment's configured AI services. This is separate from your Kubika account balance. ${providerIssues.join('; ')}. Ask an administrator to check AI Provider Health and the provider API accounts.`
         : isQuotaError
           ? 'Stacy is temporarily unavailable because AI providers are rate-limited. Please try again later.'
           : 'Stacy could not get a safe response from the configured AI providers. Check AI Provider Health and try again after resolving the provider issues.';

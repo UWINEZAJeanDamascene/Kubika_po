@@ -14,6 +14,8 @@ const FIELD_MAP = {
   supplier: { target: 'supplierId', isId: true },
   warehouse: { target: 'warehouseId', isId: true },
   status: { target: 'status' },
+  currency: { target: 'currency' },
+  exchangeRate: { target: 'exchangeRate' },
   purchaseDate: { target: 'purchaseDate' },
 };
 

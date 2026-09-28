@@ -322,14 +322,21 @@ async function checkProviderHealth(provider) {
         headers: { Authorization: 'Bearer ollama' },
       });
       clearTimeout(timer);
-      return resp.ok;
+      return { reachable: resp.ok, status: resp.ok ? null : `HTTP ${resp.status}` };
     }
 
+    // A model-list request checks connectivity and API-key access without
+    // generating a completion or consuming inference tokens.
+    await provider.client.models.list({ signal: controller.signal });
     clearTimeout(timer);
-    return true;
+    return { reachable: true, status: null };
   } catch (err) {
     clearTimeout(timer);
-    return false;
+    const statusCode = Number(err?.status || err?.statusCode);
+    return {
+      reachable: false,
+      status: Number.isFinite(statusCode) ? `HTTP ${statusCode}` : (err?.name === 'AbortError' ? 'Timed out' : 'Connection failed'),
+    };
   }
 }
 
@@ -649,17 +656,18 @@ async function getProviderStatus() {
   const all = createProviders();
   const statuses = await Promise.all(
     all.map(async (p) => {
-      const transportHealthy = await checkProviderHealth(p);
-      if (!transportHealthy && isProviderHealthy(p.name)) markProviderUnhealthy(p.name);
+      const health = await checkProviderHealth(p);
+      if (!health.reachable && isProviderHealthy(p.name)) markProviderUnhealthy(p.name);
       const circuit = getCircuitSnapshot(p.name);
-      const healthy = transportHealthy && circuit.state !== CIRCUIT_STATES.OPEN;
+      const healthy = health.reachable && circuit.state !== CIRCUIT_STATES.OPEN;
       return {
         name: p.name,
         displayName: p.displayName,
         model: p.model,
         configured: true,
         healthy,
-        reachable: isProviderHealthy(p.name) && healthy,
+        reachable: health.reachable,
+        status: health.status || (circuit.lastStatus ? `Last request: HTTP ${circuit.lastStatus}` : null),
         supportsJsonMode: p.supportsJsonMode,
         supportsToolCalling: p.supportsToolCalling,
         hosted: p.hosted,
