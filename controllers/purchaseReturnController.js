@@ -209,14 +209,15 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
         throw Object.assign(new Error('INSUFFICIENT_STOCK'), { status: 409 });
       }
 
-      // Reduce the matching FIFO lots. A return quantity may span multiple
-      // receipts, so do not require one individual batch to cover the full line.
+      // A return can be against an older receipt after the original FIFO layer
+      // has been partially consumed, merged, or adjusted. Validate and consume
+      // the product's remaining warehouse stock across all available layers;
+      // the supplier credit still uses the original GRN unit cost above.
       if (product.costingMethod === 'fifo') {
         const batches = await InventoryBatch.find({
           company: companyId,
           product: line.product,
           warehouse: pr.warehouse,
-          unitCost: line.unitCost,
           availableQuantity: { $gt: 0 },
         }).sort({ receivedDate: 1 }).session(sess);
         const requestedQuantity = Number(line.qtyReturned) || 0;
