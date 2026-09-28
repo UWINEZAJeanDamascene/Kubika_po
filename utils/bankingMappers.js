@@ -11,6 +11,13 @@ const { nextSequence } = require('../services/sequenceService');
 const moneyStr = (v) => decimalToString(v, 2);
 const qtyNum = (v) => decimalToNumber(v, 0);
 
+function optionalDate(value) {
+  if (value == null || value === '') return null;
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
 async function nextPettyCashRef(companyId, prefix, seqName) {
   const year = new Date().getFullYear();
   const seq = await nextSequence(companyId, seqName, { year });
@@ -147,7 +154,7 @@ function bankAccountTranslateCreate(data) {
   const openingBal = moneyStr(data.openingBalance ?? 0);
   return headerTranslateCreate(data, BANK_ACCOUNT_HEADER, [], {
     openingBalance: openingBal,
-    openingBalanceDate: data.openingBalanceDate || new Date(),
+    openingBalanceDate: optionalDate(data.openingBalanceDate) || new Date(),
     cachedBalance: openingBal,
     cacheValid: true,
     cacheLastComputed: new Date(),
@@ -156,10 +163,21 @@ function bankAccountTranslateCreate(data) {
     isDefault: data.isDefault ?? false,
     currencyCode: data.currencyCode || 'USD',
     accountType,
+    interestStartDate: optionalDate(data.interestStartDate),
   });
 }
 
-const bankAccountTranslateUpdate = genericTranslateUpdate(BANK_ACCOUNT_HEADER);
+const translateBankAccountUpdate = genericTranslateUpdate(BANK_ACCOUNT_HEADER);
+function bankAccountTranslateUpdate(update = {}) {
+  const translated = translateBankAccountUpdate(update);
+  if (translated.interestStartDate !== undefined) {
+    translated.interestStartDate = optionalDate(translated.interestStartDate);
+  }
+  if (translated.openingBalanceDate !== undefined) {
+    translated.openingBalanceDate = optionalDate(translated.openingBalanceDate);
+  }
+  return translated;
+}
 
 // ── BankTransaction ─────────────────────────────────────────────────────────
 
