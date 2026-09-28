@@ -1065,7 +1065,7 @@ exports.listGRNs = async (req, res, next) => {
     }
 
     const grns = await GoodsReceivedNote.find(query)
-      .populate("purchaseOrder", "referenceNo")
+      .populate("purchaseOrder", "referenceNo currencyCode")
       .populate("supplier", "name code")
       .populate("warehouse", "name code")
       .populate("createdBy", "name email")

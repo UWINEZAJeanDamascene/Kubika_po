@@ -341,10 +341,10 @@ exports.recordPOPayment = async (req, res, next) => {
     const CurrencyService = require('../services/CurrencyService');
     const baseCurrency = await CurrencyService.getCompanyBase(companyId);
     const poCurrency = String(po.currencyCode || baseCurrency).toUpperCase();
-    let poRate = Number(po.exchangeRate);
-    if (!Number.isFinite(poRate) || poRate <= 0 || (poCurrency !== baseCurrency && poRate === 1)) {
-      poRate = await CurrencyService.getRate(companyId, poCurrency, baseCurrency, po.orderDate || new Date());
-    }
+    // Payments are entered in the current display/payment currency. Convert
+    // both sides of that payment using the same current PO-to-base rate;
+    // using the PO's historical order rate can leave a false open balance.
+    const poRate = await CurrencyService.getRate(companyId, poCurrency, baseCurrency, new Date());
     const amountInBase = paymentCurrency === poCurrency
       ? Math.round(enteredAmount * poRate * 100) / 100
       : await CurrencyService.convert(companyId, enteredAmount, paymentCurrency, new Date());
