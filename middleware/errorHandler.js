@@ -2,7 +2,7 @@ const errorHandler = (err, req, res, next) => {
   const isProd = process.env.NODE_ENV === 'production';
   const exposeStack = process.env.NODE_ENV !== 'production';
 
-  if (exposeStack) {
+  if (!isProd) {
     console.error(err);
   }
 
@@ -69,6 +69,17 @@ const errorHandler = (err, req, res, next) => {
 
   if (!code) {
     code = statusCode === 404 ? 'NOT_FOUND' : 'INTERNAL_ERROR';
+  }
+
+  if (isProd && statusCode >= 500) {
+    console.error('[api-error]', {
+      method: req && req.method,
+      path: req && (req.originalUrl || req.path).split('?')[0],
+      statusCode,
+      errorName: err.name || 'Error',
+      errorCode: err.code,
+      errorMessage: err.message,
+    });
   }
 
   if (isProd && statusCode === 500 && code === 'INTERNAL_ERROR') {
