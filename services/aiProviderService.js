@@ -260,9 +260,9 @@ function createProviders() {
     missing.push('mistral');
   }
 
-  if (config.ai.openrouterApiKey) {
+  if (config.ai.openRouterApiKey) {
     providers.push(providerMeta('openrouter', 'OpenRouter', new OpenAI({
-      apiKey: config.ai.openrouterApiKey,
+      apiKey: config.ai.openRouterApiKey,
       baseURL: config.ai.openrouterBaseUrl || 'https://openrouter.ai/api/v1',
     }), config.ai.openrouterModel || 'openrouter/quasar-alpha', Math.min(TIMEOUT_MS, 20000)));
     configured.push('openrouter');

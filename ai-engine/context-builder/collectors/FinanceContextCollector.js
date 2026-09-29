@@ -7,8 +7,9 @@ const { extractUserPermissions, hasPermission } = require('../permissionUtils');
 
 const REQUIRED_PERMISSIONS = ['finance.read', 'bank_accounts.read', 'reports.read'];
 const AP_PAYMENT_PERMISSIONS = ['payables.read', 'finance.read', 'purchases.read'];
+const POSITION_QUERY = /\b(assets?|liabilit(?:y|ies)|loans?|balance sheet|financial position|net worth)\b/i;
 
-async function collect({ companyId, dateRange, user }) {
+async function collect({ companyId, dateRange, user, query = '' }) {
   const facts = [];
   const warnings = [];
   const args = {
@@ -119,6 +120,60 @@ async function collect({ companyId, dateRange, user }) {
     }));
   } else {
     warnings.push(`Finance collector skipped historical cash movements: ${cashHistoryResult.reason.message}`);
+  }
+
+  if (POSITION_QUERY.test(query)) {
+    const positionResults = await Promise.allSettled([
+      runTool(companyId, 'get_balance_sheet', { asOfDate: dateRange && dateRange.to }),
+      runTool(companyId, 'get_fixed_assets', { limit: 100 }),
+      runTool(companyId, 'get_loans', { limit: 100 }),
+    ]);
+    const [balanceSheetResult, fixedAssetsResult, loansResult] = positionResults;
+
+    if (balanceSheetResult.status === 'fulfilled') {
+      const balanceSheet = balanceSheetResult.value.result;
+      facts.push(createFact({
+        companyId,
+        domain: AI_DOMAINS.FINANCE,
+        label: 'General ledger balance sheet position',
+        value: balanceSheet,
+        sourceMethod: 'get_balance_sheet',
+        sourceIds: ['get_balance_sheet'],
+        permissions: ['finance.read', 'reports.read'],
+      }));
+    } else {
+      warnings.push(`Finance collector skipped balance sheet: ${balanceSheetResult.reason.message}`);
+    }
+
+    if (fixedAssetsResult.status === 'fulfilled') {
+      const fixedAssets = fixedAssetsResult.value.result;
+      facts.push(createFact({
+        companyId,
+        domain: AI_DOMAINS.FINANCE,
+        label: 'Fixed asset register position',
+        value: fixedAssets,
+        sourceMethod: 'get_fixed_assets',
+        sourceIds: (fixedAssets.assets || []).map((asset) => asset.id).filter(Boolean),
+        permissions: ['assets.read', 'finance.read'],
+      }));
+    } else {
+      warnings.push(`Finance collector skipped fixed asset register: ${fixedAssetsResult.reason.message}`);
+    }
+
+    if (loansResult.status === 'fulfilled') {
+      const loans = loansResult.value.result;
+      facts.push(createFact({
+        companyId,
+        domain: AI_DOMAINS.FINANCE,
+        label: 'Loan and liability register position',
+        value: loans,
+        sourceMethod: 'get_loans',
+        sourceIds: (loans.loans || []).map((loan) => loan.id).filter(Boolean),
+        permissions: ['loans.read', 'finance.read'],
+      }));
+    } else {
+      warnings.push(`Finance collector skipped loan and liability register: ${loansResult.reason.message}`);
+    }
   }
 
   const userPermissions = extractUserPermissions(user);
