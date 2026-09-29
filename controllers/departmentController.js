@@ -42,13 +42,13 @@ exports.getDepartments = async (req, res, next) => {
 
     // Get employee counts per department (using departmentRef)
     const employeeCounts = await dbClient().employee.groupBy({
-      by: ['departmentId'],
-      where: { companyId: String(companyId), departmentId: { not: null } },
+      by: ['departmentRefId'],
+      where: { companyId: String(companyId), departmentRefId: { not: null } },
       _count: { _all: true },
     });
 
     const countMap = {};
-    employeeCounts.forEach(ec => { countMap[ec.departmentId.toString()] = ec._count._all; });
+    employeeCounts.forEach(ec => { countMap[ec.departmentRefId.toString()] = ec._count._all; });
 
     const data = departments.map(d => ({
       ...d.toObject(),
