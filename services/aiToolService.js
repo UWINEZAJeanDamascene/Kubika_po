@@ -44,6 +44,7 @@ const journalAgg = require('./journalAggregationService');
 
 const AI_MAX_LIST_ROWS = Math.min(500, Math.max(20, Number(process.env.AI_MAX_LIST_ROWS || 100)));
 const AI_MAX_SUMMARY_ROWS = Math.max(AI_MAX_LIST_ROWS, Number(process.env.AI_MAX_SUMMARY_ROWS || 5000));
+const SALES_REVENUE_STATUSES = ['confirmed', 'partial', 'paid', 'partially_paid', 'fully_paid'];
 
 function safeAiLimit(value, fallback = 20) {
   const parsed = Number(value);
@@ -224,14 +225,24 @@ async function getPurchases(companyId, opts = {}) {
   const q = { company: companyId };
   if (status) q.status = status;
   const df = dateFilter(startDate, endDate);
-  if (df) q.createdAt = df;
-  const purchases = await Purchase.find(q).sort({ createdAt: -1 }).limit(safeAiLimit(limit)).lean();
+  if (df) q.purchaseDate = df;
+  const purchases = await Purchase.find(q)
+    .populate('supplier', 'name')
+    .sort({ purchaseDate: -1 })
+    .limit(safeAiLimit(limit))
+    .lean();
   return {
     count: purchases.length,
     purchases: purchases.map(p => ({
       id: p._id.toString(), purchaseNumber: p.purchaseNumber,
-      supplier: p.supplier?.name || 'Unknown', total: p.total || 0,
-      status: p.status, date: p.createdAt ? new Date(p.createdAt).toISOString().slice(0, 10) : null,
+      supplier: p.supplier?.name || p.supplierName || 'Unknown',
+      total: Number(p.totalAmount ?? p.grandTotal ?? p.roundedAmount ?? p.total ?? 0),
+      balance: Number(p.balance ?? Math.max(
+        Number(p.totalAmount ?? p.grandTotal ?? p.roundedAmount ?? p.total ?? 0) - Number(p.amountPaid || 0),
+        0,
+      )),
+      status: p.status,
+      date: p.purchaseDate ? new Date(p.purchaseDate).toISOString().slice(0, 10) : null,
     })),
   };
 }
@@ -329,7 +340,7 @@ async function getSalesSummary(companyId, opts = {}) {
   const bucketExpression = periodBucket === 'week'
     ? "date_trunc('week', i.invoice_date)"
     : `date_trunc('${periodBucket}', i.invoice_date)`;
-  const clauses = ['i.company_id = $1', "i.status IN ('confirmed', 'partial', 'paid')"];
+  const clauses = ['i.company_id = $1', "i.status IN ('confirmed', 'partial', 'paid', 'partially_paid', 'fully_paid')"];
   const params = [String(companyId)];
   addDatePredicates(clauses, params, 'i.invoice_date', startDate, endDate);
   const whereSql = clauses.join(' AND ');
@@ -337,7 +348,7 @@ async function getSalesSummary(companyId, opts = {}) {
     dbClient().invoice.aggregate({
       where: {
         companyId: String(companyId),
-        status: { in: ['confirmed', 'partial', 'paid'] },
+        status: { in: SALES_REVENUE_STATUSES },
         ...(prismaDateFilter(startDate, endDate) ? { invoiceDate: prismaDateFilter(startDate, endDate) } : {}),
       },
       _count: { _all: true },

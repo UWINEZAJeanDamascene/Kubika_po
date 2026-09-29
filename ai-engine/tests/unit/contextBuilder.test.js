@@ -17,6 +17,13 @@ describe('AI Context Builder utilities', () => {
     ]);
   });
 
+  test('routes supplier debt questions to both supplier and payable context', () => {
+    expect(normalizeDomains(undefined, 'How much do we currently owe suppliers?')).toEqual([
+      AI_DOMAINS.PURCHASES,
+      AI_DOMAINS.SUPPLIERS,
+    ]);
+  });
+
   test('uses explicit valid domains before query inference', () => {
     expect(normalizeDomains(['finance'], 'show stock risk')).toEqual([AI_DOMAINS.FINANCE]);
   });

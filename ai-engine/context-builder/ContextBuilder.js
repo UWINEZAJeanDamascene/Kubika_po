@@ -20,7 +20,7 @@ const DOMAIN_KEYWORDS = Object.freeze({
   [AI_DOMAINS.SALES]: ['sale', 'sales', 'revenue', 'invoice', 'customer order', 'pos'],
   [AI_DOMAINS.INVENTORY]: ['stock', 'inventory', 'product', 'sku', 'warehouse', 'low stock', 'out of stock'],
   [AI_DOMAINS.FINANCE]: ['cash', 'bank', 'profit', 'loss', 'expense', 'finance', 'margin', 'payable', 'receivable'],
-  [AI_DOMAINS.PURCHASES]: ['purchase', 'supplier invoice', 'procurement', 'grn', 'goods received'],
+  [AI_DOMAINS.PURCHASES]: ['purchase', 'supplier invoice', 'procurement', 'grn', 'goods received', 'payable', 'payables', 'owe suppliers', 'owed to suppliers', 'supplier balance'],
   [AI_DOMAINS.CUSTOMERS]: ['client', 'customer', 'receivable', 'aging', 'owed', 'overdue'],
   [AI_DOMAINS.SUPPLIERS]: ['supplier', 'vendor'],
   [AI_DOMAINS.PAYROLL]: ['payroll', 'salary', 'employee', 'timesheet'],
