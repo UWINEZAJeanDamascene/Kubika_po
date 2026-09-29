@@ -44,7 +44,7 @@ async function resolveLoanTxReference(companyId, type, explicit) {
  *   r = Monthly interest rate (annual rate / 12)
  *   n = Number of payments (months)
  */
-function calculateMonthlyPayment(
+function calculateScheduledPayment(
   principal,
   annualRate,
   months,
@@ -74,7 +74,7 @@ function calculateMonthlyPayment(
 /**
  * Generate payment schedule for a loan
  */
-function generatePaymentSchedule(loan) {
+function generateLiabilityPaymentSchedule(loan) {
   const schedule = [];
   const principal = loan.originalAmount;
   const annualRate = loan.interestRate || 0;
@@ -82,7 +82,7 @@ function generatePaymentSchedule(loan) {
   const method = loan.interestMethod || "simple";
   const startDate = loan.startDate ? new Date(loan.startDate) : new Date();
 
-  const monthlyPayment = calculateMonthlyPayment(
+  const monthlyPayment = calculateScheduledPayment(
     principal,
     annualRate,
     months,
@@ -564,37 +564,84 @@ exports.updateLoan = async (req, res, next) => {
         .json({ success: false, message: "Loan not found" });
     }
 
-    // Prevent updating certain fields if loan has transactions
-    if (loan.transactions && loan.transactions.length > 0) {
-      // Allow status, notes, and IFRS 7 disclosure fields (these don't affect financial calculations)
-      const allowedFields = [
-        "status",
-        "notes",
-        // IFRS 7.33 Classification
-        "isSecured",
-        "securityDescription",
-        "classification",
-        // IFRS 7.34 Currency
-        "currencyCode",
-        "exchangeRate",
-        // IAS 1.74 Covenant tracking
-        "hasCovenants",
-        "covenantDetails",
-        "covenantBreach",
-        "covenantBreachDate"
-      ];
-      const updatedFields = Object.keys(req.body);
-      const hasDisallowedFields = updatedFields.some(
-        (field) => !allowedFields.includes(field),
-      );
+    const disclosureFields = [
+      "status",
+      "notes",
+      "isSecured",
+      "securityDescription",
+      "classification",
+      "currencyCode",
+      "exchangeRate",
+      "hasCovenants",
+      "covenantDetails",
+      "covenantBreach",
+      "covenantBreachDate",
+      "ifrs9Classification",
+      "impairmentStage",
+      "eclProvision",
+      "probabilityOfDefault",
+      "lossGivenDefault",
+      "exposureAtDefault",
+      "effectiveInterestRate",
+      "significantIncreaseInCreditRisk",
+      "creditRiskAssessedAt",
+      "daysPastDue",
+      "forbearanceStatus",
+    ];
+    const scheduleFields = [
+      "interestRate",
+      "interestMethod",
+      "durationMonths",
+      "endDate",
+      "paymentTerms",
+      "interestExpenseAccountId",
+    ];
+    const loanTransactions = Array.isArray(loan.transactions)
+      ? loan.transactions
+      : [];
+    const hasRepaymentOrInterestActivity =
+      loanTransactions.some((transaction) => transaction.type !== "drawdown") ||
+      (Array.isArray(loan.payments) && loan.payments.length > 0) ||
+      Number(loan.amountPaid || 0) > 0;
+    const allowedFields = hasRepaymentOrInterestActivity
+      ? disclosureFields
+      : [...disclosureFields, ...scheduleFields];
+    const updatedFields = Object.keys(req.body).filter(
+      (field) => req.body[field] !== undefined,
+    );
 
-      if (hasDisallowedFields) {
+    if (
+      loanTransactions.length > 0 &&
+      updatedFields.some((field) => !allowedFields.includes(field))
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: hasRepaymentOrInterestActivity
+          ? "Cannot update loan terms after repayments or interest charges exist. Only status, notes, and IFRS disclosures can be updated."
+          : "Only loan schedule terms and IFRS disclosures can be updated after initial funding.",
+      });
+    }
+
+    if (req.body.interestRate !== undefined) {
+      const interestRate = Number(req.body.interestRate);
+      if (!Number.isFinite(interestRate) || interestRate < 0 || interestRate > 100) {
         return res.status(400).json({
           success: false,
-          message:
-            "Cannot update loan details once transactions exist. Only status, notes, and IFRS 7 disclosure fields can be updated.",
+          message: "Interest rate must be between 0 and 100 percent",
         });
       }
+      req.body.interestRate = interestRate;
+    }
+
+    if (req.body.durationMonths !== undefined) {
+      const durationMonths = Number(req.body.durationMonths);
+      if (!Number.isInteger(durationMonths) || durationMonths <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Duration must be a positive whole number of months",
+        });
+      }
+      req.body.durationMonths = durationMonths;
     }
 
     // Validate liability account if being updated
@@ -658,7 +705,19 @@ exports.updateLoan = async (req, res, next) => {
       });
     }
 
-    loan = await Loan.findByIdAndUpdate(req.params.id, req.body, {
+    const updateData = { ...req.body };
+    if (scheduleFields.some((field) => updateData[field] !== undefined)) {
+      const schedule = generatePaymentSchedule({
+        ...loan,
+        ...updateData,
+        interestRate: updateData.interestRate ?? loan.interestRate,
+        durationMonths: updateData.durationMonths ?? loan.durationMonths,
+        interestMethod: updateData.interestMethod ?? loan.interestMethod,
+      });
+      updateData.monthlyPayment = schedule.monthlyPayment;
+    }
+
+    loan = await Loan.findByIdAndUpdate(req.params.id, updateData, {
       new: true,
       runValidators: true,
     });
@@ -1682,7 +1741,7 @@ exports.calculatePaymentSchedule = async (req, res, next) => {
     };
 
     // Generate schedule
-    const schedule = generatePaymentSchedule(loanData);
+    const schedule = generateLiabilityPaymentSchedule(loanData);
 
     res.json({
       success: true,
@@ -1713,7 +1772,7 @@ exports.getPaymentSchedule = async (req, res, next) => {
     }
 
     // Generate schedule based on loan data
-    const schedule = generatePaymentSchedule(loan);
+    const schedule = generateLiabilityPaymentSchedule(loan);
 
     // Add current status info
     const response = {
