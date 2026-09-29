@@ -910,6 +910,12 @@ function expenseToApi(row) {
   const amount = qtyNum(row.amount);
   const taxAmount = qtyNum(row.taxAmount);
   const totalAmount = row.totalAmount != null ? qtyNum(row.totalAmount) : amount + taxAmount;
+  const exchangeRate = rateNum(row.exchangeRate) || 1;
+  const amountInRWF = row.amountInRwf != null ? qtyNum(row.amountInRwf) : round2(amount * exchangeRate);
+  const taxAmountInRWF = row.taxAmountInRwf != null ? qtyNum(row.taxAmountInRwf) : round2(taxAmount * exchangeRate);
+  const totalAmountInRWF = row.totalAmountInRwf != null
+    ? qtyNum(row.totalAmountInRwf)
+    : amountInRWF + taxAmountInRWF;
   return {
     _id: row.id,
     ...companyRefs(row),
@@ -923,10 +929,10 @@ function expenseToApi(row) {
     tax_amount: taxAmount,
     total_amount: totalAmount,
     currencyCode: row.currencyCode,
-    exchangeRate: rateNum(row.exchangeRate),
-    amountInRWF: row.amountInRwf != null ? qtyNum(row.amountInRwf) : amount,
-    taxAmountInRWF: qtyNum(row.taxAmountInRwf),
-    totalAmountInRWF: row.totalAmountInRwf != null ? qtyNum(row.totalAmountInRwf) : totalAmount,
+    exchangeRate,
+    amountInRWF,
+    taxAmountInRWF,
+    totalAmountInRWF,
     tax_account_id: row.taxAccountId ?? null,
     payment_method: row.paymentMethod,
     paymentMethod: row.paymentMethod,
@@ -937,7 +943,9 @@ function expenseToApi(row) {
     isVATRecoverable: row.isVatRecoverable,
     withholdingTax: qtyNum(row.withholdingTax),
     withholdingTaxRate: rateNum(row.withholdingTaxRate),
-    withholdingTaxInRWF: qtyNum(row.withholdingTaxInRwf),
+    withholdingTaxInRWF: row.withholdingTaxInRwf != null
+      ? qtyNum(row.withholdingTaxInRwf)
+      : round2(qtyNum(row.withholdingTax) * exchangeRate),
     department_id: row.departmentId ?? null,
     departmentAllocations: jsonField(row, 'departmentAllocations', []),
     budget_id: row.budgetId ?? null,
