@@ -574,22 +574,23 @@ async function getReceivablesAging(companyId) {
 }
 
 async function getBankAccounts(companyId) {
-  const [accounts, totals] = await Promise.all([
-    BankAccount.find({ company: companyId }).limit(AI_MAX_LIST_ROWS).lean(),
-    dbClient().bankAccount.aggregate({
-      where: { companyId: String(companyId) },
-      _count: { _all: true },
-      _sum: { cachedBalance: true },
-    }),
-  ]);
+  const accounts = await BankAccount.find({ company: companyId, isActive: true })
+    .sort({ isDefault: -1, name: 1 })
+    .lean();
+  const computedAccounts = await Promise.all(accounts.map(async (account) => ({
+    id: account._id.toString(),
+    name: account.name,
+    type: account.accountType,
+    currencyCode: account.currencyCode || 'RWF',
+    balance: await BankAccount.computeBalanceFromTransactions(account._id, account.openingBalance),
+  })));
+  const listedAccounts = computedAccounts.slice(0, AI_MAX_LIST_ROWS);
+
   return {
-    count: Number(totals._count?._all || 0),
-    totalBalance: Number(totals._sum?.cachedBalance || 0),
-    truncated: Number(totals._count?._all || 0) > accounts.length,
-    accounts: accounts.map(a => ({
-      id: a._id.toString(), name: a.name, type: a.accountType,
-      balance: a.currentBalance || a.cachedBalance || 0,
-    })),
+    count: computedAccounts.length,
+    totalBalance: computedAccounts.reduce((sum, account) => sum + Number(account.balance || 0), 0),
+    truncated: computedAccounts.length > listedAccounts.length,
+    accounts: listedAccounts,
   };
 }
 
@@ -1147,24 +1148,30 @@ async function getBalanceSheet(companyId, opts = {}) {
 
 async function getCashFlowSummary(companyId, opts = {}) {
   opts = opts || {};
-  const { startDate, endDate } = opts;
-  const date = {};
-  if (dateFilter(startDate, endDate)?.$gte) date.gte = dateFilter(startDate, endDate).$gte;
-  if (dateFilter(startDate, endDate)?.$lte) date.lte = dateFilter(startDate, endDate).$lte;
-  const [bankTotals, journalTotals] = await Promise.all([
-    dbClient().bankAccount.aggregate({
-      where: { companyId: String(companyId) },
-      _sum: { cachedBalance: true },
-    }),
-    dbClient().journalEntry.aggregate({
-      where: { companyId: String(companyId), status: 'posted', ...(Object.keys(date).length ? { date } : {}) },
-      _sum: { totalDebit: true, totalCredit: true },
-    }),
+  const today = new Date().toISOString().slice(0, 10);
+  const startDate = opts.startDate || `${today.slice(0, 4)}-01-01`;
+  const endDate = opts.endDate || today;
+  const [report, bankAccounts] = await Promise.all([
+    require('./cashFlowService').generate(companyId, { dateFrom: startDate, dateTo: endDate }),
+    getBankAccounts(companyId),
   ]);
-  const bankBalance = Number(bankTotals._sum?.cachedBalance || 0);
-  const cashIn = Number(journalTotals._sum?.totalDebit || 0);
-  const cashOut = Number(journalTotals._sum?.totalCredit || 0);
-  return { bankBalance, cashIn, cashOut, netCashFlow: cashIn - cashOut, period: { startDate, endDate }, currency: 'FRW' };
+  const current = report.current;
+  const sections = [current.operating, current.investing, current.financing];
+  const cashIn = sections.reduce((sum, section) => sum + Number(section.total_inflows || 0), 0);
+  const cashOut = sections.reduce((sum, section) => sum + Number(section.total_outflows || 0), 0);
+
+  return {
+    bankBalance: bankAccounts.totalBalance,
+    cashIn,
+    cashOut,
+    netCashFlow: Number(current.net_change_in_cash || 0),
+    openingBalance: Number(current.opening_cash_balance || 0),
+    closingBalance: Number(current.closing_cash_balance || 0),
+    isReconciled: Boolean(current.is_reconciled),
+    reconciliationDifference: Number(current.reconciliation_diff || 0),
+    period: { startDate, endDate },
+    currency: 'RWF',
+  };
 }
 
 function getModuleCatalog() {
