@@ -266,7 +266,7 @@ function buildConfig() {
       mistralApiKey: process.env.MISTRAL_API_KEY || null,
       mistralModel: process.env.MISTRAL_MODEL || 'mistral-small-latest',
       openRouterApiKey: process.env.OPENROUTER_API_KEY || null,
-      openRouterModel: process.env.OPENROUTER_MODEL || 'openrouter/quasar-alpha',
+      openRouterModel: process.env.OPENROUTER_MODEL || 'openrouter/free',
       deepseekApiKey: process.env.DEEPSEEK_API_KEY || null,
       deepseekModel: process.env.DEEPSEEK_MODEL || 'deepseek-chat',
       togetherApiKey: process.env.TOGETHER_API_KEY || null,

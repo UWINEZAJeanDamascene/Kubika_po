@@ -264,7 +264,7 @@ function createProviders() {
     providers.push(providerMeta('openrouter', 'OpenRouter', new OpenAI({
       apiKey: config.ai.openRouterApiKey,
       baseURL: config.ai.openrouterBaseUrl || 'https://openrouter.ai/api/v1',
-    }), config.ai.openrouterModel || 'openrouter/quasar-alpha', Math.min(TIMEOUT_MS, 20000)));
+    }), config.ai.openRouterModel || 'openrouter/free', Math.min(TIMEOUT_MS, 20000)));
     configured.push('openrouter');
   } else {
     missing.push('openrouter');
