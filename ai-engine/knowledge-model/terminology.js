@@ -215,6 +215,7 @@ const BUSINESS_QUESTIONS = Object.freeze([
   { pattern: /\b(inventory turnover|stock turnover|inventory turns)\b/i, kpiIds: ['inventory_turnover'], domains: [AI_DOMAINS.FINANCE, AI_DOMAINS.INVENTORY], requiredFacts: ['Cost of goods sold', 'Average inventory value or Total stock value'] },
   { pattern: /\b(dso|days sales outstanding|collection days)\b/i, kpiIds: ['days_sales_outstanding'], domains: [AI_DOMAINS.CUSTOMERS, AI_DOMAINS.SALES], requiredFacts: ['Total client outstanding balance', 'Sales revenue for selected period'] },
   { pattern: /\b(dpo|days payable outstanding|supplier payment days|payables days)\b/i, kpiIds: ['days_payable_outstanding'], domains: [AI_DOMAINS.PURCHASES], requiredFacts: ['Total supplier outstanding balance', 'Purchases for selected period'] },
+  { pattern: /\b(owe|owed|outstanding|payable|payables)\b.{0,40}\b(suppliers?|vendors?)\b/i, kpiIds: [], domains: [AI_DOMAINS.PURCHASES, AI_DOMAINS.SUPPLIERS], requiredFacts: ['Total supplier outstanding balance', 'Supplier count'] },
   { pattern: /\b(stockout risk|stockout|low stock risk|out of stock risk)\b/i, kpiIds: ['stockout_risk_count'], domains: [AI_DOMAINS.INVENTORY], requiredFacts: ['Low stock product count', 'Out of stock product count'] },
   { pattern: /\b(dead stock|non-moving stock)\b/i, kpiIds: ['dead_stock_count'], domains: [AI_DOMAINS.INVENTORY], requiredFacts: ['Dead stock candidate count'] },
   { pattern: /\b(vat collected|output vat|sales vat)\b/i, kpiIds: ['vat_collected'], domains: [AI_DOMAINS.TAX], requiredFacts: ['VAT collected for selected period'] },

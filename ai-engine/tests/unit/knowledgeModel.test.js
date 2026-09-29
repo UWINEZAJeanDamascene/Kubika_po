@@ -45,6 +45,13 @@ describe('AI Knowledge Model', () => {
     ]));
   });
 
+  test('routes supplier debt questions to payable and supplier domains', () => {
+    expect(inferDomainsFromTerms('How much do we currently owe suppliers?')).toEqual(expect.arrayContaining([
+      AI_DOMAINS.PURCHASES,
+      AI_DOMAINS.SUPPLIERS,
+    ]));
+  });
+
   test('lists KPI definitions without exposing compute functions', () => {
     const kpis = listKpis();
     expect(kpis.map((kpi) => kpi.id)).toEqual(expect.arrayContaining([
