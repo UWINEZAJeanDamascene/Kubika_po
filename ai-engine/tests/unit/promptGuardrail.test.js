@@ -12,6 +12,7 @@ const {
   validateFreeTextResponse,
   parseAndValidateStructuredText,
 } = require('../../guardrail');
+const { normalizeCompanyId } = require('../../context-builder/permissionUtils');
 
 function sampleFact() {
   return createFact({
@@ -93,6 +94,20 @@ describe('Prompt Builder and Guardrail', () => {
       recommendedActions: [],
     }, [fact]);
 
+    expect(result.ok).toBe(true);
+  });
+
+  test('normalizes populated company references before validating evidence ownership', () => {
+    const fact = sampleFact();
+    const expectedCompanyId = normalizeCompanyId({ _id: 'company_1', name: 'Test Company' });
+    const result = validateStructuredResponse({
+      answer: 'Sales were RWF 1,000.',
+      claimLabels: [{ text: 'Sales were RWF 1,000.', type: FACT_TYPES.FACT, factIds: [fact.id] }],
+      missingData: [],
+      recommendedActions: [],
+    }, [fact], { expectedCompanyId });
+
+    expect(expectedCompanyId).toBe('company_1');
     expect(result.ok).toBe(true);
   });
 

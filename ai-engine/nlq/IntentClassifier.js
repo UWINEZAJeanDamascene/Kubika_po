@@ -9,6 +9,7 @@ const {
 const NLQ_VERSION = 'nlq-v2';
 
 const INTENTS = Object.freeze({
+  GREETING: 'greeting',
   FACTUAL_QUERY: 'factual_query',
   ANALYTICAL_QUERY: 'analytical_query',
   CAUSAL_QUERY: 'causal_query',
@@ -65,6 +66,7 @@ const AMBIGUOUS_PATTERNS = [
   /^\s*(it|that|this|they|them|those)\??\s*$/i,
   /^\s*(yes|no|ok|okay|sure|do it|continue)\s*$/i,
 ];
+const GREETING_PATTERN = /^\s*(hi|hello|hey|good morning|good afternoon|good evening)(\s+stacy|\s+there)?[!?.\s]*$/i;
 
 function normalize(text) {
   return String(text || '').trim();
@@ -110,6 +112,14 @@ function detectIntent(text) {
       intent: INTENTS.AMBIGUOUS_QUERY,
       confidence: 0.99,
       reason: 'Empty query.',
+    };
+  }
+
+  if (GREETING_PATTERN.test(normalized)) {
+    return {
+      intent: INTENTS.GREETING,
+      confidence: 0.99,
+      reason: 'Standalone greeting.',
     };
   }
 

@@ -544,19 +544,43 @@ async function runProviderChain(activeProviders, providerParams, routerOptions =
     attempts.push(attempt);
     try {
       const start = Date.now();
-      const response = await callProviderWithRetry(provider, providerParams, { maxRetries: 2, routerOptions });
-      const elapsed = Date.now() - start;
-      const validation = validateRouterResponse(response, routerOptions, provider);
+      let response = await callProviderWithRetry(provider, providerParams, { maxRetries: 2, routerOptions });
+      let validation = validateRouterResponse(response, routerOptions, provider);
+      if (!validation.ok) {
+        const validationErrors = validation.errors || ['invalid output'];
+        attempt.guardrailRetry = true;
+        console.warn(`AI provider ${provider.name} output failed guardrail; retrying as strict JSON: ${validationErrors.slice(0, 3).join('; ')}`);
+        const retryParams = {
+          ...providerParams,
+          tools: undefined,
+          tool_choice: undefined,
+          messages: [
+            ...(Array.isArray(providerParams.messages) ? providerParams.messages : []),
+            {
+              role: 'user',
+              content: `Your previous response failed validation: ${validationErrors.join('; ')}. Answer again using only backend facts already provided. Return only the JSON response contract from the system prompt. Do not call tools or make unsupported claims.`,
+            },
+          ],
+        };
+        response = await callProviderWithRetry(provider, retryParams, {
+          maxRetries: 1,
+          routerOptions: { ...routerOptions, strictJson: true },
+        });
+        validation = validateRouterResponse(response, routerOptions, provider);
+      }
+
       if (!validation.ok) {
         const validationError = new Error(`Guardrail rejected provider output: ${(validation.errors || []).join('; ') || 'invalid output'}`);
         markProviderFailure(provider.name, validationError, { guardrailRejected: true });
         attempt.result = 'guardrail_rejected';
+        attempt.guardrailErrors = validation.errors || [];
         void recordEvent({ eventType: 'provider_failure', provider: provider.name, outcome: 'guardrail_rejected' });
         lastError = validationError;
-        console.warn(`AI provider ${provider.name} output failed guardrail. Trying next...`);
+        console.warn(`AI provider ${provider.name} output failed guardrail after retry: ${(validation.errors || []).slice(0, 3).join('; ')}`);
         continue;
       }
 
+      const elapsed = Date.now() - start;
       markProviderSuccess(provider.name, elapsed);
       attempt.result = 'success';
       attempt.latencyMs = elapsed;
@@ -652,12 +676,10 @@ async function cachedChatCompletion(systemPrompt, messages, completionParams) {
   return response;
 }
 
-async function getProviderStatus() {
-  const all = createProviders();
+async function getProviderStatus(all = createProviders()) {
   const statuses = await Promise.all(
     all.map(async (p) => {
       const health = await checkProviderHealth(p);
-      if (!health.reachable && isProviderHealthy(p.name)) markProviderUnhealthy(p.name);
       const circuit = getCircuitSnapshot(p.name);
       const healthy = health.reachable && circuit.state !== CIRCUIT_STATES.OPEN;
       return {

@@ -12,6 +12,13 @@ const {
 } = require('../../nlq');
 
 describe('Natural Language Query Engine', () => {
+  test('recognizes standalone greetings without requiring business clarification', () => {
+    const result = classifyQuery('hi');
+    expect(result.intent).toBe(INTENTS.GREETING);
+    expect(result.requiresClarification).toBe(false);
+    expect(result.routesToActionEngine).toBe(false);
+  });
+
   test('classifies action intent and action type', () => {
     const result = classifyQuery('Create a purchase order for low stock items');
     expect(result.intent).toBe(INTENTS.ACTION_INTENT);

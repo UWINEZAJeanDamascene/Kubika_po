@@ -4,6 +4,7 @@ jest.mock('../../../services/aiOperationalMetricsService', () => ({ recordEvent:
 
 const {
   CIRCUIT_STATES,
+  getProviderStatus,
   _internal,
 } = require('../../../services/aiProviderService');
 
@@ -93,6 +94,27 @@ describe('LLM router internals', () => {
     }));
   });
 
+  test('failed health probes do not open the chat provider circuit', async () => {
+    const provider = {
+      name: 'probe-only',
+      displayName: 'Probe Only',
+      model: 'probe-model',
+      supportsJsonMode: true,
+      supportsToolCalling: true,
+      hosted: true,
+      client: {
+        models: {
+          list: jest.fn().mockRejectedValue(Object.assign(new Error('model listing unsupported'), { status: 404 })),
+        },
+      },
+    };
+
+    const [status] = await getProviderStatus([provider]);
+
+    expect(status.reachable).toBe(false);
+    expect(_internal.getCircuitSnapshot('probe-only').state).toBe(CIRCUIT_STATES.CLOSED);
+  });
+
   test('allows one half-open probe and reopens after a failed probe', () => {
     _internal.markProviderFailure('probe', new Error('initial failure'), { openCircuit: true, until: Date.now() - 1 });
 
@@ -116,7 +138,7 @@ describe('LLM router internals', () => {
     expect(response.model).toBe('healthy-model');
   });
 
-  test('falls through after malformed or rejected model output', async () => {
+  test('falls through after malformed output remains rejected after repair', async () => {
     const malformed = mockProvider('malformed', { choices: [{ message: { content: 'not json' } }] });
     const healthy = mockProvider('healthy', { choices: [{ message: { content: '{"ok":true}' } }] });
     const validateResponse = (result) => result.choices[0].message.content.startsWith('{')
@@ -125,9 +147,44 @@ describe('LLM router internals', () => {
 
     const response = await _internal.runProviderChain([malformed, healthy], { messages: [] }, { validateResponse });
 
-    expect(malformed.create).toHaveBeenCalledTimes(1);
+    expect(malformed.create).toHaveBeenCalledTimes(2);
     expect(healthy.create).toHaveBeenCalledTimes(1);
     expect(_internal.getCircuitSnapshot('malformed').guardrailRejections).toBe(1);
     expect(response.provider).toBe('healthy');
+  });
+
+  test('retries a guardrail-rejected response as strict JSON without tools', async () => {
+    const create = jest.fn()
+      .mockResolvedValueOnce({ choices: [{ message: { content: 'There are 8 products.' } }] })
+      .mockResolvedValueOnce({ choices: [{ message: { content: JSON.stringify({ answer: 'There are 8 products.' }) } }] });
+    const provider = {
+      name: 'repairable',
+      displayName: 'Repairable',
+      model: 'repairable-model',
+      timeout: 1000,
+      supportsJsonMode: true,
+      client: { chat: { completions: { create } } },
+    };
+    const validateResponse = (result) => {
+      try {
+        return typeof JSON.parse(result.choices[0].message.content).answer === 'string'
+          ? { ok: true }
+          : { ok: false, errors: ['answer must be a string'] };
+      } catch {
+        return { ok: false, errors: ['Response must be valid JSON'] };
+      }
+    };
+
+    const response = await _internal.runProviderChain(
+      [provider],
+      { messages: [{ role: 'user', content: 'How many products?' }], tools: [{ type: 'function' }], tool_choice: 'auto' },
+      { validateResponse },
+    );
+
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(create.mock.calls[1][0].tools).toBeUndefined();
+    expect(create.mock.calls[1][0].tool_choice).toBeUndefined();
+    expect(create.mock.calls[1][0].response_format).toEqual({ type: 'json_object' });
+    expect(response.provider).toBe('repairable');
   });
 });

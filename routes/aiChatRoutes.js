@@ -6,6 +6,7 @@ const { requireAIFeature } = require('../services/aiFeatureFlags');
 const { recordEvent } = require('../services/aiOperationalMetricsService');
 const { TOOL_DEFINITIONS, executeTool } = require('../services/aiToolService');
 const { buildContext } = require('../ai-engine/context-builder/ContextBuilder');
+const { normalizeCompanyId } = require('../ai-engine/context-builder/permissionUtils');
 const { filterToolsForUser, allowedToolNames, TOOL_PERMISSIONS } = require('../ai-engine/context-builder/toolPermissions');
 const { createFact } = require('../ai-engine/shared/factFactory');
 const {
@@ -16,6 +17,7 @@ const {
 } = require('../ai-engine/prompt-builder');
 const { parseAndValidateStructuredText, extractJsonObject, guardedFallback, GUARDRAIL_VERSION } = require('../ai-engine/guardrail');
 const {
+  INTENTS,
   classifyQuery,
   buildLLMClassificationMessages,
   parseLLMClassification,
@@ -52,7 +54,7 @@ router.post('/', protect, requireAIFeature('aiChatV2'), (req, res, next) => {
   res.once('finish', () => {
     void recordEvent({
       eventType: 'chat_request',
-      companyId: req.company || req.user && req.user.company,
+      companyId: normalizeCompanyId(req.company || req.user && req.user.company),
       durationMs: Date.now() - startedAt,
       outcome: res.statusCode < 400 ? 'success' : 'error',
     });
@@ -66,6 +68,15 @@ router.post('/', protect, requireAIFeature('aiChatV2'), (req, res, next) => {
     }
 
     let nlq = classifyQuery(message, { history });
+    if (nlq.intent === INTENTS.GREETING) {
+      return res.status(200).json({
+        success: true,
+        reply: "Hi! I'm Stacy, your business assistant. Ask me about sales, stock, cash, receivables, purchases, or a specific customer or supplier.",
+        provider: 'built-in-greeting',
+        ai: { nlqVersion: NLQ_VERSION, intent: nlq, routed: 'greeting' },
+      });
+    }
+
     let aiConfigured = null;
     const hasAIProviders = () => {
       if (aiConfigured === null) aiConfigured = isConfigured();
@@ -149,7 +160,7 @@ router.post('/', protect, requireAIFeature('aiChatV2'), (req, res, next) => {
       });
     }
 
-    const companyId = req.user.company;
+    const companyId = normalizeCompanyId(req.company || req.user.company);
     const userName = req.user.name || 'there';
     const companyName = req.user.companyName || 'your company';
     const requestId = req.headers['x-request-id'] || crypto.randomUUID();
@@ -158,7 +169,7 @@ router.post('/', protect, requireAIFeature('aiChatV2'), (req, res, next) => {
     try {
       aiContext = await buildContext({
         user: req.user,
-        company: req.company || req.user.company,
+        company: companyId,
         query: message.trim(),
         domains: nlq.domains,
         requestId,
