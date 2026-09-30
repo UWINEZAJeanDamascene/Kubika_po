@@ -74,6 +74,7 @@ const createTransporter = () => {
     return nodemailer.createTransport({
       ...poolDefaults,
       service: 'gmail',
+      family: 4,
       auth: {
         user: emailConfig.gmailUser,
         pass: emailConfig.gmailAppPassword
