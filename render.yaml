@@ -63,3 +63,47 @@ services:
       - key: CORS_ORIGINS
         value: https://kubika.techmat.rw
     autoDeploy: true
+
+  # Background tasks run in a dedicated process; the API process intentionally
+  # does not start schedulers so scaled web replicas cannot duplicate postings.
+  - name: stock-management-worker
+    type: worker
+    env: node
+    region: oregon
+    buildCommand: npm install
+    startCommand: npm run worker
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: DIRECT_URL
+        sync: false
+      - key: REDIS_URL
+        sync: false
+      - key: SENTRY_DSN
+        sync: false
+      - key: PERFORMANCE_REQUIRE_REDIS
+        value: "true"
+      - key: PERFORMANCE_REQUIRE_SENTRY
+        value: "true"
+      - key: PERFORMANCE_REQUIRE_SENTRY_APDEX
+        value: "true"
+      - key: SENTRY_APDEX_PROJECT_T_MS
+        value: "1000"
+      - key: SENTRY_APDEX_PROJECT_CONFIGURED
+        value: "true"
+      - key: SENTRY_TRACES_SAMPLE_RATE
+        value: "0.1"
+      - key: PRISMA_CONNECTION_LIMIT
+        value: "20"
+      - key: PRISMA_POOL_TIMEOUT
+        value: "10"
+      - key: PRISMA_APPLICATION_NAME
+        value: stock-management-worker
+      - key: QUERY_MAX_ROWS
+        value: "500"
+      - key: QUERY_ENFORCE_MAX_ROWS
+        value: "true"
+      - key: RECONCILIATION_BATCH_SIZE
+        value: "500"

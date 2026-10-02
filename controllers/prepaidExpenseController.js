@@ -64,6 +64,9 @@ exports.postAmortization = async (req, res, next) => {
     if (error.message === 'ALREADY_POSTED') {
       return res.status(400).json({ success: false, message: 'Amortization already posted' });
     }
+    if (error.message === 'NOT_DUE') {
+      return res.status(400).json({ success: false, message: 'Amortization cannot be posted before its scheduled date' });
+    }
     next(error);
   }
 };

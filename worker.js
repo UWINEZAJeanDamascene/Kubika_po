@@ -44,6 +44,7 @@ async function startWorker() {
   };
 
   startSafely('notifications', () => require('./services/notificationScheduler').startScheduler());
+  startSafely('prepaid-expense-amortizations', () => require('./services/prepaidExpenseScheduler').startScheduler());
   startSafely('ebm-retry', () => require('./services/ebmRetryJob').startRetryJob());
   startSafely('report-snapshots', () => require('./services/reportSchedulerService').initializeScheduler());
   startSafely('ai-monitoring', () => require('./services/aiMonitoringScheduler').startMonitoringScheduler());
@@ -118,6 +119,7 @@ async function shutdown(signal) {
     stopSafely('ebm-retry', () => require('./services/ebmRetryJob').stopRetryJob());
     stopSafely('report-snapshots', () => require('./services/reportSchedulerService').stopScheduler());
     stopSafely('notifications', () => require('./services/notificationScheduler').stopScheduler());
+    stopSafely('prepaid-expense-amortizations', () => require('./services/prepaidExpenseScheduler').stopScheduler());
     stopSafely('ai-monitoring', () => require('./services/aiMonitoringScheduler').stopMonitoringScheduler());
     // closeWorkers() is async; awaiting it lets in-flight jobs finish rather
     // than being killed mid-write.
