@@ -296,6 +296,12 @@ class ProjectService {
     if (!data || !String(data.name || "").trim()) throw validationError("Project name is required");
     const name = String(data.name).trim();
     const parentId = data.parent_id || null;
+    // Project IDs are normally generated server-side, but imports may supply one.
+    // Reject an explicitly supplied ID that would make this record its own parent.
+    const requestedProjectId = data._id || data.id;
+    if (parentId && requestedProjectId && String(requestedProjectId) === String(parentId)) {
+      throw validationError("A project cannot be its own parent");
+    }
     const category = data.project_category || "internal";
     if (!PROJECT_CATEGORIES.includes(category)) throw validationError("Invalid project category");
     const type = data.type || "project";
@@ -379,7 +385,6 @@ class ProjectService {
       if (parent.type === "task" || WBS_DEPTH[parent.type] > WBS_DEPTH[type] || (WBS_DEPTH[parent.type] === WBS_DEPTH[type] && !sameLevelProjectNesting)) {
         throw validationError("A WBS node can only contain a lower-level node; tasks cannot have children");
       }
-      if (String(parent._id) === String(parentId)) throw validationError("A project cannot be its own parent");
       wbsLevel = parent.wbs_level + 1;
     }
 

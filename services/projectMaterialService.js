@@ -52,7 +52,6 @@ class ProjectMaterialService {
         input.task_id ? prisma.project.findFirst({ where: { id: String(input.task_id), companyId: String(companyId), type: "task", isActive: true } }) : null,
       ]);
       if (!product) throw fail("A selected material was not found or is inactive", 404);
-      if (product.trackingType !== "none" || product.trackBatch || product.trackSerialNumbers) throw fail(`${product.name} requires batch or serial selection. Tracked stock must be issued through its existing batch/serial workflow until project requisitions support that allocation.`);
       if (!warehouse) throw fail("A selected warehouse was not found or is inactive", 404);
       if (input.task_id && !task) throw fail("A selected project task was not found", 404);
       if (task && !await this.isDescendant(companyId, task.id, projectId)) throw fail("Selected task does not belong to this project", 400);
@@ -83,6 +82,10 @@ class ProjectMaterialService {
       if (!req) throw fail("Material requisition not found", 404);
       if (req.status !== "planned") throw fail("Only planned requisitions can be approved");
       for (const line of req.lines) {
+        const product = await tx.product.findFirst({ where: { id: line.productId, companyId: String(companyId) } });
+        if (product && (product.trackingType !== "none" || product.trackBatch || product.trackSerialNumbers)) {
+          throw fail(`${product.name} is tracked by batch or serial number. Batch/serial allocation must be added before this project requisition can reserve or issue it.`);
+        }
         const qty = number(line.plannedQuantity);
         const level = await tx.stockLevel.findUnique({ where: { companyId_productId_warehouseId: { companyId: String(companyId), productId: line.productId, warehouseId: line.warehouseId } } });
         if (!level || number(level.qtyOnHand) - number(level.qtyReserved) < qty) throw fail(`Insufficient available stock to reserve requested material ${line.productId}`);
@@ -107,6 +110,9 @@ class ProjectMaterialService {
       if (qty > outstanding) throw fail("Issue quantity exceeds the remaining planned quantity");
       const product = await tx.product.findFirst({ where: { id: line.productId, companyId: String(companyId) } });
       if (!product) throw fail("Material product not found", 404);
+      if (product.trackingType !== "none" || product.trackBatch || product.trackSerialNumbers) {
+        throw fail(`${product.name} is tracked by batch or serial number. Project requisitions can plan this material, but issue it through the existing batch/serial stock workflow until project issue supports tracked allocation.`);
+      }
       const previousStock = number(product.currentStock);
       if (qty > previousStock) throw fail("Issue quantity exceeds product on-hand stock");
       const unitCost = number(product.averageCost) || number(line.unitCost);
