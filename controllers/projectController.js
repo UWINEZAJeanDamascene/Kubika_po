@@ -5,24 +5,27 @@ const projectMaterialService = require("../services/projectMaterialService");
 const projectClosureService = require("../services/projectClosureService");
 const projectControlService = require("../services/projectControlService");
 
+function collaborationContext(req) {
+  return {
+    companyId: req.companyId || req.company?._id || req.user?.company?._id || req.user?.company,
+    userId: req.user?._id || req.user?.id,
+  };
+}
+
 /**
  * Project Controller - API endpoints for Project/Job-Level Budgeting
  */
 
 class ProjectController {
-  collaborationContext(req) {
-    return { companyId: req.companyId || req.company?._id || req.user?.company?._id || req.user?.company, userId: req.user?._id || req.user?.id };
-  }
-
-  async getTeam(req, res, next) { try { const { companyId } = this.collaborationContext(req); res.json({ success: true, data: await projectCollaboration.getTeam(companyId, req.params.id) }); } catch (e) { next(e); } }
-  async addTeamMember(req, res, next) { try { const { companyId, userId } = this.collaborationContext(req); res.status(201).json({ success: true, data: await projectCollaboration.addTeamMember(companyId, req.params.id, userId, req.body.user_id, req.body.role) }); } catch (e) { next(e); } }
-  async removeTeamMember(req, res, next) { try { const { companyId, userId } = this.collaborationContext(req); await projectCollaboration.removeTeamMember(companyId, req.params.id, userId, req.params.memberId); res.json({ success: true }); } catch (e) { next(e); } }
-  async getComments(req, res, next) { try { const { companyId } = this.collaborationContext(req); res.json({ success: true, data: await projectCollaboration.getComments(companyId, req.params.id) }); } catch (e) { next(e); } }
-  async addComment(req, res, next) { try { const { companyId, userId } = this.collaborationContext(req); res.status(201).json({ success: true, data: await projectCollaboration.addComment(companyId, req.params.id, userId, req.body.body) }); } catch (e) { next(e); } }
-  async getActivity(req, res, next) { try { const { companyId } = this.collaborationContext(req); res.json({ success: true, data: await projectCollaboration.getActivity(companyId, req.params.id) }); } catch (e) { next(e); } }
-  async getDocuments(req, res, next) { try { const { companyId } = this.collaborationContext(req); const rows = await projectCollaboration.getDocuments(companyId, req.params.id); res.json({ success: true, data: rows.map((row) => ({ _id: row.id, file_name: row.fileName, mime_type: row.mimeType, file_size: row.fileSize, uploaded_by_id: row.uploadedById, created_at: row.createdAt })) }); } catch (e) { next(e); } }
-  async addDocument(req, res, next) { try { const { companyId, userId } = this.collaborationContext(req); res.status(201).json({ success: true, data: await projectCollaboration.addDocument(companyId, req.params.id, userId, req.file) }); } catch (e) { next(e); } }
-  async downloadDocument(req, res, next) { try { const { companyId } = this.collaborationContext(req); const doc = await projectCollaboration.downloadDocument(companyId, req.params.id, req.params.documentId); const safeName = doc.fileName.replace(/[\r\n"\\]/g, "_"); res.setHeader("Content-Type", doc.mimeType); res.setHeader("Content-Length", String(doc.fileSize)); res.setHeader("Content-Disposition", `attachment; filename="${safeName}"; filename*=UTF-8''${encodeURIComponent(doc.fileName)}`); res.send(Buffer.from(doc.content)); } catch (e) { next(e); } }
+  async getTeam(req, res, next) { try { const { companyId } = collaborationContext(req); res.json({ success: true, data: await projectCollaboration.getTeam(companyId, req.params.id) }); } catch (e) { next(e); } }
+  async addTeamMember(req, res, next) { try { const { companyId, userId } = collaborationContext(req); res.status(201).json({ success: true, data: await projectCollaboration.addTeamMember(companyId, req.params.id, userId, req.body.user_id, req.body.role) }); } catch (e) { next(e); } }
+  async removeTeamMember(req, res, next) { try { const { companyId, userId } = collaborationContext(req); await projectCollaboration.removeTeamMember(companyId, req.params.id, userId, req.params.memberId); res.json({ success: true }); } catch (e) { next(e); } }
+  async getComments(req, res, next) { try { const { companyId } = collaborationContext(req); res.json({ success: true, data: await projectCollaboration.getComments(companyId, req.params.id) }); } catch (e) { next(e); } }
+  async addComment(req, res, next) { try { const { companyId, userId } = collaborationContext(req); res.status(201).json({ success: true, data: await projectCollaboration.addComment(companyId, req.params.id, userId, req.body.body) }); } catch (e) { next(e); } }
+  async getActivity(req, res, next) { try { const { companyId } = collaborationContext(req); res.json({ success: true, data: await projectCollaboration.getActivity(companyId, req.params.id) }); } catch (e) { next(e); } }
+  async getDocuments(req, res, next) { try { const { companyId } = collaborationContext(req); const rows = await projectCollaboration.getDocuments(companyId, req.params.id); res.json({ success: true, data: rows.map((row) => ({ _id: row.id, file_name: row.fileName, mime_type: row.mimeType, file_size: row.fileSize, uploaded_by_id: row.uploadedById, created_at: row.createdAt })) }); } catch (e) { next(e); } }
+  async addDocument(req, res, next) { try { const { companyId, userId } = collaborationContext(req); res.status(201).json({ success: true, data: await projectCollaboration.addDocument(companyId, req.params.id, userId, req.file) }); } catch (e) { next(e); } }
+  async downloadDocument(req, res, next) { try { const { companyId } = collaborationContext(req); const doc = await projectCollaboration.downloadDocument(companyId, req.params.id, req.params.documentId); const safeName = doc.fileName.replace(/[\r\n"\\]/g, "_"); res.setHeader("Content-Type", doc.mimeType); res.setHeader("Content-Length", String(doc.fileSize)); res.setHeader("Content-Disposition", `attachment; filename="${safeName}"; filename*=UTF-8''${encodeURIComponent(doc.fileName)}`); res.send(Buffer.from(doc.content)); } catch (e) { next(e); } }
 
   async getSetupOptions(req, res, next) {
     try {
@@ -33,17 +36,17 @@ class ProjectController {
   }
 
   async getMaterialRequisitions(req, res, next) {
-    try { const { companyId } = this.collaborationContext(req); res.json({ success: true, data: await projectMaterialService.list(companyId, req.params.id) }); }
+    try { const { companyId } = collaborationContext(req); res.json({ success: true, data: await projectMaterialService.list(companyId, req.params.id) }); }
     catch (error) { next(error); }
   }
 
   async getClosureChecklist(req, res, next) {
-    try { const { companyId } = this.collaborationContext(req); res.json({ success: true, data: await projectClosureService.checklist(companyId, req.params.id) }); }
+    try { const { companyId } = collaborationContext(req); res.json({ success: true, data: await projectClosureService.checklist(companyId, req.params.id) }); }
     catch (error) { next(error); }
   }
 
   async updateClosureChecklistItem(req, res, next) {
-    try { const { companyId, userId } = this.collaborationContext(req); res.json({ success: true, data: await projectClosureService.updateItem(companyId, req.params.id, req.params.code, req.body, userId) }); }
+    try { const { companyId, userId } = collaborationContext(req); res.json({ success: true, data: await projectClosureService.updateItem(companyId, req.params.id, req.params.code, req.body, userId) }); }
     catch (error) { next(error); }
   }
 
@@ -53,42 +56,42 @@ class ProjectController {
   }
 
   async getProjectControls(req, res, next) {
-    try { const { companyId } = this.collaborationContext(req); res.json({ success: true, data: await projectControlService.list(companyId, req.params.id) }); }
+    try { const { companyId } = collaborationContext(req); res.json({ success: true, data: await projectControlService.list(companyId, req.params.id) }); }
     catch (error) { next(error); }
   }
 
   async createProjectControl(req, res, next) {
-    try { const { companyId, userId } = this.collaborationContext(req); res.status(201).json({ success: true, data: await projectControlService.create(companyId, req.params.id, req.body, userId) }); }
+    try { const { companyId, userId } = collaborationContext(req); res.status(201).json({ success: true, data: await projectControlService.create(companyId, req.params.id, req.body, userId) }); }
     catch (error) { next(error); }
   }
 
   async updateProjectControl(req, res, next) {
-    try { const { companyId, userId } = this.collaborationContext(req); res.json({ success: true, data: await projectControlService.update(companyId, req.params.id, req.params.controlId, req.body, userId) }); }
+    try { const { companyId, userId } = collaborationContext(req); res.json({ success: true, data: await projectControlService.update(companyId, req.params.id, req.params.controlId, req.body, userId) }); }
     catch (error) { next(error); }
   }
 
   async createMaterialRequisition(req, res, next) {
-    try { const { companyId, userId } = this.collaborationContext(req); res.status(201).json({ success: true, data: await projectMaterialService.create(companyId, req.params.id, req.body, userId) }); }
+    try { const { companyId, userId } = collaborationContext(req); res.status(201).json({ success: true, data: await projectMaterialService.create(companyId, req.params.id, req.body, userId) }); }
     catch (error) { next(error); }
   }
 
   async approveMaterialRequisition(req, res, next) {
-    try { const { companyId, userId } = this.collaborationContext(req); res.json({ success: true, data: await projectMaterialService.approve(companyId, req.params.id, req.params.requisitionId, userId) }); }
+    try { const { companyId, userId } = collaborationContext(req); res.json({ success: true, data: await projectMaterialService.approve(companyId, req.params.id, req.params.requisitionId, userId) }); }
     catch (error) { next(error); }
   }
 
   async issueProjectMaterial(req, res, next) {
-    try { const { companyId, userId } = this.collaborationContext(req); res.json({ success: true, data: await projectMaterialService.issue(companyId, req.params.id, req.params.requisitionId, req.params.lineId, req.body.quantity, userId) }); }
+    try { const { companyId, userId } = collaborationContext(req); res.json({ success: true, data: await projectMaterialService.issue(companyId, req.params.id, req.params.requisitionId, req.params.lineId, req.body.quantity, userId) }); }
     catch (error) { next(error); }
   }
 
   async returnProjectMaterial(req, res, next) {
-    try { const { companyId, userId } = this.collaborationContext(req); res.json({ success: true, data: await projectMaterialService.returnStock(companyId, req.params.id, req.params.requisitionId, req.params.lineId, req.body.quantity, userId) }); }
+    try { const { companyId, userId } = collaborationContext(req); res.json({ success: true, data: await projectMaterialService.returnStock(companyId, req.params.id, req.params.requisitionId, req.params.lineId, req.body.quantity, userId) }); }
     catch (error) { next(error); }
   }
 
   async cancelMaterialRequisition(req, res, next) {
-    try { const { companyId } = this.collaborationContext(req); res.json({ success: true, data: await projectMaterialService.cancel(companyId, req.params.id, req.params.requisitionId) }); }
+    try { const { companyId } = collaborationContext(req); res.json({ success: true, data: await projectMaterialService.cancel(companyId, req.params.id, req.params.requisitionId) }); }
     catch (error) { next(error); }
   }
 
