@@ -228,6 +228,7 @@ class ProjectController {
         manager_id: req.query.manager_id,
         is_active: req.query.is_active,
         is_template: req.query.is_template,
+        include_templates: req.query.include_templates,
         search: req.query.search,
       };
 

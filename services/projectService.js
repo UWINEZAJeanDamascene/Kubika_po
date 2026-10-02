@@ -469,9 +469,11 @@ class ProjectService {
     query.is_active = filters.is_active === undefined
       ? true
       : (filters.is_active === true || filters.is_active === "true");
-    query.is_template = filters.is_template === undefined
-      ? false
-      : (filters.is_template === true || filters.is_template === "true");
+    if (filters.include_templates !== true && filters.include_templates !== "true") {
+      query.is_template = filters.is_template === undefined
+        ? false
+        : (filters.is_template === true || filters.is_template === "true");
+    }
     if (filters.search) {
       query.$or = [
         { name: { $regex: filters.search, $options: "i" } },
