@@ -469,10 +469,11 @@ class ProjectService {
     query.is_active = filters.is_active === undefined
       ? true
       : (filters.is_active === true || filters.is_active === "true");
-    if (filters.include_templates !== true && filters.include_templates !== "true") {
-      query.is_template = filters.is_template === undefined
-        ? false
-        : (filters.is_template === true || filters.is_template === "true");
+    // The project list should expose every active saved record, including
+    // templates. Callers that specifically need only templates (the template
+    // picker) can still pass is_template=true.
+    if (filters.is_template !== undefined) {
+      query.is_template = filters.is_template === true || filters.is_template === "true";
     }
     if (filters.search) {
       query.$or = [
