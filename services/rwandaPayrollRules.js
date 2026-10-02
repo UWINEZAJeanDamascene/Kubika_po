@@ -64,12 +64,12 @@ function taxBandBreakdown(taxableIncome, bands) {
   }).filter((line) => line.taxableAmount > 0);
 }
 
-function calculateRwandaPayroll({ salary = {}, additionalIncome = {}, deductions = {}, employee = {}, periodDate }) {
+function calculateRwandaPayroll({ salary = {}, additionalIncome = {}, deductions = {}, employee = {}, periodDate, proration = null }) {
   const asOf = periodDate || new Date();
   const payeRule = effectiveRule(PAYE_RULES, asOf, "PAYE");
   const rssbRule = effectiveRule(RSSB_RULES, asOf, "RSSB");
 
-  const earnings = {
+  const originalEarnings = {
     basicSalary: amount(salary.basicSalary, "Basic salary"),
     transportAllowance: amount(salary.transportAllowance, "Transport allowance"),
     housingAllowance: amount(salary.housingAllowance, "Housing allowance"),
@@ -78,6 +78,42 @@ function calculateRwandaPayroll({ salary = {}, additionalIncome = {}, deductions
     bonuses: amount(additionalIncome.bonuses ?? salary.bonuses, "Bonuses"),
     commissions: amount(additionalIncome.commissions ?? salary.commissions, "Commissions"),
     benefitsInKind: amount(additionalIncome.benefitsInKind ?? salary.benefitsInKind, "Benefits in kind"),
+  };
+  let prorationSnapshot = null;
+  let payFactor = 1;
+  if (proration) {
+    if (proration.status !== "approved" || !proration.approvedById) {
+      throw new TypeError("Attendance and leave inputs must be approved before payroll calculation");
+    }
+    const scheduledDays = amount(proration.scheduledDays, "Scheduled work days");
+    const workedDays = amount(proration.workedDays, "Worked days");
+    const paidLeaveDays = amount(proration.paidLeaveDays, "Paid leave days");
+    const unpaidLeaveDays = amount(proration.unpaidLeaveDays, "Unpaid leave days");
+    if (scheduledDays <= 0) throw new RangeError("Scheduled work days must be greater than zero");
+    if (workedDays + paidLeaveDays + unpaidLeaveDays > scheduledDays + 0.0001) {
+      throw new RangeError("Worked, paid leave, and unpaid leave days cannot exceed scheduled work days");
+    }
+    payFactor = Math.min(1, (workedDays + paidLeaveDays) / scheduledDays);
+    prorationSnapshot = {
+      scheduledDays,
+      workedDays,
+      paidLeaveDays,
+      unpaidLeaveDays,
+      payableDays: roundMoney(workedDays + paidLeaveDays),
+      factor: roundMoney(payFactor),
+      status: "approved",
+      approvedById: String(proration.approvedById),
+      approvedAt: proration.approvedAt || null,
+      inputId: proration.inputId || null,
+    };
+  }
+  const earnings = {
+    ...originalEarnings,
+    basicSalary: roundMoney(originalEarnings.basicSalary * payFactor),
+    transportAllowance: roundMoney(originalEarnings.transportAllowance * payFactor),
+    housingAllowance: roundMoney(originalEarnings.housingAllowance * payFactor),
+    otherAllowances: roundMoney(originalEarnings.otherAllowances * payFactor),
+    benefitsInKind: roundMoney(originalEarnings.benefitsInKind * payFactor),
   };
   const cashGrossSalary = roundMoney(
     earnings.basicSalary + earnings.transportAllowance + earnings.housingAllowance + earnings.otherAllowances + earnings.overtime + earnings.bonuses + earnings.commissions,
@@ -125,6 +161,8 @@ function calculateRwandaPayroll({ salary = {}, additionalIncome = {}, deductions
     ruleVersion: `RW-${new Date(asOf).toISOString().slice(0, 10)}`,
     ruleEffectiveDate: new Date(asOf).toISOString().slice(0, 10),
     earnings,
+    originalEarnings,
+    proration: prorationSnapshot,
     grossSalary: cashGrossSalary,
     cashGrossSalary,
     grossRemuneration: taxableEmploymentIncome,

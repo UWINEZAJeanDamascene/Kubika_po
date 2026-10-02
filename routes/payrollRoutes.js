@@ -14,6 +14,9 @@ const {
   finalisePayroll,
   getPayslip,
   backfillPayrollJournals,
+  getPayrollPeriodInputs,
+  savePayrollPeriodInput,
+  approvePayrollPeriodInput,
 } = require("../controllers/payrollController");
 const { protect, authorize } = require("../middleware/auth");
 
@@ -24,6 +27,11 @@ router.route("/calculate").post(calculatePayroll);
 
 // Summary
 router.route("/summary").get(getPayrollSummary);
+
+// Approved attendance, leave, earnings, and deductions consumed by payroll generation
+router.route("/period-inputs").get(authorize("admin", "manager"), getPayrollPeriodInputs);
+router.route("/period-inputs").post(authorize("admin", "manager"), savePayrollPeriodInput);
+router.route("/period-inputs/:inputId/approve").post(authorize("admin", "manager"), approvePayrollPeriodInput);
 
 // Bulk create
 router.route("/bulk").post(bulkCreatePayroll);

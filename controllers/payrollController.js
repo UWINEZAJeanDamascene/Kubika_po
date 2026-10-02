@@ -7,6 +7,9 @@ const TaxAutomationService = require("../services/taxAutomationService");
 const LaborAllocationService = require('../services/laborAllocationService');
 const { parsePagination, paginationMeta } = require("../utils/pagination");
 const JournalEntry = require("../models/JournalEntry");
+const { runInPrismaTransaction } = require("../services/transactionService");
+const { dbClient } = require("../lib/prisma");
+const { generateObjectId } = require("../utils/objectId");
 
 function round2(n) {
   return Math.round((n || 0) * 100) / 100;
@@ -298,11 +301,12 @@ exports.createPayroll = async (req, res, next) => {
     const companyId = req.user.company._id;
     const userId = req.user._id;
 
-    const { employee_id, employee, salary, deductions = {}, salaryOverrides, period, notes } = req.body;
+    const { employee_id, employee, salary, deductions = {}, additionalIncome = {}, salaryOverrides, period, notes } = req.body;
 
     let employeeSnapshot = employee;
     let salaryData = salary;
     let linkedEmployeeId = null;
+    let approvedPeriodInput = null;
 
     // ── Path A: Create from Employee Master (preferred) ─────────────
     if (employee_id) {
@@ -351,8 +355,14 @@ exports.createPayroll = async (req, res, next) => {
         });
       }
 
-      // Build from master
-      const fromMaster = Payroll.fromEmployeeMaster(emp, effectiveSalary, period);
+      approvedPeriodInput = await dbClient().payrollPeriodInput.findUnique({
+        where: { companyId_employeeId_periodYear_periodMonth: { companyId: String(companyId), employeeId: String(emp._id), periodYear: Number(period.year), periodMonth: Number(period.month) } },
+      });
+      if (approvedPeriodInput?.status === "applied") throw Object.assign(new Error("Approved payroll inputs have already been applied for this employee and period"), { statusCode: 409 });
+      if (approvedPeriodInput?.status === "draft") throw Object.assign(new Error("Attendance and leave inputs must be approved before payroll can be created"), { statusCode: 409 });
+
+      // Build from salary history and only approved period inputs.
+      const fromMaster = Payroll.fromEmployeeMaster(emp, effectiveSalary, period, approvedPeriodInput);
       employeeSnapshot = fromMaster.employee;
       salaryData = fromMaster.salary;
       linkedEmployeeId = fromMaster.employee_id;
@@ -390,26 +400,30 @@ exports.createPayroll = async (req, res, next) => {
 
     // Calculate payroll using Rwanda tax rules
     const periodDate = new Date(Date.UTC(Number(period.year), Number(period.month), 0, 12));
-    const additionalIncome = {
-      overtime: salaryData.overtime || 0,
-      bonuses: salaryData.bonuses || 0,
-      commissions: salaryData.commissions || 0,
-      benefitsInKind: salaryData.benefitsInKind || 0,
-      vehicleProvided: Boolean(salaryData.vehicleProvided),
-      accommodationProvided: Boolean(salaryData.accommodationProvided),
+    const calculatedIncome = {
+      overtime: additionalIncome.overtime ?? salaryData.overtime ?? 0,
+      bonuses: additionalIncome.bonuses ?? salaryData.bonuses ?? 0,
+      commissions: additionalIncome.commissions ?? salaryData.commissions ?? 0,
+      benefitsInKind: additionalIncome.benefitsInKind ?? salaryData.benefitsInKind ?? 0,
+      vehicleProvided: additionalIncome.vehicleProvided ?? Boolean(salaryData.vehicleProvided),
+      accommodationProvided: additionalIncome.accommodationProvided ?? Boolean(salaryData.accommodationProvided),
     };
     const employeeForTax = linkedEmployeeId
       ? await Employee.findOne({ _id: linkedEmployeeId, company: companyId }).lean()
       : employeeSnapshot;
-    const calculated = Payroll.calculatePayroll(salaryData, {
+    const salaryForCalculation = approvedPeriodInput && salaryData.originalEarnings
+      ? { ...salaryData, ...salaryData.originalEarnings }
+      : salaryData;
+    const calculated = Payroll.calculatePayroll(salaryForCalculation, {
       periodDate,
       employee: employeeForTax || employeeSnapshot,
-      additionalIncome,
+      additionalIncome: calculatedIncome,
       deductions: {
-        healthInsurance: deductions.healthInsurance ?? salaryData.healthInsurance ?? 0,
-        loanDeductions: deductions.loanDeductions ?? salaryData.loanDeductions ?? 0,
-        otherDeductions: deductions.otherDeductions ?? salaryData.otherDeductions ?? 0,
+        healthInsurance: deductions.healthInsurance ?? approvedPeriodInput?.deductions?.healthInsurance ?? salaryData.healthInsurance ?? 0,
+        loanDeductions: deductions.loanDeductions ?? approvedPeriodInput?.deductions?.loanDeductions ?? salaryData.loanDeductions ?? 0,
+        otherDeductions: deductions.otherDeductions ?? approvedPeriodInput?.deductions?.otherDeductions ?? salaryData.otherDeductions ?? 0,
       },
+      proration: approvedPeriodInput ? { scheduledDays: Number(approvedPeriodInput.scheduledDays), workedDays: Number(approvedPeriodInput.workedDays), paidLeaveDays: Number(approvedPeriodInput.paidLeaveDays), unpaidLeaveDays: Number(approvedPeriodInput.unpaidLeaveDays), status: approvedPeriodInput.status, approvedById: approvedPeriodInput.approvedById, approvedAt: approvedPeriodInput.approvedAt, inputId: approvedPeriodInput.id } : null,
     });
 
     const payroll = new Payroll({
@@ -420,11 +434,9 @@ exports.createPayroll = async (req, res, next) => {
         isActive: employeeSnapshot.isActive !== undefined ? employeeSnapshot.isActive : true,
       },
       salary: {
-        basicSalary: salaryData.basicSalary,
-        transportAllowance: salaryData.transportAllowance || 0,
-        housingAllowance: salaryData.housingAllowance || 0,
-        otherAllowances: salaryData.otherAllowances || 0,
-        ...additionalIncome,
+        ...salaryData,
+        ...calculated.earnings,
+        ...calculatedIncome,
         grossSalary: calculated.grossSalary,
         grossRemuneration: calculated.grossRemuneration,
         taxableBase: calculated.taxableBase,
@@ -432,6 +444,8 @@ exports.createPayroll = async (req, res, next) => {
         ruleVersion: calculated.ruleVersion,
         ruleEffectiveDate: calculated.ruleEffectiveDate,
         rates: calculated.rates,
+        proration: calculated.proration,
+        originalEarnings: calculated.originalEarnings,
       },
       deductions: {
         paye: calculated.deductions.paye,
@@ -458,7 +472,13 @@ exports.createPayroll = async (req, res, next) => {
       createdBy: userId,
     });
 
-    await payroll.save();
+    await runInPrismaTransaction(async () => {
+      await payroll.save();
+      if (approvedPeriodInput) {
+        const consumed = await dbClient().payrollPeriodInput.updateMany({ where: { id: approvedPeriodInput.id, companyId: String(companyId), status: "approved", appliedPayrollId: null }, data: { status: "applied", appliedPayrollId: String(payroll._id) } });
+        if (!consumed.count) throw Object.assign(new Error("Approved payroll input was already applied to another payroll record"), { statusCode: 409 });
+      }
+    });
 
     res.status(201).json({
       success: true,
@@ -495,7 +515,11 @@ exports.updatePayroll = async (req, res, next) => {
       });
     }
 
-    const { employee, salary, period, notes } = req.body;
+    const { employee, salary, period, notes, additionalIncome = {}, deductions = {} } = req.body;
+
+    if (payroll.record_status === "finalised") {
+      return res.status(400).json({ success: false, message: "Cannot change earnings or deductions after payroll is finalised" });
+    }
 
     // Recalculate if salary changed
     let calculated = null;
@@ -503,11 +527,21 @@ exports.updatePayroll = async (req, res, next) => {
       const recordPeriodDate = period
         ? new Date(Date.UTC(Number(period.year), Number(period.month), 0, 12))
         : payroll.pay_period_end || new Date();
-      calculated = Payroll.calculatePayroll(salary, {
+      const calculationSalary = { ...salary };
+      const approvedProration = payroll.salary?.proration?.status === "approved" ? payroll.salary.proration : null;
+      if (approvedProration && payroll.salary?.originalEarnings) {
+        for (const field of ["basicSalary", "transportAllowance", "housingAllowance", "otherAllowances", "benefitsInKind"]) {
+          if (Number(calculationSalary[field] || 0) === Number(payroll.salary[field] || 0)) {
+            calculationSalary[field] = payroll.salary.originalEarnings[field] ?? calculationSalary[field];
+          }
+        }
+      }
+      calculated = Payroll.calculatePayroll(calculationSalary, {
         periodDate: recordPeriodDate,
         employee: payroll.employee || {},
-        additionalIncome: salary,
-        deductions: salary,
+        additionalIncome: { ...salary, ...additionalIncome },
+        deductions: { ...salary, ...deductions },
+        proration: approvedProration,
       });
     }
 
@@ -517,14 +551,17 @@ exports.updatePayroll = async (req, res, next) => {
 
     if (salary) {
       payroll.salary = {
+        ...salary,
         basicSalary: salary.basicSalary,
         transportAllowance: salary.transportAllowance || 0,
         housingAllowance: salary.housingAllowance || 0,
         otherAllowances: salary.otherAllowances || 0,
-        overtime: salary.overtime || 0,
-        bonuses: salary.bonuses || 0,
-        commissions: salary.commissions || 0,
-        benefitsInKind: salary.benefitsInKind || 0,
+        overtime: additionalIncome.overtime ?? salary.overtime ?? 0,
+        bonuses: additionalIncome.bonuses ?? salary.bonuses ?? 0,
+        commissions: additionalIncome.commissions ?? salary.commissions ?? 0,
+        benefitsInKind: additionalIncome.benefitsInKind ?? salary.benefitsInKind ?? 0,
+        vehicleProvided: additionalIncome.vehicleProvided ?? Boolean(salary.vehicleProvided),
+        accommodationProvided: additionalIncome.accommodationProvided ?? Boolean(salary.accommodationProvided),
         grossSalary: calculated.grossSalary,
         grossRemuneration: calculated.grossRemuneration,
         taxableBase: calculated.taxableBase,
@@ -532,6 +569,8 @@ exports.updatePayroll = async (req, res, next) => {
         ruleVersion: calculated.ruleVersion,
         ruleEffectiveDate: calculated.ruleEffectiveDate,
         rates: calculated.rates,
+        proration: calculated.proration,
+        originalEarnings: calculated.originalEarnings,
       };
       payroll.deductions = {
         paye: calculated.deductions.paye,
@@ -883,6 +922,76 @@ exports.processPayment = async (req, res, next) => {
   }
 };
 
+exports.getPayrollPeriodInputs = async (req, res, next) => {
+  try {
+    const month = Number(req.query.month);
+    const year = Number(req.query.year);
+    if (!Number.isInteger(month) || month < 1 || month > 12 || !Number.isInteger(year)) {
+      return res.status(400).json({ success: false, message: "A valid month and year are required" });
+    }
+    const rows = await dbClient().payrollPeriodInput.findMany({
+      where: { companyId: String(req.user.company._id), periodMonth: month, periodYear: year },
+      orderBy: [{ status: "asc" }, { createdAt: "desc" }],
+    });
+    return res.json({ success: true, data: rows });
+  } catch (error) { return next(error); }
+};
+
+exports.savePayrollPeriodInput = async (req, res, next) => {
+  try {
+    const companyId = String(req.user.company._id);
+    const userId = String(req.user._id);
+    const { employeeId, periodMonth, periodYear } = req.body;
+    const month = Number(periodMonth), year = Number(periodYear);
+    const scheduledDays = Number(req.body.scheduledDays);
+    const workedDays = Number(req.body.workedDays || 0);
+    const paidLeaveDays = Number(req.body.paidLeaveDays || 0);
+    const unpaidLeaveDays = Number(req.body.unpaidLeaveDays || 0);
+    if (!employeeId || !Number.isInteger(month) || month < 1 || month > 12 || !Number.isInteger(year)) throw Object.assign(new Error("Employee and a valid period are required"), { statusCode: 400 });
+    if (![scheduledDays, workedDays, paidLeaveDays, unpaidLeaveDays].every(Number.isFinite) || scheduledDays <= 0 || [workedDays, paidLeaveDays, unpaidLeaveDays].some((value) => value < 0) || workedDays + paidLeaveDays + unpaidLeaveDays > scheduledDays + 0.0001) {
+      throw Object.assign(new Error("Attendance and leave days must be valid and cannot exceed scheduled work days"), { statusCode: 400 });
+    }
+    const employee = await Employee.findOne({ _id: employeeId, company: companyId });
+    if (!employee) throw Object.assign(new Error("Employee not found"), { statusCode: 404 });
+    const existing = await dbClient().payrollPeriodInput.findUnique({ where: { companyId_employeeId_periodYear_periodMonth: { companyId, employeeId: String(employeeId), periodYear: year, periodMonth: month } } });
+    if (existing && existing.status !== "draft") throw Object.assign(new Error("Approved or applied payroll inputs cannot be edited"), { statusCode: 409 });
+    const earningKeys = ["overtime", "bonuses", "commissions", "benefitsInKind", "vehicleProvided", "accommodationProvided"];
+    const deductionKeys = ["healthInsurance", "loanDeductions", "otherDeductions"];
+    const pick = (source, keys) => Object.fromEntries(keys.filter((key) => source?.[key] !== undefined).map((key) => [key, source[key]]));
+    const additionalIncome = pick(req.body.additionalIncome || {}, earningKeys);
+    const deductions = pick(req.body.deductions || {}, deductionKeys);
+    for (const [key, value] of [...Object.entries(additionalIncome), ...Object.entries(deductions)]) {
+      if (typeof value === "boolean" && ["vehicleProvided", "accommodationProvided"].includes(key)) continue;
+      if (!Number.isFinite(Number(value)) || Number(value) < 0) throw Object.assign(new Error(`${key} must be a non-negative amount`), { statusCode: 400 });
+    }
+    const base = {
+      companyId, employeeId: String(employeeId), periodMonth: month, periodYear: year,
+      scheduledDays: String(scheduledDays), workedDays: String(workedDays), paidLeaveDays: String(paidLeaveDays), unpaidLeaveDays: String(unpaidLeaveDays),
+      additionalIncome, deductions, notes: String(req.body.notes || ""), status: "draft", enteredById: userId,
+      approvedById: null, approvedAt: null,
+    };
+    const row = existing
+      ? await dbClient().payrollPeriodInput.update({ where: { id: existing.id }, data: base })
+      : await dbClient().payrollPeriodInput.create({ data: { id: generateObjectId(), ...base } });
+    return res.status(existing ? 200 : 201).json({ success: true, data: row });
+  } catch (error) { return next(error); }
+};
+
+exports.approvePayrollPeriodInput = async (req, res, next) => {
+  try {
+    const companyId = String(req.user.company._id);
+    const userId = String(req.user._id);
+    const row = await dbClient().payrollPeriodInput.findFirst({ where: { id: String(req.params.inputId), companyId } });
+    if (!row) throw Object.assign(new Error("Payroll period input not found"), { statusCode: 404 });
+    if (row.status !== "draft") throw Object.assign(new Error("Only draft payroll inputs can be approved"), { statusCode: 409 });
+    const scheduled = Number(row.scheduledDays), worked = Number(row.workedDays), paidLeave = Number(row.paidLeaveDays), unpaidLeave = Number(row.unpaidLeaveDays);
+    if (scheduled <= 0 || worked + paidLeave + unpaidLeave > scheduled + 0.0001) throw Object.assign(new Error("Attendance and leave totals are invalid"), { statusCode: 400 });
+    const updated = await dbClient().payrollPeriodInput.updateMany({ where: { id: row.id, companyId, status: "draft" }, data: { status: "approved", approvedById: userId, approvedAt: new Date() } });
+    if (!updated.count) throw Object.assign(new Error("Input was changed by another user; refresh and retry"), { statusCode: 409 });
+    return res.json({ success: true, data: await dbClient().payrollPeriodInput.findUnique({ where: { id: row.id } }) });
+  } catch (error) { return next(error); }
+};
+
 // @desc    Get payroll summary
 // @route   GET /api/payroll/summary
 // @access  Private
@@ -1054,16 +1163,19 @@ exports.bulkCreatePayroll = async (req, res, next) => {
     for (const emp of employees) {
       const periodDate = new Date(Date.UTC(Number(period.year), Number(period.month), 0, 12));
       const additionalIncome = {
-        overtime: emp.salary.overtime || 0,
-        bonuses: emp.salary.bonuses || 0,
-        commissions: emp.salary.commissions || 0,
-        benefitsInKind: emp.salary.benefitsInKind || 0,
+        overtime: emp.additionalIncome?.overtime ?? emp.salary.overtime ?? 0,
+        bonuses: emp.additionalIncome?.bonuses ?? emp.salary.bonuses ?? 0,
+        commissions: emp.additionalIncome?.commissions ?? emp.salary.commissions ?? 0,
+        benefitsInKind: emp.additionalIncome?.benefitsInKind ?? emp.salary.benefitsInKind ?? 0,
+        vehicleProvided: emp.additionalIncome?.vehicleProvided ?? Boolean(emp.salary.vehicleProvided),
+        accommodationProvided: emp.additionalIncome?.accommodationProvided ?? Boolean(emp.salary.accommodationProvided),
       };
+      const deductionInputs = { ...emp.salary, ...(emp.deductions || {}) };
       const calculated = Payroll.calculatePayroll(emp.salary, {
         periodDate,
         employee: emp.employee || {},
         additionalIncome,
-        deductions: emp.salary,
+        deductions: deductionInputs,
       });
 
       const payroll = new Payroll({
@@ -1073,10 +1185,9 @@ exports.bulkCreatePayroll = async (req, res, next) => {
           isActive: true,
         },
         salary: {
+          ...emp.salary,
+          ...calculated.earnings,
           basicSalary: emp.salary.basicSalary,
-          transportAllowance: emp.salary.transportAllowance || 0,
-          housingAllowance: emp.salary.housingAllowance || 0,
-          otherAllowances: emp.salary.otherAllowances || 0,
           ...additionalIncome,
           grossSalary: calculated.grossSalary,
           grossRemuneration: calculated.grossRemuneration,
@@ -1085,6 +1196,8 @@ exports.bulkCreatePayroll = async (req, res, next) => {
           ruleVersion: calculated.ruleVersion,
           ruleEffectiveDate: calculated.ruleEffectiveDate,
           rates: calculated.rates,
+          originalEarnings: calculated.originalEarnings,
+          proration: calculated.proration,
         },
         deductions: {
           paye: calculated.deductions.paye,
@@ -1154,6 +1267,10 @@ exports.generatePayroll = async (req, res, next) => {
     }
 
     const employees = await Employee.find(empQuery).lean();
+    const approvedInputs = await dbClient().payrollPeriodInput.findMany({
+      where: { companyId: String(companyId), periodMonth: Number(period.month), periodYear: Number(period.year), status: { in: ["draft", "approved"] } },
+    });
+    const approvedInputByEmployee = new Map(approvedInputs.map((input) => [String(input.employeeId), input]));
     const createdRecords = [];
     const errors = [];
 
@@ -1191,7 +1308,12 @@ exports.generatePayroll = async (req, res, next) => {
         }
 
         // Build payroll from master
-        const fromMaster = Payroll.fromEmployeeMaster(emp, effectiveSalary, period);
+        const approvedInput = approvedInputByEmployee.get(String(emp._id)) || null;
+        if (approvedInput?.status === "draft") {
+          errors.push({ employeeId: emp.employeeId, name: `${emp.firstName} ${emp.lastName}`, reason: "Attendance and leave inputs must be approved before payroll can be generated" });
+          continue;
+        }
+        const fromMaster = Payroll.fromEmployeeMaster(emp, effectiveSalary, period, approvedInput);
 
         // Assemble full payroll document
         const payrollDoc = {
@@ -1210,7 +1332,13 @@ exports.generatePayroll = async (req, res, next) => {
         };
 
         const payroll = new Payroll(payrollDoc);
-        await payroll.save();
+        await runInPrismaTransaction(async () => {
+          await payroll.save();
+          if (approvedInput) {
+            const consumed = await dbClient().payrollPeriodInput.updateMany({ where: { id: approvedInput.id, companyId: String(companyId), status: "approved", appliedPayrollId: null }, data: { status: "applied", appliedPayrollId: String(payroll._id) } });
+            if (!consumed.count) throw Object.assign(new Error("Approved payroll input was already applied"), { statusCode: 409 });
+          }
+        });
         createdRecords.push(payroll);
       } catch (err) {
         // Catch duplicate key (employee already has payroll for this period)
@@ -1856,5 +1984,119 @@ exports.backfillPayrollJournals = async (req, res, next) => {
     });
   } catch (error) {
     next(error);
+  }
+};
+
+// Transactional implementations override the legacy handlers above. Status is
+// only persisted after all required journal and bank writes succeed.
+exports.finalisePayroll = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const userId = req.user._id;
+    const payroll = await runInPrismaTransaction(async () => {
+      const record = await Payroll.findOne({ _id: req.params.id, company: companyId });
+      if (!record) {
+        const error = new Error("Payroll record not found");
+        error.statusCode = 404;
+        throw error;
+      }
+      if (record.record_status === "paid") throw new Error("Payroll record already paid");
+      if (!record.pay_period_start || !record.pay_period_end) {
+        const year = Number(record.period?.year);
+        const month = Number(record.period?.month);
+        if (!year || !month) throw new Error("PAYROLL_PERIOD_REQUIRED");
+        record.pay_period_start = new Date(year, month - 1, 1);
+        record.pay_period_end = new Date(year, month, 0);
+      }
+      const posting = await postPayrollAccrualJournals(companyId, userId, record);
+      if (posting.allocation) {
+        record.laborAllocation = {
+          directAmount: posting.allocation.directAmount,
+          indirectAmount: posting.allocation.indirectAmount,
+          directPercentage: posting.allocation.directPct,
+          indirectPercentage: posting.allocation.indirectPct,
+          source: posting.allocation.source,
+          timesheetId: posting.allocation.timesheetId,
+        };
+      }
+      record.record_status = "finalised";
+      await record.save();
+      return record;
+    });
+    return res.json({ success: true, data: payroll, message: "Payroll record finalised and journal entries posted" });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+exports.processPayment = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const userId = req.user._id;
+    const { paymentMethod = "bank_transfer", reference, notes, bankAccountId } = req.body;
+    const payroll = await runInPrismaTransaction(async () => {
+      const record = await Payroll.findOne({ _id: req.params.id, company: companyId });
+      if (!record) {
+        const error = new Error("Payroll record not found");
+        error.statusCode = 404;
+        throw error;
+      }
+      if (record.payment?.status === "paid") throw new Error("Payment already processed");
+      if (record.record_status !== "finalised") throw new Error("PAYROLL_NOT_FINALISED");
+      const netPay = round2(record.netPay);
+      if (netPay <= 0) throw new Error("PAYROLL_NET_PAY_MUST_BE_POSITIVE");
+
+      const usesBank = ["bank_transfer", "bank", "cheque", "mobile_money"].includes(paymentMethod);
+      let bankAccount = null;
+      if (usesBank) {
+        if (!bankAccountId) throw new Error("PAYROLL_BANK_ACCOUNT_REQUIRED");
+        const { BankAccount: BankAccountModel } = require("../models/BankAccount");
+        bankAccount = await BankAccountModel.findOne({ _id: bankAccountId, company: companyId, isActive: true });
+        if (!bankAccount) throw new Error("PAYROLL_BANK_ACCOUNT_NOT_FOUND");
+      }
+
+      const { DEFAULT_ACCOUNTS } = require("../constants/chartOfAccounts");
+      const employeeName = `${record.employee?.firstName || ""} ${record.employee?.lastName || ""}`.trim() || "Employee";
+      const periodLabel = `${record.period?.monthName || ""} ${record.period?.year || ""}`.trim();
+      const cashAccountCode = bankAccount?.ledgerAccountId || (paymentMethod === "bank" ? DEFAULT_ACCOUNTS.cashAtBank : DEFAULT_ACCOUNTS.cashInHand);
+      const journalEntry = await JournalService.createEntry(companyId, userId, {
+        date: new Date(),
+        description: `Payroll payment - ${employeeName} - ${periodLabel}`,
+        sourceType: "payroll_payment",
+        sourceId: String(record._id),
+        sourceReference: reference || String(record._id),
+        lines: [
+          JournalService.createDebitLine(DEFAULT_ACCOUNTS.accruedExpenses || "2600", netPay, `Clear accrued salary - ${employeeName}`),
+          JournalService.createCreditLine(cashAccountCode, netPay, `Net salary paid - ${employeeName}`),
+        ],
+        isAutoGenerated: true,
+        skipBankTransactions: true,
+      });
+
+      if (bankAccount) {
+        await bankAccount.addTransaction({
+          type: "withdrawal",
+          amount: netPay,
+          description: `Salary payment - ${employeeName} - ${periodLabel}`,
+          date: new Date(),
+          referenceNumber: reference || String(record._id),
+          paymentMethod: paymentMethod === "bank" ? "bank_transfer" : paymentMethod,
+          status: "completed",
+          reference: record._id,
+          referenceType: "Payment",
+          createdBy: userId,
+          notes: notes || "Payroll payment",
+          journalEntryId: journalEntry._id,
+        });
+      }
+
+      record.payment = { status: "paid", paymentDate: new Date(), paymentMethod, reference: reference || null, bankAccountId: bankAccount?._id || null, journalEntryId: journalEntry._id };
+      record.approvedBy = userId;
+      await record.save();
+      return record;
+    });
+    return res.json({ success: true, data: payroll, message: "Payment processed successfully" });
+  } catch (error) {
+    return next(error);
   }
 };

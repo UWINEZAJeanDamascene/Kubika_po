@@ -8,6 +8,7 @@ const { BankAccount } = require("../models/BankAccount");
 const { nextSequence } = require("./sequenceService");
 const PeriodService = require("./periodService");
 const LaborAllocationService = require("./laborAllocationService");
+const { runInPrismaTransaction } = require("./transactionService");
 
 const { applyJournalLinesToAccountBalances } = require('../utils/accountBalanceSync');
 
@@ -383,6 +384,10 @@ static async getAvailablePeriods(companyId) {
 
   // ── CREATE FROM FINALISED RECORDS ─────────────────────────────────────
   static async createFromRecords(companyId, data, userId) {
+    return runInPrismaTransaction(() => this.createFromRecordsInTransaction(companyId, data, userId));
+  }
+
+  static async createFromRecordsInTransaction(companyId, data, userId) {
     // ── Determine which period to process ────────────────────────────────────
     // If the caller supplies explicit period_month/period_year, use those.
     // Otherwise fall back to deriving from pay_period_start (legacy path).
@@ -713,6 +718,10 @@ static async getAvailablePeriods(companyId) {
 
   // ── POST PAYROLL RUN ────────────────────────────────────────────────────
   static async post(companyId, runId, userId) {
+    return runInPrismaTransaction(() => this.postInTransaction(companyId, runId, userId));
+  }
+
+  static async postInTransaction(companyId, runId, userId) {
     const payrollRun = await PayrollRun.findOne({
       _id: runId,
       company: companyId,
@@ -1016,11 +1025,7 @@ static async getAvailablePeriods(companyId) {
             journalEntryId: (netPayJournalEntry || journalEntry)._id,
           });
         } catch (btErr) {
-          console.error(
-            "BankTransaction creation failed for payroll run post:",
-            btErr.message,
-          );
-          // Non-fatal — journal entry already posted
+          throw btErr;
         }
       }
 
@@ -1032,6 +1037,10 @@ static async getAvailablePeriods(companyId) {
 
   // ── REVERSE PAYROLL RUN ─────────────────────────────────────────────────
   static async reverse(companyId, runId, data, userId) {
+    return runInPrismaTransaction(() => this.reverseInTransaction(companyId, runId, data, userId));
+  }
+
+  static async reverseInTransaction(companyId, runId, data, userId) {
     const payrollRun = await PayrollRun.findOne({
       _id: runId,
       company: companyId,
@@ -1118,7 +1127,7 @@ static async getAvailablePeriods(companyId) {
               [payeEntry._id],
             );
           }
-        } catch (e) { console.error("[reverse] PAYE remittance reversal failed:", e.message); }
+        } catch (e) { throw e; }
       }
 
       // Reverse RSSB remittance journal if exists
@@ -1142,7 +1151,7 @@ static async getAvailablePeriods(companyId) {
               [rssbEntry._id],
             );
           }
-        } catch (e) { console.error("[reverse] RSSB remittance reversal failed:", e.message); }
+        } catch (e) { throw e; }
       }
 
       // Clear remittance flags so the run can be re-remitted after re-posting
@@ -1180,13 +1189,7 @@ static async getAvailablePeriods(companyId) {
             notes: `Reversal of payroll run ${payrollRun.reference_no}`,
             journalEntryId: reversalEntry._id,
           });
-        } catch (btErr) {
-          console.error(
-            "BankTransaction creation failed for payroll run reversal:",
-            btErr.message,
-          );
-          // Non-fatal — journal entry already posted
-        }
+        } catch (btErr) { throw btErr; }
       }
 
       // Restore bank balance for PAYE remittance reversal
@@ -1203,7 +1206,7 @@ static async getAvailablePeriods(companyId) {
             createdBy: userId,
             notes: `Reversal of PAYE remittance for payroll run ${payrollRun.reference_no}`,
           });
-        } catch (btErr) { console.error("[reverse] PAYE bank deposit failed:", btErr.message); }
+        } catch (btErr) { throw btErr; }
       }
 
       // Restore bank balance for RSSB remittance reversal
@@ -1220,7 +1223,7 @@ static async getAvailablePeriods(companyId) {
             createdBy: userId,
             notes: `Reversal of RSSB remittance for payroll run ${payrollRun.reference_no}`,
           });
-        } catch (btErr) { console.error("[reverse] RSSB bank deposit failed:", btErr.message); }
+        } catch (btErr) { throw btErr; }
       }
 
       return payrollRun;
@@ -1231,6 +1234,10 @@ static async getAvailablePeriods(companyId) {
 
   // ── REMIT PAYE ──────────────────────────────────────────────────────────
   static async remitPaye(companyId, runId, data, userId) {
+    return runInPrismaTransaction(() => this.remitPayeInTransaction(companyId, runId, data, userId));
+  }
+
+  static async remitPayeInTransaction(companyId, runId, data, userId) {
     const payrollRun = await PayrollRun.findOne({
       _id: runId,
       company: companyId,
@@ -1266,6 +1273,7 @@ static async getAvailablePeriods(companyId) {
 
     try {
       const bankAccount = await BankAccount.findOne({ _id: payrollRun.bank_account_id, company: companyId });
+      if (!bankAccount) throw new Error("PAYROLL_BANK_ACCOUNT_NOT_FOUND");
       const periodId = await PeriodService.getOpenPeriodId(companyId, data.remitted_date || new Date());
       const amount = data.amount || payrollRun.total_tax;
 
@@ -1298,15 +1306,19 @@ static async getAvailablePeriods(companyId) {
             notes: `PAYE remittance for payroll run ${payrollRun.reference_no}`,
             journalEntryId: journalEntry._id,
           });
-        } catch (btErr) { console.error("[remitPaye] BankTransaction failed:", btErr.message); }
+        } catch (btErr) { throw btErr; }
       }
-    } catch (je) { console.error("[remitPaye] Journal entry failed:", je.message); }
+    } catch (je) { throw je; }
 
     return payrollRun;
   }
 
   // ── REMIT RSSB ──────────────────────────────────────────────────────────
   static async remitRssb(companyId, runId, data, userId) {
+    return runInPrismaTransaction(() => this.remitRssbInTransaction(companyId, runId, data, userId));
+  }
+
+  static async remitRssbInTransaction(companyId, runId, data, userId) {
     const payrollRun = await PayrollRun.findOne({
       _id: runId,
       company: companyId,
@@ -1354,6 +1366,7 @@ static async getAvailablePeriods(companyId) {
 
     try {
       const bankAccount = await BankAccount.findOne({ _id: payrollRun.bank_account_id, company: companyId });
+      if (!bankAccount) throw new Error("PAYROLL_BANK_ACCOUNT_NOT_FOUND");
       const periodId = await PeriodService.getOpenPeriodId(companyId, data.remitted_date || new Date());
       const rssbAmount = data.amount || totalRssb;
 
@@ -1396,9 +1409,9 @@ static async getAvailablePeriods(companyId) {
             notes: `RSSB remittance for payroll run ${payrollRun.reference_no}`,
             journalEntryId: journalEntry._id,
           });
-        } catch (btErr) { console.error("[remitRssb] BankTransaction failed:", btErr.message); }
+        } catch (btErr) { throw btErr; }
       }
-    } catch (je) { console.error("[remitRssb] Journal entry failed:", je.message); }
+    } catch (je) { throw je; }
 
     return payrollRun;
   }

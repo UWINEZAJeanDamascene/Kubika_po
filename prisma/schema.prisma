@@ -3500,6 +3500,32 @@ model PayrollRun {
   @@map("payroll_runs")
 }
 
+model PayrollPeriodInput {
+  id               String   @id @db.Char(24)
+  companyId        String   @map("company_id") @db.Char(24)
+  employeeId       String   @map("employee_id") @db.Char(24)
+  periodMonth      Int      @map("period_month")
+  periodYear       Int      @map("period_year")
+  scheduledDays    Decimal  @map("scheduled_days") @db.Decimal(9, 2)
+  workedDays       Decimal  @default(0) @map("worked_days") @db.Decimal(9, 2)
+  paidLeaveDays    Decimal  @default(0) @map("paid_leave_days") @db.Decimal(9, 2)
+  unpaidLeaveDays  Decimal  @default(0) @map("unpaid_leave_days") @db.Decimal(9, 2)
+  additionalIncome Json     @default("{}") @map("additional_income")
+  deductions       Json     @default("{}")
+  status           String   @default("draft")
+  notes            String?
+  enteredById      String?  @map("entered_by_id") @db.Char(24)
+  approvedById     String?  @map("approved_by_id") @db.Char(24)
+  approvedAt       DateTime? @map("approved_at") @db.Timestamptz(3)
+  appliedPayrollId String?  @map("applied_payroll_id") @db.Char(24)
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([companyId, employeeId, periodYear, periodMonth])
+  @@index([companyId, periodYear, periodMonth, status])
+  @@map("payroll_period_inputs")
+}
+
 model Timesheet {
   id                 String    @id @db.Char(24)
   companyId          String    @map("company_id") @db.Char(24)

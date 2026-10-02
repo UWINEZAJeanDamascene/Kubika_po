@@ -47,10 +47,11 @@ Payroll.calculatePayroll = function(salary, options = {}) {
     deductions: options.deductions || {},
     employee: options.employee || {},
     periodDate,
+    proration: options.proration || null,
   });
 };
 
-Payroll.fromEmployeeMaster = function(emp, effectiveSalary, period) {
+Payroll.fromEmployeeMaster = function(emp, effectiveSalary, period, approvedInput = null) {
   const employeeSnapshot = {
     employeeId: emp.employeeId,
     firstName: emp.firstName,
@@ -70,14 +71,31 @@ Payroll.fromEmployeeMaster = function(emp, effectiveSalary, period) {
     housingAllowance: effectiveSalary.housingAllowance || 0,
     otherAllowances: effectiveSalary.otherAllowances || 0,
     occupationalHazardRate: effectiveSalary.occupationalHazardRate || 2,
+    ...(approvedInput?.additionalIncome || {}),
   };
 
   const periodDate = new Date(Date.UTC(period.year, period.month, 0, 12));
-  const calculated = Payroll.calculatePayroll(salary, { employee: emp, periodDate });
+  const proration = approvedInput ? {
+    scheduledDays: Number(approvedInput.scheduledDays),
+    workedDays: Number(approvedInput.workedDays),
+    paidLeaveDays: Number(approvedInput.paidLeaveDays),
+    unpaidLeaveDays: Number(approvedInput.unpaidLeaveDays),
+    status: approvedInput.status,
+    approvedById: approvedInput.approvedById,
+    approvedAt: approvedInput.approvedAt,
+    inputId: approvedInput.id,
+  } : null;
+  const calculated = Payroll.calculatePayroll(salary, {
+    employee: emp,
+    periodDate,
+    proration,
+    additionalIncome: approvedInput?.additionalIncome || {},
+    deductions: approvedInput?.deductions || {},
+  });
 
   return {
     employee: employeeSnapshot,
-    salary: { ...salary, taxableBase: calculated.taxableBase, grossRemuneration: calculated.grossRemuneration, ruleVersion: calculated.ruleVersion, ruleEffectiveDate: calculated.ruleEffectiveDate, rates: calculated.rates },
+    salary: { ...salary, ...calculated.earnings, taxableBase: calculated.taxableBase, grossRemuneration: calculated.grossRemuneration, ruleVersion: calculated.ruleVersion, ruleEffectiveDate: calculated.ruleEffectiveDate, rates: calculated.rates, proration: calculated.proration, originalEarnings: calculated.originalEarnings },
     employee_id: emp._id || emp.employeeId,
     deductions: calculated.deductions,
     netPay: calculated.netPay,
