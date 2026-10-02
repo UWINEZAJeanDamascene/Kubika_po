@@ -295,6 +295,7 @@ class ProjectService {
   async createProject(companyId, data, userId) {
     if (!data || !String(data.name || "").trim()) throw validationError("Project name is required");
     const name = String(data.name).trim();
+    const parentId = data.parent_id || null;
     const category = data.project_category || "internal";
     if (!PROJECT_CATEGORIES.includes(category)) throw validationError("Invalid project category");
     const type = data.type || "project";
@@ -366,9 +367,9 @@ class ProjectService {
 
     // Determine WBS level
     let wbsLevel = 1;
-    if (parent_id) {
+    if (parentId) {
       const parent = await Project.findOne({
-        _id: parent_id,
+        _id: parentId,
         company_id: companyId,
       });
       if (!parent) {
@@ -378,14 +379,14 @@ class ProjectService {
       if (parent.type === "task" || WBS_DEPTH[parent.type] > WBS_DEPTH[type] || (WBS_DEPTH[parent.type] === WBS_DEPTH[type] && !sameLevelProjectNesting)) {
         throw validationError("A WBS node can only contain a lower-level node; tasks cannot have children");
       }
-      if (parent._id === data.parent_id) throw validationError("A project cannot be its own parent");
+      if (String(parent._id) === String(parentId)) throw validationError("A project cannot be its own parent");
       wbsLevel = parent.wbs_level + 1;
     }
 
     // Generate WBS code
     const wbsCode = await this.generateWBSCode(
       companyId,
-      parent_id || null,
+      parentId,
       projectCode
     );
     const estimatedHours = Number(data.estimated_hours ?? 0);
@@ -394,7 +395,7 @@ class ProjectService {
     const progress = status === "completed" ? 100 : Number(data.progress_percent ?? 0);
     if (!Number.isFinite(progress) || progress < 0 || progress > 100) throw validationError("Progress must be between 0 and 100");
     const dependencies = type === "task" && data.depends_on_ids?.length
-      ? await this.validateTaskDependencies(companyId, null, data.depends_on_ids, parent_id)
+      ? await this.validateTaskDependencies(companyId, null, data.depends_on_ids, parentId)
       : [];
     if (status === "completed" && dependencies.length) {
       const dependencyTasks = await Project.find({ company_id: companyId, _id: { $in: dependencies } });
@@ -408,7 +409,7 @@ class ProjectService {
       description: String(data.description || "").trim(),
       purpose: String(data.purpose || "").trim(),
       project_category: category,
-      parent_id: data.parent_id || null,
+      parent_id: parentId,
       wbs_level: wbsLevel,
       wbs_code: wbsCode,
       type,
