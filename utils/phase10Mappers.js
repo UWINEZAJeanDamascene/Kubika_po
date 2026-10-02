@@ -437,6 +437,7 @@ function employeeToApi(row) {
     bankBranch: row.bankBranch ?? null,
     mobileMoneyNumber: row.mobileMoneyNumber ?? null,
     taxStatus: row.taxStatus,
+    isPrimaryEmployer: row.isPrimaryEmployer !== false,
     rssbRegistrationNumber: row.rssbRegistrationNumber ?? null,
     tinNumber: row.tinNumber ?? null,
     currentSalary: row.currentSalary ?? null,
@@ -453,7 +454,7 @@ const EMPLOYEE_HEADER = {
   department: 'department', departmentRef: 'departmentRefId', position: 'position', location: 'location',
   managerId: 'managerId', laborType: 'laborType', defaultDirectPercentage: 'defaultDirectPercentage',
   costCenter: 'costCenter', bankName: 'bankName', bankAccount: 'bankAccount', bankBranch: 'bankBranch',
-  mobileMoneyNumber: 'mobileMoneyNumber', taxStatus: 'taxStatus', rssbRegistrationNumber: 'rssbRegistrationNumber',
+  mobileMoneyNumber: 'mobileMoneyNumber', taxStatus: 'taxStatus', isPrimaryEmployer: 'isPrimaryEmployer', rssbRegistrationNumber: 'rssbRegistrationNumber',
   tinNumber: 'tinNumber', currentSalary: 'currentSalary', updatedBy: 'updatedById',
 };
 

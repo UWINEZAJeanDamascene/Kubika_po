@@ -1,27 +1,27 @@
 'use strict';
 
-jest.mock('../../../models/BankAccount', () => ({
+jest.mock('../models/BankAccount', () => ({
   find: jest.fn(),
   computeBalanceFromTransactions: jest.fn(),
 }));
 
-jest.mock('../../../models/Purchase', () => ({
+jest.mock('../models/Purchase', () => ({
   find: jest.fn(),
 }));
 
-jest.mock('../../../services/cashFlowService', () => ({
+jest.mock('../services/cashFlowService', () => ({
   generate: jest.fn(),
 }));
 
-jest.mock('../../../lib/prisma', () => ({
+jest.mock('../lib/prisma', () => ({
   dbClient: jest.fn(),
 }));
 
-const BankAccount = require('../../../models/BankAccount');
-const Purchase = require('../../../models/Purchase');
-const CashFlowService = require('../../../services/cashFlowService');
-const { dbClient } = require('../../../lib/prisma');
-const { executeTool, getCashFlowSummary } = require('../../../services/aiToolService');
+const BankAccount = require('../models/BankAccount');
+const Purchase = require('../models/Purchase');
+const CashFlowService = require('../services/cashFlowService');
+const { dbClient } = require('../lib/prisma');
+const { executeTool, getCashFlowSummary } = require('../services/aiToolService');
 
 function mockBankAccounts(accounts) {
   const query = {

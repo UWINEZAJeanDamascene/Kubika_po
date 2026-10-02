@@ -544,20 +544,8 @@ class TaxAutomationService {
 
   /**
    * Compute PAYE, RSSB employee, and RSSB employer contributions for a payroll run.
-   * Uses the existing Rwanda brackets and RSSB rates.
-   *
-   * Rwanda PAYE brackets (monthly, as implemented in Payroll model):
-   *   0 - 60,000:       0%
-   *   60,001 - 100,000: 10%
-   *   100,001 - 200,000: 20%
-   *   Above 200,000:    30%
-   *
-   * RSSB rates:
-   *   Employee pension: 6%
-   *   Employee maternity: 0.3%
-   *   Employer pension: 6%
-   *   Employer maternity: 0.3%
-   *   Occupational hazard: 2%
+   * Uses effective-dated Rwanda rules and the same taxable/contribution bases
+   * as payroll generation and preview.
    *
    * @param {String} companyId
    * @param {Object} payrollData
@@ -571,6 +559,7 @@ class TaxAutomationService {
    * @returns {Object} { paye, rssbEmployeePension, rssbEmployeeMaternity, rssbEmployerPension, rssbEmployerMaternity, occupationalHazard, totalDeductions, netPay, journalLines }
    */
   static async computePayrollTax(companyId, payrollData) {
+    const { calculateRwandaPayroll } = require("./rwandaPayrollRules");
     const {
       grossSalary = 0,
       salaryAccountId = DEFAULT_ACCOUNTS.salariesWages || '5400',
@@ -580,35 +569,23 @@ class TaxAutomationService {
       employerRssbAccountId = DEFAULT_ACCOUNTS.rssbEmployerCost || '6150'
     } = payrollData;
 
-    // ── PAYE Calculation (Rwanda progressive brackets) ─────────────
-    const taxableAmount = this.round(grossSalary);
-    let paye = 0;
-
-    if (taxableAmount > 200000) {
-      paye = this.round(4000 + 20000 + (taxableAmount - 200000) * 0.30);
-    } else if (taxableAmount > 100000) {
-      paye = this.round(4000 + (taxableAmount - 100000) * 0.20);
-    } else if (taxableAmount > 60000) {
-      paye = this.round((taxableAmount - 60000) * 0.10);
-    } else {
-      paye = 0;
-    }
-    paye = this.round(paye);
-
-    // ── RSSB Employee ──────────────────────────────────────────────
-    const rssbEmployeePension = this.round(grossSalary * 0.06);
-    const rssbEmployeeMaternity = this.round(grossSalary * 0.003);
-    const rssbEmployeeTotal = this.round(rssbEmployeePension + rssbEmployeeMaternity);
-
-    // ── RSSB Employer ──────────────────────────────────────────────
-    const rssbEmployerPension = this.round(grossSalary * 0.06);
-    const rssbEmployerMaternity = this.round(grossSalary * 0.003);
-    const occupationalHazard = this.round(grossSalary * 0.02);
-    const rssbEmployerTotal = this.round(rssbEmployerPension + rssbEmployerMaternity + occupationalHazard);
-
-    // ── Totals ─────────────────────────────────────────────────────
-    const totalDeductions = this.round(paye + rssbEmployeeTotal);
-    const netPay = this.round(grossSalary - totalDeductions);
+    const calculated = calculateRwandaPayroll({
+      salary: { basicSalary: grossSalary },
+      employee: payrollData.employee || {},
+      additionalIncome: payrollData.additionalIncome || {},
+      deductions: payrollData.deductions || {},
+      periodDate: payrollData.paymentDate || new Date(),
+    });
+    const paye = calculated.deductions.paye;
+    const rssbEmployeePension = calculated.deductions.rssbEmployeePension;
+    const rssbEmployeeMaternity = calculated.deductions.rssbEmployeeMaternity;
+    const rssbEmployerPension = calculated.contributions.rssbEmployerPension;
+    const rssbEmployerMaternity = calculated.contributions.rssbEmployerMaternity;
+    const occupationalHazard = calculated.contributions.occupationalHazard;
+    const netPay = calculated.netPay;
+    const rssbEmployeeTotal = calculated.deductions.rssbEmployeePension + calculated.deductions.rssbEmployeeMaternity;
+    const rssbEmployerTotal = calculated.contributions.totalEmployerContributions;
+    const totalDeductions = calculated.deductions.totalDeductions;
     const totalRssbPayable = this.round(rssbEmployeeTotal + rssbEmployerTotal);
 
     const result = {
@@ -619,6 +596,11 @@ class TaxAutomationService {
       rssbEmployerPension,
       rssbEmployerMaternity,
       occupationalHazard,
+      taxableBase: calculated.taxableBase,
+      grossRemuneration: calculated.grossRemuneration,
+      ruleVersion: calculated.ruleVersion,
+      ruleEffectiveDate: calculated.ruleEffectiveDate,
+      rssbBases: calculated.rssbBases,
       rssbEmployerTotal,
       totalRssbPayable,
       totalDeductions,
@@ -628,17 +610,17 @@ class TaxAutomationService {
 
     // ── Journal Entry Lines ────────────────────────────────────────
     // DR Salaries & Wages — gross salary
-    if (grossSalary > 0) {
+    if (calculated.cashGrossSalary > 0) {
       result.journalLines.push({
         accountCode: salaryAccountId,
         accountName: 'Salaries & Wages',
         description: 'Gross salary',
-        debit: grossSalary,
+        debit: calculated.cashGrossSalary,
         credit: 0
       });
     }
 
-    // DR RSSB Employer Cost — employer's 5% contribution
+    // DR RSSB Employer Cost — employer statutory contributions
     if (rssbEmployerTotal > 0) {
       result.journalLines.push({
         accountCode: employerRssbAccountId,
@@ -668,6 +650,16 @@ class TaxAutomationService {
         description: 'RSSB employee & employer contributions',
         debit: 0,
         credit: totalRssbPayable
+      });
+    }
+
+    if (calculated.deductions.totalOtherDeductions > 0) {
+      result.journalLines.push({
+        accountCode: DEFAULT_ACCOUNTS.accruedExpenses || '2600',
+        accountName: 'Employee Deductions Payable',
+        description: 'Employee non-statutory deductions payable',
+        debit: 0,
+        credit: calculated.deductions.totalOtherDeductions
       });
     }
 

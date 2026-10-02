@@ -3380,6 +3380,7 @@ model Employee {
   bankBranch              String?           @map("bank_branch")
   mobileMoneyNumber       String?           @map("mobile_money_number")
   taxStatus               String            @default("resident") @map("tax_status")
+  isPrimaryEmployer       Boolean           @default(true) @map("is_primary_employer")
   rssbRegistrationNumber  String?           @map("rssb_registration_number")
   tinNumber               String?           @map("tin_number")
   currentSalary           Json?             @map("current_salary")

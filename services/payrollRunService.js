@@ -193,10 +193,10 @@ class PayrollRunService {
 
     const rssbPayableLines = useDetailedPayables
       ? [
-          ["2320", "RSSB Employee Pension Payable - 6%", totals.rssbEmployeePension],
-          ["2321", "RSSB Employee Maternity Payable - 0.3%", totals.rssbEmployeeMaternity],
-          ["2330", "RSSB Employer Pension Payable - 6%", totals.rssbEmployerPension],
-          ["2331", "RSSB Employer Maternity Payable - 0.3%", totals.rssbEmployerMaternity],
+          ["2320", "RSSB Employee Pension Payable", totals.rssbEmployeePension],
+          ["2321", "RSSB Employee Maternity Payable", totals.rssbEmployeeMaternity],
+          ["2330", "RSSB Employer Pension Payable", totals.rssbEmployerPension],
+          ["2331", "RSSB Employer Maternity Payable", totals.rssbEmployerMaternity],
           ["2332", "Occupational Hazard Payable", totals.occupationalHazard],
         ]
       : [[rssbCode, rssbName, totals.employeeRssb + employerExpense]];
@@ -519,10 +519,12 @@ static async getAvailablePeriods(companyId) {
         transport_allowance: p.salary?.transportAllowance || 0,
         housing_allowance: p.salary?.housingAllowance || 0,
         other_allowances: p.salary?.otherAllowances || 0,
-        overtime: p.additionalIncome?.overtime || 0,
-        bonuses: p.additionalIncome?.bonuses || 0,
-        commissions: p.additionalIncome?.commissions || 0,
-        benefits_in_kind: p.additionalIncome?.benefitsInKind || 0,
+        overtime: p.salary?.overtime || 0,
+        bonuses: p.salary?.bonuses || 0,
+        commissions: p.salary?.commissions || 0,
+        benefits_in_kind: p.salary?.benefitsInKind || 0,
+        taxable_base: p.salary?.taxableBase ?? p.salary?.grossRemuneration ?? p.salary?.grossSalary ?? 0,
+        statutory_rates: p.contributions?.rates || p.salary?.rates || null,
         gross_salary: p.salary?.grossSalary || 0,
         // PAYE
         tax_deduction: p.deductions?.paye || 0,
@@ -1364,10 +1366,10 @@ static async getAvailablePeriods(companyId) {
       const bankCredit = rssbAmount;
       const lines = [];
       [
-        ["2320", "RSSB Employee Pension Payable - 6%", rssbEmployeePension],
-        ["2321", "RSSB Employee Maternity Payable - 0.3%", rssbEmployeeMaternity],
-        ["2330", "RSSB Employer Pension Payable - 6%", rssbEmployerPension],
-        ["2331", "RSSB Employer Maternity Payable - 0.3%", rssbEmployerMaternity],
+        ["2320", "RSSB Employee Pension Payable", rssbEmployeePension],
+        ["2321", "RSSB Employee Maternity Payable", rssbEmployeeMaternity],
+        ["2330", "RSSB Employer Pension Payable", rssbEmployerPension],
+        ["2331", "RSSB Employer Maternity Payable", rssbEmployerMaternity],
         ["2332", "Occupational Hazard Payable", totalOccupationalHazard],
       ].forEach(([accountCode, accountName, amount]) => {
         if (amount > 0) {

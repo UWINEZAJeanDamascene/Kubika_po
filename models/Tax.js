@@ -66,8 +66,11 @@ Tax.calculateCorporateTax = function calculateCorporateTax(taxableIncome, rate =
 };
 
 Tax.calculatePAYE = function calculatePAYE(grossSalaries) {
-  const Payroll = require('./Payroll');
-  return Payroll.calculatePAYE(grossSalaries);
+  const { calculateRwandaPayroll } = require('../services/rwandaPayrollRules');
+  const salary = typeof grossSalaries === 'number'
+    ? { basicSalary: grossSalaries }
+    : (grossSalaries || {});
+  return calculateRwandaPayroll({ salary }).deductions.paye;
 };
 
 Tax.getDefaultDueDates = function getDefaultDueDates(taxType) {

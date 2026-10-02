@@ -298,7 +298,7 @@ exports.createPayroll = async (req, res, next) => {
     const companyId = req.user.company._id;
     const userId = req.user._id;
 
-    const { employee_id, employee, salary, salaryOverrides, period, notes } = req.body;
+    const { employee_id, employee, salary, deductions = {}, salaryOverrides, period, notes } = req.body;
 
     let employeeSnapshot = employee;
     let salaryData = salary;
@@ -375,6 +375,8 @@ exports.createPayroll = async (req, res, next) => {
         if (typeof salary.loanDeductions === "number") salaryData.loanDeductions = salary.loanDeductions;
         if (typeof salary.otherDeductions === "number") salaryData.otherDeductions = salary.otherDeductions;
         if (typeof salary.occupationalHazardRate === "number") salaryData.occupationalHazardRate = salary.occupationalHazardRate;
+        if (typeof salary.vehicleProvided === "boolean") salaryData.vehicleProvided = salary.vehicleProvided;
+        if (typeof salary.accommodationProvided === "boolean") salaryData.accommodationProvided = salary.accommodationProvided;
       }
     }
 
@@ -387,7 +389,28 @@ exports.createPayroll = async (req, res, next) => {
     }
 
     // Calculate payroll using Rwanda tax rules
-    const calculated = Payroll.calculatePayroll(salaryData);
+    const periodDate = new Date(Date.UTC(Number(period.year), Number(period.month), 0, 12));
+    const additionalIncome = {
+      overtime: salaryData.overtime || 0,
+      bonuses: salaryData.bonuses || 0,
+      commissions: salaryData.commissions || 0,
+      benefitsInKind: salaryData.benefitsInKind || 0,
+      vehicleProvided: Boolean(salaryData.vehicleProvided),
+      accommodationProvided: Boolean(salaryData.accommodationProvided),
+    };
+    const employeeForTax = linkedEmployeeId
+      ? await Employee.findOne({ _id: linkedEmployeeId, company: companyId }).lean()
+      : employeeSnapshot;
+    const calculated = Payroll.calculatePayroll(salaryData, {
+      periodDate,
+      employee: employeeForTax || employeeSnapshot,
+      additionalIncome,
+      deductions: {
+        healthInsurance: deductions.healthInsurance ?? salaryData.healthInsurance ?? 0,
+        loanDeductions: deductions.loanDeductions ?? salaryData.loanDeductions ?? 0,
+        otherDeductions: deductions.otherDeductions ?? salaryData.otherDeductions ?? 0,
+      },
+    });
 
     const payroll = new Payroll({
       company: companyId,
@@ -401,12 +424,22 @@ exports.createPayroll = async (req, res, next) => {
         transportAllowance: salaryData.transportAllowance || 0,
         housingAllowance: salaryData.housingAllowance || 0,
         otherAllowances: salaryData.otherAllowances || 0,
+        ...additionalIncome,
         grossSalary: calculated.grossSalary,
+        grossRemuneration: calculated.grossRemuneration,
+        taxableBase: calculated.taxableBase,
+        rssbBases: calculated.rssbBases,
+        ruleVersion: calculated.ruleVersion,
+        ruleEffectiveDate: calculated.ruleEffectiveDate,
+        rates: calculated.rates,
       },
       deductions: {
         paye: calculated.deductions.paye,
         rssbEmployeePension: calculated.deductions.rssbEmployeePension,
         rssbEmployeeMaternity: calculated.deductions.rssbEmployeeMaternity,
+        healthInsurance: calculated.deductions.healthInsurance,
+        loanDeductions: calculated.deductions.loanDeductions,
+        otherDeductions: calculated.deductions.otherDeductions,
         totalDeductions: calculated.deductions.totalDeductions,
       },
       netPay: calculated.netPay,
@@ -414,6 +447,7 @@ exports.createPayroll = async (req, res, next) => {
         rssbEmployerPension: calculated.contributions.rssbEmployerPension,
         rssbEmployerMaternity: calculated.contributions.rssbEmployerMaternity,
         occupationalHazard: calculated.contributions.occupationalHazard,
+        rates: calculated.rates,
       },
       period: {
         month: period.month,
@@ -466,7 +500,15 @@ exports.updatePayroll = async (req, res, next) => {
     // Recalculate if salary changed
     let calculated = null;
     if (salary) {
-      calculated = Payroll.calculatePayroll(salary);
+      const recordPeriodDate = period
+        ? new Date(Date.UTC(Number(period.year), Number(period.month), 0, 12))
+        : payroll.pay_period_end || new Date();
+      calculated = Payroll.calculatePayroll(salary, {
+        periodDate: recordPeriodDate,
+        employee: payroll.employee || {},
+        additionalIncome: salary,
+        deductions: salary,
+      });
     }
 
     if (employee) {
@@ -479,12 +521,25 @@ exports.updatePayroll = async (req, res, next) => {
         transportAllowance: salary.transportAllowance || 0,
         housingAllowance: salary.housingAllowance || 0,
         otherAllowances: salary.otherAllowances || 0,
+        overtime: salary.overtime || 0,
+        bonuses: salary.bonuses || 0,
+        commissions: salary.commissions || 0,
+        benefitsInKind: salary.benefitsInKind || 0,
         grossSalary: calculated.grossSalary,
+        grossRemuneration: calculated.grossRemuneration,
+        taxableBase: calculated.taxableBase,
+        rssbBases: calculated.rssbBases,
+        ruleVersion: calculated.ruleVersion,
+        ruleEffectiveDate: calculated.ruleEffectiveDate,
+        rates: calculated.rates,
       };
       payroll.deductions = {
         paye: calculated.deductions.paye,
         rssbEmployeePension: calculated.deductions.rssbEmployeePension,
         rssbEmployeeMaternity: calculated.deductions.rssbEmployeeMaternity,
+        healthInsurance: calculated.deductions.healthInsurance,
+        loanDeductions: calculated.deductions.loanDeductions,
+        otherDeductions: calculated.deductions.otherDeductions,
         totalDeductions: calculated.deductions.totalDeductions,
       };
       payroll.netPay = calculated.netPay;
@@ -492,6 +547,7 @@ exports.updatePayroll = async (req, res, next) => {
         rssbEmployerPension: calculated.contributions.rssbEmployerPension,
         rssbEmployerMaternity: calculated.contributions.rssbEmployerMaternity,
         occupationalHazard: calculated.contributions.occupationalHazard,
+        rates: calculated.rates,
       };
     }
 
@@ -946,7 +1002,7 @@ exports.getPayrollSummary = async (req, res, next) => {
 // @access  Private
 exports.calculatePayroll = async (req, res, next) => {
   try {
-    const { salary } = req.body;
+    const { salary, deductions = {}, additionalIncome = {}, employee = {}, period } = req.body;
 
     if (!salary || !salary.basicSalary) {
       return res.status(400).json({
@@ -955,43 +1011,19 @@ exports.calculatePayroll = async (req, res, next) => {
       });
     }
 
-    const calculated = Payroll.calculatePayroll(salary);
-
-    // Get tax brackets for display - Updated 2025
-    const grossSalary =
-      salary.basicSalary +
-      (salary.transportAllowance || 0) +
-      (salary.housingAllowance || 0) +
-      (salary.otherAllowances || 0);
-    const taxBrackets = [
-      { range: "0 - 60,000", rate: "0%", tax: 0 },
-      {
-        range: "60,001 - 100,000",
-        rate: "10%",
-        tax: Math.max(0, (Math.min(grossSalary, 100000) - 60000) * 0.1),
-      },
-      {
-        range: "100,001 - 200,000",
-        rate: "20%",
-        tax:
-          grossSalary > 100000
-            ? 4000 + Math.max(0, (Math.min(grossSalary, 200000) - 100000) * 0.2)
-            : 0,
-      },
-      {
-        range: "Above 200,000",
-        rate: "30%",
-        tax: grossSalary > 200000 ? 24000 + (grossSalary - 200000) * 0.3 : 0,
-      },
-    ];
+    const periodDate = period?.month && period?.year
+      ? new Date(Date.UTC(Number(period.year), Number(period.month), 0, 12))
+      : new Date();
+    const calculated = Payroll.calculatePayroll(salary, { periodDate, employee, additionalIncome, deductions });
 
     res.json({
       success: true,
       data: {
         ...calculated,
-        taxBrackets: taxBrackets.map((t) => ({
-          ...t,
-          tax: Math.round(t.tax * 100) / 100,
+        taxBrackets: calculated.payeBreakdown.map((band) => ({
+          range: `${band.from.toLocaleString()} - ${band.to == null ? "above" : band.to.toLocaleString()}`,
+          rate: `${band.rate * 100}%`,
+          tax: band.tax,
         })),
       },
     });
@@ -1020,7 +1052,19 @@ exports.bulkCreatePayroll = async (req, res, next) => {
     const createdPayroll = [];
 
     for (const emp of employees) {
-      const calculated = Payroll.calculatePayroll(emp.salary);
+      const periodDate = new Date(Date.UTC(Number(period.year), Number(period.month), 0, 12));
+      const additionalIncome = {
+        overtime: emp.salary.overtime || 0,
+        bonuses: emp.salary.bonuses || 0,
+        commissions: emp.salary.commissions || 0,
+        benefitsInKind: emp.salary.benefitsInKind || 0,
+      };
+      const calculated = Payroll.calculatePayroll(emp.salary, {
+        periodDate,
+        employee: emp.employee || {},
+        additionalIncome,
+        deductions: emp.salary,
+      });
 
       const payroll = new Payroll({
         company: companyId,
@@ -1033,12 +1077,22 @@ exports.bulkCreatePayroll = async (req, res, next) => {
           transportAllowance: emp.salary.transportAllowance || 0,
           housingAllowance: emp.salary.housingAllowance || 0,
           otherAllowances: emp.salary.otherAllowances || 0,
+          ...additionalIncome,
           grossSalary: calculated.grossSalary,
+          grossRemuneration: calculated.grossRemuneration,
+          taxableBase: calculated.taxableBase,
+          rssbBases: calculated.rssbBases,
+          ruleVersion: calculated.ruleVersion,
+          ruleEffectiveDate: calculated.ruleEffectiveDate,
+          rates: calculated.rates,
         },
         deductions: {
           paye: calculated.deductions.paye,
           rssbEmployeePension: calculated.deductions.rssbEmployeePension,
           rssbEmployeeMaternity: calculated.deductions.rssbEmployeeMaternity,
+          healthInsurance: calculated.deductions.healthInsurance,
+          loanDeductions: calculated.deductions.loanDeductions,
+          otherDeductions: calculated.deductions.otherDeductions,
           totalDeductions: calculated.deductions.totalDeductions,
         },
         netPay: calculated.netPay,
@@ -1046,6 +1100,7 @@ exports.bulkCreatePayroll = async (req, res, next) => {
           rssbEmployerPension: calculated.contributions.rssbEmployerPension,
           rssbEmployerMaternity: calculated.contributions.rssbEmployerMaternity,
           occupationalHazard: calculated.contributions.occupationalHazard,
+          rates: calculated.rates,
         },
         period: {
           month: period.month,

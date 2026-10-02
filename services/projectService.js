@@ -444,6 +444,10 @@ class ProjectService {
       depends_on_ids: dependencies,
       progress_percent: progress,
       completed_at: status === "completed" ? (data.completed_at ? new Date(data.completed_at) : new Date()) : null,
+      is_template: Boolean(data.is_template),
+      // Set these on every insert instead of relying on database defaults.
+      // The Projects list filters active rows and excludes templates.
+      is_active: true,
     });
 
     if (project.parent_id) await this.rollupWbsProgress(companyId, project.parent_id);

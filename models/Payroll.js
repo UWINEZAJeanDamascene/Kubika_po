@@ -4,6 +4,7 @@
 
 const { buildTenantModel } = require('../utils/masterDataCommon');
 const { prisma } = require('../lib/prisma');
+const { calculateRwandaPayroll } = require('../services/rwandaPayrollRules');
 const {
   payrollToApi,
   payrollTranslateCreate,
@@ -38,57 +39,15 @@ Payroll.getMonthName = function(month) {
   return MONTH_NAMES[month] || '';
 };
 
-Payroll.calculatePayroll = function(salary) {
-  const basicSalary = salary.basicSalary || 0;
-  const transportAllowance = salary.transportAllowance || 0;
-  const housingAllowance = salary.housingAllowance || 0;
-  const otherAllowances = salary.otherAllowances || 0;
-  const grossSalary = basicSalary + transportAllowance + housingAllowance + otherAllowances;
-
-  const payeBrackets = [
-    { max: 60000, rate: 0 },
-    { max: 100000, rate: 0.1 },
-    { max: 200000, rate: 0.2 },
-    { max: Infinity, rate: 0.3 },
-  ];
-
-  let paye = 0;
-  let remaining = grossSalary;
-  let prevMax = 0;
-  for (const bracket of payeBrackets) {
-    const taxableInBracket = Math.min(remaining, bracket.max - prevMax);
-    if (taxableInBracket <= 0) break;
-    paye += taxableInBracket * bracket.rate;
-    remaining -= taxableInBracket;
-    prevMax = bracket.max;
-  }
-
-  const rssbEmployeePension = grossSalary * 0.06;
-  const rssbEmployeeMaternity = grossSalary * 0.005;
-  const totalDeductions = paye + rssbEmployeePension + rssbEmployeeMaternity;
-
-  const rssbEmployerPension = grossSalary * 0.06;
-  const rssbEmployerMaternity = grossSalary * 0.005;
-  const occupationalHazardRate = salary.occupationalHazardRate || 2;
-  const occupationalHazard = grossSalary * (occupationalHazardRate / 100);
-
-  const netPay = grossSalary - totalDeductions;
-
-  return {
-    grossSalary,
-    deductions: {
-      paye: Math.round(paye * 100) / 100,
-      rssbEmployeePension: Math.round(rssbEmployeePension * 100) / 100,
-      rssbEmployeeMaternity: Math.round(rssbEmployeeMaternity * 100) / 100,
-      totalDeductions: Math.round(totalDeductions * 100) / 100,
-    },
-    netPay: Math.round(netPay * 100) / 100,
-    contributions: {
-      rssbEmployerPension: Math.round(rssbEmployerPension * 100) / 100,
-      rssbEmployerMaternity: Math.round(rssbEmployerMaternity * 100) / 100,
-      occupationalHazard: Math.round(occupationalHazard * 100) / 100,
-    },
-  };
+Payroll.calculatePayroll = function(salary, options = {}) {
+  const periodDate = options.periodDate || new Date();
+  return calculateRwandaPayroll({
+    salary,
+    additionalIncome: options.additionalIncome || {},
+    deductions: options.deductions || {},
+    employee: options.employee || {},
+    periodDate,
+  });
 };
 
 Payroll.fromEmployeeMaster = function(emp, effectiveSalary, period) {
@@ -97,9 +56,11 @@ Payroll.fromEmployeeMaster = function(emp, effectiveSalary, period) {
     firstName: emp.firstName,
     lastName: emp.lastName,
     email: emp.email,
+    employmentType: emp.employmentType,
     department: emp.department,
     position: emp.position,
     laborType: emp.laborType,
+    isPrimaryEmployer: emp.isPrimaryEmployer !== false,
     isActive: emp.status === 'active',
   };
 
@@ -111,11 +72,12 @@ Payroll.fromEmployeeMaster = function(emp, effectiveSalary, period) {
     occupationalHazardRate: effectiveSalary.occupationalHazardRate || 2,
   };
 
-  const calculated = Payroll.calculatePayroll(salary);
+  const periodDate = new Date(Date.UTC(period.year, period.month, 0, 12));
+  const calculated = Payroll.calculatePayroll(salary, { employee: emp, periodDate });
 
   return {
     employee: employeeSnapshot,
-    salary,
+    salary: { ...salary, taxableBase: calculated.taxableBase, grossRemuneration: calculated.grossRemuneration, ruleVersion: calculated.ruleVersion, ruleEffectiveDate: calculated.ruleEffectiveDate, rates: calculated.rates },
     employee_id: emp._id || emp.employeeId,
     deductions: calculated.deductions,
     netPay: calculated.netPay,
