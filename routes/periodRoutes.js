@@ -12,7 +12,14 @@ const { cacheMiddleware, cacheInvalidationMiddleware } = require('../middleware/
 // NOTE: closing or reopening a period also changes what the report cache is
 // allowed to hold (a closed period's figures are immutable, a reopened one's
 // are not), so these handlers invalidate the report type as well.
-const cachePeriods = cacheMiddleware({ type: 'period', ttl: 600 });
+// Period definitions are stable, but include_stats is derived from journal
+// entries and can change whenever a journal is posted. Never serve the stats
+// variant from the periods cache, which may have been filled before postings.
+const cachePeriods = cacheMiddleware({
+  type: 'period',
+  ttl: 600,
+  skipCache: (req) => req.query.include_stats === 'true',
+});
 const invalidatePeriods = cacheInvalidationMiddleware({ type: 'period', invalidateAll: true });
 // Closed-period report entries are persistent, so a close/reopen/lock must
 // invalidate this tenant's report namespace without evicting other companies.
