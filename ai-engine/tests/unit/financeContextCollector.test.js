@@ -10,6 +10,14 @@ const financeCollector = require('../../context-builder/collectors/FinanceContex
 const toolResults = {
   get_bank_accounts: { totalBalance: 900_000, accounts: [] },
   get_profit_loss_summary: { revenue: 0, cogs: 0, netProfit: 0 },
+  get_executive_financial_summary: {
+    revenue: 1_000_000,
+    expenses: 1_526_800,
+    netProfit: -526_800,
+    netMarginPercent: -52.68,
+    currency: 'RWF',
+    period: { start: '2026-10-01', end: '2026-10-02', kind: 'current_month', isFallback: false },
+  },
   get_cash_flow_summary: { bankBalance: 900_000 },
   get_cash_flow_history: { monthly: [] },
   get_balance_sheet: { totalAssets: 900_000, totalLiabilities: 1_000, totalEquity: 0 },
@@ -32,6 +40,20 @@ describe('Finance context position facts', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     runTool.mockImplementation(async (_companyId, toolName) => ({ result: toolResults[toolName] }));
+  });
+
+  test('uses dashboard-sourced facts for current revenue, expense, and profit questions', async () => {
+    const context = await financeCollector.collect({
+      companyId: 'company_1',
+      user: { permissions: ['reports.read'] },
+      query: 'What is the current revenue, expenses, and profit position?',
+    });
+    const fact = context.facts.find((entry) => entry.label === 'Executive dashboard financial position');
+
+    expect(runTool).toHaveBeenCalledWith('company_1', 'get_executive_financial_summary', {});
+    expect(runTool).not.toHaveBeenCalledWith('company_1', 'get_profit_loss_summary', expect.anything());
+    expect(fact.value).toEqual(toolResults.get_executive_financial_summary);
+    expect(fact.permissions).toEqual(['reports.read']);
   });
 
   test('includes ledger, fixed-asset, and liability register facts for position questions', async () => {

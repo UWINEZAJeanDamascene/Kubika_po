@@ -1313,6 +1313,8 @@ function budgetWorkflowConfigToApi(row) {
     ...companyRefs(row, true),
     name: row.name,
     description: row.description,
+      purpose: row.purpose ?? "",
+      project_category: row.projectCategory ?? "internal",
     workflow_type: row.workflowType,
     min_amount: qtyNum(row.minAmount),
     max_amount: row.maxAmount != null ? qtyNum(row.maxAmount) : null,
@@ -1738,6 +1740,8 @@ function projectToApi(row) {
     project_code: row.projectCode,
     name: row.name,
     description: row.description,
+    purpose: row.purpose ?? "",
+    project_category: row.projectCategory ?? "internal",
     parent_id: row.parentId ?? null,
     wbs_level: row.wbsLevel,
     wbs_code: row.wbsCode,
@@ -1754,8 +1758,24 @@ function projectToApi(row) {
     department_id: row.departmentId ?? null,
     client_id: row.clientId ?? null,
     manager_id: row.managerId ?? null,
+    sponsor_id: row.sponsorId ?? null,
+    team_member_ids: row.teamMemberIds ?? [],
     billing_type: row.billingType,
     contract_value: qtyNum(row.contractValue),
+    currency_code: row.currencyCode ?? "RWF",
+    tax_rate_id: row.taxRateId ?? null,
+    tax_rate_pct: qtyNum(row.taxRatePct),
+    tax_inclusive: row.taxInclusive ?? false,
+    scope: row.scope ?? "",
+    exclusions: row.exclusions ?? "",
+    assumptions: row.assumptions ?? "",
+    constraints: row.constraints ?? "",
+    is_template: row.isTemplate ?? false,
+    estimated_hours: qtyNum(row.estimatedHours),
+    actual_hours: qtyNum(row.actualHours),
+    acceptance_criteria: row.acceptanceCriteria ?? "",
+    depends_on_ids: row.dependsOnIds ?? [],
+    completed_at: row.completedAt ?? null,
     progress_percent: rateNum(row.progressPercent),
     is_active: row.isActive,
     ...mapTimestamps(row),
@@ -1763,28 +1783,46 @@ function projectToApi(row) {
 }
 
 const PROJECT_HEADER = {
-  company_id: 'companyId', company: 'companyId', project_code: 'projectCode', name: 'name',
-  description: 'description', parent_id: 'parentId', wbs_level: 'wbsLevel', wbs_code: 'wbsCode',
+    company_id: 'companyId', company: 'companyId', project_code: 'projectCode', name: 'name',
+    description: 'description', purpose: 'purpose', project_category: 'projectCategory',
+    parent_id: 'parentId', wbs_level: 'wbsLevel', wbs_code: 'wbsCode',
   type: 'type', status: 'status', priority: 'priority', budget_allocated: 'budgetAllocated',
   budget_spent: 'budgetSpent', budget_remaining: 'budgetRemaining', start_date: 'startDate',
   end_date: 'endDate', actual_start_date: 'actualStartDate', actual_end_date: 'actualEndDate',
-  department_id: 'departmentId', client_id: 'clientId', manager_id: 'managerId',
-  billing_type: 'billingType', contract_value: 'contractValue', progress_percent: 'progressPercent',
+    department_id: 'departmentId', client_id: 'clientId', manager_id: 'managerId', sponsor_id: 'sponsorId',
+    team_member_ids: 'teamMemberIds', billing_type: 'billingType', contract_value: 'contractValue',
+    currency_code: 'currencyCode', tax_rate_id: 'taxRateId', tax_rate_pct: 'taxRatePct',
+    tax_inclusive: 'taxInclusive', scope: 'scope', exclusions: 'exclusions', assumptions: 'assumptions',
+    constraints: 'constraints', is_template: 'isTemplate', progress_percent: 'progressPercent',
+    estimated_hours: 'estimatedHours', actual_hours: 'actualHours', acceptance_criteria: 'acceptanceCriteria',
+    depends_on_ids: 'dependsOnIds', completed_at: 'completedAt',
   is_active: 'isActive',
 };
 
 function projectTranslateCreate(data) {
-  return headerTranslateCreate(data, PROJECT_HEADER, ['companyId', 'parentId', 'departmentId', 'clientId', 'managerId'], {
+  return headerTranslateCreate(data, PROJECT_HEADER, ['companyId', 'parentId', 'departmentId', 'clientId', 'managerId', 'sponsorId', 'taxRateId'], {
+    teamMemberIds: Array.isArray(data.team_member_ids) ? data.team_member_ids.map(toIdString) : [],
+    dependsOnIds: Array.isArray(data.depends_on_ids) ? data.depends_on_ids.map(toIdString) : [],
     budgetAllocated: moneyStr(data.budget_allocated ?? 0),
     budgetSpent: moneyStr(data.budget_spent ?? 0),
     budgetRemaining: moneyStr(data.budget_remaining ?? 0),
     contractValue: moneyStr(data.contract_value ?? 0),
   }, 'company_id');
 }
-const projectTranslateUpdate = genericTranslateUpdate(
-  PROJECT_HEADER,
-  ['companyId', 'parentId', 'departmentId', 'clientId', 'managerId'],
-);
+const projectTranslateUpdate = (update = {}) => {
+  const data = mergeUpdatePayload(update);
+  const mapped = genericTranslateUpdate(
+    PROJECT_HEADER,
+    ['companyId', 'parentId', 'departmentId', 'clientId', 'managerId', 'sponsorId', 'taxRateId'],
+  )(data);
+  if (Array.isArray(data.team_member_ids)) {
+    mapped.teamMemberIds = data.team_member_ids.map(toIdString);
+  }
+  if (Array.isArray(data.depends_on_ids)) {
+    mapped.dependsOnIds = data.depends_on_ids.map(toIdString);
+  }
+  return mapped;
+};
 
 // ── EBM ─────────────────────────────────────────────────────────────────────
 

@@ -549,6 +549,27 @@ class BudgetService {
 
     const affectedProjectIds = new Set();
     const projectById = new Map();
+    const lineIds = [...new Set(lines.map((line) => line.line_id).filter(Boolean).map(String))];
+    const existingLineRows = lineIds.length
+      ? await BudgetLine.find({ _id: { $in: lineIds }, company_id: companyId, budget_id: budgetId }).select('_id project_id account_id period_month period_year')
+      : [];
+    const existingLinesById = new Map((existingLineRows || []).map((line) => [String(line._id), line]));
+    if (existingLinesById.size !== lineIds.length) throw new Error('BUDGET_LINE_NOT_FOUND');
+    for (const line of lines) {
+      if (!line.line_id) continue;
+      const current = existingLinesById.get(String(line.line_id));
+      if (current?.project_id) affectedProjectIds.add(String(current.project_id));
+      const duplicate = await BudgetLine.findOne({
+        company_id: companyId,
+        budget_id: budgetId,
+        account_id: line.account_id,
+        project_id: line.project_id || null,
+        period_month: line.period_month,
+        period_year: line.period_year,
+        _id: { $ne: line.line_id },
+      });
+      if (duplicate) throw new Error('DUPLICATE_BUDGET_LINE');
+    }
 
     // Validate every account and project belongs to this company
     // Accounts for every line in one query; validation still walks lines in
@@ -596,7 +617,11 @@ class BudgetService {
 
       return {
         updateOne: {
-          filter: {
+          filter: line.line_id ? {
+            _id: line.line_id,
+            company_id: companyId,
+            budget_id: budgetId,
+          } : {
             company_id: companyId,
             budget_id: budgetId,
             account_id: line.account_id,
@@ -629,6 +654,12 @@ class BudgetService {
   }
 
   // ── GET LINES ────────────────────────────────────────────────────────
+  static async syncProjectTotalsForBudget(companyId, budgetId) {
+    const lines = await BudgetLine.find({ company_id: companyId, budget_id: budgetId }).lean();
+    const projectIds = [...new Set(lines.map((line) => line.project_id).filter(Boolean).map(String))];
+    if (projectIds.length) await projectService.updateBudgetSpentForProjects(companyId, projectIds);
+  }
+
   static async getLines(companyId, budgetId, filters = {}) {
     const query = { company_id: companyId, budget_id: budgetId };
 
@@ -683,11 +714,13 @@ class BudgetService {
         await approval.save();
 
         // Update budget to approved
-        return Budget.findByIdAndUpdate(budgetId, {
+        const approvedBudget = await Budget.findByIdAndUpdate(budgetId, {
           status: 'approved',
           approved_by: userId,
           approved_at: new Date()
         }, { new: true });
+        await BudgetService.syncProjectTotalsForBudget(companyId, budgetId);
+        return approvedBudget;
       } else {
         // Move to next step
         approval.current_step += 1;
@@ -709,11 +742,13 @@ class BudgetService {
       throw new Error('BUDGET_NOT_DRAFT');
     }
 
-    return Budget.findByIdAndUpdate(budgetId, {
+    const approvedBudget = await Budget.findByIdAndUpdate(budgetId, {
       status: 'approved',
       approved_by: userId,
       approved_at: new Date()
     }, { new: true });
+    await BudgetService.syncProjectTotalsForBudget(companyId, budgetId);
+    return approvedBudget;
   }
 
   // ── REJECT ───────────────────────────────────────────────────────────
@@ -2348,6 +2383,7 @@ class BudgetService {
         approved_by: userId,
         approved_at: new Date()
       });
+      await BudgetService.syncProjectTotalsForBudget(companyId, approval.budget_id);
     } else {
       approval.current_step += 1;
       approval.status = 'in_progress';

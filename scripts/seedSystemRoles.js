@@ -34,6 +34,7 @@ const systemRoles = [
       { resource: 'sales_invoices', actions: ['read', 'create', 'update'] },
       { resource: 'purchase_orders', actions: ['read', 'create', 'update'] },
       { resource: 'users', actions: ['read', 'create', 'update'] },
+      { resource: 'projects', actions: ['read', 'create', 'update', 'close', 'reopen'] },
       { resource: 'reports', actions: ['read'] }
     ]
   },
@@ -46,7 +47,8 @@ const systemRoles = [
       { resource: 'stock', actions: ['read', 'create', 'update'] },
       { resource: 'suppliers', actions: ['read', 'create', 'update'] },
       { resource: 'warehouses', actions: ['read', 'create', 'update'] },
-      { resource: 'stock_transfers', actions: ['read', 'create', 'update'] }
+      { resource: 'stock_transfers', actions: ['read', 'create', 'update'] },
+      { resource: 'projects', actions: ['read', 'update'] }
     ]
   },
   {
@@ -77,7 +79,8 @@ const systemRoles = [
       { resource: 'reports', actions: ['read'] },
       { resource: 'quotations', actions: ['read'] },
       { resource: 'journal_entries', actions: ['read'] },
-      { resource: 'chart_of_accounts', actions: ['read'] }
+      { resource: 'chart_of_accounts', actions: ['read'] },
+      { resource: 'projects', actions: ['read'] }
     ]
   },
   {
@@ -95,6 +98,7 @@ const systemRoles = [
       { resource: 'ap_payments', actions: ['read', 'create', 'update'] },
       { resource: 'expenses', actions: ['read', 'create', 'update'] },
       { resource: 'budgets', actions: ['read', 'create', 'update'] },
+      { resource: 'projects', actions: ['read'] },
       { resource: 'payroll', actions: ['read', 'create', 'update'] },
       { resource: 'periods', actions: ['read', 'update', 'close'] }
     ]
@@ -122,7 +126,8 @@ const systemRoles = [
       { resource: 'stock_transfers', actions: ['read', 'create', 'update'] },
       { resource: 'stock_audits', actions: ['read', 'create', 'update'] },
       { resource: 'delivery_notes', actions: ['read', 'create', 'update'] },
-      { resource: 'pick_packs', actions: ['read', 'create', 'update'] }
+      { resource: 'pick_packs', actions: ['read', 'create', 'update'] },
+      { resource: 'projects', actions: ['read', 'update'] }
     ]
   }
 ];

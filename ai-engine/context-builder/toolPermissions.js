@@ -7,6 +7,7 @@ const { extractUserPermissions, hasPermission } = require('./permissionUtils');
 const TOOL_PERMISSIONS = Object.freeze({
   get_company_info: ['company.read', 'settings.read'],
   get_dashboard_metrics: ['reports.read'],
+  get_executive_financial_summary: ['reports.read'],
   get_products: ['products.read', 'inventory.read', 'stock.read'],
   get_categories: ['products.read', 'inventory.read'],
   get_warehouses: ['inventory.read', 'warehouses.read', 'stock.read'],

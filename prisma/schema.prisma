@@ -659,6 +659,13 @@ model Company {
   prepaidExpenses             PrepaidExpense[]
   products                    Product[]
   projects                    Project[]
+  projectMilestones           ProjectMilestone[]
+  projectMembers              ProjectMember[]
+  projectComments             ProjectComment[]
+  projectActivity             ProjectActivity[]
+  projectDocuments            ProjectDocument[]
+  projectLaborEntries         ProjectLaborEntry[]
+  projectTypeSettings         ProjectTypeSetting[]
   purchaseOrders              PurchaseOrder[]
   purchaseReturns             PurchaseReturn[]
   purchases                   Purchase[]
@@ -762,6 +769,7 @@ model User {
   company              Company?       @relation(fields: [companyId], references: [id])
   createdBy            User?          @relation("UserCreatedBy", fields: [createdById], references: [id])
   createdUsers         User[]         @relation("UserCreatedBy")
+  projectMemberships   ProjectMember[]
 
   @@unique([companyId, email])
   @@index([email])
@@ -1343,6 +1351,7 @@ model TaxRate {
   inputAccount      ChartOfAccount   @relation("TaxRateInputAccount", fields: [inputAccountId], references: [id])
   outputAccount     ChartOfAccount   @relation("TaxRateOutputAccount", fields: [outputAccountId], references: [id])
   taxTransactions   TaxTransaction[]
+  projects          Project[]          @relation("ProjectTaxRate")
 
   @@unique([companyId, code])
   @@index([companyId])
@@ -3385,6 +3394,7 @@ model Employee {
   payrolls                Payroll[]
   salaryHistories         SalaryHistory[]
   timesheets              Timesheet[]
+  projectLaborEntries     ProjectLaborEntry[]
 
   @@unique([companyId, employeeId])
   @@index([companyId, status])
@@ -3513,6 +3523,7 @@ model Timesheet {
   updatedAt          DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
   company            Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
   employee           Employee  @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  projectLaborEntries ProjectLaborEntry[]
 
   @@unique([companyId, employeeId, periodMonth, periodYear])
   @@index([companyId, status])
@@ -4073,6 +4084,8 @@ model Project {
   projectCode        String                    @map("project_code")
   name               String
   description        String                    @default("")
+  purpose            String                    @default("")
+  projectCategory    String                    @default("internal") @map("project_category")
   parentId           String?                   @map("parent_id") @db.Char(24)
   wbsLevel           Int                       @default(1) @map("wbs_level")
   wbsCode            String                    @map("wbs_code")
@@ -4089,8 +4102,24 @@ model Project {
   departmentId       String?                   @map("department_id") @db.Char(24)
   clientId           String?                   @map("client_id") @db.Char(24)
   managerId          String?                   @map("manager_id") @db.Char(24)
+  sponsorId          String?                   @map("sponsor_id") @db.Char(24)
+  teamMemberIds      String[]                  @default([]) @map("team_member_ids") @db.Char(24)
   billingType        String                    @default("none") @map("billing_type")
   contractValue      Decimal                   @default(0) @map("contract_value") @db.Decimal(19, 2)
+  currencyCode       String                    @default("RWF") @map("currency_code") @db.VarChar(3)
+  taxRateId          String?                   @map("tax_rate_id") @db.Char(24)
+  taxRatePct         Decimal                   @default(0) @map("tax_rate_pct") @db.Decimal(9, 4)
+  taxInclusive       Boolean                   @default(false) @map("tax_inclusive")
+  scope              String                    @default("")
+  exclusions         String                    @default("")
+  assumptions        String                    @default("")
+  constraints        String                    @default("")
+  isTemplate         Boolean                   @default(false) @map("is_template")
+  estimatedHours     Decimal                   @default(0) @map("estimated_hours") @db.Decimal(9, 2)
+  actualHours        Decimal                   @default(0) @map("actual_hours") @db.Decimal(9, 2)
+  acceptanceCriteria String                    @default("") @map("acceptance_criteria")
+  dependsOnIds       String[]                  @default([]) @map("depends_on_ids") @db.Char(24)
+  completedAt        DateTime?                 @map("completed_at") @db.Timestamptz(3)
   progressPercent    Decimal                   @default(0) @map("progress_percent") @db.Decimal(19, 4)
   isActive           Boolean                   @default(true) @map("is_active")
   createdAt          DateTime                  @default(now()) @map("created_at") @db.Timestamptz(3)
@@ -4100,6 +4129,14 @@ model Project {
   company            Company                   @relation(fields: [companyId], references: [id], onDelete: Cascade)
   parent             Project?                  @relation("ProjectTree", fields: [parentId], references: [id])
   children           Project[]                 @relation("ProjectTree")
+  milestones         ProjectMilestone[]
+  members            ProjectMember[]
+  comments           ProjectComment[]
+  activityEvents     ProjectActivity[]
+  documents          ProjectDocument[]
+  laborEntries       ProjectLaborEntry[] @relation("ProjectLaborProject")
+  laborTaskEntries   ProjectLaborEntry[] @relation("ProjectLaborTask")
+  taxRate            TaxRate?                  @relation("ProjectTaxRate", fields: [taxRateId], references: [id], onDelete: SetNull)
 
   @@unique([companyId, projectCode])
   @@index([companyId, status])
@@ -4109,7 +4146,213 @@ model Project {
   @@index([companyId, departmentId])
   @@index([companyId, clientId])
   @@index([companyId, isActive])
+  @@index([companyId, projectCategory])
+  @@index([companyId, isTemplate])
   @@map("projects")
+}
+
+model ProjectMilestone {
+  id             String   @id @db.Char(24)
+  companyId      String   @map("company_id") @db.Char(24)
+  projectId      String   @map("project_id") @db.Char(24)
+  name           String
+  description    String   @default("")
+  assigneeId     String?  @map("assignee_id") @db.Char(24)
+  status         String   @default("planned")
+  priority       String   @default("medium")
+  dueDate        DateTime? @map("due_date") @db.Timestamptz(3)
+  progressPercent Decimal @default(0) @map("progress_percent") @db.Decimal(5, 2)
+  dependsOnIds   String[] @default([]) @map("depends_on_ids") @db.Char(24)
+  completedAt    DateTime? @map("completed_at") @db.Timestamptz(3)
+  createdById    String?  @map("created_by_id") @db.Char(24)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company        Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  project        Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, projectId, dueDate])
+  @@index([companyId, status])
+  @@map("project_milestones")
+}
+
+model ProjectLaborEntry {
+  id            String   @id @db.Char(24)
+  companyId     String   @map("company_id") @db.Char(24)
+  projectId     String   @map("project_id") @db.Char(24)
+  taskId        String   @map("task_id") @db.Char(24)
+  timesheetId   String   @map("timesheet_id") @db.Char(24)
+  employeeId    String   @map("employee_id") @db.Char(24)
+  lineIndex     Int      @map("line_index")
+  entryDate     DateTime @map("entry_date") @db.Date
+  hours         Decimal  @db.Decimal(9, 2)
+  hourlyRate    Decimal  @map("hourly_rate") @db.Decimal(19, 4)
+  laborCost     Decimal  @map("labor_cost") @db.Decimal(19, 2)
+  currencyCode  String   @map("currency_code") @db.VarChar(3)
+  activityType  String   @map("activity_type")
+  notes         String   @default("")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  company       Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  project       Project  @relation("ProjectLaborProject", fields: [projectId], references: [id], onDelete: Cascade)
+  task          Project  @relation("ProjectLaborTask", fields: [taskId], references: [id], onDelete: Cascade)
+  timesheet     Timesheet @relation(fields: [timesheetId], references: [id], onDelete: Cascade)
+  employee      Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  @@unique([timesheetId, lineIndex])
+  @@index([companyId, projectId, entryDate])
+  @@index([companyId, taskId, entryDate])
+  @@map("project_labor_entries")
+}
+
+model ProjectMaterialRequisition {
+  id             String   @id @db.Char(24)
+  companyId      String   @map("company_id") @db.Char(24)
+  projectId      String   @map("project_id") @db.Char(24)
+  requisitionNo  String   @map("requisition_no")
+  status         String   @default("planned")
+  requiredDate   DateTime? @map("required_date") @db.Timestamptz(3)
+  notes          String   @default("")
+  requestedById  String?  @map("requested_by_id") @db.Char(24)
+  approvedById   String?  @map("approved_by_id") @db.Char(24)
+  approvedAt     DateTime? @map("approved_at") @db.Timestamptz(3)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  lines          ProjectMaterialRequisitionLine[]
+
+  @@unique([companyId, requisitionNo])
+  @@index([companyId, projectId, status])
+  @@map("project_material_requisitions")
+}
+
+model ProjectMaterialRequisitionLine {
+  id              String   @id @db.Char(24)
+  requisitionId   String   @map("requisition_id") @db.Char(24)
+  companyId       String   @map("company_id") @db.Char(24)
+  projectId       String   @map("project_id") @db.Char(24)
+  taskId          String?  @map("task_id") @db.Char(24)
+  productId       String   @map("product_id") @db.Char(24)
+  warehouseId     String   @map("warehouse_id") @db.Char(24)
+  plannedQuantity Decimal  @default(0) @map("planned_quantity") @db.Decimal(19, 4)
+  reservedQuantity Decimal @default(0) @map("reserved_quantity") @db.Decimal(19, 4)
+  issuedQuantity  Decimal  @default(0) @map("issued_quantity") @db.Decimal(19, 4)
+  returnedQuantity Decimal @default(0) @map("returned_quantity") @db.Decimal(19, 4)
+  unitCost        Decimal  @default(0) @map("unit_cost") @db.Decimal(19, 6)
+  notes           String   @default("")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  requisition     ProjectMaterialRequisition @relation(fields: [requisitionId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, projectId, taskId])
+  @@index([companyId, productId, warehouseId])
+  @@map("project_material_requisition_lines")
+}
+
+model ProjectControlItem {
+  id             String   @id @db.Char(24)
+  companyId      String   @map("company_id") @db.Char(24)
+  projectId      String   @map("project_id") @db.Char(24)
+  taskId         String?  @map("task_id") @db.Char(24)
+  type           String
+  referenceNo    String   @map("reference_no")
+  title          String
+  description    String   @default("")
+  status         String   @default("open")
+  priority       String   @default("medium")
+  ownerId        String?  @map("owner_id") @db.Char(24)
+  dueDate        DateTime? @map("due_date") @db.Timestamptz(3)
+  probabilityPct Decimal  @default(0) @map("probability_pct") @db.Decimal(5, 2)
+  impactCost     Decimal  @default(0) @map("impact_cost") @db.Decimal(19, 2)
+  impactDays     Decimal  @default(0) @map("impact_days") @db.Decimal(9, 2)
+  mitigation     String   @default("")
+  decision       String   @default("")
+  notes          String   @default("")
+  createdById    String?  @map("created_by_id") @db.Char(24)
+  resolvedAt     DateTime? @map("resolved_at") @db.Timestamptz(3)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@unique([companyId, referenceNo])
+  @@index([companyId, projectId, type, status])
+  @@index([companyId, taskId])
+  @@map("project_control_items")
+}
+
+model ProjectTypeSetting {
+  id              String   @id @db.Char(24)
+  companyId       String   @map("company_id") @db.Char(24)
+  projectCategory String   @map("project_category")
+  requiredFields  String[] @default([]) @map("required_fields")
+  updatedById     String?  @map("updated_by") @db.Char(24)
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company         Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, projectCategory])
+  @@index([companyId])
+  @@map("project_type_settings")
+}
+
+model ProjectMember {
+  id        String   @id @db.Char(24)
+  companyId String   @map("company_id") @db.Char(24)
+  projectId String   @map("project_id") @db.Char(24)
+  userId    String   @map("user_id") @db.Char(24)
+  role      String   @default("contributor")
+  isActive  Boolean  @default(true) @map("is_active")
+  addedById String?  @map("added_by_id") @db.Char(24)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  @@unique([companyId, projectId, userId])
+  @@index([companyId, userId, isActive])
+  @@map("project_members")
+}
+
+model ProjectComment {
+  id         String   @id @db.Char(24)
+  companyId  String   @map("company_id") @db.Char(24)
+  projectId  String   @map("project_id") @db.Char(24)
+  authorId   String   @map("author_id") @db.Char(24)
+  authorName String   @map("author_name")
+  body       String
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company    Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  @@index([companyId, projectId, createdAt])
+  @@map("project_comments")
+}
+
+model ProjectActivity {
+  id        String   @id @db.Char(24)
+  companyId String   @map("company_id") @db.Char(24)
+  projectId String   @map("project_id") @db.Char(24)
+  actorId   String?  @map("actor_id") @db.Char(24)
+  actorName String   @map("actor_name")
+  eventType String   @map("event_type")
+  message   String
+  metadata  Json     @default("{}")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  company   Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  project   Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  @@index([companyId, projectId, createdAt])
+  @@map("project_activity")
+}
+
+model ProjectDocument {
+  id           String   @id @db.Char(24)
+  companyId    String   @map("company_id") @db.Char(24)
+  projectId    String   @map("project_id") @db.Char(24)
+  uploadedById String   @map("uploaded_by_id") @db.Char(24)
+  fileName     String   @map("file_name")
+  mimeType     String   @map("mime_type")
+  fileSize     Int      @map("file_size")
+  content      Bytes
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  company      Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  project      Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  @@index([companyId, projectId, createdAt])
+  @@map("project_documents")
 }
 
 model EbmDevice {

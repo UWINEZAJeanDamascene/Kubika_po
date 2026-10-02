@@ -53,7 +53,7 @@ function safeAiLimit(value, fallback = 20) {
 }
 
 const MODULE_CATALOG = [
-  { group: 'Command', modules: ['Dashboards', 'Inventory dashboard', 'Sales dashboard', 'Purchase dashboard', 'Finance dashboard'], tools: ['get_dashboard_metrics'] },
+  { group: 'Command', modules: ['Dashboards', 'Inventory dashboard', 'Sales dashboard', 'Purchase dashboard', 'Finance dashboard'], tools: ['get_dashboard_metrics', 'get_executive_financial_summary'] },
   { group: 'Inventory Core', modules: ['Products', 'Categories', 'Warehouses', 'Stock levels', 'Stock movements', 'Stock transfers', 'Stock audits', 'Batches', 'Serial numbers'], tools: ['get_products', 'get_categories', 'get_warehouses', 'get_stock_summary', 'get_stock_movements', 'get_stock_transfers'] },
   { group: 'Supply Chain', modules: ['Suppliers', 'Purchase orders', 'Goods received notes', 'Imported items', 'Purchases', 'Purchase returns'], tools: ['get_suppliers', 'get_purchase_orders', 'get_goods_received_notes', 'get_purchases'] },
   { group: 'Revenue Flow', modules: ['POS', 'Clients', 'Quotations', 'Sales orders', 'Pick packs', 'Invoices', 'Delivery notes', 'Credit notes', 'Recurring invoices', 'Accounts receivable', 'Accounts payable'], tools: ['get_clients', 'get_quotations', 'get_sales_orders', 'get_invoices', 'get_delivery_notes', 'get_credit_notes', 'get_ar_receipts', 'get_ap_payments', 'get_receivables_aging', 'get_sales_summary'] },
@@ -668,6 +668,30 @@ async function getDashboardMetrics(companyId) {
     products: { total: stockSummary.totalProducts, totalValue: stockSummary.totalStockValue, outOfStock: stockSummary.outOfStockCount, lowStock: stockSummary.lowStockCount || lowStock.length },
     sales: { pendingInvoices, monthlyRevenue: monthlyRevenue.timeline.map((point) => ({ month: point.period, revenue: point.revenue, count: point.count })) },
     clients: { total: clients },
+  };
+}
+
+async function getExecutiveFinancialSummary(companyId) {
+  const ExecutiveDashboardService = require('./dashboards/ExecutiveDashboardService');
+  const dashboard = await ExecutiveDashboardService.get(companyId);
+  const metrics = dashboard.key_metrics || {};
+  const revenue = Number(metrics.revenue?.this_month || 0);
+  const expenses = Number(metrics.expenses?.this_month || 0);
+  const netProfit = Number(metrics.net_profit?.this_month || 0);
+
+  return {
+    revenue,
+    expenses,
+    netProfit,
+    netMarginPercent: revenue > 0 ? Number(((netProfit / revenue) * 100).toFixed(2)) : 0,
+    currency: 'RWF',
+    period: {
+      start: dashboard.date_context?.selected_period_start || dashboard.date_context?.this_month_start || null,
+      end: dashboard.date_context?.selected_period_end || dashboard.date_context?.this_month_end || null,
+      kind: dashboard.date_context?.selected_period_kind || 'current_month',
+      isFallback: Boolean(dashboard.date_context?.selected_period_is_fallback),
+    },
+    generatedAt: dashboard.generated_at || null,
   };
 }
 
@@ -1340,6 +1364,7 @@ const TOOL_DEFINITIONS = [
   { type: 'function', function: { name: 'get_module_records', description: 'Generic adaptive record fetcher by moduleKey. Use when the user names a module and Stacy needs live records. Supported keys include products, invoices, clients, suppliers, purchase_orders, sales_orders, expenses, budgets, users, audit_logs, and more.', parameters: { type: 'object', properties: { moduleKey: { type: 'string' }, limit: { type: 'integer', default: 20 }, search: { type: 'string' }, status: { type: 'string' }, startDate: { type: 'string' }, endDate: { type: 'string' } }, required: ['moduleKey'] } } },
   // Dashboard
   { type: 'function', function: { name: 'get_dashboard_metrics', description: 'High-level business dashboard: KPIs, recent activity, top products, alerts, and quick stats', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'get_executive_financial_summary', description: 'Read the current revenue, expenses, net profit, margin, and reporting period from the same journal-based Executive Dashboard source shown in the app. Use this for questions about the current financial position instead of deriving dashboard figures from invoices or expense records.', parameters: { type: 'object', properties: {} } } },
   // Inventory
   { type: 'function', function: { name: 'get_products', description: 'List products with stock levels, pricing, reorder points, categories, and warehouse locations', parameters: { type: 'object', properties: { limit: { type: 'integer', default: 50 }, search: { type: 'string' }, lowStock: { type: 'boolean', default: false }, outOfStock: { type: 'boolean', default: false } } } } },
   { type: 'function', function: { name: 'get_categories', description: 'List product categories', parameters: { type: 'object', properties: { limit: { type: 'integer', default: 50 }, search: { type: 'string' } } } } },
@@ -1573,6 +1598,7 @@ async function executeTool(companyId, toolName, args = {}) {
     case 'get_module_catalog': return getModuleCatalog();
     case 'get_module_records': return getModuleRecords(companyId, args);
     case 'get_dashboard_metrics': return getDashboardMetrics(companyId);
+    case 'get_executive_financial_summary': return getExecutiveFinancialSummary(companyId);
     // Inventory
     case 'get_products': return getProducts(companyId, args);
     case 'get_categories': return getCategories(companyId, args);
@@ -1631,6 +1657,7 @@ module.exports = {
   TOOL_DEFINITIONS,
   executeTool,
   getDashboardMetrics,
+  getExecutiveFinancialSummary,
   generateChartData,
   getProfitLossSummary,
   getModuleCatalog,

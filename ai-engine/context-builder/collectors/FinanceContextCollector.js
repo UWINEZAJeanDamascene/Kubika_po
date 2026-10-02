@@ -8,6 +8,8 @@ const { extractUserPermissions, hasPermission } = require('../permissionUtils');
 const REQUIRED_PERMISSIONS = ['finance.read', 'bank_accounts.read', 'reports.read'];
 const AP_PAYMENT_PERMISSIONS = ['payables.read', 'finance.read', 'purchases.read'];
 const POSITION_QUERY = /\b(assets?|liabilit(?:y|ies)|loans?|balance sheet|financial position|net worth)\b/i;
+const CURRENT_FINANCIAL_POSITION_QUERY = /\b(current(?:ly)?|today|this month|month.to.date|mtd)\b/i;
+const FINANCIAL_METRIC_QUERY = /\b(revenue|sales|expenses?|profit|loss|p&l)\b/i;
 
 async function collect({ companyId, dateRange, user, query = '' }) {
   const facts = [];
@@ -16,10 +18,18 @@ async function collect({ companyId, dateRange, user, query = '' }) {
     startDate: dateRange && dateRange.from,
     endDate: dateRange && dateRange.to,
   };
+  const userPermissions = extractUserPermissions(user);
+  const useExecutiveSummary =
+    CURRENT_FINANCIAL_POSITION_QUERY.test(query) &&
+    FINANCIAL_METRIC_QUERY.test(query) &&
+    hasPermission(userPermissions, ['reports.read']);
+  const profitLossTool = useExecutiveSummary
+    ? 'get_executive_financial_summary'
+    : 'get_profit_loss_summary';
 
   const results = await Promise.allSettled([
     runTool(companyId, 'get_bank_accounts'),
-    runTool(companyId, 'get_profit_loss_summary', args),
+    runTool(companyId, profitLossTool, useExecutiveSummary ? {} : args),
     runTool(companyId, 'get_cash_flow_summary', args),
     runTool(companyId, 'get_cash_flow_history', args),
   ]);
@@ -57,39 +67,51 @@ async function collect({ companyId, dateRange, user, query = '' }) {
 
   if (plResult.status === 'fulfilled') {
     const pl = plResult.value.result;
-    addNumericFact(facts, {
-      companyId,
-      domain: AI_DOMAINS.FINANCE,
-      label: 'Profit and loss revenue',
-      value: pl.revenue || pl.totalRevenue || 0,
-      unit: 'RWF',
-      sourceMethod: 'get_profit_loss_summary',
-      sourceIds: ['get_profit_loss_summary'],
-      permissions: REQUIRED_PERMISSIONS,
-    });
-    addNumericFact(facts, {
-      companyId,
-      domain: AI_DOMAINS.FINANCE,
-      label: 'Cost of goods sold',
-      value: pl.cogs,
-      unit: 'RWF',
-      sourceMethod: 'get_profit_loss_summary',
-      sourceIds: ['get_profit_loss_summary'],
-      computed: Boolean(pl.cogsEstimated),
-      formula: pl.cogsEstimated ? 'Estimated as 60% of revenue because no recorded COGS was available.' : null,
-      metadata: pl.cogsEstimated ? { caveat: 'COGS is a 60% revenue estimate because recorded invoice-line COGS was unavailable.' } : {},
-      permissions: REQUIRED_PERMISSIONS,
-    });
-    addNumericFact(facts, {
-      companyId,
-      domain: AI_DOMAINS.FINANCE,
-      label: 'Profit and loss net profit',
-      value: pl.netProfit || pl.profit || 0,
-      unit: 'RWF',
-      sourceMethod: 'get_profit_loss_summary',
-      sourceIds: ['get_profit_loss_summary'],
-      permissions: REQUIRED_PERMISSIONS,
-    });
+    if (useExecutiveSummary) {
+      facts.push(createFact({
+        companyId,
+        domain: AI_DOMAINS.FINANCE,
+        label: 'Executive dashboard financial position',
+        value: pl,
+        sourceMethod: profitLossTool,
+        sourceIds: [profitLossTool],
+        permissions: ['reports.read'],
+      }));
+    } else {
+      addNumericFact(facts, {
+        companyId,
+        domain: AI_DOMAINS.FINANCE,
+        label: 'Profit and loss revenue',
+        value: pl.revenue || pl.totalRevenue || 0,
+        unit: 'RWF',
+        sourceMethod: 'get_profit_loss_summary',
+        sourceIds: ['get_profit_loss_summary'],
+        permissions: REQUIRED_PERMISSIONS,
+      });
+      addNumericFact(facts, {
+        companyId,
+        domain: AI_DOMAINS.FINANCE,
+        label: 'Cost of goods sold',
+        value: pl.cogs,
+        unit: 'RWF',
+        sourceMethod: 'get_profit_loss_summary',
+        sourceIds: ['get_profit_loss_summary'],
+        computed: Boolean(pl.cogsEstimated),
+        formula: pl.cogsEstimated ? 'Estimated as 60% of revenue because no recorded COGS was available.' : null,
+        metadata: pl.cogsEstimated ? { caveat: 'COGS is a 60% revenue estimate because recorded invoice-line COGS was unavailable.' } : {},
+        permissions: REQUIRED_PERMISSIONS,
+      });
+      addNumericFact(facts, {
+        companyId,
+        domain: AI_DOMAINS.FINANCE,
+        label: 'Profit and loss net profit',
+        value: pl.netProfit || pl.profit || 0,
+        unit: 'RWF',
+        sourceMethod: 'get_profit_loss_summary',
+        sourceIds: ['get_profit_loss_summary'],
+        permissions: REQUIRED_PERMISSIONS,
+      });
+    }
   } else {
     warnings.push(`Finance collector skipped P&L: ${plResult.reason.message}`);
   }
@@ -176,7 +198,6 @@ async function collect({ companyId, dateRange, user, query = '' }) {
     }
   }
 
-  const userPermissions = extractUserPermissions(user);
   if (hasPermission(userPermissions, AP_PAYMENT_PERMISSIONS)) {
     try {
       const { result: apPayments } = await runTool(companyId, 'get_ap_payments', { limit: 100, ...args });
