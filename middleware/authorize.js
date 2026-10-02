@@ -107,6 +107,35 @@ async function resolveUserRole(user) {
   return null;
 }
 
+async function resolveUserRoles(user) {
+  if (!user) return [];
+  const roles = [];
+  if (user.role && typeof user.role === 'object' && Array.isArray(user.role.permissions)) roles.push(user.role);
+  const roleIds = [];
+  for (const item of (Array.isArray(user.roles) ? user.roles : [])) {
+    if (item && typeof item === 'object' && Array.isArray(item.permissions)) roles.push(item);
+    else {
+      const id = toIdString(item && item._id ? item._id : item);
+      if (id) roleIds.push(id);
+    }
+  }
+  if (roleIds.length) {
+    const rows = await prisma.role.findMany({ where: { id: { in: [...new Set(roleIds)] } } });
+    roles.push(...rows.map(roleToApi));
+  }
+  if (typeof user.role === 'string') {
+    const role = await prisma.role.findFirst({ where: { name: user.role } });
+    if (role) roles.push(roleToApi(role));
+  }
+  const seen = new Set();
+  return roles.filter((role) => {
+    const key = String(role.id || role._id || role.name);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 function buildAuthorizeMiddleware(checkFn, failureMessage) {
   return (resourceOrPermissions, maybeAction) => {
     return async (req, res, next) => {
@@ -185,5 +214,7 @@ module.exports = {
   authorize,
   authorizeAny,
   authorizeAll,
-  PermissionService
+  PermissionService,
+  resolveUserRole,
+  resolveUserRoles,
 };

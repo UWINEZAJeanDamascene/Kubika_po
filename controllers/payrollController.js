@@ -10,9 +10,27 @@ const JournalEntry = require("../models/JournalEntry");
 const { runInPrismaTransaction } = require("../services/transactionService");
 const { dbClient } = require("../lib/prisma");
 const { generateObjectId } = require("../utils/objectId");
+const { PAYROLL_ACCOUNTS, assertJournalBalanced } = require("../constants/payrollAccounts");
+const { PermissionService, resolveUserRoles } = require("../middleware/authorize");
+const { recordPayrollAudit, payrollSnapshot } = require("../services/payrollAuditService");
+
+function sameActor(left, right) {
+  const id = (value) => value && typeof value === "object" ? String(value._id || value.id || "") : String(value || "");
+  return Boolean(id(left) && id(left) === id(right));
+}
 
 function round2(n) {
   return Math.round((n || 0) * 100) / 100;
+}
+
+function payrollPeriodConflict(error) {
+  if (["P2002", "23505", 11000].includes(error?.code)) {
+    const conflict = new Error("A payroll record already exists for this employee and period.");
+    conflict.code = "PAYROLL_PERIOD_EXISTS";
+    conflict.statusCode = 409;
+    return conflict;
+  }
+  return error;
 }
 
 async function buildPayrollAccrualLines(companyId, payroll, suffix = "") {
@@ -69,21 +87,30 @@ async function buildPayrollAccrualLines(companyId, payroll, suffix = "") {
   if (paye > 0) {
     lines.push(
       JournalService.createCreditLine(
-        DEFAULT_ACCOUNTS.payePayable || "2230",
+        PAYROLL_ACCOUNTS.payePayable,
         paye,
         `PAYE withheld - ${employeeName}${suffix}`,
       ),
     );
   }
 
-  if (rssbEmployee > 0) {
+  const rssbEmployeePension = round2(payroll.deductions?.rssbEmployeePension);
+  const rssbEmployeeMaternity = round2(payroll.deductions?.rssbEmployeeMaternity);
+  if (rssbEmployeePension > 0) {
     lines.push(
       JournalService.createCreditLine(
-        DEFAULT_ACCOUNTS.rssbPayable || "2240",
-        rssbEmployee,
-        `RSSB employee deduction - ${employeeName}${suffix}`,
+        PAYROLL_ACCOUNTS.employeePensionPayable,
+        rssbEmployeePension,
+        `RSSB employee pension deduction - ${employeeName}${suffix}`,
       ),
     );
+  }
+  if (rssbEmployeeMaternity > 0) {
+    lines.push(JournalService.createCreditLine(
+      PAYROLL_ACCOUNTS.employeeMaternityPayable,
+      rssbEmployeeMaternity,
+      `RSSB employee maternity deduction - ${employeeName}${suffix}`,
+    ));
   }
 
   if (occupationalHazard > 0) {
@@ -96,7 +123,7 @@ async function buildPayrollAccrualLines(companyId, payroll, suffix = "") {
     );
     lines.push(
       JournalService.createCreditLine(
-        DEFAULT_ACCOUNTS.employerContributionPayable || "2310",
+        PAYROLL_ACCOUNTS.occupationalHazardPayable,
         occupationalHazard,
         `Occupational hazard payable - ${employeeName}${suffix}`,
       ),
@@ -106,7 +133,7 @@ async function buildPayrollAccrualLines(companyId, payroll, suffix = "") {
   if (healthInsurance > 0) {
     lines.push(
       JournalService.createCreditLine(
-        DEFAULT_ACCOUNTS.accruedExpenses || "2600",
+        PAYROLL_ACCOUNTS.otherDeductionsPayable,
         healthInsurance,
         `Health Insurance Payable - ${employeeName}${suffix}`,
       ),
@@ -116,7 +143,7 @@ async function buildPayrollAccrualLines(companyId, payroll, suffix = "") {
   if (loanDeductions > 0) {
     lines.push(
       JournalService.createCreditLine(
-        DEFAULT_ACCOUNTS.accruedExpenses || "2600",
+        PAYROLL_ACCOUNTS.otherDeductionsPayable,
         loanDeductions,
         `Loan Deductions Payable - ${employeeName}${suffix}`,
       ),
@@ -126,7 +153,7 @@ async function buildPayrollAccrualLines(companyId, payroll, suffix = "") {
   if (otherDeductions > 0) {
     lines.push(
       JournalService.createCreditLine(
-        DEFAULT_ACCOUNTS.accruedExpenses || "2600",
+        PAYROLL_ACCOUNTS.otherDeductionsPayable,
         otherDeductions,
         `Other Deductions Payable - ${employeeName}${suffix}`,
       ),
@@ -136,13 +163,14 @@ async function buildPayrollAccrualLines(companyId, payroll, suffix = "") {
   if (netPay > 0) {
     lines.push(
       JournalService.createCreditLine(
-        DEFAULT_ACCOUNTS.accruedExpenses || "2600",
+        PAYROLL_ACCOUNTS.salaryPayable,
         netPay,
         `Net salary payable - ${employeeName}${suffix}`,
       ),
     );
   }
 
+  assertJournalBalanced(lines, `Payroll accrual for ${employeeName}`);
   return { lines, allocation, employeeName, periodLabel };
 }
 
@@ -178,24 +206,25 @@ async function postPayrollAccrualJournals(companyId, userId, payroll, options = 
   }
 
   if (rssbEmployerPensionMaternity > 0) {
+    const pension = round2(payroll.contributions?.rssbEmployerPension);
+    const maternity = round2(payroll.contributions?.rssbEmployerMaternity);
+    const employerLines = [
+      JournalService.createDebitLine(
+        PAYROLL_ACCOUNTS.employerContributionExpense,
+        rssbEmployerPensionMaternity,
+        `Employer RSSB cost - ${employeeName}${suffix}`,
+      ),
+    ];
+    if (pension > 0) employerLines.push(JournalService.createCreditLine(PAYROLL_ACCOUNTS.employerPensionPayable, pension, `Employer RSSB pension - ${employeeName}${suffix}`));
+    if (maternity > 0) employerLines.push(JournalService.createCreditLine(PAYROLL_ACCOUNTS.employerMaternityPayable, maternity, `Employer RSSB maternity - ${employeeName}${suffix}`));
+    assertJournalBalanced(employerLines, `Employer RSSB accrual for ${employeeName}`);
     await JournalService.createEntry(companyId, userId, {
       date: entryDate,
       description: `Employer RSSB Contribution - ${employeeName} - ${periodLabel}${suffix}`,
       sourceType: "payroll_employer",
       sourceId: payroll._id,
       sourceReference: periodLabel,
-      lines: [
-        JournalService.createDebitLine(
-          DEFAULT_ACCOUNTS.rssbEmployerCost || "6150",
-          rssbEmployerPensionMaternity,
-          `Employer RSSB - ${employeeName}${suffix}`,
-        ),
-        JournalService.createCreditLine(
-          DEFAULT_ACCOUNTS.rssbPayable || "2240",
-          rssbEmployerPensionMaternity,
-          `Employer RSSB pension/maternity - ${employeeName}${suffix}`,
-        ),
-      ],
+      lines: employerLines,
       isAutoGenerated: true,
     });
   }
@@ -397,6 +426,9 @@ exports.createPayroll = async (req, res, next) => {
         message: "Employee information and salary are required",
       });
     }
+    if (!linkedEmployeeId && !String(employeeSnapshot.employeeId || "").trim()) {
+      return res.status(400).json({ success: false, message: "An employee ID is required to prevent duplicate payroll records for the same period." });
+    }
 
     // Calculate payroll using Rwanda tax rules
     const periodDate = new Date(Date.UTC(Number(period.year), Number(period.month), 0, 12));
@@ -468,6 +500,8 @@ exports.createPayroll = async (req, res, next) => {
         year: period.year,
         monthName: Payroll.getMonthName(period.month),
       },
+      pay_period_start: new Date(Number(period.year), Number(period.month) - 1, 1),
+      pay_period_end: new Date(Number(period.year), Number(period.month), 0),
       notes,
       createdBy: userId,
     });
@@ -477,7 +511,9 @@ exports.createPayroll = async (req, res, next) => {
       if (approvedPeriodInput) {
         const consumed = await dbClient().payrollPeriodInput.updateMany({ where: { id: approvedPeriodInput.id, companyId: String(companyId), status: "approved", appliedPayrollId: null }, data: { status: "applied", appliedPayrollId: String(payroll._id) } });
         if (!consumed.count) throw Object.assign(new Error("Approved payroll input was already applied to another payroll record"), { statusCode: 409 });
+        await recordPayrollAudit({ companyId, userId, action: "payroll.period_input.applied", entityType: "payroll_period_input", entityId: approvedPeriodInput.id, before: { status: "approved", appliedPayrollId: null }, after: { status: "applied", appliedPayrollId: String(payroll._id) }, req });
       }
+      await recordPayrollAudit({ companyId, userId, action: "payroll.record.created", entityType: "payroll", entityId: payroll._id, before: null, after: payrollSnapshot(payroll), req });
     });
 
     res.status(201).json({
@@ -485,7 +521,7 @@ exports.createPayroll = async (req, res, next) => {
       data: payroll,
     });
   } catch (error) {
-    next(error);
+    next(payrollPeriodConflict(error));
   }
 };
 
@@ -506,6 +542,8 @@ exports.updatePayroll = async (req, res, next) => {
         .status(404)
         .json({ success: false, message: "Payroll record not found" });
     }
+
+    const before = payrollSnapshot(payroll);
 
     // Check if already paid
     if (payroll.payment.status === "paid") {
@@ -596,6 +634,8 @@ exports.updatePayroll = async (req, res, next) => {
         year: period.year,
         monthName: Payroll.getMonthName(period.month),
       };
+      payroll.pay_period_start = new Date(Number(period.year), Number(period.month) - 1, 1);
+      payroll.pay_period_end = new Date(Number(period.year), Number(period.month), 0);
     }
 
     if (notes !== undefined) {
@@ -603,14 +643,17 @@ exports.updatePayroll = async (req, res, next) => {
     }
 
     payroll.updatedAt = new Date();
-    await payroll.save();
+    await runInPrismaTransaction(async () => {
+      await payroll.save();
+      await recordPayrollAudit({ companyId, userId: req.user._id, action: "payroll.record.updated", entityType: "payroll", entityId: payroll._id, before, after: payrollSnapshot(payroll), req });
+    });
 
     res.json({
       success: true,
       data: payroll,
     });
   } catch (error) {
-    next(error);
+    next(payrollPeriodConflict(error));
   }
 };
 
@@ -640,7 +683,19 @@ exports.deletePayroll = async (req, res, next) => {
       });
     }
 
-    await payroll.deleteOne();
+    if (payroll.payroll_run_id) {
+      return res.status(409).json({
+        success: false,
+        message: "This payroll record belongs to a payroll run and cannot be deleted. Reverse or cancel the run first.",
+        code: "PAYROLL_RECORD_ASSIGNED_TO_RUN",
+      });
+    }
+
+    const before = payrollSnapshot(payroll);
+    await runInPrismaTransaction(async () => {
+      await payroll.deleteOne();
+      await recordPayrollAudit({ companyId, userId: req.user._id, action: "payroll.record.deleted", entityType: "payroll", entityId: req.params.id, before, after: null, req });
+    });
 
     res.json({
       success: true,
@@ -970,9 +1025,13 @@ exports.savePayrollPeriodInput = async (req, res, next) => {
       additionalIncome, deductions, notes: String(req.body.notes || ""), status: "draft", enteredById: userId,
       approvedById: null, approvedAt: null,
     };
-    const row = existing
-      ? await dbClient().payrollPeriodInput.update({ where: { id: existing.id }, data: base })
-      : await dbClient().payrollPeriodInput.create({ data: { id: generateObjectId(), ...base } });
+    const row = await runInPrismaTransaction(async () => {
+      const saved = existing
+        ? await dbClient().payrollPeriodInput.update({ where: { id: existing.id }, data: base })
+        : await dbClient().payrollPeriodInput.create({ data: { id: generateObjectId(), ...base } });
+      await recordPayrollAudit({ companyId, userId, action: existing ? "payroll.period_input.updated" : "payroll.period_input.created", entityType: "payroll_period_input", entityId: saved.id, before: existing ? { ...existing } : null, after: { ...saved }, req });
+      return saved;
+    });
     return res.status(existing ? 200 : 201).json({ success: true, data: row });
   } catch (error) { return next(error); }
 };
@@ -984,11 +1043,17 @@ exports.approvePayrollPeriodInput = async (req, res, next) => {
     const row = await dbClient().payrollPeriodInput.findFirst({ where: { id: String(req.params.inputId), companyId } });
     if (!row) throw Object.assign(new Error("Payroll period input not found"), { statusCode: 404 });
     if (row.status !== "draft") throw Object.assign(new Error("Only draft payroll inputs can be approved"), { statusCode: 409 });
+    if (sameActor(row.enteredById, userId)) throw Object.assign(new Error("Payroll inputs must be approved by a different user than the preparer"), { statusCode: 403, code: "PAYROLL_APPROVAL_SEPARATION_REQUIRED" });
     const scheduled = Number(row.scheduledDays), worked = Number(row.workedDays), paidLeave = Number(row.paidLeaveDays), unpaidLeave = Number(row.unpaidLeaveDays);
     if (scheduled <= 0 || worked + paidLeave + unpaidLeave > scheduled + 0.0001) throw Object.assign(new Error("Attendance and leave totals are invalid"), { statusCode: 400 });
-    const updated = await dbClient().payrollPeriodInput.updateMany({ where: { id: row.id, companyId, status: "draft" }, data: { status: "approved", approvedById: userId, approvedAt: new Date() } });
-    if (!updated.count) throw Object.assign(new Error("Input was changed by another user; refresh and retry"), { statusCode: 409 });
-    return res.json({ success: true, data: await dbClient().payrollPeriodInput.findUnique({ where: { id: row.id } }) });
+    const updatedRow = await runInPrismaTransaction(async () => {
+      const updated = await dbClient().payrollPeriodInput.updateMany({ where: { id: row.id, companyId, status: "draft" }, data: { status: "approved", approvedById: userId, approvedAt: new Date() } });
+      if (!updated.count) throw Object.assign(new Error("Input was changed by another user; refresh and retry"), { statusCode: 409 });
+      const result = await dbClient().payrollPeriodInput.findUnique({ where: { id: row.id } });
+      await recordPayrollAudit({ companyId, userId, action: "payroll.period_input.approved", entityType: "payroll_period_input", entityId: row.id, before: { status: row.status, enteredById: row.enteredById }, after: { status: result.status, approvedById: result.approvedById, approvedAt: result.approvedAt }, req });
+      return result;
+    });
+    return res.json({ success: true, data: updatedRow });
   } catch (error) { return next(error); }
 };
 
@@ -1157,6 +1222,10 @@ exports.bulkCreatePayroll = async (req, res, next) => {
         message: "Employees array is required",
       });
     }
+    const employeeKeys = employees.map((item) => String(item.employee_id || item.employee?.employeeId || "").trim().toLowerCase());
+    if (employeeKeys.some((key) => !key) || new Set(employeeKeys).size !== employeeKeys.length) {
+      return res.status(400).json({ success: false, message: "Bulk payroll requires a unique employee ID for every employee." });
+    }
 
     const createdPayroll = [];
 
@@ -1220,11 +1289,16 @@ exports.bulkCreatePayroll = async (req, res, next) => {
           year: period.year,
           monthName: Payroll.getMonthName(period.month),
         },
+        pay_period_start: new Date(Number(period.year), Number(period.month) - 1, 1),
+        pay_period_end: new Date(Number(period.year), Number(period.month), 0),
         notes,
         createdBy: userId,
       });
 
-      await payroll.save();
+      await runInPrismaTransaction(async () => {
+        await payroll.save();
+        await recordPayrollAudit({ companyId, userId, action: "payroll.record.created", entityType: "payroll", entityId: payroll._id, before: null, after: payrollSnapshot(payroll), req });
+      });
       createdPayroll.push(payroll);
     }
 
@@ -1234,7 +1308,7 @@ exports.bulkCreatePayroll = async (req, res, next) => {
       data: createdPayroll,
     });
   } catch (error) {
-    next(error);
+    next(payrollPeriodConflict(error));
   }
 };
 
@@ -1337,12 +1411,14 @@ exports.generatePayroll = async (req, res, next) => {
           if (approvedInput) {
             const consumed = await dbClient().payrollPeriodInput.updateMany({ where: { id: approvedInput.id, companyId: String(companyId), status: "approved", appliedPayrollId: null }, data: { status: "applied", appliedPayrollId: String(payroll._id) } });
             if (!consumed.count) throw Object.assign(new Error("Approved payroll input was already applied"), { statusCode: 409 });
+            await recordPayrollAudit({ companyId, userId, action: "payroll.period_input.applied", entityType: "payroll_period_input", entityId: approvedInput.id, before: { status: "approved", appliedPayrollId: null }, after: { status: "applied", appliedPayrollId: String(payroll._id) }, req });
           }
+          await recordPayrollAudit({ companyId, userId, action: "payroll.record.created", entityType: "payroll", entityId: payroll._id, before: null, after: payrollSnapshot(payroll), req });
         });
         createdRecords.push(payroll);
       } catch (err) {
         // Catch duplicate key (employee already has payroll for this period)
-        if (err.code === 11000) {
+        if ([11000, "P2002", "23505"].includes(err.code)) {
           errors.push({
             employeeId: emp.employeeId,
             name: `${emp.firstName} ${emp.lastName}`,
@@ -1683,6 +1759,19 @@ exports.getPayslip = async (req, res, next) => {
         .json({ success: false, message: "Payroll record not found" });
     }
 
+    const roles = await resolveUserRoles(req.user);
+    const canReadAllPayroll = roles.some((role) => PermissionService.check(role, "payroll", "read"));
+    if (!canReadAllPayroll) {
+      const employee = payroll.employee_id
+        ? await Employee.findOne({ _id: payroll.employee_id, company: companyId })
+        : await Employee.findOne({ employeeId: payroll.employee?.employeeId, company: companyId });
+      const callerEmail = String(req.user.email || "").trim().toLowerCase();
+      const employeeEmail = String(employee?.email || "").trim().toLowerCase();
+      if (!callerEmail || !employeeEmail || callerEmail !== employeeEmail) {
+        return res.status(404).json({ success: false, message: "Payslip not found" });
+      }
+    }
+
     // Build payslip data
     const payslip = {
       employee: payroll.employee,
@@ -1692,12 +1781,19 @@ exports.getPayslip = async (req, res, next) => {
         transportAllowance: payroll.salary.transportAllowance,
         housingAllowance: payroll.salary.housingAllowance,
         otherAllowances: payroll.salary.otherAllowances,
+        overtime: payroll.salary.overtime || payroll.additionalIncome?.overtime || 0,
+        bonuses: payroll.salary.bonuses || payroll.additionalIncome?.bonuses || 0,
+        commissions: payroll.salary.commissions || payroll.additionalIncome?.commissions || 0,
+        benefitsInKind: payroll.salary.benefitsInKind || payroll.additionalIncome?.benefitsInKind || 0,
         grossSalary: payroll.salary.grossSalary,
       },
       deductions: {
         paye: payroll.deductions.paye,
         rssbPension: payroll.deductions.rssbEmployeePension,
         rssbMaternity: payroll.deductions.rssbEmployeeMaternity,
+        healthInsurance: payroll.deductions.healthInsurance || 0,
+        loanDeductions: payroll.deductions.loanDeductions || 0,
+        otherDeductions: payroll.deductions.otherDeductions || 0,
         totalDeductions: payroll.deductions.totalDeductions,
       },
       netPay: payroll.netPay,
@@ -1713,6 +1809,32 @@ exports.getPayslip = async (req, res, next) => {
   } catch (error) {
     next(error);
   }
+};
+
+exports.getPayrollAuditHistory = async (req, res, next) => {
+  try {
+    const companyId = String(req.user.company._id);
+    const events = await dbClient().payrollAuditEvent.findMany({
+      where: { companyId, entityType: "payroll", entityId: String(req.params.id) },
+      orderBy: { createdAt: "desc" },
+      take: 200,
+    });
+    return res.json({ success: true, data: events });
+  } catch (error) { return next(error); }
+};
+
+exports.getPayrollPeriodInputAuditHistory = async (req, res, next) => {
+  try {
+    const companyId = String(req.user.company._id);
+    const input = await dbClient().payrollPeriodInput.findFirst({ where: { id: String(req.params.inputId), companyId } });
+    if (!input) return res.status(404).json({ success: false, message: "Payroll period input not found" });
+    const events = await dbClient().payrollAuditEvent.findMany({
+      where: { companyId, entityType: "payroll_period_input", entityId: input.id },
+      orderBy: { createdAt: "desc" },
+      take: 200,
+    });
+    return res.json({ success: true, data: events });
+  } catch (error) { return next(error); }
 };
 
 // @desc    Backfill missing payroll journal entries for all finalised/paid records
@@ -1763,10 +1885,8 @@ exports.backfillPayrollJournals = async (req, res, next) => {
 
         const grossSalary = round2(payroll.salary?.grossSalary);
         const paye = round2(payroll.deductions?.paye);
-        const rssbEmployee = round2(
-          (payroll.deductions?.rssbEmployeePension || 0) +
-            (payroll.deductions?.rssbEmployeeMaternity || 0),
-        );
+        const rssbEmployeePension = round2(payroll.deductions?.rssbEmployeePension);
+        const rssbEmployeeMaternity = round2(payroll.deductions?.rssbEmployeeMaternity);
         const netPay = round2(payroll.netPay);
         const rssbEmployerPensionMaternity = round2(
           (payroll.contributions?.rssbEmployerPension || 0) +
@@ -1826,10 +1946,7 @@ exports.backfillPayrollJournals = async (req, res, next) => {
 
         if (paye > 0) {
           lines1.push({
-            accountCode:
-              DEFAULT_ACCOUNTS.payePayable ||
-              DEFAULT_ACCOUNTS.payePayable ||
-              "2230",
+            accountCode: PAYROLL_ACCOUNTS.payePayable,
             accountName: "PAYE Tax Payable",
             description: `PAYE withheld — ${employeeName} [backfill]`,
             debit: 0,
@@ -1837,18 +1954,22 @@ exports.backfillPayrollJournals = async (req, res, next) => {
           });
         }
 
-        if (rssbEmployee > 0) {
+        if (rssbEmployeePension > 0) {
           lines1.push({
-            accountCode:
-              DEFAULT_ACCOUNTS.rssbPayable ||
-              DEFAULT_ACCOUNTS.rssbPayable ||
-              "2240",
-            accountName: "RSSB Payable",
-            description: `RSSB employee deduction — ${employeeName} [backfill]`,
+            accountCode: PAYROLL_ACCOUNTS.employeePensionPayable,
+            accountName: "RSSB Employee Pension Payable",
+            description: `RSSB employee pension deduction — ${employeeName} [backfill]`,
             debit: 0,
-            credit: rssbEmployee,
+            credit: rssbEmployeePension,
           });
         }
+        if (rssbEmployeeMaternity > 0) lines1.push({
+          accountCode: PAYROLL_ACCOUNTS.employeeMaternityPayable,
+          accountName: "RSSB Employee Maternity Payable",
+          description: `RSSB employee maternity deduction — ${employeeName} [backfill]`,
+          debit: 0,
+          credit: rssbEmployeeMaternity,
+        });
 
         if (occupationalHazard > 0) {
           lines1.push({
@@ -1859,8 +1980,8 @@ exports.backfillPayrollJournals = async (req, res, next) => {
             credit: 0,
           });
           lines1.push({
-            accountCode: DEFAULT_ACCOUNTS.employerContributionPayable || "2310",
-            accountName: "Employer Contribution Payable",
+            accountCode: PAYROLL_ACCOUNTS.occupationalHazardPayable,
+            accountName: "Occupational Hazard Payable",
             description: `Occupational hazard payable — ${employeeName} [backfill]`,
             debit: 0,
             credit: occupationalHazard,
@@ -1873,8 +1994,8 @@ exports.backfillPayrollJournals = async (req, res, next) => {
 
         if (healthInsurance > 0) {
           lines1.push({
-            accountCode: DEFAULT_ACCOUNTS.accruedExpenses || "2600",
-            accountName: "Accrued Payroll",
+            accountCode: PAYROLL_ACCOUNTS.otherDeductionsPayable,
+            accountName: "Other Payroll Deductions Payable",
             description: `Health Insurance Payable — ${employeeName} [backfill]`,
             debit: 0,
             credit: healthInsurance,
@@ -1883,8 +2004,8 @@ exports.backfillPayrollJournals = async (req, res, next) => {
 
         if (loanDeductions > 0) {
           lines1.push({
-            accountCode: DEFAULT_ACCOUNTS.accruedExpenses || "2600",
-            accountName: "Accrued Payroll",
+            accountCode: PAYROLL_ACCOUNTS.otherDeductionsPayable,
+            accountName: "Other Payroll Deductions Payable",
             description: `Loan Deductions Payable — ${employeeName} [backfill]`,
             debit: 0,
             credit: loanDeductions,
@@ -1893,8 +2014,8 @@ exports.backfillPayrollJournals = async (req, res, next) => {
 
         if (otherDeductions > 0) {
           lines1.push({
-            accountCode: DEFAULT_ACCOUNTS.accruedExpenses || "2600",
-            accountName: "Accrued Payroll",
+            accountCode: PAYROLL_ACCOUNTS.otherDeductionsPayable,
+            accountName: "Other Payroll Deductions Payable",
             description: `Other Deductions Payable — ${employeeName} [backfill]`,
             debit: 0,
             credit: otherDeductions,
@@ -1903,8 +2024,8 @@ exports.backfillPayrollJournals = async (req, res, next) => {
 
         if (netPay > 0) {
           lines1.push({
-            accountCode: DEFAULT_ACCOUNTS.accruedExpenses || "2600",
-            accountName: "Accrued Payroll",
+            accountCode: PAYROLL_ACCOUNTS.salaryPayable,
+            accountName: "Salaries Payable",
             description: `Net salary payable — ${employeeName} [backfill]`,
             debit: 0,
             credit: netPay,
@@ -1944,19 +2065,14 @@ exports.backfillPayrollJournals = async (req, res, next) => {
               sourceReference: periodLabel,
               lines: [
                 {
-                  accountCode: DEFAULT_ACCOUNTS.rssbEmployerCost || "6150",
+                  accountCode: PAYROLL_ACCOUNTS.employerContributionExpense,
                   accountName: "RSSB Employer Cost",
                   description: `Employer RSSB — ${employeeName} [backfill]`,
                   debit: rssbEmployerPensionMaternity,
                   credit: 0,
                 },
-                {
-                  accountCode: DEFAULT_ACCOUNTS.rssbPayable || "2240",
-                  accountName: "RSSB Payable",
-                  description: `Employer RSSB pension/maternity — ${employeeName} [backfill]`,
-                  debit: 0,
-                  credit: rssbEmployerPensionMaternity,
-                },
+                ...(payroll.contributions?.rssbEmployerPension > 0 ? [{ accountCode: PAYROLL_ACCOUNTS.employerPensionPayable, accountName: "RSSB Employer Pension Payable", description: `Employer pension — ${employeeName} [backfill]`, debit: 0, credit: payroll.contributions.rssbEmployerPension }] : []),
+                ...(payroll.contributions?.rssbEmployerMaternity > 0 ? [{ accountCode: PAYROLL_ACCOUNTS.employerMaternityPayable, accountName: "RSSB Employer Maternity Payable", description: `Employer maternity — ${employeeName} [backfill]`, debit: 0, credit: payroll.contributions.rssbEmployerMaternity }] : []),
               ],
               isAutoGenerated: true,
             });
@@ -2001,6 +2117,9 @@ exports.finalisePayroll = async (req, res, next) => {
         throw error;
       }
       if (record.record_status === "paid") throw new Error("Payroll record already paid");
+      if (record.record_status !== "draft") throw Object.assign(new Error("Only draft payroll records can be finalised"), { statusCode: 409 });
+      if (sameActor(record.createdBy, userId)) throw Object.assign(new Error("Payroll must be finalised by a user other than its preparer"), { statusCode: 403, code: "PAYROLL_APPROVAL_SEPARATION_REQUIRED" });
+      const before = payrollSnapshot(record);
       if (!record.pay_period_start || !record.pay_period_end) {
         const year = Number(record.period?.year);
         const month = Number(record.period?.month);
@@ -2021,6 +2140,7 @@ exports.finalisePayroll = async (req, res, next) => {
       }
       record.record_status = "finalised";
       await record.save();
+      await recordPayrollAudit({ companyId, userId, action: "payroll.record.finalised", entityType: "payroll", entityId: record._id, before, after: payrollSnapshot(record), req });
       return record;
     });
     return res.json({ success: true, data: payroll, message: "Payroll record finalised and journal entries posted" });
@@ -2043,6 +2163,9 @@ exports.processPayment = async (req, res, next) => {
       }
       if (record.payment?.status === "paid") throw new Error("Payment already processed");
       if (record.record_status !== "finalised") throw new Error("PAYROLL_NOT_FINALISED");
+      if (record.payroll_run_id) throw Object.assign(new Error("This record belongs to a payroll run and must be paid through that run"), { statusCode: 409 });
+      if (sameActor(record.createdBy, userId)) throw Object.assign(new Error("Payroll payment must be processed by a user other than its preparer"), { statusCode: 403, code: "PAYROLL_APPROVAL_SEPARATION_REQUIRED" });
+      const before = payrollSnapshot(record);
       const netPay = round2(record.netPay);
       if (netPay <= 0) throw new Error("PAYROLL_NET_PAY_MUST_BE_POSITIVE");
 
@@ -2066,7 +2189,7 @@ exports.processPayment = async (req, res, next) => {
         sourceId: String(record._id),
         sourceReference: reference || String(record._id),
         lines: [
-          JournalService.createDebitLine(DEFAULT_ACCOUNTS.accruedExpenses || "2600", netPay, `Clear accrued salary - ${employeeName}`),
+          JournalService.createDebitLine(PAYROLL_ACCOUNTS.salaryPayable, netPay, `Clear accrued salary - ${employeeName}`),
           JournalService.createCreditLine(cashAccountCode, netPay, `Net salary paid - ${employeeName}`),
         ],
         isAutoGenerated: true,
@@ -2091,8 +2214,8 @@ exports.processPayment = async (req, res, next) => {
       }
 
       record.payment = { status: "paid", paymentDate: new Date(), paymentMethod, reference: reference || null, bankAccountId: bankAccount?._id || null, journalEntryId: journalEntry._id };
-      record.approvedBy = userId;
       await record.save();
+      await recordPayrollAudit({ companyId, userId, action: "payroll.record.paid", entityType: "payroll", entityId: record._id, before, after: payrollSnapshot(record), req });
       return record;
     });
     return res.json({ success: true, data: payroll, message: "Payment processed successfully" });

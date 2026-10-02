@@ -2,6 +2,9 @@ const PayrollRunService = require("../services/payrollRunService");
 const PayrollRun = require("../models/PayrollRun");
 const Payroll = require("../models/Payroll");
 const { parsePagination, paginationMeta } = require("../utils/pagination");
+const { runInPrismaTransaction } = require("../services/transactionService");
+const { recordPayrollAudit, runSnapshot } = require("../services/payrollAuditService");
+const { dbClient } = require("../lib/prisma");
 
 // @desc    Get available periods (months with finalised, unprocessed payroll records)
 // @route   GET /api/payroll-runs/available-periods
@@ -89,6 +92,18 @@ const getPayrollRunById = async (req, res, next) => {
   } catch (error) {
     next(error);
   }
+};
+
+const getPayrollRunAuditHistory = async (req, res, next) => {
+  try {
+    const companyId = String(req.user.company._id);
+    const events = await dbClient().payrollAuditEvent.findMany({
+      where: { companyId, entityType: "payroll_run", entityId: String(req.params.id) },
+      orderBy: { createdAt: "desc" },
+      take: 200,
+    });
+    return res.json({ success: true, data: events });
+  } catch (error) { return next(error); }
 };
 
 // @desc    Create new payroll run (draft)
@@ -189,7 +204,12 @@ const deletePayrollRun = async (req, res, next) => {
       });
     }
 
-    await payrollRun.deleteOne();
+    const before = runSnapshot(payrollRun);
+    await runInPrismaTransaction(async () => {
+      await Payroll.updateMany({ payroll_run_id: payrollRun._id, record_status: "finalised" }, { payroll_run_id: null });
+      await payrollRun.deleteOne();
+      await recordPayrollAudit({ companyId, userId: req.user._id, action: "payroll.run.deleted", entityType: "payroll_run", entityId: id, before, after: null, req });
+    });
 
     res.status(200).json({
       success: true,
@@ -324,9 +344,40 @@ const generateBankTransfer = async (req, res, next) => {
   }
 };
 
+const confirmBankTransfer = async (req, res, next) => {
+  try {
+    const data = await PayrollRunService.confirmBankTransfer(
+      req.user.company._id, req.params.id, req.body, req.user._id,
+    );
+    res.status(200).json({ success: true, data, message: "Salary bank payment confirmation recorded" });
+  } catch (error) { next(error); }
+};
+
+const exportStatutoryFiling = async (req, res, next) => {
+  try {
+    const filing = await PayrollRunService.generateStatutoryFilingCsv(req.user.company._id, req.params.id, req.params.type);
+    res.status(200).json({ success: true, data: filing });
+  } catch (error) { next(error); }
+};
+
+const submitStatutoryFiling = async (req, res, next) => {
+  try {
+    const data = await PayrollRunService.submitStatutoryFiling(req.user.company._id, req.params.id, req.params.type, req.body, req.user._id);
+    res.status(200).json({ success: true, data, message: `${String(req.params.type).toUpperCase()} filing evidence recorded` });
+  } catch (error) { next(error); }
+};
+
+const getComplianceDeadlines = async (req, res, next) => {
+  try {
+    const data = await PayrollRunService.getComplianceDeadlines(req.user.company._id, req.query);
+    res.status(200).json({ success: true, count: data.length, data });
+  } catch (error) { next(error); }
+};
+
 module.exports = {
   getPayrollRuns,
   getPayrollRunById,
+  getPayrollRunAuditHistory,
   createPayrollRun,
   postPayrollRun,
   reversePayrollRun,
@@ -337,4 +388,8 @@ module.exports = {
   remitPaye,
   remitRssb,
   generateBankTransfer,
+  confirmBankTransfer,
+  exportStatutoryFiling,
+  submitStatutoryFiling,
+  getComplianceDeadlines,
 };

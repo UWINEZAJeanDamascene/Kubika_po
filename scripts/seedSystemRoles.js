@@ -22,7 +22,8 @@ const systemRoles = [
     description: 'Company administrator with full company access',
     is_system_role: true,
     permissions: [
-      { resource: '*', actions: ['read', 'create', 'update', 'delete', 'approve', 'post', 'confirm', 'admin'] }
+      { resource: '*', actions: ['read', 'create', 'update', 'delete', 'approve', 'post', 'confirm', 'admin'] },
+      { resource: 'payroll', actions: ['read', 'create', 'update', 'delete', 'approve', 'post', 'pay', 'remit', 'export', 'file', 'admin'] },
     ]
   },
   {
@@ -35,6 +36,7 @@ const systemRoles = [
       { resource: 'purchase_orders', actions: ['read', 'create', 'update'] },
       { resource: 'users', actions: ['read', 'create', 'update'] },
       { resource: 'projects', actions: ['read', 'create', 'update', 'close', 'reopen'] },
+      { resource: 'payroll', actions: ['read', 'create', 'update'] },
       { resource: 'reports', actions: ['read'] }
     ]
   },
@@ -99,7 +101,7 @@ const systemRoles = [
       { resource: 'expenses', actions: ['read', 'create', 'update'] },
       { resource: 'budgets', actions: ['read', 'create', 'update'] },
       { resource: 'projects', actions: ['read'] },
-      { resource: 'payroll', actions: ['read', 'create', 'update'] },
+      { resource: 'payroll', actions: ['read', 'create', 'update', 'approve', 'post', 'pay', 'remit', 'export', 'file'] },
       { resource: 'periods', actions: ['read', 'update', 'close'] }
     ]
   },

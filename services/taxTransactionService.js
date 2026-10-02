@@ -31,8 +31,12 @@ class TaxTransactionService {
     '2230': { taxType: 'paye', direction: 'withheld' },             // PAYE Tax Payable
 
     // ── RSSB ─────────────────────────────────────────
-    '2240': { taxType: 'rssb_employee', direction: 'withheld' },    // RSSB Payable
-    '2310': { taxType: 'rssb_employer', direction: 'withheld' },    // Employer Contribution Payable
+    '2240': { taxType: 'rssb_employee', direction: 'withheld' },    // Legacy aggregate RSSB Payable
+    '2320': { taxType: 'rssb_employee', direction: 'withheld' },    // Employee pension
+    '2321': { taxType: 'rssb_employee', direction: 'withheld' },    // Employee maternity
+    '2330': { taxType: 'rssb_employer', direction: 'withheld' },    // Employer pension
+    '2331': { taxType: 'rssb_employer', direction: 'withheld' },    // Employer maternity
+    '2332': { taxType: 'rssb_employer', direction: 'withheld' },    // Occupational hazard
 
     // ── Income Tax ────────────────────────────────────────────────────
     '2400': { taxType: 'income_tax', direction: 'withheld' },        // Income Tax Payable
@@ -107,13 +111,16 @@ class TaxTransactionService {
           taxType = 'vat_output_reversed';
           direction = 'input';
         }
-      } else if (accountCode === '2240') {
+      } else if (['2240', '2320', '2321'].includes(accountCode)) {
         amount = creditAmount || debitAmount;
         if (sourceData.employerContribution && creditAmount > 0) {
           taxType = 'rssb_employer';
         } else {
           taxType = 'rssb_employee';
         }
+      } else if (['2330', '2331', '2332'].includes(accountCode)) {
+        amount = creditAmount || debitAmount;
+        taxType = 'rssb_employer';
       } else {
         amount = creditAmount || debitAmount;
       }

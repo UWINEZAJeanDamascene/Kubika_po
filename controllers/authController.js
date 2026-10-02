@@ -165,7 +165,7 @@ exports.login = async (req, res, next) => {
            for (const perm of role.permissions) {
              if (perm.resource === '*') {
                // Wildcard resource - add all common actions
-               const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post'];
+               const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post', 'pay', 'remit', 'export', 'file', 'admin'];
                for (const action of (perm.actions.includes('*') ? allActions : perm.actions)) {
                  permissionsSet.add(`*:${action}`);
                }
@@ -177,7 +177,7 @@ exports.login = async (req, res, next) => {
                  if (action === '*') {
                    // Wildcard action - add all actions for this resource
                    permissionsSet.add(`${perm.resource}:*`);
-                   const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post'];
+                   const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post', 'pay', 'remit', 'export', 'file', 'admin'];
                    for (const a of allActions) {
                      permissionsSet.add(`${perm.resource}:${a}`);
                    }
@@ -195,7 +195,7 @@ exports.login = async (req, res, next) => {
        if (legacyRole && legacyRole.permissions && legacyRole.permissions.length > 0) {
          for (const perm of legacyRole.permissions) {
            if (perm.resource === '*') {
-             const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post'];
+             const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post', 'pay', 'remit', 'export', 'file', 'admin'];
              for (const action of (perm.actions.includes('*') ? allActions : perm.actions)) {
                permissionsSet.add(`*:${action}`);
              }
@@ -206,7 +206,7 @@ exports.login = async (req, res, next) => {
              for (const action of perm.actions) {
                if (action === '*') {
                  permissionsSet.add(`${perm.resource}:*`);
-                 const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post'];
+                 const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post', 'pay', 'remit', 'export', 'file', 'admin'];
                  for (const a of allActions) {
                    permissionsSet.add(`${perm.resource}:${a}`);
                  }
@@ -282,7 +282,7 @@ exports.getMe = async (req, res, next) => {
           for (const perm of role.permissions) {
             if (perm.resource === '*') {
               // Wildcard resource - add all common actions
-              const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post'];
+              const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post', 'pay', 'remit', 'export', 'file', 'admin'];
               for (const action of (perm.actions.includes('*') ? allActions : perm.actions)) {
                 permissionsSet.add(`*:${action}`);
               }
@@ -294,7 +294,7 @@ exports.getMe = async (req, res, next) => {
                 if (action === '*') {
                   // Wildcard action - add all actions for this resource
                   permissionsSet.add(`${perm.resource}:*`);
-                  const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post'];
+                  const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post', 'pay', 'remit', 'export', 'file', 'admin'];
                   for (const a of allActions) {
                     permissionsSet.add(`${perm.resource}:${a}`);
                   }
@@ -312,7 +312,7 @@ exports.getMe = async (req, res, next) => {
       if (legacyRole && legacyRole.permissions && legacyRole.permissions.length > 0) {
         for (const perm of legacyRole.permissions) {
           if (perm.resource === '*') {
-            const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post'];
+            const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post', 'pay', 'remit', 'export', 'file', 'admin'];
             for (const action of (perm.actions.includes('*') ? allActions : perm.actions)) {
               permissionsSet.add(`*:${action}`);
             }
@@ -323,7 +323,7 @@ exports.getMe = async (req, res, next) => {
             for (const action of perm.actions) {
               if (action === '*') {
                 permissionsSet.add(`${perm.resource}:*`);
-                const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post'];
+                const allActions = ['read', 'create', 'update', 'delete', 'approve', 'post', 'pay', 'remit', 'export', 'file', 'admin'];
                 for (const a of allActions) {
                   permissionsSet.add(`${perm.resource}:${a}`);
                 }

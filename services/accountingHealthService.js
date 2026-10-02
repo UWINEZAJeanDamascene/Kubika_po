@@ -111,7 +111,7 @@ async function getVatReconciliation(companyId) {
  * total PAYE withheld minus all PAYE settlements.
  */
 async function getPayeReconciliation(companyId) {
-  const payeCodes = ['2230'];
+  const payeCodes = ['2230', '2310'];
 
   const payeAgg = await journalLineTotals(companyId, payeCodes);
 
@@ -133,7 +133,7 @@ async function getPayeReconciliation(companyId) {
  * total RSSB contributions minus all RSSB settlements.
  */
 async function getRssbReconciliation(companyId) {
-  const rssbCodes = ['2240'];
+  const rssbCodes = ['2240', '2320', '2321', '2330', '2331', '2332'];
 
   const rssbAgg = await journalLineTotals(companyId, rssbCodes);
 

@@ -153,23 +153,23 @@ class TaxService {
     const netVatPayable = netOutputVat - netInputVat;
 
     // ── PAYE SECTION ───────────────────────────────────────────────
-    const payePayableCodes = ["2230"];
+    const payePayableCodes = ["2230", "2310"];
 
     // PAYE withheld — sum of credit lines on PAYE accounts
     const payeWithheld = await journalAmount(companyId, periodStart, periodEnd, payePayableCodes, 'credit');
 
     // PAYE remitted — sum of debit lines on PAYE accounts (settlements)
-    const payeRemitted = await journalAmount(companyId, periodStart, periodEnd, payePayableCodes, 'debit', ["paye_settlement", "payroll_tax"]);
+    const payeRemitted = await journalAmount(companyId, periodStart, periodEnd, payePayableCodes, 'debit', ["paye_settlement", "payroll_tax", "payroll_remit_paye"]);
     const payeOutstanding = payeWithheld - payeRemitted;
 
     // ── RSSB SECTION ───────────────────────────────────────────────
-    const rssbPayableCodes = ["2240"];
+    const rssbPayableCodes = ["2240", "2320", "2321", "2330", "2331", "2332"];
 
     // RSSB contributions — sum of credit lines on RSSB accounts
     const rssbContributed = await journalAmount(companyId, periodStart, periodEnd, rssbPayableCodes, 'credit');
 
     // RSSB remitted — sum of debit lines on RSSB accounts (settlements)
-    const rssbRemitted = await journalAmount(companyId, periodStart, periodEnd, rssbPayableCodes, 'debit', ["rssb_settlement", "payroll_tax"]);
+    const rssbRemitted = await journalAmount(companyId, periodStart, periodEnd, rssbPayableCodes, 'debit', ["rssb_settlement", "payroll_tax", "payroll_remit_rssb"]);
     const rssbOutstanding = rssbContributed - rssbRemitted;
 
     return {

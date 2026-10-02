@@ -61,7 +61,7 @@ async function findSystemRole(name) {
   return prisma.role.findFirst({ where: { name, isSystemRole: true } });
 }
 
-const ALL_ACTIONS = ['read', 'create', 'update', 'delete', 'approve', 'post'];
+const ALL_ACTIONS = ['read', 'create', 'update', 'delete', 'approve', 'post', 'pay', 'remit', 'export', 'file', 'admin'];
 
 function collectPermissions(set, permissions) {
   for (const perm of permissions || []) {

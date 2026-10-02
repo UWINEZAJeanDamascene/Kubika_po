@@ -589,10 +589,18 @@ function payrollRunToApi(row) {
     rssb_remit_journal_id: row.rssbRemitJournalId ?? null,
     notes: row.notes ?? null,
     posted_by: row.postedById ?? null,
+    created_by: row.createdById ?? null,
     lines: Array.isArray(row.lines) ? row.lines : [],
     employee_count: row.employeeCount,
     remittance: row.remittance ?? {},
     bank_transfer: row.bankTransfer ?? {},
+    compliance: row.compliance ?? {},
+    statutory_deadlines: require('./payrollCompliance').buildPayrollDeadlines({
+      pay_period_end: row.payPeriodEnd,
+      compliance: row.compliance ?? {},
+      remittance: row.remittance ?? {},
+      bank_transfer: row.bankTransfer ?? {},
+    }),
     warnings: Array.isArray(row.warnings) ? row.warnings : [],
     ...mapTimestamps(row),
   };
@@ -606,15 +614,16 @@ const PAYROLL_RUN_HEADER = {
   tax_payable_account_id: 'taxPayableAccountId', other_deductions_account_id: 'otherDeductionsAccountId',
   journal_entry_id: 'journalEntryId', reversal_journal_entry_id: 'reversalJournalEntryId',
   net_pay_journal_id: 'netPayJournalId', paye_remit_journal_id: 'payeRemitJournalId',
-  rssb_remit_journal_id: 'rssbRemitJournalId', notes: 'notes', posted_by: 'postedById',
+  rssb_remit_journal_id: 'rssbRemitJournalId', notes: 'notes', posted_by: 'postedById', created_by: 'createdById',
   lines: 'lines', employee_count: 'employeeCount', remittance: 'remittance',
   bank_transfer: 'bankTransfer', warnings: 'warnings',
+  compliance: 'compliance',
 };
 
 const PAYROLL_RUN_IDS = [
   'bankAccountId', 'salaryAccountId', 'taxPayableAccountId', 'otherDeductionsAccountId',
   'journalEntryId', 'reversalJournalEntryId', 'netPayJournalId', 'payeRemitJournalId',
-  'rssbRemitJournalId', 'postedById',
+  'rssbRemitJournalId', 'postedById', 'createdById',
 ];
 
 function payrollRunTranslateCreate(data) {
@@ -628,9 +637,11 @@ function payrollRunTranslateCreate(data) {
     taxPayableAccountId: toIdString(data.tax_payable_account_id),
     otherDeductionsAccountId: data.other_deductions_account_id ? toIdString(data.other_deductions_account_id) : null,
     postedById: data.posted_by ? toIdString(data.posted_by) : null,
+    createdById: data.created_by ? toIdString(data.created_by) : null,
     lines: data.lines ?? [],
     remittance: data.remittance ?? {},
     bankTransfer: data.bank_transfer ?? {},
+    compliance: data.compliance ?? {},
     warnings: data.warnings ?? [],
   });
 }

@@ -3428,6 +3428,9 @@ model SalaryHistory {
   @@map("salary_histories")
 }
 
+// A functional partial unique index in migration
+// 20261002000012_enforce_unique_employee_payroll_period enforces one record per
+// tenant, employee ID, and JSON payroll period (Prisma cannot model this index).
 model Payroll {
   id               String      @id @db.Char(24)
   companyId        String      @map("company_id") @db.Char(24)
@@ -3483,10 +3486,12 @@ model PayrollRun {
   rssbRemitJournalId       String?   @map("rssb_remit_journal_id") @db.Char(24)
   notes                    String?
   postedById               String?   @map("posted_by") @db.Char(24)
+  createdById              String?   @map("created_by") @db.Char(24)
   lines                    Json      @default("[]")
   employeeCount            Int       @default(0) @map("employee_count")
   remittance               Json      @default("{}")
   bankTransfer             Json      @default("{}") @map("bank_transfer")
+  compliance               Json      @default("{}")
   warnings                 Json      @default("[]")
   createdAt                DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt                DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
@@ -3524,6 +3529,23 @@ model PayrollPeriodInput {
   @@unique([companyId, employeeId, periodYear, periodMonth])
   @@index([companyId, periodYear, periodMonth, status])
   @@map("payroll_period_inputs")
+}
+
+model PayrollAuditEvent {
+  id          String   @id @db.Char(24)
+  companyId   String   @map("company_id") @db.Char(24)
+  actorUserId String?  @map("actor_user_id") @db.Char(24)
+  action      String
+  entityType  String   @map("entity_type")
+  entityId    String   @map("entity_id")
+  changes     Json     @default("{}")
+  ipAddress   String?  @map("ip_address")
+  userAgent   String?  @map("user_agent")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([companyId, entityType, entityId, createdAt(sort: Desc)])
+  @@index([companyId, actorUserId, createdAt(sort: Desc)])
+  @@map("payroll_audit_events")
 }
 
 model Timesheet {
