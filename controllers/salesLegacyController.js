@@ -583,8 +583,9 @@ exports.createDirectSale = async (req, res, next) => {
 exports.getPosProducts = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { search, warehouseId, category, limit = 50 } = req.query;
+    const { search, warehouseId, category, limit = 50, page = 1 } = req.query;
     const resultLimit = Math.min(100, Math.max(1, parseInt(limit, 10) || 50));
+    const requestedPage = Math.max(1, parseInt(page, 10) || 1);
     const toNumber = (value) => {
       if (value == null) return 0;
       if (typeof value === 'number') return value;
@@ -616,10 +617,14 @@ exports.getPosProducts = async (req, res, next) => {
       query.category = category;
     }
 
+    const total = await Product.countDocuments(query);
+    const pages = Math.ceil(total / resultLimit);
+    const currentPage = pages ? Math.min(requestedPage, pages) : 1;
     const products = await Product.find(query)
       .select('name sku sellingPrice unit taxRate taxCode currentStock averageCost barcode category isStockable')
-.limit(resultLimit)
-      .sort({ name: 1 });
+      .sort({ name: 1, _id: 1 })
+      .skip((currentPage - 1) * resultLimit)
+      .limit(resultLimit);
 
     // Enhance with availability info
     const enhancedProducts = products.map(p => {
@@ -643,6 +648,14 @@ exports.getPosProducts = async (req, res, next) => {
     res.json({
       success: true,
       count: enhancedProducts.length,
+      total,
+      pages,
+      pagination: {
+        page: currentPage,
+        limit: resultLimit,
+        total,
+        pages
+      },
       data: enhancedProducts
     });
   } catch (error) {
