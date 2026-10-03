@@ -1977,7 +1977,13 @@ static async getAvailablePeriods(companyId) {
   }
 
   static async getComplianceDeadlines(companyId, filters = {}) {
-    const runs = await PayrollRun.find({ company: companyId, status: "posted" }).sort({ pay_period_end: -1 }).limit(500);
+    // The payroll filing migration is not present in every tenant database yet.
+    // Explicitly omit this optional JSON column so deadline checks can continue
+    // using the calculated statutory dates and any existing remittance state.
+    const runs = await PayrollRun.find({ company: companyId, status: "posted" })
+      .select("-compliance")
+      .sort({ pay_period_end: -1 })
+      .limit(500);
     const items = [];
     for (const run of runs) {
       const deadlines = buildPayrollDeadlines(run);
@@ -1999,6 +2005,7 @@ static async getAvailablePeriods(companyId) {
   static async getOperationalExceptions(companyId, filters = {}) {
     const [runs, records] = await Promise.all([
       PayrollRun.find({ company: companyId })
+        .select("-compliance")
         .sort({ pay_period_end: -1 })
         .limit(500),
       Payroll.find({ company: companyId, record_status: { $in: ["finalised", "paid"] } })
