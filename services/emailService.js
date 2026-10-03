@@ -77,7 +77,11 @@ const sendEmail = async (to, subject, html, { text, attachments, retries } = {})
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       const transporter = getTransporter();
-      await transporter.sendMail(mailOptions);
+      const delivery = await transporter.sendMail(mailOptions);
+      if (delivery?.messageId === 'skipped' || (Array.isArray(delivery?.accepted) && delivery.accepted.length === 0)) {
+        console.warn(`[Mailer] Provider did not accept the message for ${validRecipients.join(', ')}`);
+        return false;
+      }
       console.log(`📧 Email sent to: ${validRecipients.join(', ')}`);
       return true;
     } catch (error) {
@@ -136,7 +140,7 @@ const sendInvoiceEmail = async (invoice, company, client, pdfBuffer = null) => {
 
   const html = `
     <div style="font-family:Arial,sans-serif; max-width:600px; margin:0 auto;">
-      <div style="background:linear-gradient(135deg,#7c3aed,#6d28d9); padding:30px; border-radius:10px 10px 0 0;">
+      <div style="background:#0f766e; padding:30px; border-radius:10px 10px 0 0;">
         <h1 style="color:white; margin:0; text-align:center;">📄 Invoice</h1>
       </div>
       <div style="background:#f9f9f9; padding:30px; border:1px solid #ddd; border-top:none; border-radius:0 0 10px 10px;">
@@ -353,7 +357,14 @@ const sendWelcomeEmail = async ({ to, name, companyName }) => {
 
 const sendPasswordResetEmail = async ({ to, name, resetToken }) => {
   const resetUrl = `${FRONTEND_URL}/reset-password?token=${encodeURIComponent(resetToken)}`;
-  const subject = 'Reset Your StockManager Password';
+  const subject = 'Reset your KUBIKA password';
+  const text = [
+    `Hello ${name || 'there'},`,
+    '',
+    'A password reset was requested for your KUBIKA account.',
+    `Reset your password using this one-time link: ${resetUrl}`,
+    'This link expires in one hour. If you did not request this, you can ignore this email.',
+  ].join('\n');
 
   const html = `
     <div style="font-family:Arial,sans-serif; max-width:600px; margin:0 auto;">
@@ -372,7 +383,7 @@ const sendPasswordResetEmail = async ({ to, name, resetToken }) => {
       </div>
     </div>`;
 
-  return sendEmail(to, subject, html);
+  return sendEmail(to, subject, html, { text });
 };
 
 // ============================================
@@ -854,43 +865,44 @@ const sendWeeklySummaryEmail = async (company, stats) => {
 // USER INVITATION
 // ============================================
 
-const sendUserInvitationEmail = async ({ to, name, companyName, inviterName, role, temporaryPassword }) => {
+const sendUserInvitationEmail = async ({ to, name, companyName, inviterName, role, departmentName, setupUrl }) => {
   const safeCompanyName = esc(companyName || 'KUBIKA');
   const safeInviterName = esc(inviterName || 'Your administrator');
   const safeRole = esc(role || 'Viewer');
-  const subject = `Invitation to join ${companyName || 'KUBIKA'}`;
-  const loginUrl = `${FRONTEND_URL}/login`;
+  const safeDepartment = esc(departmentName || 'Not specified');
+  const subject = `Invitation to join ${String(companyName || 'KUBIKA').replace(/[\r\n]+/g, ' ').trim()}`;
+  const actionUrl = setupUrl || `${FRONTEND_URL}/login`;
   const text = [
     `Hello ${name || 'there'},`,
     '',
     `${inviterName || 'Your administrator'} invited you to join ${companyName || 'KUBIKA'} as ${role || 'Viewer'}.`,
-    temporaryPassword ? `Temporary password: ${temporaryPassword}` : 'Use your existing password to sign in.',
-    `Sign in here: ${loginUrl}`,
+    `Department: ${departmentName || 'Not specified'}`,
+    setupUrl ? 'Set your password using this secure, one-time link:' : 'Use your existing password to sign in.',
+    `${actionUrl}${setupUrl ? '\nThis link expires in 24 hours.' : ''}`,
     '',
     'If you were not expecting this invitation, you can ignore this email.',
   ].join('\n');
 
   const html = `
     <div style="font-family:Arial,sans-serif; max-width:600px; margin:0 auto; color:#1f2937;">
-      <div style="padding:24px 0; border-bottom:2px solid #2563eb;">
-        <h1 style="color:#1d4ed8; margin:0; font-size:24px;">KUBIKA invitation</h1>
+      <div style="padding:24px 0; border-bottom:2px solid #0f766e;">
+        <p style="margin:0 0 8px; color:#0f766e; font-size:12px; font-weight:700; letter-spacing:1.5px;">KUBIKA SYSTEM</p>
+        <h1 style="color:#172033; margin:0; font-size:24px;">You have been invited</h1>
       </div>
       <div style="padding:24px 0;">
         <p>Hello <strong>${esc(name || 'there')}</strong>,</p>
         <p><strong>${safeInviterName}</strong> invited you to join <strong>${safeCompanyName}</strong> on KUBIKA.</p>
         <p>Your role: <strong>${safeRole}</strong></p>
-        ${temporaryPassword
-          ? `<div style="margin:20px 0; padding:16px; border:1px solid #d1d5db; background:#f9fafb;">
-              <p style="margin:0 0 8px;"><strong>Temporary password</strong></p>
-              <p style="margin:0; font-family:monospace; font-size:16px;">${esc(temporaryPassword)}</p>
-              <p style="margin:10px 0 0; color:#6b7280; font-size:12px;">You will be asked to change this password after signing in.</p>
-            </div>`
-          : '<p>Use your existing password to sign in.</p>'}
+        <p>Department: <strong>${safeDepartment}</strong></p>
+        ${setupUrl
+          ? '<p>For your security, set your password using the one-time link below. The link expires in 24 hours.</p>'
+          : '<p>Use your existing password to sign in. Your access to this workspace has been added.</p>'}
         <div style="margin:28px 0;">
-          <a href="${loginUrl}" style="background:#2563eb; color:white; padding:12px 20px; border-radius:4px; text-decoration:none; display:inline-block;">Open KUBIKA</a>
+          <a href="${esc(actionUrl)}" style="background:#0f766e; color:white; padding:12px 20px; border-radius:6px; text-decoration:none; display:inline-block;">${setupUrl ? 'Set password and continue' : 'Open KUBIKA'}</a>
         </div>
+        ${setupUrl ? `<p style="color:#6b7280; font-size:12px;">If the button does not work, copy this link into your browser:<br/><a href="${esc(actionUrl)}" style="color:#0f766e; word-break:break-all;">${esc(actionUrl)}</a></p>` : ''}
         <p style="color:#6b7280; font-size:13px;">If you were not expecting this invitation, you can ignore this email.</p>
-        <p style="color:#6b7280; font-size:12px; margin-top:28px;">KUBIKA system</p>
+        <p style="color:#6b7280; font-size:12px; margin-top:28px;">KUBIKA System · Secure Business Operations</p>
       </div>
     </div>`;
 

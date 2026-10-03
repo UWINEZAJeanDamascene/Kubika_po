@@ -1,21 +1,10 @@
 const { prisma } = require('../lib/prisma');
-const { generateObjectId, toIdString } = require('../utils/objectId');
+const { toIdString } = require('../utils/objectId');
 const { userToApi, userInputToPrisma } = require('../utils/authMappers');
-const passwordUtils = require('../utils/passwordUtils');
 const ActionLog = require('../models/ActionLog');
-const { notifyUserCreated, notifyPasswordChanged } = require('../services/notificationHelper');
+const UserService = require('../services/UserService');
 const Warehouse = require('../models/Warehouse');
 const EBMBranchService = require('../services/ebmBranchService');
-
-// Generate a random temporary password
-const generateTempPassword = (length = 8) => {
-  const charset = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*';
-  let password = '';
-  for (let i = 0; i < length; i++) {
-    password += charset.charAt(Math.floor(Math.random() * charset.length));
-  }
-  return password;
-};
 
 const companyIdOf = (req) => toIdString(req.user.company._id || req.user.company);
 
@@ -24,7 +13,7 @@ const companyIdOf = (req) => toIdString(req.user.company._id || req.user.company
 // @access  Private (admin)
 exports.getUsers = async (req, res, next) => {
   try {
-    const { page = 1, limit = 20, role, isActive } = req.query;
+    const { page = 1, limit = 20, role, isActive, search } = req.query;
 
     // Multi-tenancy: Filter by company
     const where = { companyId: companyIdOf(req) };
@@ -36,12 +25,27 @@ exports.getUsers = async (req, res, next) => {
     if (isActive !== undefined) {
       where.isActive = isActive === 'true';
     }
+    if (String(search || '').trim()) {
+      const term = String(search).trim().slice(0, 120);
+      where.OR = [
+        { name: { contains: term, mode: 'insensitive' } },
+        { email: { contains: term, mode: 'insensitive' } },
+        { role: { contains: term, mode: 'insensitive' } },
+      ];
+    }
 
-    const pageNum = parseInt(page, 10) || 1;
-    const limitNum = parseInt(limit, 10) || 20;
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
 
-    const [total, users] = await Promise.all([
+    const [total, active, inactive, administrators, roles, users] = await Promise.all([
       prisma.user.count({ where }),
+      prisma.user.count({ where: { ...where, isActive: true } }),
+      prisma.user.count({ where: { ...where, isActive: false } }),
+      prisma.user.count({ where: { ...where, role: 'admin' } }),
+      prisma.role.findMany({
+        where: { OR: [{ isSystemRole: true }, { companyId: companyIdOf(req) }] },
+        select: { name: true },
+      }),
       prisma.user.findMany({
         where,
         include: { createdBy: { select: { id: true, name: true, email: true } } },
@@ -57,6 +61,7 @@ exports.getUsers = async (req, res, next) => {
       total,
       pages: Math.ceil(total / limitNum),
       currentPage: pageNum,
+      summary: { total, active, inactive, administrators, roles: roles.length },
       data: users.map(userToApi)
     });
   } catch (error) {
@@ -90,84 +95,52 @@ exports.getUser = async (req, res, next) => {
   }
 };
 
-// @desc    Create new user (Admin only with temp password)
+// @desc    Create a user through the secure invitation flow
 // @route   POST /api/users
 // @access  Private (admin)
 exports.createUser = async (req, res, next) => {
   try {
     const companyId = companyIdOf(req);
-    const { name, email, role, generateTemp } = req.body;
-
-    // Check if user already exists in this company
-    const existingUser = await prisma.user.findFirst({
-      where: { email: String(email).toLowerCase(), companyId },
-    });
-    if (existingUser) {
+    if (req.body.password) {
       return res.status(400).json({
         success: false,
-        message: 'User with this email already exists in your company'
+        code: 'PASSWORD_MUST_BE_SET_BY_INVITEE',
+        message: 'Passwords are set by the invited user through the secure email link. Do not send passwords through user management.',
       });
     }
-
-    // Generate temporary password or use provided one
-    const tempPassword = generateTemp ? generateTempPassword() : req.body.password || generateTempPassword();
-    const mustChangePassword = generateTemp || !req.body.password;
-
-    // Look up the Role by name - can be system role OR company custom role
-    const userRole = String(role || 'viewer').trim();
-    const roleDoc = await prisma.role.findFirst({
-      where: {
-        name: userRole,
-        OR: [{ isSystemRole: true }, { companyId }],
-      },
+    const branchId = req.body.branch || req.body.defaultWarehouse;
+    const branch = branchId ? await Warehouse.findOne({ _id: branchId, company: companyId }) : null;
+    if (branchId && !branch) return res.status(400).json({ success: false, message: 'Select a branch in this company' });
+    const result = await UserService.inviteUserToCompany(req.user.id, {
+      name: req.body.name,
+      email: req.body.email,
+      role: req.body.role,
+      departmentId: req.body.departmentId || req.body.department || null,
+      companyId,
     });
-
-    if (!roleDoc) {
-      return res.status(400).json({ success: false, code: 'INVALID_ROLE', message: 'Select a valid system or company role before creating the user' });
+    if (branchId) {
+      await prisma.user.update({ where: { id: result.user._id, companyId }, data: { branchId: toIdString(branchId) } });
+      result.user.branch = toIdString(branchId);
+      if (branch.rraBranchId) EBMBranchService.submitBranchUsers(companyId, branch.rraBranchId).catch((err) => console.error('[User] EBM branch user submission failed:', err.message));
     }
-    if (roleDoc.name === 'platform_admin' && req.user.role !== 'platform_admin') {
-      return res.status(403).json({ success: false, code: 'PLATFORM_ROLE_ASSIGNMENT_FORBIDDEN', message: 'Only a platform administrator can assign the platform administrator role' });
-    }
-
-    const branchId = req.body.branch || req.body.defaultWarehouse || null;
-
-    const user = await prisma.user.create({
-      data: {
-        id: generateObjectId(),
-        name,
-        email: String(email).toLowerCase(),
-        password: await passwordUtils.hash(tempPassword),
-        companyId,
-        role: userRole,
-        branchId: branchId ? toIdString(branchId) : null,
-        createdById: toIdString(req.user.id),
-        mustChangePassword,
-        tempPassword: mustChangePassword,
-        roles: { create: [{ roleId: roleDoc.id }] },
-      },
-      include: { roles: { include: { role: true } } },
-    });
-
-    if (user.branchId) {
-      // Warehouse / EBM integration is still Mongo-backed until its own migration phase
-      Warehouse.findOne({ _id: user.branchId, company: companyId }).then((branch) => {
-        if (branch?.rraBranchId) return EBMBranchService.submitBranchUsers(companyId, branch.rraBranchId);
-      }).catch((err) => console.error('[User] EBM branch user submission failed:', err.message));
-    }
-
     res.status(201).json({
       success: true,
-      data: userToApi(user),
-      tempPassword // Only returned once during creation
+      data: result.user,
+      isNewUser: result.isNewUser,
+      invitationEmailSent: result.invitationEmailSent,
+      message: result.message,
     });
-
-    // Notify new user created
-    try {
-      await notifyUserCreated(companyId, userToApi(user), req.user);
-    } catch (e) {
-      console.error('notifyUserCreated failed', e);
-    }
   } catch (error) {
+    if (error.code === 'P2002') return res.status(409).json({ success: false, message: 'An account with this email is already present in the workspace', code: 'USER_ALREADY_MEMBER' });
+    if (error.code === 'USER_ALREADY_MEMBER') return res.status(409).json({ success: false, message: 'User is already a member of this company', code: error.code });
+    if (['INVALID_ROLE', 'INVALID_DEPARTMENT', 'USER_BELONGS_TO_OTHER_COMPANY'].includes(error.code)) {
+      const messages = {
+        INVALID_ROLE: 'The selected role is not available in this company.',
+        INVALID_DEPARTMENT: 'The selected department is not active in this company.',
+        USER_BELONGS_TO_OTHER_COMPANY: 'This email already belongs to another company. Multi-company account invitations are not supported yet.',
+      };
+      return res.status(409).json({ success: false, code: error.code, message: messages[error.code] });
+    }
     next(error);
   }
 };
@@ -211,6 +184,18 @@ exports.updateUser = async (req, res, next) => {
       }
       data.role = roleDoc.name;
       data.roles = { deleteMany: {}, create: [{ roleId: roleDoc.id }] };
+    }
+
+    const departmentValue = req.body.departmentId !== undefined ? req.body.departmentId : req.body.department;
+    if (departmentValue) {
+      const department = await prisma.department.findFirst({
+        where: { id: toIdString(departmentValue), companyId, isActive: true },
+        select: { id: true },
+      });
+      if (!department) return res.status(400).json({ success: false, code: 'INVALID_DEPARTMENT', message: 'Select an active department in this company' });
+      data.departmentId = department.id;
+    } else if (departmentValue === null || departmentValue === '') {
+      data.departmentId = null;
     }
 
     const assignedBranch = req.body.branch || req.body.defaultWarehouse;
@@ -359,48 +344,20 @@ exports.resetPassword = async (req, res, next) => {
       });
     }
 
-    const { newPassword, temporary } = req.body;
-
-    if (newPassword) {
-      // Set permanent password
-      await prisma.user.update({
-        where: { id: user.id },
-        data: {
-          password: await passwordUtils.hash(newPassword),
-          mustChangePassword: false,
-          tempPassword: false,
-          passwordChangedAt: new Date(),
-        },
-      });
-
-      res.json({
-        success: true,
-        message: 'Password updated successfully'
-      });
-      try {
-        await notifyPasswordChanged(companyId, user.id);
-      } catch (e) {
-        console.error('notifyPasswordChanged failed', e);
-      }
-    } else {
-      // Generate temporary password (requires user to change on next login)
-      const tempPassword = generateTempPassword();
-      await prisma.user.update({
-        where: { id: user.id },
-        data: {
-          password: await passwordUtils.hash(tempPassword),
-          mustChangePassword: true,
-          tempPassword: true,
-          passwordChangedAt: null,
-        },
-      });
-
-      res.json({
-        success: true,
-        message: 'Password reset successfully',
-        tempPassword
+    if (req.body.newPassword) {
+      return res.status(400).json({
+        success: false,
+        code: 'PASSWORD_MUST_BE_SET_BY_USER',
+        message: 'Administrators cannot set or view a user password. Send a secure reset link instead.',
       });
     }
+
+    await UserService.requestPasswordReset(user.email);
+    return res.json({
+      success: true,
+      emailSent: true,
+      message: `Password reset link sent to ${user.email}`,
+    });
   } catch (error) {
     next(error);
   }
@@ -441,6 +398,24 @@ exports.toggleUserStatus = async (req, res, next) => {
       message: updated.isActive ? 'User activated successfully' : 'User deactivated successfully'
     });
   } catch (error) {
+    next(error);
+  }
+};
+
+exports.resendInvitation = async (req, res, next) => {
+  try {
+    const companyId = companyIdOf(req);
+    const result = await UserService.resendUserInvitation(req.user.id, companyId, req.params.id);
+    res.json({
+      success: true,
+      invitationEmailSent: result.invitationEmailSent,
+      message: result.invitationEmailSent
+        ? 'Password setup invitation sent'
+        : 'Email was not delivered; check notification and provider settings',
+    });
+  } catch (error) {
+    if (error.code === 'USER_NOT_FOUND') return res.status(404).json({ success: false, message: 'User not found' });
+    if (error.code === 'INVITATION_NOT_PENDING') return res.status(409).json({ success: false, message: 'This user has already completed password setup' });
     next(error);
   }
 };

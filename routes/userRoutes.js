@@ -10,7 +10,8 @@ const {
   resetPassword,
   toggleUserStatus,
   getProfile,
-  updateProfile
+  updateProfile,
+  resendInvitation,
 } = require('../controllers/userController');
 const { inviteUser } = require('../controllers/userAuthController');
 const { protect, authorize } = require('../middleware/auth');
@@ -42,6 +43,7 @@ router.route('/:id')
 
 // Admin-only special actions
 router.post('/:id/reset-password', logAction('user'), resetPassword);
+router.post('/:id/resend-invitation', logAction('user'), resendInvitation);
 router.put('/:id/toggle-status', logAction('user'), toggleUserStatus);
 
 router.get('/:id/action-logs', getUserActionLogs);

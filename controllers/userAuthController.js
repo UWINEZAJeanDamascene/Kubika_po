@@ -179,12 +179,14 @@ exports.refresh = async (req, res, next) => {
  */
 exports.inviteUser = async (req, res, next) => {
   try {
-    const { email, companyId, role, name } = req.body;
+    const { email, role, name, departmentId } = req.body;
+    const authenticatedCompany = req.company || req.user.company;
+    const companyId = authenticatedCompany?._id || authenticatedCompany?.id || req.user.companyId || authenticatedCompany;
 
     if (!email || !companyId) {
       return res.status(400).json({
         success: false,
-        message: 'Please provide email and companyId'
+        message: 'A valid email and authenticated company are required'
       });
     }
 
@@ -192,22 +194,35 @@ exports.inviteUser = async (req, res, next) => {
       email,
       companyId,
       role,
-      name
+      name,
+      departmentId,
     });
 
     res.status(201).json({
       success: true,
       data: result.user,
       isNewUser: result.isNewUser,
-      message: result.message
+      invitationEmailSent: result.invitationEmailSent,
+      message: result.message,
     });
   } catch (error) {
+    if (error.code === 'P2002') {
+      return res.status(409).json({ success: false, message: 'An account with this email is already present in the workspace', code: 'USER_ALREADY_MEMBER' });
+    }
     if (error.code === 'USER_ALREADY_MEMBER') {
       return res.status(409).json({
         success: false,
         message: 'User is already a member of this company',
         code: 'USER_ALREADY_MEMBER'
       });
+    }
+    if (['INVALID_ROLE', 'INVALID_DEPARTMENT', 'USER_BELONGS_TO_OTHER_COMPANY'].includes(error.code)) {
+      const messages = {
+        INVALID_ROLE: 'The selected role is not available in this company.',
+        INVALID_DEPARTMENT: 'The selected department is not active in this company.',
+        USER_BELONGS_TO_OTHER_COMPANY: 'This email already belongs to another company. Multi-company account invitations are not supported yet.',
+      };
+      return res.status(409).json({ success: false, code: error.code, message: messages[error.code] });
     }
     next(error);
   }
