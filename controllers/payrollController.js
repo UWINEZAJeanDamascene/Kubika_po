@@ -23,6 +23,27 @@ function round2(n) {
   return Math.round((n || 0) * 100) / 100;
 }
 
+function maskPersonalIdentifier(value) {
+  const normalized = String(value || "").replace(/\s+/g, "");
+  return normalized.length < 5 ? null : `${"•".repeat(Math.max(4, normalized.length - 4))}${normalized.slice(-4)}`;
+}
+
+async function findSelfServiceEmployee(companyId, email) {
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+  if (!companyId || !normalizedEmail) return null;
+  const matches = await dbClient().employee.findMany({
+    where: { companyId: String(companyId), email: { equals: normalizedEmail, mode: "insensitive" } },
+    take: 2,
+  });
+  if (matches.length > 1) {
+    const error = new Error("This login email is linked to multiple employee profiles. Ask payroll administration to resolve the duplicate.");
+    error.statusCode = 409;
+    error.code = "PAYROLL_EMPLOYEE_LINK_AMBIGUOUS";
+    throw error;
+  }
+  return matches[0] || null;
+}
+
 function payrollPeriodConflict(error) {
   if (["P2002", "23505", 11000].includes(error?.code)) {
     const conflict = new Error("A payroll record already exists for this employee and period.");
@@ -1741,6 +1762,114 @@ exports.finalisePayroll = async (req, res, next) => {
   }
 };
 
+// @desc    Get the signed-in employee's own payroll profile and finalized payslips
+// @route   GET /api/payroll/me
+// @access  Private, employee-owned data only
+exports.getMyPayroll = async (req, res, next) => {
+  try {
+    const companyId = String(req.user.company?._id || req.user.companyId || "");
+    const employee = await findSelfServiceEmployee(companyId, req.user.email);
+    if (!employee) {
+      return res.status(404).json({
+        success: false,
+        code: "PAYROLL_EMPLOYEE_LINK_NOT_FOUND",
+        message: "No employee profile is linked to this login email. Ask payroll administration to link your employee profile.",
+      });
+    }
+
+    const records = await dbClient().payroll.findMany({
+      where: {
+        companyId,
+        recordStatus: { in: ["finalised", "paid"] },
+        OR: [
+          { employeeRefId: employee.id },
+          { employee: { path: ["employeeId"], equals: employee.employeeId } },
+        ],
+      },
+      orderBy: [{ payPeriodEnd: "desc" }, { createdAt: "desc" }],
+      take: 120,
+    });
+
+    const currentSalary = employee.currentSalary && typeof employee.currentSalary === "object"
+      ? employee.currentSalary
+      : {};
+    const payslips = records.map((record) => ({
+      id: record.id,
+      period: record.period || {},
+      payPeriodStart: record.payPeriodStart,
+      payPeriodEnd: record.payPeriodEnd,
+      status: record.recordStatus,
+      payment: {
+        status: record.payment?.status || "pending",
+        paymentDate: record.payment?.paymentDate || null,
+        paymentMethod: record.payment?.paymentMethod || null,
+        reference: record.payment?.reference || null,
+      },
+      earnings: {
+        basicSalary: Number(record.salary?.basicSalary || 0),
+        transportAllowance: Number(record.salary?.transportAllowance || 0),
+        housingAllowance: Number(record.salary?.housingAllowance || 0),
+        otherAllowances: Number(record.salary?.otherAllowances || 0),
+        overtime: Number(record.salary?.overtime || 0),
+        bonuses: Number(record.salary?.bonuses || 0),
+        commissions: Number(record.salary?.commissions || 0),
+        benefitsInKind: Number(record.salary?.benefitsInKind || 0),
+        grossSalary: Number(record.salary?.grossSalary || 0),
+        taxableBase: Number(record.salary?.taxableBase ?? record.salary?.grossRemuneration ?? record.salary?.grossSalary ?? 0),
+      },
+      deductions: {
+        paye: Number(record.deductions?.paye || 0),
+        rssbEmployeePension: Number(record.deductions?.rssbEmployeePension || 0),
+        rssbEmployeeMaternity: Number(record.deductions?.rssbEmployeeMaternity || 0),
+        healthInsurance: Number(record.deductions?.healthInsurance || 0),
+        loanDeductions: Number(record.deductions?.loanDeductions || 0),
+        otherDeductions: Number(record.deductions?.otherDeductions || 0),
+        totalDeductions: Number(record.deductions?.totalDeductions || 0),
+      },
+      employerContributions: {
+        rssbEmployerPension: Number(record.contributions?.rssbEmployerPension || 0),
+        rssbEmployerMaternity: Number(record.contributions?.rssbEmployerMaternity || 0),
+        occupationalHazard: Number(record.contributions?.occupationalHazard || 0),
+      },
+      netPay: Number(record.netPay || 0),
+    }));
+
+    return res.json({
+      success: true,
+      data: {
+        employee: {
+          employeeId: employee.employeeId,
+          firstName: employee.firstName,
+          lastName: employee.lastName,
+          email: employee.email,
+          phone: employee.phone,
+          department: employee.department,
+          position: employee.position,
+          employmentType: employee.employmentType,
+          hireDate: employee.hireDate,
+          taxStatus: employee.taxStatus,
+          nationalIdMasked: maskPersonalIdentifier(employee.nationalId),
+          tinMasked: maskPersonalIdentifier(employee.tinNumber),
+          rssbRegistrationMasked: maskPersonalIdentifier(employee.rssbRegistrationNumber),
+          bankName: employee.bankName,
+          bankAccountMasked: maskPersonalIdentifier(employee.bankAccount),
+          currentPay: {
+            currency: currentSalary.currency || "RWF",
+            basicSalary: Number(currentSalary.basicSalary || 0),
+            transportAllowance: Number(currentSalary.transportAllowance || 0),
+            housingAllowance: Number(currentSalary.housingAllowance || 0),
+            otherAllowances: Number(currentSalary.otherAllowances || 0),
+          },
+        },
+        payslips,
+        count: payslips.length,
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 // @desc    Get payslip for payroll record
 // @route   GET /api/payroll/:id/payslip
 // @access  Private
@@ -1762,12 +1891,12 @@ exports.getPayslip = async (req, res, next) => {
     const roles = await resolveUserRoles(req.user);
     const canReadAllPayroll = roles.some((role) => PermissionService.check(role, "payroll", "read"));
     if (!canReadAllPayroll) {
-      const employee = payroll.employee_id
-        ? await Employee.findOne({ _id: payroll.employee_id, company: companyId })
-        : await Employee.findOne({ employeeId: payroll.employee?.employeeId, company: companyId });
-      const callerEmail = String(req.user.email || "").trim().toLowerCase();
-      const employeeEmail = String(employee?.email || "").trim().toLowerCase();
-      if (!callerEmail || !employeeEmail || callerEmail !== employeeEmail) {
+      const employee = await findSelfServiceEmployee(String(companyId), req.user.email);
+      const ownsRecord = employee && (
+        String(payroll.employee_id || "") === String(employee.id)
+        || String(payroll.employee?.employeeId || "") === String(employee.employeeId)
+      );
+      if (!ownsRecord || !["finalised", "paid"].includes(payroll.record_status)) {
         return res.status(404).json({ success: false, message: "Payslip not found" });
       }
     }

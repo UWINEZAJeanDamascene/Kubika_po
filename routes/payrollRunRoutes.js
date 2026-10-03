@@ -18,6 +18,7 @@ const {
   exportStatutoryFiling,
   submitStatutoryFiling,
   getComplianceDeadlines,
+  getOperationalExceptions,
 } = require("../controllers/payrollRunController");
 const { protect } = require("../middleware/auth");
 const { requirePayrollPermission } = require("../middleware/payrollPermission");
@@ -37,6 +38,7 @@ router.route("/preview").get(requirePayrollPermission("read"), previewPayrollRun
 // (MUST be before /:id so it is not treated as an id param)
 router.route("/available-periods").get(requirePayrollPermission("read"), getAvailablePeriods);
 router.route("/compliance/deadlines").get(requirePayrollPermission("read"), getComplianceDeadlines);
+router.route("/operations/exceptions").get(requirePayrollPermission("read"), getOperationalExceptions);
 
 // Create payroll run from finalised employee records (MUST be before /:id)
 router

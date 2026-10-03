@@ -374,6 +374,13 @@ const getComplianceDeadlines = async (req, res, next) => {
   } catch (error) { next(error); }
 };
 
+const getOperationalExceptions = async (req, res, next) => {
+  try {
+    const data = await PayrollRunService.getOperationalExceptions(req.user.company._id, req.query);
+    res.status(200).json({ success: true, ...data });
+  } catch (error) { next(error); }
+};
+
 module.exports = {
   getPayrollRuns,
   getPayrollRunById,
@@ -392,4 +399,5 @@ module.exports = {
   exportStatutoryFiling,
   submitStatutoryFiling,
   getComplianceDeadlines,
+  getOperationalExceptions,
 };

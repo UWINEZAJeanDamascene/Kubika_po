@@ -1996,6 +1996,110 @@ static async getAvailablePeriods(companyId) {
       .sort((a, b) => String(a.due_date).localeCompare(String(b.due_date)));
   }
 
+  static async getOperationalExceptions(companyId, filters = {}) {
+    const [runs, records] = await Promise.all([
+      PayrollRun.find({ company: companyId })
+        .sort({ pay_period_end: -1 })
+        .limit(500),
+      Payroll.find({ company: companyId, record_status: { $in: ["finalised", "paid"] } })
+        .sort({ pay_period_end: -1, createdAt: -1 })
+        .limit(1500),
+    ]);
+    const exceptions = [];
+    const today = new Date().toISOString().slice(0, 10);
+    const dateOnly = (value) => {
+      if (!value) return null;
+      const date = new Date(value);
+      return Number.isNaN(date.getTime()) ? null : date.toISOString().slice(0, 10);
+    };
+    const add = (item) => exceptions.push({
+      id: `${item.type}:${item.run_id || item.payroll_id || item.reference_no || exceptions.length}`,
+      status: "open",
+      ...item,
+    });
+
+    for (const run of runs) {
+      const runId = String(run._id);
+      const reference = run.reference_no || runId;
+      const runLines = Array.isArray(run.lines) ? run.lines : [];
+      const lineGross = money(runLines.reduce((sum, line) => sum + Number(line.gross_salary || 0), 0));
+      const lineNet = money(runLines.reduce((sum, line) => sum + Number(line.net_pay || 0), 0));
+      if (run.status === "posted" && !run.journal_entry_id) {
+        add({ type: "run_journal_missing", severity: "critical", title: "Posted payroll has no linked journal", description: `${reference} is posted but has no payroll journal reference.`, run_id: runId, reference_no: reference, amount: money(run.total_gross) });
+      }
+      if (run.status === "posted" && (!nearMoney(run.total_gross, lineGross) || !nearMoney(run.total_net, lineNet))) {
+        add({ type: "run_total_mismatch", severity: "critical", title: "Payroll run totals do not match its employee lines", description: `${reference} header totals differ from the sum of its payroll lines.`, run_id: runId, reference_no: reference, amount: money(run.total_net) });
+      }
+      for (const warning of (Array.isArray(run.warnings) ? run.warnings : [])) {
+        add({ type: "run_warning", severity: "warning", title: "Payroll run needs review", description: String(warning), run_id: runId, reference_no: reference, amount: null });
+      }
+      const paymentDate = dateOnly(run.payment_date);
+      if (run.status === "draft" && paymentDate && paymentDate < today) {
+        add({ type: "draft_run_past_payment_date", severity: "critical", title: "Draft payroll is past its payment date", description: `${reference} has not been posted and its payment date has passed.`, run_id: runId, reference_no: reference, due_date: paymentDate, amount: money(run.total_net) });
+      }
+      if (run.status === "posted" && run.bank_transfer?.status !== "confirmed" && paymentDate && paymentDate < today) {
+        add({ type: "salary_payment_unconfirmed", severity: "critical", title: "Salary payment is past due and unconfirmed", description: `${reference} has no recorded bank payment confirmation.`, run_id: runId, reference_no: reference, due_date: paymentDate, amount: money(run.total_net) });
+      }
+    }
+
+    const payrollIds = records.map((record) => String(record._id));
+    const salaryEntries = payrollIds.length ? await JournalEntry.find({
+      company: companyId,
+      sourceType: "payroll_salary",
+      sourceId: { $in: payrollIds },
+      status: "posted",
+    }) : [];
+    const accruedPayrollIds = new Set(salaryEntries.map((entry) => String(entry.sourceId)));
+    for (const record of records) {
+      const id = String(record._id);
+      const name = `${record.employee?.firstName || ""} ${record.employee?.lastName || ""}`.trim() || record.employee?.employeeId || id;
+      if (!record.employee_id) {
+        add({ type: "employee_master_link_missing", severity: "warning", title: "Payroll record is not linked to an employee profile", description: `${name} (${record.period?.monthName || record.period?.month || ""} ${record.period?.year || ""}) has no employee master link.`, payroll_id: id, employee_name: name, amount: money(record.salary?.grossSalary) });
+      }
+      if (money(record.salary?.grossSalary) > 0 && !accruedPayrollIds.has(id)) {
+        add({ type: "employee_accrual_missing", severity: "critical", title: "Finalized payroll is missing its posted accrual", description: `${name} has no posted payroll salary accrual journal.`, payroll_id: id, employee_name: name, run_id: record.payroll_run_id ? String(record.payroll_run_id) : null, amount: money(record.salary?.grossSalary) });
+      }
+    }
+
+    const overdue = await this.getComplianceDeadlines(companyId, { status: "overdue" });
+    for (const item of overdue) {
+      add({
+        type: `${item.type}_${item.stage}_overdue`,
+        severity: "critical",
+        title: `${item.type.toUpperCase()} ${item.stage} is overdue`,
+        description: `${item.reference_no} ${item.type.toUpperCase()} ${item.stage} deadline passed without a recorded completion.`,
+        run_id: item.run_id,
+        reference_no: item.reference_no,
+        due_date: item.due_date,
+        amount: money(item.amount),
+      });
+    }
+
+    const filtered = exceptions.filter((item) =>
+      (!filters.severity || item.severity === String(filters.severity))
+      && (!filters.type || item.type === String(filters.type))
+      && (!filters.from || !item.due_date || item.due_date >= String(filters.from))
+      && (!filters.to || !item.due_date || item.due_date <= String(filters.to))
+    ).sort((a, b) => {
+      const rank = { critical: 0, warning: 1, info: 2 };
+      return (rank[a.severity] ?? 3) - (rank[b.severity] ?? 3)
+        || String(a.due_date || "9999-12-31").localeCompare(String(b.due_date || "9999-12-31"));
+    });
+    const requestedLimit = Number.parseInt(filters.limit, 10);
+    const limit = Number.isFinite(requestedLimit) ? Math.min(500, Math.max(1, requestedLimit)) : 200;
+    const items = filtered.slice(0, limit);
+    return {
+      generated_at: new Date().toISOString(),
+      total: filtered.length,
+      summary: {
+        critical: filtered.filter((item) => item.severity === "critical").length,
+        warning: filtered.filter((item) => item.severity === "warning").length,
+        overdue: filtered.filter((item) => item.type.endsWith("_overdue") || item.type === "salary_payment_unconfirmed").length,
+      },
+      items,
+    };
+  }
+
   // ── GENERATE BANK TRANSFER DATA ─────────────────────────────────────────
   static async generateBankTransferData(companyId, runId) {
     const payrollRun = await PayrollRun.findOne({

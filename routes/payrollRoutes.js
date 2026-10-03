@@ -13,6 +13,7 @@ const {
   generatePayroll,
   finalisePayroll,
   getPayslip,
+  getMyPayroll,
   backfillPayrollJournals,
   getPayrollPeriodInputs,
   savePayrollPeriodInput,
@@ -24,6 +25,9 @@ const { protect } = require("../middleware/auth");
 const { requirePayrollPermission } = require("../middleware/payrollPermission");
 
 router.use(protect);
+
+// Employee self-service is tied to the authenticated email and tenant, not payroll-wide access.
+router.route("/me").get(getMyPayroll);
 
 // Calculate payroll (preview)
 router.route("/calculate").post(requirePayrollPermission("read"), calculatePayroll);
