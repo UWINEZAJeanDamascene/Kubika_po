@@ -1,7 +1,8 @@
 const express = require('express');
 const router = express.Router();
-const { protect, authorize } = require('../middleware/auth');
+const { protect } = require('../middleware/auth');
 const logAction = require('../middleware/logAction');
+const { requirePosPermissions } = require('../middleware/posAuthorization');
 const { cacheMiddleware, cacheInvalidationMiddleware } = require('../middleware/cacheMiddleware');
 
 const cachePosReads = cacheMiddleware({
@@ -26,12 +27,19 @@ const {
 router.use(protect);
 router.use(invalidatePosReads);
 
-router.post('/sale', logAction('pos_sale'), createSale);
-router.post('/sale/:id/pay', logAction('pos_payment'), addPayment);
-router.get('/sale/:id/receipt', cachePosReads, getReceipt);
+const canCreateSale = requirePosPermissions({ resource: 'sales_invoices', action: 'create' });
+const canReadSale = requirePosPermissions({ resource: 'sales_invoices', action: 'read' });
+const canRecordPayment = requirePosPermissions(
+  { resource: 'sales_invoices', action: 'update' },
+  { resource: 'ar_receipts', action: 'create' },
+);
 
-router.post('/drawer/open', logAction('drawer_open'), openDrawer);
-router.post('/drawer/close', logAction('drawer_close'), closeDrawer);
-router.get('/drawer/:drawerId', cachePosReads, getDrawer);
+router.post('/sale', canCreateSale, logAction('pos_sale'), createSale);
+router.post('/sale/:id/pay', canRecordPayment, logAction('pos_payment'), addPayment);
+router.get('/sale/:id/receipt', canReadSale, cachePosReads, getReceipt);
+
+router.post('/drawer/open', canCreateSale, logAction('drawer_open'), openDrawer);
+router.post('/drawer/close', canCreateSale, logAction('drawer_close'), closeDrawer);
+router.get('/drawer/:drawerId', canReadSale, cachePosReads, getDrawer);
 
 module.exports = router;

@@ -6,6 +6,7 @@ const Warehouse = require('../models/Warehouse');
 const Company = require('../models/Company');
 const { BankAccount } = require('../models/BankAccount');
 const TillSession = require('../models/TillSession');
+const StockLevel = require('../models/StockLevel');
 
 function escapeRegex(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -17,6 +18,9 @@ function isObjectIdString(value) {
 const { runInTransaction } = require('../services/transactionService');
 const inventoryService = require('../services/inventoryService');
 const JournalService = require('../services/journalService');
+const CurrencyService = require('../services/CurrencyService');
+const { PermissionService, resolveUserRoles } = require('../middleware/authorize');
+const cacheService = require('../services/cacheService');
 const emailService = require('../services/emailService');
 const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
 
@@ -54,6 +58,7 @@ const sendDirectSaleEmail = async (invoice, companyId) => {
 exports.createDirectSale = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
+    const invoiceCurrency = await CurrencyService.getCompanyBase(companyId);
     const {
       clientId,
       clientInfo, // For walk-in customers: { name, contact, address }
@@ -70,10 +75,17 @@ exports.createDirectSale = async (req, res, next) => {
     } = req.body;
 
     // Validation
-    if (!items || items.length === 0) {
+    if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({
         success: false,
         message: 'No items provided for sale'
+      });
+    }
+    if (items.some((item) => !item || !isObjectIdString(item.productId))) {
+      return res.status(400).json({
+        success: false,
+        code: 'ERR_INVALID_SALE_LINE',
+        message: 'Every sale line must include a valid product ID',
       });
     }
 
@@ -107,23 +119,17 @@ exports.createDirectSale = async (req, res, next) => {
       client = await Client.findOne({ _id: clientId, company: companyId });
     }
 
-    // Create walk-in client if not found
-    if (!client) {
-      const walkInName = clientInfo?.name || 'Walk-in Customer';
-      const walkInCode = 'WALKIN-' + Date.now().toString().slice(-6);
-      
-      client = await Client.create({
-        company: companyId,
-        name: walkInName,
-        code: walkInCode,
-        type: 'individual',
-        contact: clientInfo?.contact || {},
-        address: clientInfo?.address || {}
-      });
-    }
+    // Defer creating a walk-in customer until the sale transaction begins so
+    // a failed accounting post cannot leave an orphan customer record.
+    const walkInCustomer = {
+      name: clientInfo?.name || 'Walk-in Customer',
+      code: 'WALKIN-' + Date.now().toString().slice(-6),
+      contact: clientInfo?.contact || {},
+      address: clientInfo?.address || {},
+    };
 
      // Batch-load all products in a single query with select projection
-    const productIds = items.map((it) => it.productId);
+    const productIds = [...new Set(items.map((it) => String(it.productId)))];
     const productsMap = new Map();
     try {
       const productsBatch = await Product.find({
@@ -141,21 +147,69 @@ exports.createDirectSale = async (req, res, next) => {
     const invoiceLines = [];
     const stockUpdates = [];
     const missingProducts = [];
+    const selectedWarehouseLevels = await StockLevel.find({
+      company_id: companyId,
+      warehouse_id: warehouseId,
+      product_id: { $in: productIds },
+    }).lean();
+    const stockLevelByProduct = new Map(
+      selectedWarehouseLevels.map((level) => [String(level.product_id), level]),
+    );
+    let salePricingOverridePermission;
+    const canOverrideSalePricing = () => {
+      if (!salePricingOverridePermission) {
+        salePricingOverridePermission = resolveUserRoles(req.user).then((roles) =>
+          roles.some((role) => PermissionService.check(role, 'sales_invoices', 'update')),
+        );
+      }
+      return salePricingOverridePermission;
+    };
 
     for (const item of items) {
-      const product = productsMap.get(item.productId);
+      const product = productsMap.get(String(item.productId));
       if (!product) {
         missingProducts.push(item.productId);
         continue;
       }
 
-      const quantity = Number(item.quantity) || 1;
-      const unitPrice = Number(item.unitPrice) || product.sellingPrice || 0;
-      const discountPct = Number(item.discountPct) || 0;
+      const quantity = Number(item.quantity);
+      const productPrice = Number(product.sellingPrice);
+      const requestedUnitPrice = item.unitPrice == null ? productPrice : Number(item.unitPrice);
+      const discountPct = item.discountPct == null ? 0 : Number(item.discountPct);
+      if (!Number.isFinite(quantity) || quantity <= 0 || quantity > Number.MAX_SAFE_INTEGER
+        || !Number.isFinite(productPrice) || productPrice < 0 || productPrice > Number.MAX_SAFE_INTEGER) {
+        return res.status(400).json({
+          success: false,
+          code: 'ERR_INVALID_SALE_LINE',
+          message: `Quantity or catalog price is invalid for ${product.name}`,
+        });
+      }
+      if (!Number.isFinite(requestedUnitPrice) || requestedUnitPrice < 0 || !Number.isFinite(discountPct) || discountPct < 0 || discountPct > 100) {
+        return res.status(400).json({
+          success: false,
+          code: 'ERR_INVALID_SALE_LINE',
+          message: `Price or discount is invalid for ${product.name}`,
+        });
+      }
 
+      const unitPrice = requestedUnitPrice;
+      const hasPriceOverride = Math.abs(unitPrice - productPrice) > 0.000001;
+      if (hasPriceOverride || discountPct > 0) {
+        if (!(await canOverrideSalePricing())) {
+          return res.status(403).json({
+            success: false,
+            code: 'ERR_SALE_PRICE_OVERRIDE_FORBIDDEN',
+            message: 'Your role cannot override catalog prices or apply discounts',
+          });
+        }
+      }
+      
       const isStockable = product.isStockable !== false;
       if (isStockable) {
-        const availableStock = Number(product.currentStock) || 0;
+        const stockLevel = stockLevelByProduct.get(String(product._id));
+        const availableStock = stockLevel
+          ? Math.max(0, Number(stockLevel.qty_on_hand || 0) - Number(stockLevel.qty_reserved || 0))
+          : 0;
         if (availableStock < quantity) {
           return res.status(409).json({
             success: false,
@@ -168,10 +222,25 @@ exports.createDirectSale = async (req, res, next) => {
       const subtotal = quantity * unitPrice;
       const discountAmount = subtotal * (discountPct / 100);
       const netAmount = subtotal - discountAmount;
-      const taxRate = Number(item.taxRate) || Number(product.taxRate) || 0;
-      const taxCode = item.taxCode || product.taxCode || (taxRate > 0 ? 'B' : 'A');
+      const taxRate = product.taxRate == null ? 0 : Number(product.taxRate);
+      if (!Number.isFinite(taxRate) || taxRate < 0 || taxRate > 100) {
+        return res.status(422).json({
+          success: false,
+          code: 'ERR_INVALID_PRODUCT_TAX',
+          message: `The configured tax rate for ${product.name} is invalid`,
+        });
+      }
+      const taxCode = product.taxCode || (taxRate > 0 ? 'B' : 'A');
       const taxAmount = netAmount * (taxRate / 100);
       const lineTotal = netAmount + taxAmount;
+      if (![subtotal, discountAmount, netAmount, taxAmount, lineTotal].every(Number.isFinite)
+        || lineTotal > Number.MAX_SAFE_INTEGER) {
+        return res.status(400).json({
+          success: false,
+          code: 'ERR_INVALID_SALE_LINE',
+          message: `Sale line total is outside the supported range for ${product.name}`,
+        });
+      }
 
       invoiceLines.push({
         product: product._id,
@@ -218,7 +287,31 @@ exports.createDirectSale = async (req, res, next) => {
     const grandTotal = invoiceLines.reduce((sum, line) => sum + line.lineTotal, 0);
 
     // Determine payment status
-    const paidAmount = Number(paymentAmount) || 0;
+    const amountTendered = paymentAmount == null || paymentAmount === '' ? 0 : Number(paymentAmount);
+    const supportedPaymentMethods = ['cash', 'card', 'bank_transfer', 'mobile_money', 'cheque'];
+    if (!Number.isFinite(amountTendered) || amountTendered < 0 || amountTendered > Number.MAX_SAFE_INTEGER) {
+      return res.status(400).json({
+        success: false,
+        code: 'ERR_INVALID_PAYMENT_AMOUNT',
+        message: 'Payment amount must be a valid non-negative number',
+      });
+    }
+    if (amountTendered > 0 && !supportedPaymentMethods.includes(paymentMethod)) {
+      return res.status(400).json({
+        success: false,
+        code: 'ERR_INVALID_PAYMENT_METHOD',
+        message: 'Select a supported payment method for the received amount',
+      });
+    }
+    if (amountTendered > grandTotal && paymentMethod !== 'cash') {
+      return res.status(400).json({
+        success: false,
+        code: 'ERR_PAYMENT_EXCEEDS_TOTAL',
+        message: 'Only cash payments can include an amount above the sale total',
+      });
+    }
+    const paidAmount = Math.min(amountTendered, grandTotal);
+    const changeDue = Math.max(0, amountTendered - paidAmount);
     let paymentStatus = 'draft';
     let amountPaid = 0;
     let amountOutstanding = grandTotal;
@@ -236,8 +329,17 @@ exports.createDirectSale = async (req, res, next) => {
     // Execute in transaction
     let invoice;
     let totalCOGS = 0;
+    const financialAccountCodes = new Set();
 
     await runInTransaction(async (session) => {
+      if (!client) {
+        client = await Client.create({
+          company: companyId,
+          ...walkInCustomer,
+          type: 'individual',
+        });
+      }
+
       // 1. Create the invoice
       invoice = await Invoice.create([{
         company: companyId,
@@ -247,7 +349,7 @@ exports.createDirectSale = async (req, res, next) => {
         customerAddress: client.contact?.address || client.address,
         lines: invoiceLines,
         status: paymentStatus, // Already confirmed/paid status
-        currencyCode: 'USD',
+        currencyCode: invoiceCurrency,
         subtotal: subtotal,
         taxAmount: totalTax,
         totalAmount: grandTotal,
@@ -271,7 +373,28 @@ exports.createDirectSale = async (req, res, next) => {
       const productUpdates = [];
 
       for (const stockUpdate of stockUpdates) {
-        const { product, quantity, warehouse } = stockUpdate;
+        const { product, quantity, warehouseId: selectedWarehouseId } = stockUpdate;
+        const stockLevel = stockLevelByProduct.get(String(product._id));
+        const reserved = Number(stockLevel?.qty_reserved || 0);
+        const stockLevelUpdate = await StockLevel.updateMany(
+          {
+            company_id: companyId,
+            product_id: product._id,
+            warehouse_id: selectedWarehouseId,
+            qty_reserved: reserved,
+            qty_on_hand: { $gte: quantity + reserved },
+          },
+          {
+            $inc: { qty_on_hand: -quantity },
+            $set: { last_movement_at: new Date(), last_movement_type: 'dispatch' },
+          },
+        );
+        if (!stockLevelUpdate.matchedCount) {
+          const error = new Error(`Insufficient stock at the selected warehouse for ${product.name}`);
+          error.code = 'WAREHOUSE_STOCK_CHANGED';
+          error.productName = product.name;
+          throw error;
+        }
         const trackingType = product.trackingType || 'none';
         let unitCost = 0;
         let cogsAmount = 0;
@@ -282,7 +405,7 @@ exports.createDirectSale = async (req, res, next) => {
               companyId,
               product._id,
               quantity,
-              { method: 'fifo', warehouse, session }
+              { method: 'fifo', warehouse: selectedWarehouseId, session }
             );
 
             if (consumeResult.allocations && consumeResult.allocations.length > 0) {
@@ -319,7 +442,7 @@ exports.createDirectSale = async (req, res, next) => {
         stockMovementCreates.push({
           company: companyId,
           product: product._id,
-          warehouse,
+          warehouse: selectedWarehouseId,
           type: 'out',
           reason: 'sale',
           quantity,
@@ -345,151 +468,147 @@ exports.createDirectSale = async (req, res, next) => {
         await StockMovement.insertMany(stockMovementCreates, { session });
       }
 
-      // 3. Post Journal Entries
-      try {
-        // Get account mappings
-        const arAccount = await JournalService.getMappedAccountCode(
-          companyId, 'sales', 'accountsReceivable', 
-          DEFAULT_ACCOUNTS.accountsReceivable
-        );
-        const salesAccount = await JournalService.getMappedAccountCode(
-          companyId, 'sales', 'salesRevenue', 
-          DEFAULT_ACCOUNTS.salesRevenue
-        );
-        const vatAccount = await JournalService.getMappedAccountCode(
-          companyId, 'tax', 'vatOutput',
-          DEFAULT_ACCOUNTS.vatOutput
-        );
-        const cogsAccount = await JournalService.getMappedAccountCode(
-          companyId, 'inventory', 'costOfGoodsSold', 
-          DEFAULT_ACCOUNTS.costOfGoodsSold
-        );
-        const inventoryAccount = await JournalService.getMappedAccountCode(
-          companyId, 'purchases', 'inventory', 
-          DEFAULT_ACCOUNTS.inventory
-        );
+      // 3. Post balanced revenue and COGS entries in the same transaction as
+      // the invoice and inventory changes. Any posting error must roll back it all.
+      const arAccount = await JournalService.getMappedAccountCode(
+        companyId, 'sales', 'accountsReceivable', DEFAULT_ACCOUNTS.accountsReceivable,
+      );
+      const salesAccount = await JournalService.getMappedAccountCode(
+        companyId, 'sales', 'salesRevenue', DEFAULT_ACCOUNTS.salesRevenue,
+      );
+      const vatAccount = await JournalService.getMappedAccountCode(
+        companyId, 'tax', 'vatOutput', DEFAULT_ACCOUNTS.vatOutput,
+      );
+      const cogsAccount = await JournalService.getMappedAccountCode(
+        companyId, 'inventory', 'costOfGoodsSold', DEFAULT_ACCOUNTS.costOfGoodsSold,
+      );
+      const inventoryAccount = await JournalService.getMappedAccountCode(
+        companyId, 'purchases', 'inventory', DEFAULT_ACCOUNTS.inventory,
+      );
 
-        // Build Revenue journal lines
-        const revenueLines = [];
-        
-        // Determine which account to debit - cash, bank, or AR
-        let debitAccount;
-        const bankPaymentMethods = ['bank_transfer', 'cheque', 'mobile_money'];
-        
-         if (amountPaid >= grandTotal) {
-           if (bankPaymentMethods.includes(paymentMethod) && bankAccountId) {
-             const bankAccount = await BankAccount.findOne({
-               _id: bankAccountId,
-               company: companyId,
-               isActive: true,
-             })
-               .select('_id ledgerAccountId name')
-               .lean();
-             if (bankAccount && bankAccount.ledgerAccountId) {
-               debitAccount = bankAccount.ledgerAccountId;
-             } else {
-               debitAccount = await JournalService.getMappedAccountCode(
-                 companyId, 'cash', 'cashAtBank',
-                 DEFAULT_ACCOUNTS.cashAtBank || '1100'
-               );
-             }
-           } else if (paymentMethod === 'cash' || paymentMethod === 'card') {
-            debitAccount = await JournalService.getMappedAccountCode(
-              companyId, 'cash', 'cashOnHand',
-              DEFAULT_ACCOUNTS.cashOnHand || '1000'
-            );
-          } else if (paymentMethod === 'mobile_money') {
-            debitAccount = await JournalService.getMappedAccountCode(
-              companyId, 'cash', 'mtnMoMo',
-              DEFAULT_ACCOUNTS.mtnMoMo || '1200'
-            );
-          } else {
-            debitAccount = await JournalService.getMappedAccountCode(
-              companyId, 'cash', 'cashAtBank',
-              DEFAULT_ACCOUNTS.cashAtBank || '1100'
-            );
-          }
-          revenueLines.push(
-            JournalService.createDebitLine(debitAccount, grandTotal, 
-              `Cash sale - Invoice ${invoice.referenceNo}`)
+      const bankPaymentMethods = ['bank_transfer', 'cheque', 'mobile_money'];
+      let paymentBankAccount = null;
+      if (paidAmount > 0 && bankPaymentMethods.includes(paymentMethod)) {
+        if (!bankAccountId) {
+          const error = new Error('Select the bank or mobile money account used for this payment');
+          error.code = 'POS_PAYMENT_ACCOUNT_REQUIRED';
+          throw error;
+        }
+        paymentBankAccount = await BankAccount.findOne({
+          _id: bankAccountId,
+          company: companyId,
+          isActive: true,
+        }).select('_id ledgerAccountId name').lean();
+        if (!paymentBankAccount) {
+          const error = new Error('The selected payment account is unavailable');
+          error.code = 'POS_PAYMENT_ACCOUNT_INVALID';
+          throw error;
+        }
+      }
+
+      const revenueLines = [];
+      if (paidAmount > 0) {
+        let settlementAccount;
+        if (paymentBankAccount) {
+          settlementAccount = paymentBankAccount.ledgerAccountId;
+        } else if (paymentMethod === 'mobile_money') {
+          settlementAccount = await JournalService.getMappedAccountCode(
+            companyId, 'cash', 'mtnMoMo', DEFAULT_ACCOUNTS.mtnMoMo || '1200',
+          );
+        } else if (paymentMethod === 'cash' || paymentMethod === 'card') {
+          settlementAccount = await JournalService.getMappedAccountCode(
+            companyId, 'cash', 'cashOnHand', DEFAULT_ACCOUNTS.cashOnHand || '1000',
           );
         } else {
-          revenueLines.push(
-            JournalService.createDebitLine(arAccount, grandTotal, 
-              `Receivable from ${client.name} - Invoice ${invoice.referenceNo}`)
+          settlementAccount = await JournalService.getMappedAccountCode(
+            companyId, 'cash', 'cashAtBank', DEFAULT_ACCOUNTS.cashAtBank || '1100',
           );
         }
+        if (!settlementAccount) throw new Error('No ledger account is configured for this payment method');
+        revenueLines.push(JournalService.createDebitLine(
+          settlementAccount, paidAmount, `POS payment - Invoice ${invoice.referenceNo}`,
+        ));
+      }
+      if (amountOutstanding > 0) {
+        revenueLines.push(JournalService.createDebitLine(
+          arAccount, amountOutstanding, `Receivable from ${client.name} - Invoice ${invoice.referenceNo}`,
+        ));
+      }
+      if (netSales > 0) {
+        revenueLines.push(JournalService.createCreditLine(
+          salesAccount, netSales, `Sales revenue - Invoice ${invoice.referenceNo}`,
+        ));
+      }
+      if (totalTax > 0) {
+        revenueLines.push(JournalService.createCreditLine(
+          vatAccount, totalTax, `VAT on sales - Invoice ${invoice.referenceNo}`,
+        ));
+      }
+      if (revenueLines.length < 2) {
+        const error = new Error('The sale cannot be posted because it has no positive amount to account for');
+        error.code = 'POS_ZERO_VALUE_SALE';
+        throw error;
+      }
 
-        // Cr Sales Revenue (net of discount)
-        if (netSales > 0) {
-          revenueLines.push(
-            JournalService.createCreditLine(salesAccount, netSales, 
-              `Sales revenue - Invoice ${invoice.referenceNo}`)
-          );
-        }
+      const cogsLines = [];
+      if (totalCOGS > 0) {
+        cogsLines.push(JournalService.createDebitLine(
+          cogsAccount, totalCOGS, `COGS for Invoice ${invoice.referenceNo}`,
+        ));
+        cogsLines.push(JournalService.createCreditLine(
+          inventoryAccount, totalCOGS, `Inventory reduction for Invoice ${invoice.referenceNo}`,
+        ));
+      }
 
-        // Cr VAT Payable
-        if (totalTax > 0) {
-          revenueLines.push(
-            JournalService.createCreditLine(vatAccount, totalTax, 
-              `VAT on sales - Invoice ${invoice.referenceNo}`)
-          );
-        }
-
-        // Build COGS journal lines
-        const cogsLines = [];
-        if (totalCOGS > 0) {
-          cogsLines.push(
-            JournalService.createDebitLine(cogsAccount, totalCOGS, 
-              `COGS for Invoice ${invoice.referenceNo}`)
-          );
-          cogsLines.push(
-            JournalService.createCreditLine(inventoryAccount, totalCOGS, 
-              `Inventory reduction for Invoice ${invoice.referenceNo}`)
-          );
-        }
-
-        // Create journal entries
-        const journalEntries = [];
-        
+      const journalEntries = [{
+        date: invoice.invoiceDate,
+        description: `Direct sale - Invoice ${invoice.referenceNo}`,
+        sourceType: 'invoice',
+        sourceId: invoice._id,
+        sourceReference: invoice.referenceNo,
+        lines: revenueLines,
+        isAutoGenerated: true,
+        sourceData: {
+          bankAccountId: paymentBankAccount?._id || null,
+          paymentReference: paymentReference || null,
+          paymentMethod: paymentMethod || null,
+        },
+      }];
+      if (cogsLines.length > 0) {
         journalEntries.push({
           date: invoice.invoiceDate,
-          description: `Direct sale - Invoice ${invoice.referenceNo}`,
-          sourceType: 'invoice',
+          description: `COGS for Invoice ${invoice.referenceNo}`,
+          sourceType: 'invoice_cogs',
           sourceId: invoice._id,
           sourceReference: invoice.referenceNo,
-          lines: revenueLines,
-          isAutoGenerated: true
+          lines: cogsLines,
+          isAutoGenerated: true,
         });
-
-        if (cogsLines.length > 0) {
-          journalEntries.push({
-            date: invoice.invoiceDate,
-            description: `COGS for Invoice ${invoice.referenceNo}`,
-            sourceType: 'invoice_cogs',
-            sourceId: invoice._id,
-            sourceReference: invoice.referenceNo,
-            lines: cogsLines,
-            isAutoGenerated: true
-          });
-        }
-
-        const createdEntries = await JournalService.createEntriesAtomic(
-          companyId, req.user.id, journalEntries, { session }
-        );
-
-        if (Array.isArray(createdEntries) && createdEntries.length > 0) {
-          invoice.revenueJournalEntry = createdEntries[0]._id;
-          if (createdEntries[1]) {
-            invoice.cogsJournalEntry = createdEntries[1]._id;
-          }
-          await invoice.save({ session });
-        }
-
-      } catch (je) {
-        console.error('Journal posting failed in direct sale:', je);
-        // Non-fatal - invoice still created
       }
+      for (const line of journalEntries.flatMap((entry) => entry.lines)) {
+        financialAccountCodes.add(line.accountCode);
+      }
+
+      let createdEntries;
+      try {
+        createdEntries = await JournalService.createEntriesAtomic(
+          companyId, req.user.id, journalEntries, { session },
+        );
+      } catch (error) {
+        error.accountingPostingFailure = true;
+        throw error;
+      }
+      if (!Array.isArray(createdEntries) || createdEntries.length !== journalEntries.length
+        || createdEntries.some((entry) => !entry?._id)) {
+        const error = new Error('Accounting did not confirm all journal entries for the sale');
+        error.code = 'POS_ACCOUNTING_POST_FAILED';
+        error.accountingPostingFailure = true;
+        throw error;
+      }
+
+      invoice.revenueJournalEntry = createdEntries[0]._id;
+      if (createdEntries[1]) invoice.cogsJournalEntry = createdEntries[1]._id;
+      await invoice.save({ session });
 
       // 4. Add payment record if provided
       if (paidAmount > 0 && paymentMethod) {
@@ -502,45 +621,30 @@ exports.createDirectSale = async (req, res, next) => {
         });
         await invoice.save({ session });
 
-        // Update client totals
-        client.totalPurchases = (client.totalPurchases || 0) + paidAmount;
-        client.lastPurchaseDate = new Date();
-        if (amountOutstanding > 0) {
-          client.outstandingBalance = (client.outstandingBalance || 0) + amountOutstanding;
-        }
-        await client.save({ session });
-
-        // 5. Create bank transaction for bank-based payment methods (deposit adds to balance)
-        const bankPaymentMethods = ['bank_transfer', 'cheque', 'mobile_money'];
-        if (bankPaymentMethods.includes(paymentMethod) && bankAccountId) {
-          try {
-            const bankAccount = await BankAccount.findOne({
-              _id: bankAccountId,
-              company: companyId,
-              isActive: true,
-            });
-
-            if (bankAccount) {
-              await bankAccount.addTransaction({
-                type: 'deposit',
-                amount: paidAmount,
-                description: `POS Sale - Invoice #${invoice.invoiceNumber}`,
-                date: new Date(),
-                referenceNumber: paymentReference || invoice.invoiceNumber,
-                paymentMethod,
-                status: 'completed',
-                reference: invoice._id,
-                referenceType: 'Invoice',
-                createdBy: req.user.id,
-                notes: `POS sale payment from ${client.name}`,
-              });
-            }
-          } catch (bankErr) {
-            console.error('[createDirectSale] Error creating bank transaction:', bankErr);
-          }
-        }
+        // Bank transactions are created from the posted journal line by
+        // JournalService. Do not create a second, unlinked transaction here.
       }
+
+      // Keep customer sales totals aligned with invoice revenue, including
+      // credit sales and partially paid invoices.
+      client.totalPurchases = (client.totalPurchases || 0) + grandTotal;
+      client.lastPurchaseDate = new Date();
+      if (amountOutstanding > 0) {
+        client.outstandingBalance = (client.outstandingBalance || 0) + amountOutstanding;
+      }
+      await client.save({ session });
     });
+
+    // Journal posting used the outer sale transaction, so refresh reporting
+    // and bank balance caches only after all records have committed.
+    try {
+      await cacheService.bumpCompanyFinancialCaches(companyId);
+      await Promise.all([...financialAccountCodes].map((accountCode) =>
+        BankAccount.invalidateCacheForLedgerAccount(companyId, accountCode),
+      ));
+    } catch (cacheError) {
+      console.error('[createDirectSale] Failed to invalidate financial caches:', cacheError.message);
+    }
 
     // Populate response
     await invoice.populate('client lines.product createdBy');
@@ -554,10 +658,35 @@ exports.createDirectSale = async (req, res, next) => {
     res.status(201).json({
       success: true,
       message: 'Direct sale completed successfully',
-      data: invoice
+      data: invoice,
+      changeDue,
     });
 
   } catch (error) {
+    if (error?.accountingPostingFailure || error?.code === 'POS_ACCOUNTING_POST_FAILED') {
+      console.error('[createDirectSale] Accounting posting failed; sale rolled back:', error);
+      return res.status(503).json({
+        success: false,
+        code: 'POS_ACCOUNTING_POST_FAILED',
+        message: 'The sale could not be completed because its accounting records were not posted. No sale or stock changes were saved. Please retry or contact an administrator.',
+      });
+    }
+    if (error?.code === 'POS_PAYMENT_ACCOUNT_REQUIRED' || error?.code === 'POS_PAYMENT_ACCOUNT_INVALID') {
+      return res.status(400).json({ success: false, code: error.code, message: error.message });
+    }
+    if (error?.code === 'POS_ZERO_VALUE_SALE') {
+      return res.status(400).json({ success: false, code: error.code, message: error.message });
+    }
+    if (error?.code === 'PERIOD_CLOSED') {
+      return res.status(409).json({ success: false, code: error.code, message: error.message });
+    }
+    if (error && error.code === 'WAREHOUSE_STOCK_CHANGED') {
+      return res.status(409).json({
+        success: false,
+        code: 'ERR_INSUFFICIENT_STOCK',
+        message: `Stock at the selected warehouse changed while this sale was being processed${error.productName ? ` for ${error.productName}` : ''}. Refresh the POS and try again.`,
+      });
+    }
     if (error && error.code === 'INSUFFICIENT_STOCK') {
       // The on-hand check already passed, so this is a costing gap: the product
       // has stock but no purchase/opening-stock cost layers covering it.
@@ -584,6 +713,12 @@ exports.getPosProducts = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const { search, warehouseId, category, limit = 50, page = 1 } = req.query;
+    if (warehouseId) {
+      const warehouse = await Warehouse.findOne({ _id: warehouseId, company: companyId, isActive: { $ne: false } });
+      if (!warehouse) {
+        return res.status(404).json({ success: false, message: 'Warehouse not found' });
+      }
+    }
     const resultLimit = Math.min(100, Math.max(1, parseInt(limit, 10) || 50));
     const requestedPage = Math.max(1, parseInt(page, 10) || 1);
     const toNumber = (value) => {
@@ -626,9 +761,23 @@ exports.getPosProducts = async (req, res, next) => {
       .skip((currentPage - 1) * resultLimit)
       .limit(resultLimit);
 
+    const warehouseStockLevels = warehouseId && products.length
+      ? await StockLevel.find({
+          company_id: companyId,
+          warehouse_id: warehouseId,
+          product_id: { $in: products.map((product) => product._id) },
+        }).lean()
+      : [];
+    const warehouseStockByProduct = new Map(
+      warehouseStockLevels.map((level) => [String(level.product_id), level]),
+    );
+
     // Enhance with availability info
     const enhancedProducts = products.map(p => {
-      const currentStock = toNumber(p.currentStock);
+      const stockLevel = warehouseStockByProduct.get(String(p._id));
+      const onHandStock = warehouseId ? toNumber(stockLevel?.qty_on_hand) : toNumber(p.currentStock);
+      const reservedStock = warehouseId ? toNumber(stockLevel?.qty_reserved) : toNumber(p.qtyReserved);
+      const currentStock = Math.max(0, onHandStock - reservedStock);
       return {
         _id: p._id,
         name: p.name,
@@ -639,6 +788,8 @@ exports.getPosProducts = async (req, res, next) => {
         taxRate: toNumber(p.taxRate),
         taxCode: p.taxCode || 'A',
         currentStock,
+        onHandStock,
+        reservedStock,
         averageCost: toNumber(p.averageCost),
         category: p.category,
         isAvailable: currentStock > 0 || p.isStockable === false

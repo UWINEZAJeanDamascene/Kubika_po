@@ -159,6 +159,15 @@ exports.createSale = async (req, res, next) => {
 
     // Attach payments if provided
     if (payments && payments.length) {
+      const invalidPayment = payments.some((payment) =>
+        !Number.isFinite(Number(payment.amount)) || Number(payment.amount) <= 0
+        || !['cash', 'bank_transfer', 'cheque', 'mobile_money'].includes(payment.paymentMethod),
+      );
+      if (invalidPayment) {
+        const error = new Error('Each POS payment must have a supported method and a positive amount.');
+        error.statusCode = 400;
+        throw error;
+      }
       payments.forEach(p => invoice.payments.push({
         amount: p.amount,
         paymentMethod: p.paymentMethod,
@@ -173,6 +182,11 @@ exports.createSale = async (req, res, next) => {
 
     // Saving will compute totals via pre-save hook
     await timedQuery('pos_createSale_invoice_save', () => invoice.save());
+    if ((invoice.amountPaid || 0) > (invoice.roundedAmount || 0) + 0.01) {
+      const error = new Error('POS payments cannot exceed the sale total.');
+      error.statusCode = 400;
+      throw error;
+    }
 
     // Deduct stock for each sold item AND create stock movement records
     const productUpdates = [];
@@ -221,72 +235,58 @@ exports.createSale = async (req, res, next) => {
 
     // Record cash transactions in drawer when payment method is cash
     if (drawerId) {
-      try {
-        let drawer = await CashDrawer.findOne({ company: companyId, drawerId });
-        if (drawer && drawer.status === 'open') {
-          invoice.payments.forEach(p => {
-            if (p.paymentMethod === 'cash') {
-              drawer.transactions.push({
-                type: 'sale',
-                amount: p.amount,
-                paymentMethod: p.paymentMethod,
-                reference: p.reference,
-                notes: `Sale ${invoice._id}`,
-                recordedBy: req.user.id
-              });
-            }
-          });
-          await drawer.save();
-        }
-      } catch (err) {
-        console.warn('Failed to record drawer transactions', err.message);
+      const drawer = await CashDrawer.findOne({ company: companyId, drawerId });
+      if (!drawer || drawer.status !== 'open') {
+        throw new Error('The selected cash drawer is not open. The sale was not committed.');
       }
+      invoice.payments.forEach(p => {
+        if (p.paymentMethod === 'cash') {
+          drawer.transactions.push({
+            type: 'sale',
+            amount: p.amount,
+            paymentMethod: p.paymentMethod,
+            reference: p.reference,
+            notes: `Sale ${invoice._id}`,
+            recordedBy: req.user.id
+          });
+        }
+      });
+      await drawer.save();
     }
 
-    // Create bank transactions for bank-based payments
+    // Validate linked bank accounts before posting. JournalService creates the
+    // matching bank transactions from the posted bank debit lines atomically.
     const bankPaymentMethods = ['bank_transfer', 'cheque', 'mobile_money'];
     for (const p of invoice.payments) {
-      if (bankPaymentMethods.includes(p.paymentMethod) && p.bankAccountId) {
-        try {
-          const bankAccount = await BankAccount.findOne({
-            _id: p.bankAccountId,
-            company: companyId,
-            isActive: true
-          });
-          if (bankAccount) {
-            await bankAccount.addTransaction({
-              type: 'deposit',
-              amount: p.amount,
-              description: `POS Sale - Invoice ${invoice.invoiceNumber}`,
-              date: new Date(),
-              referenceNumber: p.reference || invoice.invoiceNumber,
-              paymentMethod: p.paymentMethod,
-              status: 'completed',
-              reference: invoice._id,
-              referenceType: 'Invoice',
-              createdBy: req.user.id,
-              notes: p.notes || `POS payment for invoice ${invoice.invoiceNumber}`
-            });
-          }
-        } catch (bankErr) {
-          console.warn('Failed to create bank transaction for POS sale', bankErr.message);
+      if (bankPaymentMethods.includes(p.paymentMethod)) {
+        if (!p.bankAccountId) {
+          throw new Error(`A bank account is required for ${p.paymentMethod} payments. The sale was not committed.`);
+        }
+        const bankAccount = await BankAccount.findOne({
+          _id: p.bankAccountId,
+          company: companyId,
+          isActive: true
+        });
+        if (!bankAccount) {
+          throw new Error('The selected bank account is unavailable. The sale was not committed.');
         }
       }
     }
 
     // Create journal entry for POS sale
-    try {
+    {
       const DEFAULT_ACCOUNTS = require('../constants/chartOfAccounts').DEFAULT_ACCOUNTS;
       const lines = [];
       
       // Debit: Cash/Bank (based on payment method)
       for (const p of invoice.payments) {
         let cashAccount = DEFAULT_ACCOUNTS.cashInHand;
-        if (p.bankAccountId) {
+        if (bankPaymentMethods.includes(p.paymentMethod)) {
           const bankAccount = await BankAccount.findById(p.bankAccountId);
-          if (bankAccount && bankAccount.ledgerAccountId) {
-            cashAccount = bankAccount.ledgerAccountId;
+          if (!bankAccount?.ledgerAccountId) {
+            throw new Error('The selected bank account has no linked ledger account. The sale was not committed.');
           }
+          cashAccount = bankAccount.ledgerAccountId;
         } else if (p.paymentMethod === 'mobile_money') {
           cashAccount = DEFAULT_ACCOUNTS.mtnMoMo;
         }
@@ -299,6 +299,8 @@ exports.createSale = async (req, res, next) => {
       }
       
       const grossAmount = Number(invoice.roundedAmount || invoice.totalAmount || 0);
+      const paidAmount = Number(invoice.amountPaid || 0);
+      const outstandingAmount = Math.max(0, grossAmount - paidAmount);
       const vatAmount = Number(invoice.totalTax || invoice.taxAmount || 0);
       const netSalesAmount = Math.max(0, grossAmount - vatAmount);
 
@@ -318,36 +320,38 @@ exports.createSale = async (req, res, next) => {
           `POS Sale - ${invoice.invoiceNumber} VAT`
         ));
       }
+
+      if (outstandingAmount > 0) {
+        lines.push(JournalService.createDebitLine(
+          DEFAULT_ACCOUNTS.accountsReceivable,
+          outstandingAmount,
+          `POS Sale - ${invoice.invoiceNumber} - Receivable`
+        ));
+      }
       
       await JournalService.createEntry(companyId, req.user.id, {
         date: new Date(),
         description: `POS Sale - Invoice ${invoice.invoiceNumber}`,
         sourceType: 'invoice',
+        sourceId: invoice._id,
         sourceReference: invoice.invoiceNumber,
         lines,
         isAutoGenerated: true
       });
-    } catch (jeErr) {
-      // A sale without its GL posting is inconsistent financial data. Let the
-      // enclosing transaction roll back every preceding stock/payment write.
-      throw jeErr;
     }
 
     // Sync client totals and outstanding balance for POS sale
-    try {
-      const clientDoc = await Client.findOne({ _id: client._id, company: companyId });
-      if (clientDoc) {
-        const paid = invoice.amountPaid || 0;
-        const rounded = invoice.roundedAmount || 0;
-        const outstandingDelta = Math.max(0, rounded - paid);
-        clientDoc.outstandingBalance = Math.max(0, (clientDoc.outstandingBalance || 0) + outstandingDelta);
-        clientDoc.totalPurchases = (clientDoc.totalPurchases || 0) + paid;
-        clientDoc.lastPurchaseDate = new Date();
-        await clientDoc.save();
-      }
-    } catch (e) {
-      console.warn('Failed to update client totals for POS sale', e.message);
+    const clientDoc = await Client.findOne({ _id: client._id, company: companyId });
+    if (!clientDoc) {
+      throw new Error('The sale customer could not be updated. The sale was not committed.');
     }
+    const paid = invoice.amountPaid || 0;
+    const rounded = invoice.roundedAmount || 0;
+    const outstandingDelta = Math.max(0, rounded - paid);
+    clientDoc.outstandingBalance = Math.max(0, (clientDoc.outstandingBalance || 0) + outstandingDelta);
+    clientDoc.totalPurchases = (clientDoc.totalPurchases || 0) + rounded;
+    clientDoc.lastPurchaseDate = new Date();
+    await clientDoc.save();
 
     // Send email notification
     const sendEmailOnCreate = req.body.sendEmail || false;
@@ -384,84 +388,81 @@ exports.createSale = async (req, res, next) => {
 exports.addPayment = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const invoice = await timedQuery('pos_addPayment_findInvoice', () => Invoice.findOne({ _id: req.params.id, company: companyId }));
-    if (!invoice) return res.status(404).json({ success: false, message: 'Sale not found' });
-
-    const { amount, paymentMethod, reference, notes, drawerId, bankAccountId } = req.body;
-    if (!amount || amount <= 0) return res.status(400).json({ success: false, message: 'Invalid payment amount' });
-
-    const payment = { amount, paymentMethod, reference, notes, bankAccountId, recordedBy: req.user.id };
-    invoice.payments.push(payment);
-    invoice.amountPaid = (invoice.amountPaid || 0) + amount;
-    invoice.balance = Math.max(0, invoice.roundedAmount - invoice.amountPaid);
-
-    if (invoice.amountPaid >= invoice.roundedAmount) {
-      invoice.status = 'paid';
-      invoice.paidDate = new Date();
-    } else if (invoice.amountPaid > 0) {
-      invoice.status = 'partial';
-    }
-
-    await invoice.save();
-
-    // Drawer record
-    if (drawerId && paymentMethod === 'cash') {
-      try {
-        let drawer = await timedQuery('pos_addPayment_drawer', () => CashDrawer.findOne({ company: companyId, drawerId }));
-        if (drawer && drawer.status === 'open') {
-          drawer.transactions.push({ type: 'sale', amount, paymentMethod, reference, notes, recordedBy: req.user.id });
-          await timedQuery('pos_addPayment_drawer_save', () => drawer.save());
-        }
-      } catch (err) {
-        console.warn('Drawer record failed', err.message);
+    const updatedInvoice = await runInTransaction(async () => {
+      const invoice = await timedQuery('pos_addPayment_findInvoice', () => Invoice.findOne({ _id: req.params.id, company: companyId }));
+      if (!invoice) {
+        const error = new Error('Sale not found');
+        error.statusCode = 404;
+        throw error;
       }
-    }
 
-    // Create bank transaction for bank-based payments
-    const bankPaymentMethods = ['bank_transfer', 'cheque', 'mobile_money'];
-    if (bankPaymentMethods.includes(paymentMethod) && bankAccountId) {
-      try {
-        const bankAccount = await timedQuery('pos_addPayment_bankAccount', () =>
-          BankAccount.findOne({
-            _id: bankAccountId,
-            company: companyId,
-            isActive: true
-          })
-        );
-        if (bankAccount) {
-          await bankAccount.addTransaction({
-            type: 'deposit',
-            amount: amount,
-            description: `POS Payment - Invoice ${invoice.invoiceNumber}`,
-            date: new Date(),
-            referenceNumber: reference || invoice.invoiceNumber,
-            paymentMethod: paymentMethod,
-            status: 'completed',
-            reference: invoice._id,
-            referenceType: 'Invoice',
-            createdBy: req.user.id,
-            notes: notes || `POS payment for invoice ${invoice.invoiceNumber}`
-          });
-        }
-      } catch (bankErr) {
-        console.warn('Failed to create bank transaction for POS payment', bankErr.message);
+      const { amount: rawAmount, paymentMethod, reference, notes, drawerId, bankAccountId } = req.body;
+      const amount = Number(rawAmount);
+      if (!Number.isFinite(amount) || amount <= 0
+        || !['cash', 'bank_transfer', 'cheque', 'mobile_money'].includes(paymentMethod)) {
+        const error = new Error('Enter a positive payment amount and a supported payment method.');
+        error.statusCode = 400;
+        throw error;
       }
-    }
+      const remaining = Math.max(0, Number(invoice.roundedAmount || 0) - Number(invoice.amountPaid || 0));
+      if (amount > remaining + 0.01) {
+        const error = new Error('Payment cannot exceed the outstanding sale balance.');
+        error.statusCode = 400;
+        throw error;
+      }
 
-    // Update client totals to reflect POS payment
-    try {
+      const bankPaymentMethods = ['bank_transfer', 'cheque', 'mobile_money'];
+      let bankAccount = null;
+      if (bankPaymentMethods.includes(paymentMethod)) {
+        if (!bankAccountId) throw new Error(`A bank account is required for ${paymentMethod} payments.`);
+        bankAccount = await timedQuery('pos_addPayment_bankAccount', () => BankAccount.findOne({
+          _id: bankAccountId,
+          company: companyId,
+          isActive: true,
+        }));
+        if (!bankAccount?.ledgerAccountId) throw new Error('The selected bank account is unavailable or has no linked ledger account.');
+      }
+
+      invoice.payments.push({ amount, paymentMethod, reference, notes, bankAccountId, recordedBy: req.user.id });
+      const savedPayment = invoice.payments[invoice.payments.length - 1];
+      invoice.amountPaid = (invoice.amountPaid || 0) + amount;
+      invoice.balance = Math.max(0, Number(invoice.roundedAmount || 0) - invoice.amountPaid);
+      if (invoice.balance <= 0.01) {
+        invoice.status = 'paid';
+        invoice.paidDate = new Date();
+      } else {
+        invoice.status = 'partial';
+      }
+      await timedQuery('pos_addPayment_invoice_save', () => invoice.save());
+
+      if (drawerId && paymentMethod === 'cash') {
+        const drawer = await timedQuery('pos_addPayment_drawer', () => CashDrawer.findOne({ company: companyId, drawerId }));
+        if (!drawer || drawer.status !== 'open') throw new Error('The selected cash drawer is not open.');
+        drawer.transactions.push({ type: 'sale', amount, paymentMethod, reference, notes, recordedBy: req.user.id });
+        await timedQuery('pos_addPayment_drawer_save', () => drawer.save());
+      }
+
       const clientDoc = await timedQuery('pos_addPayment_client', () => Client.findOne({ _id: invoice.client, company: companyId }));
-      if (clientDoc) {
-        clientDoc.totalPurchases = (clientDoc.totalPurchases || 0) + amount;
-        clientDoc.outstandingBalance = Math.max(0, (clientDoc.outstandingBalance || 0) - amount);
-        clientDoc.lastPurchaseDate = new Date();
-        await timedQuery('pos_addPayment_client_save', () => clientDoc.save());
-      }
-    } catch (e) {
-      console.warn('Failed updating client after POS payment', e.message);
-    }
+      if (!clientDoc) throw new Error('The sale customer could not be updated.');
+      clientDoc.outstandingBalance = Math.max(0, (clientDoc.outstandingBalance || 0) - amount);
+      await timedQuery('pos_addPayment_client_save', () => clientDoc.save());
 
-    res.json({ success: true, data: invoice });
+      await JournalService.createInvoicePaymentEntry(companyId, req.user.id, {
+        amount,
+        paymentMethod,
+        paymentId: savedPayment?._id,
+        bankAccountId: bankAccount?._id || null,
+        bankAccountCode: bankAccount?.ledgerAccountId || null,
+        invoiceId: invoice._id,
+        invoiceNumber: invoice.invoiceNumber,
+        customerName: invoice.customerName,
+        date: new Date(),
+      });
+
+      return invoice;
+    });
+
+    res.json({ success: true, data: updatedInvoice });
   } catch (error) {
     next(error);
   }

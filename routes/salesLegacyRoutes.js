@@ -1,7 +1,8 @@
 const express = require('express');
 const router = express.Router();
-const { protect, authorize } = require('../middleware/auth');
+const { protect } = require('../middleware/auth');
 const logAction = require('../middleware/logAction');
+const { requirePosPermissions } = require('../middleware/posAuthorization');
 const {
   createDirectSale,
   getPosProducts,
@@ -11,13 +12,20 @@ const {
 // All routes require authentication
 router.use(protect);
 
+const canCreateSale = requirePosPermissions({ resource: 'sales_invoices', action: 'create' });
+const canReadPosCatalog = requirePosPermissions(
+  { resource: 'sales_invoices', action: 'create' },
+  { resource: 'products', action: 'read' },
+);
+const canReadSale = requirePosPermissions({ resource: 'sales_invoices', action: 'read' });
+
 // Direct sale endpoint (Legacy/Direct POS workflow)
-router.post('/direct-sale', logAction('sales_legacy_direct_sale'), createDirectSale);
+router.post('/direct-sale', canCreateSale, logAction('sales_legacy_direct_sale'), createDirectSale);
 
 // Get products for POS with stock availability
-router.get('/products', getPosProducts);
+router.get('/products', canReadPosCatalog, getPosProducts);
 
 // Get receipt for printing
-router.get('/receipt/:invoiceId', getReceipt);
+router.get('/receipt/:invoiceId', canReadSale, getReceipt);
 
 module.exports = router;

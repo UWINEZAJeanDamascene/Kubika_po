@@ -177,7 +177,8 @@ async function createFromJournalLine(entry, line, bankAccount, context = {}) {
   const sourceType = sourceDocumentType(entry.sourceType);
   const sourceId = id(entry.sourceId || context.sourceId);
   const bankType = bankMovementType(entry.sourceType, movementType);
-  const ref = readableReference(entry, journalEntryId);
+  const journalReference = readableReference(entry, journalEntryId);
+  const ref = context.sourceData?.paymentReference || journalReference;
 
   const transaction = new BankTransaction({
     company: companyId,
@@ -194,7 +195,7 @@ async function createFromJournalLine(entry, line, bankAccount, context = {}) {
     description: descriptionFor(entry, line, bankAccount, movementType, txType),
     reference: ref,
     referenceNumber: ref,
-    sourceReference: ref,
+    sourceReference: journalReference,
     transactionType: txType,
     sourceDocumentType: sourceType,
     sourceDocumentId: sourceId || null,

@@ -82,7 +82,12 @@ async function consume(companyId, productId, qty, opts = {}) {
     }
 
     // FIFO
-    const layers = await InventoryLayer.find({ company: companyId, product: productId, qtyRemaining: { $gt: 0 } })
+    const layers = await InventoryLayer.find({
+      company: companyId,
+      product: productId,
+      qtyRemaining: { $gt: 0 },
+      ...(opts.warehouse ? { warehouse: opts.warehouse } : {}),
+    })
       .sort({ receiptDate: 1 })
       .session(session);
 

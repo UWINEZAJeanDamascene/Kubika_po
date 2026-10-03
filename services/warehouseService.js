@@ -4,39 +4,40 @@
  */
 
 const Product = require('../models/Product');
-const InventoryBatch = require('../models/InventoryBatch');
+const StockLevel = require('../models/StockLevel');
 
 /**
  * Get stock level for a product in a specific warehouse
  */
 async function getStockLevel(companyId, productId, warehouseId) {
   try {
-    // Get product's current stock
-    const product = await Product.findOne({ _id: productId, company: companyId });
-    if (!product) {
-      return { qty_available: 0, qty_reserved: 0 };
-    }
-
-    // If no specific warehouse, use product's currentStock
-    if (!warehouseId) {
-      const reserved = product.qtyReserved || 0;
-      const available = (product.currentStock || 0) - reserved;
-      return { 
-        qty_available: Math.max(0, available), 
-        qty_reserved: reserved,
-        qty_on_hand: product.currentStock || 0
+    if (warehouseId) {
+      const stockLevel = await StockLevel.findOne({
+        company_id: companyId,
+        product_id: productId,
+        warehouse_id: warehouseId,
+      }).lean();
+      const qtyOnHand = Number(stockLevel?.qty_on_hand) || 0;
+      const qtyReserved = Number(stockLevel?.qty_reserved) || 0;
+      return {
+        qty_available: Math.max(0, qtyOnHand - qtyReserved),
+        qty_reserved: qtyReserved,
+        qty_on_hand: qtyOnHand,
       };
     }
 
-    // For specific warehouse, we need to check warehouse inventory
-    // For now, fall back to product level
+    const product = await Product.findOne({ _id: productId, company: companyId });
+    if (!product) return { qty_available: 0, qty_reserved: 0, qty_on_hand: 0 };
+
+    // Without a warehouse context, use the product's company-wide stock.
     const reserved = product.qtyReserved || 0;
     const available = (product.currentStock || 0) - reserved;
-    return { 
-      qty_available: Math.max(0, available), 
+    return {
+      qty_available: Math.max(0, available),
       qty_reserved: reserved,
-      qty_on_hand: product.currentStock || 0
+      qty_on_hand: product.currentStock || 0,
     };
+
   } catch (error) {
     console.error('Error getting stock level:', error);
     return { qty_available: 0, qty_reserved: 0 };
