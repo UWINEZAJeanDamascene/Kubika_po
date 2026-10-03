@@ -28,6 +28,24 @@ function maskPersonalIdentifier(value) {
   return normalized.length < 5 ? null : `${"•".repeat(Math.max(4, normalized.length - 4))}${normalized.slice(-4)}`;
 }
 
+async function attachPayrollInputActors(inputs, companyId) {
+  const rows = Array.isArray(inputs) ? inputs : [inputs];
+  const ids = [...new Set(rows.flatMap((row) => [row.enteredById, row.approvedById]).filter(Boolean).map(String))];
+  const users = ids.length
+    ? await dbClient().user.findMany({
+      where: { companyId: String(companyId), id: { in: ids } },
+      select: { id: true, name: true, email: true },
+    })
+    : [];
+  const byId = new Map(users.map((user) => [String(user.id), { id: user.id, name: user.name, email: user.email }]));
+  const enriched = rows.map((row) => ({
+    ...row,
+    enteredBy: row.enteredById ? byId.get(String(row.enteredById)) || null : null,
+    approvedBy: row.approvedById ? byId.get(String(row.approvedById)) || null : null,
+  }));
+  return Array.isArray(inputs) ? enriched : enriched[0];
+}
+
 async function findSelfServiceEmployee(companyId, email) {
   const normalizedEmail = String(email || "").trim().toLowerCase();
   if (!companyId || !normalizedEmail) return null;
@@ -1009,7 +1027,7 @@ exports.getPayrollPeriodInputs = async (req, res, next) => {
       where: { companyId: String(req.user.company._id), periodMonth: month, periodYear: year },
       orderBy: [{ status: "asc" }, { createdAt: "desc" }],
     });
-    return res.json({ success: true, data: rows });
+    return res.json({ success: true, data: await attachPayrollInputActors(rows, req.user.company._id) });
   } catch (error) { return next(error); }
 };
 
@@ -1053,7 +1071,7 @@ exports.savePayrollPeriodInput = async (req, res, next) => {
       await recordPayrollAudit({ companyId, userId, action: existing ? "payroll.period_input.updated" : "payroll.period_input.created", entityType: "payroll_period_input", entityId: saved.id, before: existing ? { ...existing } : null, after: { ...saved }, req });
       return saved;
     });
-    return res.status(existing ? 200 : 201).json({ success: true, data: row });
+    return res.status(existing ? 200 : 201).json({ success: true, data: await attachPayrollInputActors(row, companyId) });
   } catch (error) { return next(error); }
 };
 
@@ -1074,7 +1092,7 @@ exports.approvePayrollPeriodInput = async (req, res, next) => {
       await recordPayrollAudit({ companyId, userId, action: "payroll.period_input.approved", entityType: "payroll_period_input", entityId: row.id, before: { status: row.status, enteredById: row.enteredById }, after: { status: result.status, approvedById: result.approvedById, approvedAt: result.approvedAt }, req });
       return result;
     });
-    return res.json({ success: true, data: updatedRow });
+    return res.json({ success: true, data: await attachPayrollInputActors(updatedRow, companyId) });
   } catch (error) { return next(error); }
 };
 

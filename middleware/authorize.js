@@ -124,7 +124,18 @@ async function resolveUserRoles(user) {
     roles.push(...rows.map(roleToApi));
   }
   if (typeof user.role === 'string') {
-    const role = await prisma.role.findFirst({ where: { name: user.role } });
+    const rawCompany = user.company;
+    const companyId = toIdString(rawCompany && typeof rawCompany === 'object'
+      ? rawCompany._id || rawCompany.id
+      : rawCompany);
+    const role = await prisma.role.findFirst({
+      where: {
+        name: user.role,
+        ...(companyId
+          ? { OR: [{ isSystemRole: true }, { companyId }] }
+          : { isSystemRole: true }),
+      },
+    });
     if (role) roles.push(roleToApi(role));
   }
   const seen = new Set();

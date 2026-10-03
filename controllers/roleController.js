@@ -13,6 +13,24 @@ const { prisma } = require('../lib/prisma');
 const { generateObjectId, toIdString } = require('../utils/objectId');
 const { roleToApi } = require('../utils/authMappers');
 const { parsePagination, paginationMeta } = require('../utils/pagination');
+const RESERVED_ROLE_NAMES = new Set(['admin', 'platform_admin', 'super_admin']);
+
+function requestCompanyId(req) {
+  const company = req.company || req.user?.company;
+  return toIdString(company?._id || company?.id || company || null);
+}
+
+function isPlatformAdmin(req) {
+  return req.user?.role === 'platform_admin';
+}
+
+function visibleRoleWhere(req, id) {
+  const companyId = requestCompanyId(req);
+  return {
+    id,
+    OR: companyId ? [{ isSystemRole: true }, { companyId }] : [{ isSystemRole: true }],
+  };
+}
 
 const normalizePermissions = (permissions = []) => {
   if (!Array.isArray(permissions)) return [];
@@ -53,14 +71,16 @@ const normalizePermissions = (permissions = []) => {
  */
 exports.getRoles = async (req, res, next) => {
   try {
-    const companyId = toIdString(
-      req.query.company_id || req.company?._id || req.user?.company?._id || req.user?.company || null
-    );
+    // Tenant admins may only list their own roles and the shared system roles.
+    // Only a platform admin may choose a tenant through the query string.
+    const companyId = isPlatformAdmin(req)
+      ? toIdString(req.query.company_id || null)
+      : requestCompanyId(req);
 
     // System roles have companyId null; include the company's custom roles when known
     const where = companyId
-      ? { OR: [{ companyId: null }, { companyId }] }
-      : { companyId: null };
+      ? { OR: [{ isSystemRole: true }, { companyId }] }
+      : { isSystemRole: true };
 
     const { page, limit, skip } = parsePagination(req.query, { defaultLimit: 50, maxLimit: 200 });
     const [total, roles] = await Promise.all([
@@ -90,7 +110,7 @@ exports.getRoles = async (req, res, next) => {
  */
 exports.getRoleById = async (req, res, next) => {
   try {
-    const role = await prisma.role.findUnique({ where: { id: toIdString(req.params.id) } });
+    const role = await prisma.role.findFirst({ where: visibleRoleWhere(req, toIdString(req.params.id)) });
 
     if (!role) {
       return res.status(404).json({
@@ -115,8 +135,8 @@ exports.getRoleById = async (req, res, next) => {
  */
 exports.getRolePermissions = async (req, res, next) => {
   try {
-    const role = await prisma.role.findUnique({
-      where: { id: toIdString(req.params.id) },
+    const role = await prisma.role.findFirst({
+      where: visibleRoleWhere(req, toIdString(req.params.id)),
       select: { id: true, name: true, isSystemRole: true, permissions: true },
     });
 
@@ -151,24 +171,31 @@ exports.getRolePermissions = async (req, res, next) => {
 exports.createRole = async (req, res, next) => {
   try {
     const { name, description, permissions, company_id } = req.body;
-    const effectiveCompanyId = toIdString(
-      company_id || req.company?._id || req.user?.company?._id || req.user?.company || null
-    );
+    const effectiveCompanyId = isPlatformAdmin(req)
+      ? toIdString(company_id || null)
+      : requestCompanyId(req);
 
     // Validate required fields
-    if (!name) {
+    if (!String(name || '').trim()) {
       return res.status(400).json({
         success: false,
         error: 'VALIDATION_ERROR',
         message: 'Role name is required'
       });
     }
+    if (RESERVED_ROLE_NAMES.has(String(name).trim().toLowerCase())) {
+      return res.status(400).json({ success: false, error: 'RESERVED_ROLE_NAME', message: 'This role name is reserved for system access' });
+    }
+
+    if (!effectiveCompanyId) {
+      return res.status(400).json({ success: false, error: 'COMPANY_REQUIRED', message: 'A company is required to create a role' });
+    }
 
     // Check if role already exists for this company (or clashes with a system role)
     const existingRole = await prisma.role.findFirst({
       where: {
-        name: name.trim(),
-        OR: [{ companyId: effectiveCompanyId }, { companyId: null }],
+        name: String(name).trim(),
+        OR: [{ companyId: effectiveCompanyId }, { isSystemRole: true }],
       },
     });
 
@@ -184,7 +211,7 @@ exports.createRole = async (req, res, next) => {
     const role = await prisma.role.create({
       data: {
         id: generateObjectId(),
-        name: name.trim(),
+        name: String(name).trim(),
         description: description || null,
         permissions: normalizePermissions(permissions),
         companyId: effectiveCompanyId,
@@ -213,7 +240,7 @@ exports.updateRole = async (req, res, next) => {
     const id = toIdString(req.params.id);
     const { name, description, permissions } = req.body;
 
-    const role = await prisma.role.findUnique({ where: { id } });
+    const role = await prisma.role.findFirst({ where: visibleRoleWhere(req, id) });
 
     if (!role) {
       return res.status(404).json({
@@ -223,12 +250,22 @@ exports.updateRole = async (req, res, next) => {
       });
     }
 
+    if (role.isSystemRole) {
+      return res.status(403).json({ success: false, error: 'SYSTEM_ROLE_IMMUTABLE', message: 'System roles cannot be modified' });
+    }
+    if (!isPlatformAdmin(req) && role.companyId !== requestCompanyId(req)) {
+      return res.status(404).json({ success: false, error: 'ROLE_NOT_FOUND', message: 'Role not found' });
+    }
+
     // Check if trying to change name to an existing role
     if (name && name.trim() !== role.name) {
+      if (RESERVED_ROLE_NAMES.has(String(name).trim().toLowerCase())) {
+        return res.status(400).json({ success: false, error: 'RESERVED_ROLE_NAME', message: 'This role name is reserved for system access' });
+      }
       const existingRole = await prisma.role.findFirst({
         where: {
           name: name.trim(),
-          companyId: role.companyId,
+          OR: [{ companyId: role.companyId }, { isSystemRole: true }],
           NOT: { id },
         },
       });
@@ -242,11 +279,8 @@ exports.updateRole = async (req, res, next) => {
       }
     }
 
-    // Prevent changing is_system_role flag (system roles must stay system, custom must stay custom)
-    // This maintains data integrity while allowing edits to permissions
-
     const data = {};
-    if (name) data.name = name.trim();
+    if (name) data.name = String(name).trim();
     if (description !== undefined) data.description = description;
     if (permissions) data.permissions = normalizePermissions(permissions);
 
@@ -272,7 +306,7 @@ exports.deleteRole = async (req, res, next) => {
   try {
     const id = toIdString(req.params.id);
 
-    const role = await prisma.role.findUnique({ where: { id } });
+    const role = await prisma.role.findFirst({ where: visibleRoleWhere(req, id) });
 
     if (!role) {
       return res.status(404).json({
@@ -280,6 +314,10 @@ exports.deleteRole = async (req, res, next) => {
         error: 'ROLE_NOT_FOUND',
         message: 'Role not found'
       });
+    }
+
+    if (!isPlatformAdmin(req) && role.companyId !== requestCompanyId(req)) {
+      return res.status(404).json({ success: false, error: 'ROLE_NOT_FOUND', message: 'Role not found' });
     }
 
     // Cannot delete system roles

@@ -114,13 +114,20 @@ exports.createUser = async (req, res, next) => {
     const mustChangePassword = generateTemp || !req.body.password;
 
     // Look up the Role by name - can be system role OR company custom role
-    const userRole = role || 'viewer';
+    const userRole = String(role || 'viewer').trim();
     const roleDoc = await prisma.role.findFirst({
       where: {
         name: userRole,
         OR: [{ isSystemRole: true }, { companyId }],
       },
     });
+
+    if (!roleDoc) {
+      return res.status(400).json({ success: false, code: 'INVALID_ROLE', message: 'Select a valid system or company role before creating the user' });
+    }
+    if (roleDoc.name === 'platform_admin' && req.user.role !== 'platform_admin') {
+      return res.status(403).json({ success: false, code: 'PLATFORM_ROLE_ASSIGNMENT_FORBIDDEN', message: 'Only a platform administrator can assign the platform administrator role' });
+    }
 
     const branchId = req.body.branch || req.body.defaultWarehouse || null;
 
@@ -136,7 +143,7 @@ exports.createUser = async (req, res, next) => {
         createdById: toIdString(req.user.id),
         mustChangePassword,
         tempPassword: mustChangePassword,
-        roles: roleDoc ? { create: [{ roleId: roleDoc.id }] } : undefined,
+        roles: { create: [{ roleId: roleDoc.id }] },
       },
       include: { roles: { include: { role: true } } },
     });
@@ -194,16 +201,16 @@ exports.updateUser = async (req, res, next) => {
     if (req.body.role) {
       const roleDoc = await prisma.role.findFirst({
         where: {
-          name: req.body.role,
+          name: String(req.body.role).trim(),
           OR: [{ isSystemRole: true }, { companyId }],
         },
       });
-      if (roleDoc) {
-        data.roles = {
-          deleteMany: {},
-          create: [{ roleId: roleDoc.id }],
-        };
+      if (!roleDoc) return res.status(400).json({ success: false, code: 'INVALID_ROLE', message: 'Select a valid system or company role' });
+      if (roleDoc.name === 'platform_admin' && req.user.role !== 'platform_admin') {
+        return res.status(403).json({ success: false, code: 'PLATFORM_ROLE_ASSIGNMENT_FORBIDDEN', message: 'Only a platform administrator can assign the platform administrator role' });
       }
+      data.role = roleDoc.name;
+      data.roles = { deleteMany: {}, create: [{ roleId: roleDoc.id }] };
     }
 
     const assignedBranch = req.body.branch || req.body.defaultWarehouse;
