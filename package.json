@@ -17,6 +17,7 @@
     "migrate:bank-transactions": "node scripts/backfillBankTransactionsFromJournalEntries.js",
     "seed:platform-admin": "node scripts/seedPlatformAdmin.js",
     "delivery-notes:backfill": "node scripts/backfillDeliveryNotes.js",
+    "repair:pos-opening-stock-levels": "node scripts/backfill-pos-opening-stock-levels.js",
     "db:generate": "prisma generate --schema=./prisma/schema.prisma",
     "db:migrate": "prisma migrate dev",
     "db:migrate:deploy": "prisma migrate deploy --schema=./prisma/schema.prisma",

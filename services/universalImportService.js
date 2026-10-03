@@ -25,7 +25,8 @@ const PROCESSABLE_ENTITY_TYPES = new Set([
 ]);
 
 function getCompanyId(req) {
-  return req.company?._id || req.companyId || req.user?.company || req.headers['x-company-id'];
+  const userCompany = req.user?.company;
+  return req.company?._id || req.companyId || userCompany?._id || userCompany || req.headers['x-company-id'];
 }
 
 function extOf(fileName) {
@@ -240,7 +241,7 @@ async function buildProductEnrichmentContext(companyId) {
     Product.find({ company: companyId }).select('brand').lean(),
     EBMItemClass.find({ company: companyId, active: { $ne: false } }).lean(),
     EBMCode.find({ company: companyId, active: { $ne: false } }).lean(),
-    ChartOfAccount.find({ company: companyId, code: { $in: ['1400', '5000', '4000'] } }).lean(),
+    ChartOfAccount.find({ company: companyId, isActive: true }).lean(),
   ]);
 
   return { company, categories, warehouses, suppliers, products, itemClasses, ebmCodes, accounts };
@@ -248,126 +249,115 @@ async function buildProductEnrichmentContext(companyId) {
 
 async function enrichProductRow(companyId, clean, context, rowNumber) {
   const warnings = [];
-  const categoryMatch = bestMatch(clean.category, context.categories);
-  if (categoryMatch && categoryMatch.score >= 0.8) {
-    clean.category = categoryMatch.candidate.name;
+  const category = context.categories.find((candidate) => normalizeMatch(candidate.name) === normalizeMatch(clean.category));
+  if (category) {
+    clean.category = category.name;
+    clean.categoryId = category._id;
   } else {
-    const general = context.categories.find((category) => normalizeMatch(category.name) === 'general');
-    clean.category = general?.name || 'General';
-    if (!general) {
-      const created = await require('../models/Category').create({
-        company: companyId,
-        name: 'General',
-        description: 'Created automatically during product import',
-      });
-      context.categories.push(created);
-    }
-    if (clean.category !== (categoryMatch?.candidate?.name || '')) {
-      warnings.push({ field: 'category', message: 'Category was resolved to General because no confident match was found.' });
-    }
+    warnings.push({ field: 'category', blocking: true, message: 'Select an existing category from this workspace.' });
   }
 
-  const warehouseMatch = bestMatch(
-    clean.warehouse,
-    context.warehouses,
-    (warehouse) => `${warehouse.name || ''} ${warehouse.code || ''} ${warehouse.rraBranchId || ''}`,
-  );
+  const requestedWarehouse = clean.warehouse;
+  const warehouseMatch = requestedWarehouse && context.warehouses.find((warehouse) =>
+    [warehouse.name, warehouse.code, warehouse.rraBranchId].some((value) => normalizeMatch(value) === normalizeMatch(requestedWarehouse)));
   const defaultWarehouse = context.warehouses.find((warehouse) => warehouse.isDefault)
     || context.warehouses.find((warehouse) => normalizeMatch(warehouse.name).includes('main'))
     || context.warehouses[0];
-  const selectedWarehouse = warehouseMatch && warehouseMatch.score >= 0.75
-    ? warehouseMatch.candidate
-    : defaultWarehouse;
+  const selectedWarehouse = warehouseMatch || (isBlank(clean.warehouse) ? defaultWarehouse : null);
   clean.warehouse = selectedWarehouse?.name || null;
   clean.warehouseId = selectedWarehouse?._id || null;
-  if (!warehouseMatch && !defaultWarehouse) {
-    warnings.push({ field: 'warehouse', message: 'No warehouse exists; create one before importing opening stock.' });
+  if (!isBlank(requestedWarehouse) && !selectedWarehouse) {
+    warnings.push({ field: 'warehouse', blocking: true, message: 'Select an active warehouse from this workspace.' });
+  } else if (!selectedWarehouse && parseNumber(clean.openingStockQuantity) > 0) {
+    warnings.push({ field: 'warehouse', blocking: true, message: 'Create a warehouse before importing opening stock.' });
   }
 
-  const supplierMatch = bestMatch(clean.supplier, context.suppliers);
-  if (clean.supplier && supplierMatch && supplierMatch.score >= 0.8) {
-    clean.supplier = supplierMatch.candidate.name;
-    clean.supplierId = supplierMatch.candidate._id;
-  } else if (clean.supplier) {
-    const Supplier = require('../models/Supplier');
-    const draftName = String(clean.supplier).trim();
-    const draft = await Supplier.create({
-      company: companyId,
-      name: draftName,
-      code: `IMP-${Date.now().toString(36).toUpperCase().slice(-8)}`,
-      contact: {},
-      isActive: true,
-      notes: 'Draft supplier created automatically during product import; add contact details.',
-      customFields: { importNeedsContactInfo: true },
-    });
-    context.suppliers.push(draft);
-    clean.supplierId = draft._id;
-    warnings.push({ field: 'supplier', message: `Draft supplier created for ${draftName}; contact details still need completion.` });
+  const supplierMatch = clean.supplier && context.suppliers.find((supplier) =>
+    [supplier.name, supplier.code].some((value) => normalizeMatch(value) === normalizeMatch(clean.supplier)));
+  if (supplierMatch) {
+    clean.supplier = supplierMatch.name;
+    clean.supplierId = supplierMatch._id;
+  } else if (!isBlank(clean.supplier)) {
+    warnings.push({ field: 'supplier', blocking: true, message: 'Select an active supplier from this workspace or leave it blank.' });
   }
 
   if (clean.brand) {
     const brands = [...new Set(context.products.map((product) => product.brand).filter(Boolean))].map((name) => ({ name }));
     const brandMatch = bestMatch(clean.brand, brands);
-    clean.brand = brandMatch && brandMatch.score >= 0.8 ? brandMatch.candidate.name : null;
+    if (brandMatch && brandMatch.score >= 0.8) clean.brand = brandMatch.candidate.name;
   }
 
   const taxDefault = context.company?.is_vat_registered === false ? 'A' : 'B';
   clean.taxTypeCode = String(clean.taxTypeCode || taxDefault).toUpperCase();
+  clean.taxRate = clean.taxTypeCode === 'B' && context.company?.is_vat_registered !== false && context.company?.isVatRegistered !== false
+    ? Number(context.company?.vat_rate_pct ?? context.company?.vatRatePct ?? context.company?.vatRate ?? 18)
+    : 0;
 
-  const unit = clean.quantityUnitCode || clean.unit || 'pcs';
   const unitCode = String(clean.quantityUnitCode || '').toUpperCase();
-  const quantityCandidates = context.ebmCodes.filter((code) => /quantity|unit|uom|qty/i.test(`${code.codeClassName || ''} ${code.codeClass || ''}`));
-  const packagingCandidates = context.ebmCodes.filter((code) => /pack|pkg/i.test(`${code.codeClassName || ''} ${code.codeClass || ''}`));
-  const quantityMatch = clean.quantityUnitCode
-    ? bestMatch(clean.quantityUnitCode, quantityCandidates.length ? quantityCandidates : context.ebmCodes, (code) => `${code.code} ${code.name}`)
-    : null;
-  clean.quantityUnitCode = quantityMatch && quantityMatch.score >= 0.8
-    ? quantityMatch.candidate.code
-    : (context.ebmCodes.find((code) => code.code === (unitCode || quantityUnitFor(unit)))?.code
-      || quantityCandidates[0]?.code
-      || quantityUnitFor(unit));
-  const packagingMatch = clean.packagingUnitCode
-    ? bestMatch(clean.packagingUnitCode, packagingCandidates.length ? packagingCandidates : context.ebmCodes, (code) => `${code.code} ${code.name}`)
-    : null;
-  clean.packagingUnitCode = packagingMatch && packagingMatch.score >= 0.8
-    ? packagingMatch.candidate.code
-    : (context.ebmCodes.find((code) => code.code === (String(unit).toLowerCase().includes('kg') ? 'NT' : 'CT'))?.code
-      || packagingCandidates[0]?.code
-      || (String(unit).toLowerCase().includes('kg') ? 'NT' : 'CT'));
+  clean.quantityUnitCode = unitCode;
+  clean.packagingUnitCode = String(clean.packagingUnitCode || '').toUpperCase();
 
   const suppliedItemClassCode = String(clean.itemClassCode || '').trim();
   const exactClass = context.itemClasses.find((itemClass) => String(itemClass.itemClassCode) === suppliedItemClassCode);
   if (exactClass) {
     clean.itemClassCode = exactClass.itemClassCode;
-  } else if (isWellFormedRraItemClassCode(suppliedItemClassCode)) {
-    clean.itemClassCode = suppliedItemClassCode;
-    warnings.push({
-      field: 'itemClassCode',
-      message: 'The supplied RRA item classification was preserved but is not in the local cache; verify it during EBM registration.',
-    });
   } else {
-    const classMatch = bestMatch(`${clean.name} ${clean.description}`, context.itemClasses, (itemClass) => itemClass.itemClassName);
-    if (classMatch && classMatch.score >= 0.65) {
-      clean.itemClassCode = classMatch.candidate.itemClassCode;
-    } else {
-      clean.itemClassCode = null;
-      warnings.push({ field: 'itemClassCode', blocking: true, message: 'No confident synced RRA item classification was found; review this row before importing.' });
-    }
+    clean.itemClassCode = null;
+    warnings.push({ field: 'itemClassCode', blocking: true, message: 'Select a synced RRA item classification code before importing.' });
   }
 
-  clean.costingMethod = clean.costingMethod || 'fifo';
-  clean.trackingType = clean.trackingType || 'none';
-  clean.isStockable = clean.isStockable == null ? true : clean.isStockable;
+  clean.unit = String(clean.unit || 'pcs').toLowerCase();
+  clean.costingMethod = String(clean.costingMethod || 'fifo').toLowerCase();
+  clean.trackingType = String(clean.trackingType || 'none').toLowerCase();
+  clean.isStockable = isBlank(clean.isStockable) ? true : ['true', 'yes', '1'].includes(String(clean.isStockable).toLowerCase());
   clean.barcodeType = clean.barcodeType || 'CODE128';
+  clean.barcodeType = String(clean.barcodeType).toUpperCase();
+  clean.taxTypeCode = String(clean.taxTypeCode || (context.company?.is_vat_registered === false ? 'A' : 'B')).toUpperCase();
+  const isTaxType = (code) => /tax.*type|^tax$/i.test(`${code.codeClassName || ''} ${code.codeClass || ''}`);
+  const isPackagingUnit = (code) => /packag/i.test(`${code.codeClassName || ''} ${code.codeClass || ''}`);
+  const isQuantityUnit = (code) => /quantity|unit.*quantity|unit of quantity/i.test(`${code.codeClassName || ''} ${code.codeClass || ''}`);
+  const selectedTaxType = context.ebmCodes.find((code) => isTaxType(code) && String(code.code).toUpperCase() === clean.taxTypeCode);
+  const taxTypesAvailable = context.ebmCodes.some(isTaxType);
+  if (!taxTypesAvailable || !selectedTaxType) warnings.push({ field: 'taxTypeCode', blocking: true, message: 'Sync RRA tax type codes, then choose a code from this workspace dropdown.' });
+  if (!context.itemClasses.some((itemClass) => String(itemClass.itemClassCode) === String(clean.itemClassCode || ''))) {
+    warnings.push({ field: 'itemClassCode', blocking: true, message: 'Select an item class from this workspace’s synced RRA item classes.' });
+  }
+  if (!context.ebmCodes.some((code) => isPackagingUnit(code) && String(code.code).toUpperCase() === String(clean.packagingUnitCode || '').toUpperCase())) {
+    warnings.push({ field: 'packagingUnitCode', blocking: true, message: 'Select a packaging unit from this workspace’s synced RRA codes.' });
+  }
+  if (!context.ebmCodes.some((code) => isQuantityUnit(code) && String(code.code).toUpperCase() === String(clean.quantityUnitCode || '').toUpperCase())) {
+    warnings.push({ field: 'quantityUnitCode', blocking: true, message: 'Select a quantity unit from this workspace’s synced RRA codes.' });
+  }
   const openingQuantity = parseNumber(clean.openingStockQuantity) || 0;
   clean.reorderLevel = isBlank(clean.reorderLevel) ? Math.round(openingQuantity * 0.2 * 100) / 100 : clean.reorderLevel;
   clean.reorderQuantity = isBlank(clean.reorderQuantity) ? clean.reorderLevel : clean.reorderQuantity;
 
-  const category = context.categories.find((candidate) => normalizeMatch(candidate.name) === normalizeMatch(clean.category));
+  const categoryRecord = context.categories.find((candidate) => normalizeMatch(candidate.name) === normalizeMatch(clean.category));
   const accountByCode = new Map(context.accounts.map((account) => [String(account.code), account]));
-  clean.inventoryAccount = category?.defaultInventoryAccount || accountByCode.get('1400')?.code || null;
-  clean.cogsAccount = category?.defaultCogsAccount || accountByCode.get('5000')?.code || null;
-  clean.revenueAccount = category?.defaultRevenueAccount || accountByCode.get('4000')?.code || null;
+  const sortedAccounts = [...context.accounts].sort((a, b) => (parseInt(a.code, 10) || 0) - (parseInt(b.code, 10) || 0));
+  const accountTypes = { inventoryAccount: ['asset'], cogsAccount: ['cogs', 'expense'], revenueAccount: ['revenue'] };
+  const isEligibleAccount = (account, key) => account && accountTypes[key].includes(String(account.type || '').toLowerCase());
+  for (const key of Object.keys(accountTypes)) {
+    if (!isBlank(clean[key]) && !isEligibleAccount(accountByCode.get(String(clean[key])), key)) {
+      warnings.push({ field: key, blocking: true, message: 'Choose an active account of the correct type from this workspace chart of accounts.' });
+    }
+  }
+  const accountDefault = (key, categoryCode) => {
+    const categoryAccount = accountByCode.get(String(categoryCode || ''));
+    if (isEligibleAccount(categoryAccount, key)) return categoryAccount.code;
+    const typed = sortedAccounts.filter((account) => isEligibleAccount(account, key));
+    if (key === 'inventoryAccount') {
+      const inventory = typed.find((account) => String(account.name || '').toLowerCase().includes('inventory'));
+      if (inventory) return inventory.code;
+    }
+    return typed[0]?.code || null;
+  };
+  clean.inventoryAccount = clean.inventoryAccount || accountDefault('inventoryAccount', categoryRecord?.defaultInventoryAccount);
+  clean.cogsAccount = clean.cogsAccount || accountDefault('cogsAccount', categoryRecord?.defaultCogsAccount);
+  clean.revenueAccount = clean.revenueAccount || accountDefault('revenueAccount', categoryRecord?.defaultRevenueAccount);
+  for (const key of ['inventoryAccount', 'cogsAccount', 'revenueAccount']) {
+    if (!clean[key]) warnings.push({ field: key, blocking: true, message: 'A valid account is required. Select one in the import sheet or configure the category/company account defaults.' });
+  }
 
   return warnings.map((warning) => ({ ...warning, row: rowNumber }));
 }
@@ -408,6 +398,11 @@ function cleanMappedRow(entityType, row, mapping) {
     const value = valueFor(row, mapping, field.key);
     clean[field.key] = isBlank(value) ? null : String(value).trim();
   }
+  if (entityType === 'products') {
+    for (const key of ['taxTypeCode', 'itemClassCode', 'packagingUnitCode', 'quantityUnitCode', 'inventoryAccount', 'cogsAccount', 'revenueAccount']) {
+      if (clean[key]) clean[key] = clean[key].split(/\s+-\s+/, 1)[0].trim();
+    }
+  }
   return clean;
 }
 
@@ -422,7 +417,7 @@ function validateCleanRow(entityType, clean, rowNumber) {
     }
   }
 
-  for (const key of ['sellingPrice', 'costPrice', 'openingStockQuantity', 'reorderLevel', 'creditLimit', 'openingBalance', 'basicSalary', 'debitBalance', 'creditBalance', 'cost', 'accumulatedDepreciation', 'usefulLifeYears', 'budgetedAmount', 'quantity', 'costPerUnit', 'amountOutstanding']) {
+  for (const key of ['sellingPrice', 'costPrice', 'openingStockQuantity', 'reorderLevel', 'reorderQuantity', 'weight', 'creditLimit', 'openingBalance', 'basicSalary', 'debitBalance', 'creditBalance', 'cost', 'accumulatedDepreciation', 'usefulLifeYears', 'budgetedAmount', 'quantity', 'costPerUnit', 'amountOutstanding']) {
     if (!isBlank(clean[key]) && Number.isNaN(parseNumber(clean[key]))) {
       errors.push(buildValidationError(rowNumber, key, `${key} must be a number - found '${clean[key]}'.`, clean[key]));
     }
@@ -456,11 +451,36 @@ function validateCleanRow(entityType, clean, rowNumber) {
   if (entityType === 'products') {
     const cost = parseNumber(clean.costPrice);
     const price = parseNumber(clean.sellingPrice);
+    const openingQuantity = parseNumber(clean.openingStockQuantity) || 0;
     if (!isBlank(clean.costPrice) && (cost == null || cost <= 0)) {
       errors.push(buildValidationError(rowNumber, 'costPrice', 'Cost price must be greater than zero when provided.', clean.costPrice));
     }
     if (!isBlank(clean.sellingPrice) && cost != null && price != null && price < cost) {
       errors.push(buildValidationError(rowNumber, 'sellingPrice', 'Selling price must be greater than or equal to cost price.', clean.sellingPrice));
+    }
+    if (openingQuantity > 0 && (cost == null || cost <= 0)) {
+      errors.push(buildValidationError(rowNumber, 'costPrice', 'A positive cost price is required with opening stock so the product can be sold with recorded cost.', clean.costPrice));
+    }
+    const allowed = {
+      unit: ['kg', 'g', 'pcs', 'box', 'm', 'm2', 'm3', 'l', 'ml', 'ton', 'bag', 'roll', 'sheet', 'set'],
+      barcodeType: ['CODE128', 'EAN13', 'EAN8', 'UPC', 'CODE39', 'ITF14', 'QR', 'NONE'],
+      costingMethod: ['fifo', 'weighted', 'wac', 'avg'],
+      trackingType: ['none', 'batch', 'serial'],
+    };
+    for (const [key, values] of Object.entries(allowed)) {
+      if (!isBlank(clean[key]) && !values.some((value) => String(value).toLowerCase() === String(clean[key]).trim().toLowerCase())) {
+        errors.push(buildValidationError(rowNumber, key, `${key} must be one of: ${values.join(', ')}.`, clean[key]));
+      }
+    }
+    if (!isBlank(clean.isStockable) && !['true', 'false', 'yes', 'no', '1', '0'].includes(String(clean.isStockable).toLowerCase())) {
+      errors.push(buildValidationError(rowNumber, 'isStockable', 'Stockable must be TRUE or FALSE.', clean.isStockable));
+    }
+    if (!isBlank(clean.barcode) && !isBlank(clean.barcodeType)) {
+      const barcode = String(clean.barcode).trim();
+      const type = String(clean.barcodeType).toUpperCase();
+      const patterns = { EAN13: /^\d{13}$/, EAN8: /^\d{8}$/, UPC: /^\d{12}$/, ITF14: /^\d{14}$/ };
+      if (patterns[type] && !patterns[type].test(barcode)) errors.push(buildValidationError(rowNumber, 'barcode', `${type} barcode has an invalid length or format.`, clean.barcode));
+      if (type === 'CODE39' && !/^[0-9A-Z .$/+%-]+$/i.test(barcode)) errors.push(buildValidationError(rowNumber, 'barcode', 'Barcode contains characters that are not supported by CODE39.', clean.barcode));
     }
   }
 
@@ -842,29 +862,36 @@ async function writeOpeningGl(companyId, userId, rows) {
 }
 
 function productPayload(companyId, userId, data) {
-  const importedUnit = String(data.quantityUnitCode || '').toUpperCase();
-  const unit = importedUnit === 'KGM' ? 'kg' : importedUnit === 'U' ? 'pcs' : (data.unit || 'pcs');
+  const ebmQuantityUnit = String(data.quantityUnitCode || '').toUpperCase();
+  const unit = String(data.unit || (ebmQuantityUnit === 'KGM' ? 'kg' : ebmQuantityUnit === 'U' ? 'pcs' : 'pcs')).toLowerCase();
   return {
     company: companyId,
     name: data.name,
     sku: String(data.sku).toUpperCase(),
     description: data.description,
+    barcode: data.barcode || null,
     unit,
     currentStock: 0,
     lowStockThreshold: parseNumber(data.reorderLevel) || 0,
+    reorderPoint: parseNumber(data.reorderLevel) || 0,
     reorderQuantity: parseNumber(data.reorderQuantity) || 0,
     averageCost: parseNumber(data.costPrice) || 0,
     costPrice: parseNumber(data.costPrice) || 0,
     sellingPrice: parseNumber(data.sellingPrice) || 0,
     costingMethod: data.costingMethod || 'fifo',
     trackingType: data.trackingType || 'none',
+    trackBatch: data.trackingType === 'batch',
+    trackSerialNumbers: data.trackingType === 'serial',
     isStockable: data.isStockable !== false,
     barcodeType: data.barcodeType || 'CODE128',
+    location: data.location || null,
+    weight: parseNumber(data.weight) || 0,
     brand: data.brand || null,
     inventoryAccount: data.inventoryAccount || null,
     cogsAccount: data.cogsAccount || null,
     revenueAccount: data.revenueAccount || null,
     taxCode: String(data.taxTypeCode || 'A').toUpperCase(),
+    taxRate: parseNumber(data.taxRate) || 0,
     ebm: {
       taxTyCd: String(data.taxTypeCode || 'A').toUpperCase(),
       itemClassCd: data.itemClassCode,
@@ -876,7 +903,7 @@ function productPayload(companyId, userId, data) {
       quantityUnitCode: data.quantityUnitCode
     },
     createdBy: userId,
-    ...(data.supplierId ? { supplier: data.supplierId } : {})
+    ...(data.supplierId ? { supplier: data.supplierId, preferredSupplier: data.supplierId } : {})
   };
 }
 
@@ -1132,19 +1159,22 @@ async function writeReports(logId, outcomes) {
   return { resultsReportUrl: `/downloads/${resultsFile}`, errorReportUrl };
 }
 
-async function generateTemplate(entityType) {
+async function generateTemplate(entityType, companyId) {
   const definition = getEntityDefinition(entityType);
   if (!definition) throw new Error('Invalid import entity type.');
   const workbook = new ExcelJS.Workbook();
   workbook.creator = 'Kubika Smart Import';
   const sheet = workbook.addWorksheet(definition.label);
   const instructions = workbook.addWorksheet('Instructions');
+  const optionSheet = entityType === 'products' ? workbook.addWorksheet('Options') : null;
   const headers = definition.fields.map((field) => `${field.label}${field.required ? ' *' : ''}`);
   const examples = definition.fields.map((field) => field.example || '');
   const notes = definition.fields.map((field) => field.instructions || '');
   sheet.addRow(headers);
-  sheet.addRow(examples);
-  sheet.addRow(notes);
+  if (entityType !== 'products') {
+    sheet.addRow(examples);
+    sheet.addRow(notes);
+  }
   sheet.views = [{ state: 'frozen', ySplit: 1 }];
   sheet.getRow(1).font = { bold: true, color: { argb: 'FF111827' } };
   sheet.getRow(3).font = { italic: true, color: { argb: 'FF6B7280' } };
@@ -1154,13 +1184,77 @@ async function generateTemplate(entityType) {
       sheet.getRow(1).getCell(index + 1).font = { bold: true, color: { argb: 'FFB91C1C' } };
     }
   });
+  if (entityType === 'products' && companyId) {
+    const context = await buildProductEnrichmentContext(companyId);
+    const options = {
+      category: context.categories.map((item) => item.name).filter(Boolean),
+      supplier: context.suppliers.map((item) => item.name).filter(Boolean),
+      warehouse: context.warehouses.map((item) => item.name).filter(Boolean),
+      taxTypeCode: context.ebmCodes.filter((item) => /tax.*type|^tax$/i.test(`${item.codeClassName || ''} ${item.codeClass || ''}`)).map((item) => `${String(item.code).toUpperCase()} - ${item.name || item.description || item.code}`),
+      itemClassCode: context.itemClasses.map((item) => `${item.itemClassCode} - ${item.itemClassName || item.itemClassCode}`).filter(Boolean),
+      packagingUnitCode: context.ebmCodes.filter((item) => /packag/i.test(`${item.codeClassName || ''} ${item.codeClass || ''}`)).map((item) => `${String(item.code).toUpperCase()} - ${item.name || item.description || item.code}`),
+      quantityUnitCode: context.ebmCodes.filter((item) => /quantity|unit.*quantity|unit of quantity/i.test(`${item.codeClassName || ''} ${item.codeClass || ''}`)).map((item) => `${String(item.code).toUpperCase()} - ${item.name || item.description || item.code}`),
+      inventoryAccount: context.accounts.filter((item) => String(item.type).toLowerCase() === 'asset').map((item) => `${item.code} - ${item.name || item.accountName || item.code}`).filter(Boolean),
+      cogsAccount: context.accounts.filter((item) => ['cogs', 'expense'].includes(String(item.type).toLowerCase())).map((item) => `${item.code} - ${item.name || item.accountName || item.code}`).filter(Boolean),
+      revenueAccount: context.accounts.filter((item) => String(item.type).toLowerCase() === 'revenue').map((item) => `${item.code} - ${item.name || item.accountName || item.code}`).filter(Boolean),
+      unit: ['kg', 'g', 'pcs', 'box', 'm', 'm2', 'm3', 'l', 'ml', 'ton', 'bag', 'roll', 'sheet', 'set'],
+      barcodeType: ['CODE128', 'EAN13', 'EAN8', 'UPC', 'CODE39', 'ITF14', 'QR', 'NONE'],
+      costingMethod: ['fifo', 'weighted', 'wac', 'avg'],
+      trackingType: ['none', 'batch', 'serial'],
+      isStockable: ['TRUE', 'FALSE'],
+    };
+    optionSheet.addRow(['Field', 'Allowed values (also used by dropdowns)']);
+    const ranges = {};
+    for (const [key, rawValues] of Object.entries(options)) {
+      const values = [...new Set(rawValues)].sort((a, b) => String(a).localeCompare(String(b)));
+      if (!values.length) continue;
+      const col = optionSheet.columnCount + 1;
+      optionSheet.getCell(1, col).value = key;
+      values.forEach((value, offset) => { optionSheet.getCell(offset + 2, col).value = value; });
+      ranges[key] = { col, count: values.length };
+      optionSheet.getColumn(col).width = Math.min(48, Math.max(18, ...values.map((value) => String(value).length + 2)));
+    }
+    optionSheet.state = 'hidden';
+    const columnLetter = (number) => {
+      let value = number;
+      let result = '';
+      while (value > 0) {
+        const remainder = (value - 1) % 26;
+        result = String.fromCharCode(65 + remainder) + result;
+        value = Math.floor((value - 1) / 26);
+      }
+      return result;
+    };
+    definition.fields.forEach((field, index) => {
+      const range = ranges[field.key];
+      if (!range) return;
+      const letter = columnLetter(range.col);
+      for (let row = 2; row <= 10001; row++) {
+        sheet.getCell(row, index + 1).dataValidation = {
+          type: 'list',
+          allowBlank: !field.required,
+          formulae: [`INDIRECT("Options!$${letter}$2:$${letter}$${range.count + 1}")`],
+          showErrorMessage: true,
+          errorTitle: 'Choose a listed value',
+          error: 'Select one of the values from this workspace dropdown list.',
+        };
+      }
+    });
+    optionSheet.views = [{ state: 'frozen', ySplit: 1 }];
+    instructions.addRow(['Workspace choices', 'Dropdowns use active categories, suppliers, warehouses, synced RRA item classes/codes, and this workspace chart of accounts. Download a fresh template after master data changes.']);
+  }
   instructions.addRows([
     ['Smart Import Template', definition.label],
     ['Step 1', 'Keep row 1 headers unchanged where possible.'],
-    ['Step 2', 'Replace row 2 with your data or paste data below it.'],
-    ['Step 3', 'Use row 3 instructions to format fields correctly.'],
+    ['Step 2', entityType === 'products' ? 'Enter product records beginning in row 2 of the Products sheet. The sheet contains only headers so example data cannot be imported accidentally.' : 'Replace row 2 with your data or paste data below it.'],
+    ['Step 3', entityType === 'products' ? 'Use the Field Guide below for examples and formatting rules.' : 'Use row 3 instructions to format fields correctly.'],
     ['Limits', 'Maximum 10MB and 10,000 rows per import.']
   ]);
+  if (entityType === 'products') {
+    instructions.addRow([]);
+    instructions.addRow(['Product field', 'Example', 'Required', 'How to fill it']);
+    definition.fields.forEach((field) => instructions.addRow([field.label, field.example || '', field.required ? 'Yes' : 'No', field.instructions || '']));
+  }
   if (entityType === 'opening_stock') {
     instructions.addRows([
       ['Opening Stock Rules', 'Opening stock can only be imported once per product per warehouse. If you made a mistake — wrong quantity or wrong cost — you cannot re-import. You must ask your accountant to reverse the opening stock journal entry manually through Finance Control → Journal Entries, then import again. Contact your system administrator for assistance.'],
@@ -1168,7 +1262,7 @@ async function generateTemplate(entityType) {
       ['As-of Date', 'Enter the date your business started or migration date in DD/MM/YYYY. Leave blank to use today (not recommended for historical migrations).']
     ]);
   }
-  instructions.columns = [{ width: 24 }, { width: 90 }];
+  instructions.columns = [{ width: 34 }, { width: 34 }, { width: 14 }, { width: 96 }];
   return workbook.xlsx.writeBuffer();
 }
 

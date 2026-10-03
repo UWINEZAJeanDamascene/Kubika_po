@@ -7,6 +7,7 @@
 const Product = require('../models/Product');
 const Warehouse = require('../models/Warehouse');
 const StockMovement = require('../models/StockMovement');
+const StockLevel = require('../models/StockLevel');
 const InventoryBatch = require('../models/InventoryBatch');
 const { createLayer } = require('./inventoryService');
 const JournalService = require('./journalService');
@@ -148,6 +149,22 @@ async function createOpeningStock({
     product.lastSupplyDate = movementDate;
     await product.save(opts);
 
+    // Keep the warehouse-scoped quantity used by POS in sync with the product
+    // aggregate. Without this row, imported/opening stock appears in inventory
+    // totals but the POS correctly reads zero for the selected warehouse.
+    const stockLevel = await StockLevel.getOrCreate(companyId, productId, warehouseId);
+    const previousWarehouseQty = toNumber(stockLevel.qty_on_hand);
+    const previousWarehouseValue = previousWarehouseQty * toNumber(stockLevel.avg_cost);
+    const nextWarehouseQty = previousWarehouseQty + qty;
+    stockLevel.qty_on_hand = nextWarehouseQty;
+    stockLevel.avg_cost = nextWarehouseQty > 0
+      ? (previousWarehouseValue + totalCost) / nextWarehouseQty
+      : cost;
+    stockLevel.total_value = nextWarehouseQty * stockLevel.avg_cost;
+    stockLevel.last_movement_at = movementDate;
+    stockLevel.last_movement_type = 'initial_stock';
+    await stockLevel.save(opts);
+
     // Create per-warehouse batch for visibility in stock levels
     await InventoryBatch.create([
       {
@@ -167,7 +184,14 @@ async function createOpeningStock({
     ], opts);
 
     // Create inventory layer for costing (FIFO/avg consumers)
-    await createLayer(companyId, productId, qty, cost, { sourceType: 'opening_stock', sourceId: movementDoc._id }, { session, userId });
+    await createLayer(
+      companyId,
+      productId,
+      qty,
+      cost,
+      { sourceType: 'opening_stock', sourceId: movementDoc._id },
+      { session, userId, warehouse: warehouseId },
+    );
 
     // Journal entry: DR Inventory, CR Opening Balance Equity
     await ensureOpeningBalanceEquityAccount(companyId, userId, session);

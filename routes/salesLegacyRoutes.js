@@ -3,6 +3,7 @@ const router = express.Router();
 const { protect } = require('../middleware/auth');
 const logAction = require('../middleware/logAction');
 const { requirePosPermissions } = require('../middleware/posAuthorization');
+const heldSaleController = require('../controllers/posHeldSaleController');
 const {
   createDirectSale,
   getPosProducts,
@@ -18,6 +19,12 @@ const canReadPosCatalog = requirePosPermissions(
   { resource: 'products', action: 'read' },
 );
 const canReadSale = requirePosPermissions({ resource: 'sales_invoices', action: 'read' });
+const canManageHeldSales = requirePosPermissions({ resource: 'sales_invoices', action: 'create' });
+
+router.route('/held-sales')
+  .get(canManageHeldSales, heldSaleController.listHeldSales)
+  .post(canManageHeldSales, heldSaleController.createHeldSale);
+router.delete('/held-sales/:heldSaleId', canManageHeldSales, heldSaleController.deleteHeldSale);
 
 // Direct sale endpoint (Legacy/Direct POS workflow)
 router.post('/direct-sale', canCreateSale, logAction('sales_legacy_direct_sale'), createDirectSale);

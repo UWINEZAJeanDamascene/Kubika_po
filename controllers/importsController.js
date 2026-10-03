@@ -187,7 +187,7 @@ exports.downloadResultsReport = async (req, res) => {
 
 exports.downloadTemplate = async (req, res) => {
   try {
-    const buffer = await ImportService.generateTemplate(req.params.entityType);
+    const buffer = await ImportService.generateTemplate(req.params.entityType, companyId(req));
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Disposition', `attachment; filename="${req.params.entityType}_import_template.xlsx"`);
     res.send(Buffer.from(buffer));

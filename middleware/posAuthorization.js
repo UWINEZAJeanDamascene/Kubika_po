@@ -13,7 +13,7 @@ function requirePosPermissions(...permissions) {
         return res.status(403).json({
           success: false,
           error: 'FORBIDDEN',
-          message: 'Your role does not have permission to use this POS action.',
+          message: 'Your assigned roles do not allow this action.',
           requiredPermissions: missing,
         });
       }
@@ -30,4 +30,7 @@ function requirePosPermissions(...permissions) {
   };
 }
 
-module.exports = { requirePosPermissions };
+module.exports = {
+  requirePosPermissions,
+  requireAssignedPermissions: requirePosPermissions,
+};

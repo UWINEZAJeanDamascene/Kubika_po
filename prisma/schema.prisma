@@ -447,6 +447,21 @@ model CashDrawer {
   @@map("cash_drawers")
 }
 
+model PosHeldSale {
+  id          String   @id @db.Char(24)
+  companyId   String   @map("company_id") @db.Char(24)
+  createdById String   @map("created_by_id") @db.Char(24)
+  label       String
+  saleData    Json     @map("sale_data")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  createdBy   User     @relation(fields: [createdById], references: [id], onDelete: Cascade)
+
+  @@index([companyId, createdAt])
+  @@map("pos_held_sales")
+}
+
 model InterestAccrual {
   id                    String   @id @db.Char(24)
   companyId             String   @map("company_id") @db.Char(24)
@@ -690,6 +705,7 @@ model Company {
   taxTransactions             TaxTransaction[]
   taxes                       Tax[]
   tillSessions                TillSession[]
+  posHeldSales                PosHeldSale[]
   timesheets                  Timesheet[]
   users                       User[]
   warehouses                  Warehouse[]
@@ -764,6 +780,7 @@ model User {
   notifications        Notification[]
   refreshTokens        RefreshToken[]
   tillSessions         TillSession[]
+  createdPosHeldSales  PosHeldSale[]
   roles                UserRole[]
   sessions             UserSession[]
   company              Company?       @relation(fields: [companyId], references: [id])
@@ -1127,6 +1144,7 @@ model Client {
   @@index([companyId])
   @@index([companyId, isActive])
   @@index([companyId, name])
+  @@index([companyId, isActive, name, id], map: "products_company_active_name_id_idx")
   @@index([name(ops: raw("gin_trgm_ops"))], map: "clients_name_trgm_idx", type: Gin)
   @@index([code(ops: raw("gin_trgm_ops"))], map: "clients_code_trgm_idx", type: Gin)
   @@map("clients")

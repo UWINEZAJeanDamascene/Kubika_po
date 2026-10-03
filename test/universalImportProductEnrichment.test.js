@@ -2,11 +2,14 @@ const { getEntityDefinition } = require('../services/importDefinitions');
 const ImportService = require('../services/universalImportService');
 
 describe('universal product import enrichment contract', () => {
-  it('does not require fields that the importer can resolve', () => {
+  it('requires the same core product and RRA classification selections as product creation', () => {
     const fields = getEntityDefinition('products').fields;
     const required = new Set(fields.filter((field) => field.required).map((field) => field.key));
 
-    expect(required).toEqual(new Set(['name', 'sku', 'sellingPrice']));
+    expect(required).toEqual(new Set([
+      'name', 'sku', 'category', 'unit', 'sellingPrice',
+      'itemClassCode', 'packagingUnitCode', 'quantityUnitCode',
+    ]));
     expect(fields.map((field) => field.key)).toEqual(expect.arrayContaining([
       'supplier',
       'brand',

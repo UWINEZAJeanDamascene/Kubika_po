@@ -296,6 +296,16 @@ exports.createDirectSale = async (req, res, next) => {
         message: 'Payment amount must be a valid non-negative number',
       });
     }
+    // Card is not a cash-equivalent tender. Until a terminal/provider
+    // confirms authorization and settlement, accepting it here would mark an
+    // unverified payment as paid and post it to the cash-on-hand account.
+    if (amountTendered > 0 && paymentMethod === 'card') {
+      return res.status(409).json({
+        success: false,
+        code: 'POS_CARD_TERMINAL_NOT_CONFIGURED',
+        message: 'Card payments are unavailable because no payment terminal is configured. No card payment was recorded.',
+      });
+    }
     if (amountTendered > 0 && !supportedPaymentMethods.includes(paymentMethod)) {
       return res.status(400).json({
         success: false,
@@ -712,7 +722,7 @@ exports.createDirectSale = async (req, res, next) => {
 exports.getPosProducts = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { search, warehouseId, category, limit = 50, page = 1 } = req.query;
+    const { search, warehouseId, category, limit = 50, cursor: rawCursor } = req.query;
     if (warehouseId) {
       const warehouse = await Warehouse.findOne({ _id: warehouseId, company: companyId, isActive: { $ne: false } });
       if (!warehouse) {
@@ -720,7 +730,17 @@ exports.getPosProducts = async (req, res, next) => {
       }
     }
     const resultLimit = Math.min(100, Math.max(1, parseInt(limit, 10) || 50));
-    const requestedPage = Math.max(1, parseInt(page, 10) || 1);
+    let cursor = null;
+    if (rawCursor) {
+      try {
+        if (String(rawCursor).length > 2048) throw new Error('Cursor too long');
+        cursor = JSON.parse(Buffer.from(String(rawCursor), 'base64url').toString('utf8'));
+        if (!cursor || typeof cursor.name !== 'string' || cursor.name.length > 1000
+          || !isObjectIdString(cursor.id)) throw new Error('Invalid cursor shape');
+      } catch {
+        return res.status(400).json({ success: false, code: 'INVALID_CURSOR', message: 'The product page cursor is invalid.' });
+      }
+    }
     const toNumber = (value) => {
       if (value == null) return 0;
       if (typeof value === 'number') return value;
@@ -729,37 +749,46 @@ exports.getPosProducts = async (req, res, next) => {
       return Number(value) || 0;
     };
 
-    let query = { company: companyId, isActive: { $ne: false } };
+    const filters = [{ company: companyId, isActive: true }];
     
     if (search && String(search).trim()) {
       const term = escapeRegex(String(search).trim());
       // Prefix predicates keep the B-tree/trigram indexes usable for the hot
       // POS lookup. Barcode and SKU also get exact-match clauses so scans and
       // scanner input resolve without a leading-wildcard substring query.
-      query.$or = [
+      const searchTerms = [
         { barcode: { $regex: `^${term}$`, $options: 'i' } },
         { sku: { $regex: `^${term}$`, $options: 'i' } },
         { barcode: { $regex: `^${term}`, $options: 'i' } },
         { sku: { $regex: `^${term}`, $options: 'i' } },
         { name: { $regex: `^${term}`, $options: 'i' } },
       ];
+      if (isObjectIdString(search)) searchTerms.push({ _id: String(search).trim() });
+      filters.push({ $or: searchTerms });
     }
-    if (isObjectIdString(search)) {
-      query.$or.push({ _id: String(search).trim() });
+    if (category) filters.push({ category });
+    if (cursor) {
+      filters.push({
+        $or: [
+          { name: { $gt: cursor.name } },
+          { name: cursor.name, _id: { $gt: cursor.id } },
+        ],
+      });
     }
-    
-    if (category) {
-      query.category = category;
-    }
+    const query = filters.length === 1 ? filters[0] : { $and: filters };
 
-    const total = await Product.countDocuments(query);
-    const pages = Math.ceil(total / resultLimit);
-    const currentPage = pages ? Math.min(requestedPage, pages) : 1;
-    const products = await Product.find(query)
+    // Keyset pagination uses the indexed sort key and a single look-ahead row.
+    // It avoids a full matching-row count and work proportional to page depth.
+    const fetchedProducts = await Product.find(query)
       .select('name sku sellingPrice unit taxRate taxCode currentStock averageCost barcode category isStockable')
       .sort({ name: 1, _id: 1 })
-      .skip((currentPage - 1) * resultLimit)
-      .limit(resultLimit);
+      .limit(resultLimit + 1);
+    const hasMore = fetchedProducts.length > resultLimit;
+    const products = hasMore ? fetchedProducts.slice(0, resultLimit) : fetchedProducts;
+    const lastProduct = products[products.length - 1];
+    const nextCursor = hasMore && lastProduct
+      ? Buffer.from(JSON.stringify({ name: lastProduct.name, id: String(lastProduct._id) })).toString('base64url')
+      : null;
 
     const warehouseStockLevels = warehouseId && products.length
       ? await StockLevel.find({
@@ -798,14 +827,10 @@ exports.getPosProducts = async (req, res, next) => {
 
     res.json({
       success: true,
-      count: enhancedProducts.length,
-      total,
-      pages,
       pagination: {
-        page: currentPage,
         limit: resultLimit,
-        total,
-        pages
+        hasMore,
+        nextCursor,
       },
       data: enhancedProducts
     });

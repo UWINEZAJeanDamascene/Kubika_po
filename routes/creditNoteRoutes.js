@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
-const { protect, authorize } = require('../middleware/auth');
+const { protect } = require('../middleware/auth');
+const { requireAssignedPermissions: requirePermission } = require('../middleware/posAuthorization');
 const controller = require('../controllers/creditNoteController');
 
 router.use(protect);
@@ -14,23 +15,23 @@ router.use(protect);
 // DELETE /api/credit-notes/:id - Delete draft credit notes
 
 router.route('/')
-  .get(controller.getCreditNotes)
-  .post(controller.createCreditNote);
+  .get(requirePermission('credit_notes', 'read'), controller.getCreditNotes)
+  .post(requirePermission('credit_notes', 'create'), controller.createCreditNote);
 
 router.route('/:id')
-  .get(controller.getCreditNote)
-  .put(controller.updateCreditNote)
-  .delete(controller.deleteCreditNote);
+  .get(requirePermission('credit_notes', 'read'), controller.getCreditNote)
+  .put(requirePermission('credit_notes', 'update'), controller.updateCreditNote)
+  .delete(requirePermission('credit_notes', 'delete'), controller.deleteCreditNote);
 
-router.get('/:id/pdf', controller.generateCreditNotePDF);
+router.get('/:id/pdf', requirePermission('credit_notes', 'read'), controller.generateCreditNotePDF);
 
 // Module 8: Confirm credit note - triggers dual journal reversal + stock return
-router.post('/:id/confirm', controller.confirmCreditNote);
-router.post('/:id/submit-ebm', controller.submitCreditNoteEbm);
+router.post('/:id/confirm', requirePermission('credit_notes', 'approve'), controller.confirmCreditNote);
+router.post('/:id/submit-ebm', requirePermission('credit_notes', 'approve'), controller.submitCreditNoteEbm);
 
 // Legacy endpoints (backwards compatibility)
-router.put('/:id/approve', controller.approveCreditNote);
-router.post('/:id/apply', controller.applyCreditNote); // Apply to another invoice
-router.post('/:id/refund', controller.recordRefund);
+router.put('/:id/approve', requirePermission('credit_notes', 'approve'), controller.approveCreditNote);
+router.post('/:id/apply', requirePermission('credit_notes', 'approve'), controller.applyCreditNote); // Apply to another invoice
+router.post('/:id/refund', requirePermission('credit_notes', 'approve'), controller.recordRefund);
 
 module.exports = router;
