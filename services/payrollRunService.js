@@ -2003,7 +2003,8 @@ static async getAvailablePeriods(companyId) {
         .limit(500),
       Payroll.find({ company: companyId, record_status: { $in: ["finalised", "paid"] } })
         .sort({ pay_period_end: -1, createdAt: -1 })
-        .limit(1500),
+        // Prisma HTTP-backed reads enforce a hard 500-row ceiling.
+        .limit(500),
     ]);
     const exceptions = [];
     const today = new Date().toISOString().slice(0, 10);
