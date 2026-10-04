@@ -11,6 +11,7 @@
 const { prisma } = require('../lib/prisma');
 const { toIdString } = require('../utils/objectId');
 const { roleToApi } = require('../utils/authMappers');
+const { registerPermission, registerPermissionList } = require('../utils/permissionCatalog');
 
 /**
  * PermissionService - Checks if a role has a specific permission
@@ -28,9 +29,15 @@ class PermissionService {
       return false;
     }
 
+    const isSystemRole = role.is_system_role === true || role.isSystemRole === true;
+
     for (const permission of role.permissions) {
       // Wildcard resource matches everything
       if (permission.resource === '*') {
+        // Tenant-defined roles must never gain access across every resource
+        // through a crafted or legacy wildcard grant.
+        if (!isSystemRole) continue;
+
         if (role.name === 'admin') {
           return true;
         }
@@ -42,7 +49,10 @@ class PermissionService {
 
       // Exact resource match
       if (permission.resource === resource) {
-        if (permission.actions.includes(action) || permission.actions.includes('*')) {
+        if (
+          permission.actions.includes(action) ||
+          (isSystemRole && permission.actions.includes('*'))
+        ) {
           return true;
         }
       }
@@ -149,6 +159,11 @@ async function resolveUserRoles(user) {
 
 function buildAuthorizeMiddleware(checkFn, failureMessage) {
   return (resourceOrPermissions, maybeAction) => {
+    if (Array.isArray(resourceOrPermissions)) {
+      registerPermissionList(resourceOrPermissions);
+    } else if (typeof resourceOrPermissions === 'string' && typeof maybeAction === 'string') {
+      registerPermission(resourceOrPermissions, maybeAction);
+    }
     return async (req, res, next) => {
       try {
         const user = req.user;
@@ -161,9 +176,9 @@ function buildAuthorizeMiddleware(checkFn, failureMessage) {
           });
         }
 
-        const role = await resolveUserRole(user);
+        const roles = await resolveUserRoles(user);
 
-        if (!role) {
+        if (!roles.length) {
           return res.status(403).json({
             success: false,
             error: 'ROLE_NOT_FOUND',
@@ -171,18 +186,25 @@ function buildAuthorizeMiddleware(checkFn, failureMessage) {
           });
         }
 
-        const hasPermission = checkFn(role, resourceOrPermissions, maybeAction);
+        // A user can be assigned more than one role. Evaluate the same
+        // effective role set everywhere rather than silently considering only
+        // the first role (POS and payroll already evaluate the full set).
+        const hasPermission = roles.some((role) =>
+          checkFn(role, resourceOrPermissions, maybeAction),
+        );
 
         if (!hasPermission) {
+          const roleNames = roles.map((role) => role.name).filter(Boolean).join(', ');
           return res.status(403).json({
             success: false,
             error: 'FORBIDDEN',
-            message: failureMessage(role, resourceOrPermissions, maybeAction)
+            message: failureMessage({ name: roleNames }, resourceOrPermissions, maybeAction)
           });
         }
 
         // Attach role to request for downstream use
-        req.userRole = role;
+        req.userRole = roles[0];
+        req.userRoles = roles;
 
         next();
       } catch (err) {

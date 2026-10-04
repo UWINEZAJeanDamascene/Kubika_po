@@ -8,7 +8,8 @@ const {
   syncNow,
   convert
 } = require('../controllers/exchangeRateController');
-const { protect, authorize } = require('../middleware/auth');
+const { protect } = require('../middleware/auth');
+const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
 const { cacheMiddleware, cacheInvalidationMiddleware } = require('../middleware/cacheMiddleware');
 
 router.use(protect);
@@ -20,15 +21,15 @@ const cacheRates = cacheMiddleware({ type: 'exchange_rate', ttl: 3600 });
 const invalidateRates = cacheInvalidationMiddleware({ type: 'exchange_rate', invalidateAll: true });
 
 // Spec endpoints
-router.get('/', cacheRates, listRates);
-router.post('/', invalidateRates, addRate);
-router.get('/latest', cacheRates, getLatestRates);
-router.get('/current/:currency', cacheRates, getCurrentRate);
+router.get('/', requirePermissionOrRoles('exchange_rates', 'read', ['admin', 'accountant']), cacheRates, listRates);
+router.post('/', requirePermissionOrRoles('exchange_rates', 'create', ['admin', 'accountant']), invalidateRates, addRate);
+router.get('/latest', requirePermissionOrRoles('exchange_rates', 'read', ['admin', 'accountant']), cacheRates, getLatestRates);
+router.get('/current/:currency', requirePermissionOrRoles('exchange_rates', 'read', ['admin', 'accountant']), cacheRates, getCurrentRate);
 
 // Manual "Refresh Now" (admin)
-router.post('/sync', authorize('admin'), invalidateRates, syncNow);
+router.post('/sync', requirePermissionOrRoles('exchange_rates', 'update', ['admin']), invalidateRates, syncNow);
 
 // Internal / convert
-router.post('/convert', convert);
+router.post('/convert', requirePermissionOrRoles('exchange_rates', 'read', ['admin', 'accountant']), convert);
 
 module.exports = router;

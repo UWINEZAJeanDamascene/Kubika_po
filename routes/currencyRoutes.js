@@ -6,7 +6,8 @@ const {
   updateCurrency,
   seedDefaults
 } = require('../controllers/currencyController');
-const { protect, authorize } = require('../middleware/auth');
+const { protect } = require('../middleware/auth');
+const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
 const { cacheMiddleware, cacheInvalidationMiddleware } = require('../middleware/cacheMiddleware');
 
 // The currency list is not tenant-scoped (listCurrencies applies no company
@@ -21,8 +22,8 @@ const invalidateCurrencies = cacheInvalidationMiddleware({ type: 'currency', inv
 router.get('/', cacheCurrencies, listCurrencies);
 
 // Admin management
-router.post('/', protect, authorize('admin'), invalidateCurrencies, createCurrency);
-router.post('/seed', protect, authorize('admin'), invalidateCurrencies, seedDefaults);
-router.put('/:id', protect, authorize('admin'), invalidateCurrencies, updateCurrency);
+router.post('/', protect, requirePermissionOrRoles('currencies', 'create', ['admin']), invalidateCurrencies, createCurrency);
+router.post('/seed', protect, requirePermissionOrRoles('currencies', 'create', ['admin']), invalidateCurrencies, seedDefaults);
+router.put('/:id', protect, requirePermissionOrRoles('currencies', 'update', ['admin']), invalidateCurrencies, updateCurrency);
 
 module.exports = router;

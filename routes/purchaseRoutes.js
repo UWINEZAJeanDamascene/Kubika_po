@@ -12,33 +12,34 @@ const {
   getSupplierPurchases,
   generatePurchasePDF
 } = require('../controllers/purchaseController');
-const { protect, authorize } = require('../middleware/auth');
+const { protect } = require('../middleware/auth');
+const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
 const logAction = require('../middleware/logAction');
 
 router.use(protect);
 
 router.route('/')
-  .get(getPurchases)
-  .post(authorize('admin'), logAction('purchase'), createPurchase);
+  .get(requirePermissionOrRoles('purchase_orders', 'read', ['admin']), getPurchases)
+  .post(requirePermissionOrRoles('purchase_orders', 'create', ['admin']), logAction('purchase'), createPurchase);
 
 router.route('/:id')
-  .get(getPurchase)
-  .put(authorize('admin'), logAction('purchase'), updatePurchase)
-  .delete(authorize('admin'), logAction('purchase'), deletePurchase);
+  .get(requirePermissionOrRoles('purchase_orders', 'read', ['admin']), getPurchase)
+  .put(requirePermissionOrRoles('purchase_orders', 'update', ['admin']), logAction('purchase'), updatePurchase)
+  .delete(requirePermissionOrRoles('purchase_orders', 'delete', ['admin']), logAction('purchase'), deletePurchase);
 
 // Receive purchase (add stock)
-router.put('/:id/receive', authorize('admin'), logAction('purchase'), receivePurchase);
+router.put('/:id/receive', requirePermissionOrRoles('purchase_orders', 'update', ['admin']), logAction('purchase'), receivePurchase);
 
 // Record payment
-router.post('/:id/payment', authorize('admin'), logAction('purchase'), recordPayment);
+router.post('/:id/payment', requirePermissionOrRoles('ap_payments', 'create', ['admin']), logAction('purchase'), recordPayment);
 
 // Cancel purchase
-router.put('/:id/cancel', authorize('admin'), logAction('purchase'), cancelPurchase);
+router.put('/:id/cancel', requirePermissionOrRoles('purchase_orders', 'delete', ['admin']), logAction('purchase'), cancelPurchase);
 
 // PDF generation
-router.get('/:id/pdf', generatePurchasePDF);
+router.get('/:id/pdf', requirePermissionOrRoles('purchase_orders', 'read', ['admin']), generatePurchasePDF);
 
 // Supplier specific routes
-router.get('/supplier/:supplierId', getSupplierPurchases);
+router.get('/supplier/:supplierId', requirePermissionOrRoles('purchase_orders', 'read', ['admin']), getSupplierPurchases);
 
 module.exports = router;

@@ -13,35 +13,36 @@ const {
   getPayablesSummary,
   generateSchedulesFromPurchases
 } = require('../controllers/payableController');
-const { protect, authorize } = require('../middleware/auth');
+const { protect } = require('../middleware/auth');
+const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
 const logAction = require('../middleware/logAction');
 
 router.use(protect);
 
 // Payment schedules CRUD
 router.route('/schedules')
-  .get(getPaymentSchedules)
-  .post(authorize('admin'), logAction('payable'), createPaymentSchedule);
+  .get(requirePermissionOrRoles('ap_payments', 'read', ['admin']), getPaymentSchedules)
+  .post(requirePermissionOrRoles('ap_payments', 'create', ['admin']), logAction('payable'), createPaymentSchedule);
 
 router.route('/schedules/:id')
-  .get(getPaymentSchedule)
-  .put(authorize('admin'), logAction('payable'), updatePaymentSchedule)
-  .delete(authorize('admin'), logAction('payable'), deletePaymentSchedule);
+  .get(requirePermissionOrRoles('ap_payments', 'read', ['admin']), getPaymentSchedule)
+  .put(requirePermissionOrRoles('ap_payments', 'update', ['admin']), logAction('payable'), updatePaymentSchedule)
+  .delete(requirePermissionOrRoles('ap_payments', 'delete', ['admin']), logAction('payable'), deletePaymentSchedule);
 
 // Record payment for a schedule
-router.post('/schedules/:id/pay', authorize('admin', 'stock_manager'), logAction('payable'), recordSchedulePayment);
+router.post('/schedules/:id/pay', requirePermissionOrRoles('ap_payments', 'create', ['admin', 'accountant']), logAction('payable'), recordSchedulePayment);
 
 // Supplier statement reconciliation
-router.get('/supplier/:supplierId/statement', getSupplierStatement);
-router.post('/supplier/:supplierId/reconcile', authorize('admin'), logAction('payable'), reconcileSupplierStatement);
+router.get('/supplier/:supplierId/statement', requirePermissionOrRoles('ap_payments', 'read', ['admin', 'accountant']), getSupplierStatement);
+router.post('/supplier/:supplierId/reconcile', requirePermissionOrRoles('ap_payments', 'update', ['admin', 'accountant']), logAction('payable'), reconcileSupplierStatement);
 
 // Payable aging report (enhanced version)
-router.get('/aging', getPayableAgingReport);
+router.get('/aging', requirePermissionOrRoles('ap_payments', 'read', ['admin', 'accountant']), getPayableAgingReport);
 
 // Payables dashboard summary
-router.get('/summary', getPayablesSummary);
+router.get('/summary', requirePermissionOrRoles('ap_payments', 'read', ['admin', 'accountant']), getPayablesSummary);
 
 // Auto-generate payment schedules
-router.post('/generate-schedules', authorize('admin'), logAction('payable'), generateSchedulesFromPurchases);
+router.post('/generate-schedules', requirePermissionOrRoles('ap_payments', 'create', ['admin']), logAction('payable'), generateSchedulesFromPurchases);
 
 module.exports = router;

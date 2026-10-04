@@ -17,7 +17,8 @@ const {
   getPendingPack,
   cancelPickPack
 } = require('../controllers/pickPackController');
-const { protect, authorize } = require('../middleware/auth');
+const { protect } = require('../middleware/auth');
+const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
 const logAction = require('../middleware/logAction');
 const { cacheMiddleware, cacheInvalidationMiddleware } = require('../middleware/cacheMiddleware');
 
@@ -36,35 +37,35 @@ router.use(protect);
 router.use(invalidatePickPackReads);
 
 // Special routes (must come before :id routes)
-router.get('/my-tasks', authorize('admin', 'stock_manager', 'warehouse'), cachePickPackReads, getMyTasks);
-router.get('/pending-pick', authorize('admin', 'stock_manager', 'warehouse'), cachePickPackReads, getPendingPick);
-router.get('/pending-pack', authorize('admin', 'stock_manager', 'warehouse'), cachePickPackReads, getPendingPack);
+router.get('/my-tasks', requirePermissionOrRoles('pick_packs', 'read', ['admin', 'stock_manager', 'warehouse', 'warehouse_manager']), cachePickPackReads, getMyTasks);
+router.get('/pending-pick', requirePermissionOrRoles('pick_packs', 'read', ['admin', 'stock_manager', 'warehouse', 'warehouse_manager']), cachePickPackReads, getPendingPick);
+router.get('/pending-pack', requirePermissionOrRoles('pick_packs', 'read', ['admin', 'stock_manager', 'warehouse', 'warehouse_manager']), cachePickPackReads, getPendingPack);
 
 // Main routes
 router.route('/')
-  .get(authorize('admin', 'stock_manager', 'warehouse'), cachePickPackReads, getPickPacks)
-  .post(authorize('admin', 'stock_manager', 'warehouse'), logAction('pick_pack'), createPickPack);
+  .get(requirePermissionOrRoles('pick_packs', 'read', ['admin', 'stock_manager', 'warehouse', 'warehouse_manager']), cachePickPackReads, getPickPacks)
+  .post(requirePermissionOrRoles('pick_packs', 'create', ['admin', 'stock_manager', 'warehouse', 'warehouse_manager']), logAction('pick_pack'), createPickPack);
 
 router.route('/:id')
-  .get(authorize('admin', 'stock_manager', 'warehouse'), cachePickPackReads, getPickPack);
+  .get(requirePermissionOrRoles('pick_packs', 'read', ['admin', 'stock_manager', 'warehouse', 'warehouse_manager']), cachePickPackReads, getPickPack);
 
 // Assignment
-router.post('/:id/assign', authorize('admin', 'stock_manager'), logAction('pick_pack'), assignPickPack);
+router.post('/:id/assign', requirePermissionOrRoles('pick_packs', 'update', ['admin', 'stock_manager']), logAction('pick_pack'), assignPickPack);
 
 // Picking workflow
-router.post('/:id/start-picking', authorize('admin', 'stock_manager', 'warehouse'), logAction('pick_pack'), startPicking);
-router.post('/:id/pick-items', authorize('admin', 'stock_manager', 'warehouse'), logAction('pick_pack'), pickItems);
-router.post('/:id/complete-picking', authorize('admin', 'stock_manager', 'warehouse'), logAction('pick_pack'), completePicking);
+router.post('/:id/start-picking', requirePermissionOrRoles('pick_packs', 'update', ['admin', 'stock_manager', 'warehouse', 'warehouse_manager']), logAction('pick_pack'), startPicking);
+router.post('/:id/pick-items', requirePermissionOrRoles('pick_packs', 'update', ['admin', 'stock_manager', 'warehouse', 'warehouse_manager']), logAction('pick_pack'), pickItems);
+router.post('/:id/complete-picking', requirePermissionOrRoles('pick_packs', 'update', ['admin', 'stock_manager', 'warehouse', 'warehouse_manager']), logAction('pick_pack'), completePicking);
 
 // Packing workflow
-router.post('/:id/start-packing', authorize('admin', 'stock_manager', 'warehouse'), logAction('pick_pack'), startPacking);
-router.post('/:id/pack-items', authorize('admin', 'stock_manager', 'warehouse'), logAction('pick_pack'), packItems);
-router.post('/:id/complete-packing', authorize('admin', 'stock_manager', 'warehouse'), logAction('pick_pack'), completePacking);
+router.post('/:id/start-packing', requirePermissionOrRoles('pick_packs', 'update', ['admin', 'stock_manager', 'warehouse', 'warehouse_manager']), logAction('pick_pack'), startPacking);
+router.post('/:id/pack-items', requirePermissionOrRoles('pick_packs', 'update', ['admin', 'stock_manager', 'warehouse', 'warehouse_manager']), logAction('pick_pack'), packItems);
+router.post('/:id/complete-packing', requirePermissionOrRoles('pick_packs', 'update', ['admin', 'stock_manager', 'warehouse', 'warehouse_manager']), logAction('pick_pack'), completePacking);
 
 // Issue reporting
-router.post('/:id/report-issue', authorize('admin', 'stock_manager', 'warehouse'), logAction('pick_pack'), reportIssue);
+router.post('/:id/report-issue', requirePermissionOrRoles('pick_packs', 'update', ['admin', 'stock_manager', 'warehouse', 'warehouse_manager']), logAction('pick_pack'), reportIssue);
 
 // Cancel
-router.post('/:id/cancel', authorize('admin', 'stock_manager'), logAction('pick_pack'), cancelPickPack);
+router.post('/:id/cancel', requirePermissionOrRoles('pick_packs', 'delete', ['admin', 'stock_manager']), logAction('pick_pack'), cancelPickPack);
 
 module.exports = router;

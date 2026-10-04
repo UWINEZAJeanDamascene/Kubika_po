@@ -6,6 +6,7 @@ const {
   createRole, 
   getRoles, 
   getRoleById,
+  getPermissionCatalog,
   getRolePermissions,
   updateRole, 
   deleteRole 
@@ -48,6 +49,7 @@ router.use(ipWhitelist);
  */
 router.get('/roles', authorize('platform_admin', 'admin'), getRoles);
 router.post('/roles', authorize('platform_admin', 'admin'), createRole);
+router.get('/roles/permission-catalog', authorize('platform_admin', 'admin'), getPermissionCatalog);
 router.get('/roles/:id', authorize('platform_admin', 'admin'), getRoleById);
 router.get('/roles/:id/permissions', authorize('platform_admin', 'admin'), getRolePermissions);
 router.put('/roles/:id', authorize('platform_admin', 'admin'), updateRole);

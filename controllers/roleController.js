@@ -13,6 +13,7 @@ const { prisma } = require('../lib/prisma');
 const { generateObjectId, toIdString } = require('../utils/objectId');
 const { roleToApi } = require('../utils/authMappers');
 const { parsePagination, paginationMeta } = require('../utils/pagination');
+const { getPermissionCatalog: getRegisteredPermissionCatalog } = require('../utils/permissionCatalog');
 const RESERVED_ROLE_NAMES = new Set(['admin', 'platform_admin', 'super_admin']);
 
 function requestCompanyId(req) {
@@ -31,6 +32,10 @@ function visibleRoleWhere(req, id) {
     OR: companyId ? [{ isSystemRole: true }, { companyId }] : [{ isSystemRole: true }],
   };
 }
+
+exports.getPermissionCatalog = async (req, res) => {
+  res.json({ success: true, data: getRegisteredPermissionCatalog() });
+};
 
 const normalizePermissions = (permissions = []) => {
   if (!Array.isArray(permissions)) return [];
@@ -64,6 +69,34 @@ const normalizePermissions = (permissions = []) => {
     actions: Array.from(actions).filter(Boolean)
   })).filter(permission => permission.actions.length > 0);
 };
+
+function hasWildcardGrant(permissions) {
+  return permissions.some((permission) =>
+    permission.resource === '*' || permission.actions.includes('*'),
+  );
+}
+
+function unregisteredPermissionPairs(permissions, previouslyAssigned = []) {
+  const catalogPairs = new Set(
+    getRegisteredPermissionCatalog().flatMap(({ resource, actions }) =>
+      actions.map((action) => `${String(resource).toLowerCase()}:${String(action).toLowerCase()}`),
+    ),
+  );
+  const priorPairs = new Set(
+    previouslyAssigned.flatMap(({ resource, actions = [] }) =>
+      actions.map((action) => `${String(resource).toLowerCase()}:${String(action).toLowerCase()}`),
+    ),
+  );
+
+  return permissions.flatMap(({ resource, actions }) =>
+    actions
+      .filter((action) => {
+        const key = `${String(resource).toLowerCase()}:${String(action).toLowerCase()}`;
+        return !catalogPairs.has(key) && !priorPairs.has(key);
+      })
+      .map((action) => ({ resource, action })),
+  );
+}
 
 /**
  * List all roles (system roles + company custom roles)
@@ -207,13 +240,33 @@ exports.createRole = async (req, res, next) => {
       });
     }
 
+    const normalizedPermissions = normalizePermissions(permissions);
+    if (!isPlatformAdmin(req) && hasWildcardGrant(normalizedPermissions)) {
+      return res.status(400).json({
+        success: false,
+        error: 'WILDCARD_PERMISSION_FORBIDDEN',
+        message: 'Company roles must use the specific resource and actions listed in the permission catalog.',
+      });
+    }
+    if (!isPlatformAdmin(req)) {
+      const unknownPermissions = unregisteredPermissionPairs(normalizedPermissions);
+      if (unknownPermissions.length) {
+        return res.status(400).json({
+          success: false,
+          error: 'PERMISSION_NOT_IN_CATALOG',
+          message: 'Choose permissions from the current system permission catalog.',
+          details: unknownPermissions,
+        });
+      }
+    }
+
     // Create the role (custom roles cannot be system roles)
     const role = await prisma.role.create({
       data: {
         id: generateObjectId(),
         name: String(name).trim(),
         description: description || null,
-        permissions: normalizePermissions(permissions),
+        permissions: normalizedPermissions,
         companyId: effectiveCompanyId,
         isSystemRole: false,
       },
@@ -282,7 +335,28 @@ exports.updateRole = async (req, res, next) => {
     const data = {};
     if (name) data.name = String(name).trim();
     if (description !== undefined) data.description = description;
-    if (permissions) data.permissions = normalizePermissions(permissions);
+    if (permissions) {
+      const normalizedPermissions = normalizePermissions(permissions);
+      if (!isPlatformAdmin(req) && hasWildcardGrant(normalizedPermissions)) {
+        return res.status(400).json({
+          success: false,
+          error: 'WILDCARD_PERMISSION_FORBIDDEN',
+          message: 'Company roles must use the specific resource and actions listed in the permission catalog.',
+        });
+      }
+      if (!isPlatformAdmin(req)) {
+        const unknownPermissions = unregisteredPermissionPairs(normalizedPermissions, role.permissions || []);
+        if (unknownPermissions.length) {
+          return res.status(400).json({
+            success: false,
+            error: 'PERMISSION_NOT_IN_CATALOG',
+            message: 'Choose permissions from the current system permission catalog.',
+            details: unknownPermissions,
+          });
+        }
+      }
+      data.permissions = normalizedPermissions;
+    }
 
     const updated = await prisma.role.update({ where: { id }, data });
 

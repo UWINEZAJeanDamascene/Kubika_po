@@ -12,7 +12,8 @@ const {
   updateStockMovement,
   deleteStockMovement
 } = require('../controllers/stockController');
-const { protect, authorize } = require('../middleware/auth');
+const { protect } = require('../middleware/auth');
+const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
 const logAction = require('../middleware/logAction');
 const { cacheMiddleware, cacheInvalidationMiddleware } = require('../middleware/cacheMiddleware');
 
@@ -30,18 +31,18 @@ router.use(protect);
 router.use(invalidateStockReads);
 
 router.route('/movements')
-  .get(cacheStockReads, getStockMovements)
-  .post(authorize('admin'), logAction('stock'), receiveStock);
+  .get(requirePermissionOrRoles('stock', 'read', ['admin']), cacheStockReads, getStockMovements)
+  .post(requirePermissionOrRoles('stock', 'create', ['admin']), logAction('stock'), receiveStock);
 
-router.get('/movements/:id', cacheStockReads, getStockMovement);
-router.put('/movements/:id', authorize('admin'), logAction('stock'), updateStockMovement);
-router.delete('/movements/:id', authorize('admin'), logAction('stock'), deleteStockMovement);
-router.get('/product/:productId/movements', cacheStockReads, getProductStockMovements);
-router.post('/adjust', authorize('admin'), logAction('stock'), adjustStock);
-router.post('/opening', authorize('admin'), logAction('stock'), createOpeningStock);
-router.get('/summary', cacheStockReads, getStockSummary);
+router.get('/movements/:id', requirePermissionOrRoles('stock', 'read', ['admin']), cacheStockReads, getStockMovement);
+router.put('/movements/:id', requirePermissionOrRoles('stock', 'update', ['admin']), logAction('stock'), updateStockMovement);
+router.delete('/movements/:id', requirePermissionOrRoles('stock', 'delete', ['admin']), logAction('stock'), deleteStockMovement);
+router.get('/product/:productId/movements', requirePermissionOrRoles('stock', 'read', ['admin']), cacheStockReads, getProductStockMovements);
+router.post('/adjust', requirePermissionOrRoles('stock', 'update', ['admin']), logAction('stock'), adjustStock);
+router.post('/opening', requirePermissionOrRoles('stock', 'create', ['admin']), logAction('stock'), createOpeningStock);
+router.get('/summary', requirePermissionOrRoles('stock', 'read', ['admin']), cacheStockReads, getStockSummary);
 
 // Stock Levels endpoint - provides per-warehouse stock information
-router.get('/levels', cacheStockReads, getStockLevels);
+router.get('/levels', requirePermissionOrRoles('stock', 'read', ['admin']), cacheStockReads, getStockLevels);
 
 module.exports = router;

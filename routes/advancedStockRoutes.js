@@ -105,8 +105,9 @@ const {
   getFreightAnalysis
 } = require('../controllers/freightBillController');
 
-const { protect, authorize } = require('../middleware/auth');
+const { protect } = require('../middleware/auth');
 const { requirePermission, requireAnyPermission } = require('../middleware/rbacMiddleware');
+const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
 
 // GRNs are needed by GRN UI and by purchase-return creation (select confirmed GRN)
 const canReadGrn = requireAnyPermission([
@@ -120,65 +121,65 @@ router.use(protect);
 
 // ========== WAREHOUSE ROUTES ==========
 router.route('/warehouses')
-  .get(getWarehouses)
-  .post(authorize('admin', 'stock_manager'), logAction('stock'), createWarehouse);
+  .get(requirePermissionOrRoles('warehouses', 'read', ['admin', 'stock_manager', 'warehouse_manager']), getWarehouses)
+  .post(requirePermissionOrRoles('warehouses', 'create', ['admin', 'stock_manager', 'warehouse_manager']), logAction('stock'), createWarehouse);
 
 router.route('/warehouses/:id')
-  .get(getWarehouse)
-  .put(authorize('admin', 'stock_manager'), logAction('stock'), updateWarehouse)
-  .delete(authorize('admin'), logAction('stock'), deleteWarehouse);
+  .get(requirePermissionOrRoles('warehouses', 'read', ['admin', 'stock_manager', 'warehouse_manager']), getWarehouse)
+  .put(requirePermissionOrRoles('warehouses', 'update', ['admin', 'stock_manager', 'warehouse_manager']), logAction('stock'), updateWarehouse)
+  .delete(requirePermissionOrRoles('warehouses', 'delete', ['admin']), logAction('stock'), deleteWarehouse);
 
-router.get('/warehouses/:id/inventory', getWarehouseInventory);
+router.get('/warehouses/:id/inventory', requirePermissionOrRoles('warehouses', 'read', ['admin', 'stock_manager', 'warehouse_manager']), getWarehouseInventory);
 
 // ========== INVENTORY BATCH ROUTES ==========
 router.route('/batches')
-  .get(getInventoryBatches)
-  .post(authorize('admin', 'stock_manager'), logAction('stock'), createInventoryBatch);
+  .get(requirePermissionOrRoles('stock', 'read', ['admin', 'stock_manager', 'warehouse_manager']), getInventoryBatches)
+  .post(requirePermissionOrRoles('stock', 'create', ['admin', 'stock_manager', 'warehouse_manager']), logAction('stock'), createInventoryBatch);
 
 router.route('/batches/:id')
-  .get(getInventoryBatch)
-  .put(authorize('admin', 'stock_manager'), logAction('stock'), updateInventoryBatch);
+  .get(requirePermissionOrRoles('stock', 'read', ['admin', 'stock_manager', 'warehouse_manager']), getInventoryBatch)
+  .put(requirePermissionOrRoles('stock', 'update', ['admin', 'stock_manager', 'warehouse_manager']), logAction('stock'), updateInventoryBatch);
 
-router.post('/batches/:id/consume', authorize('admin', 'stock_manager'), logAction('stock'), consumeFromBatch);
+router.post('/batches/:id/consume', requirePermissionOrRoles('stock', 'update', ['admin', 'stock_manager', 'warehouse_manager']), logAction('stock'), consumeFromBatch);
 
-router.get('/batches/expiring', getExpiringBatches);
-router.get('/batches/product/:productId', getProductBatches);
+router.get('/batches/expiring', requirePermissionOrRoles('stock', 'read', ['admin', 'stock_manager', 'warehouse_manager']), getExpiringBatches);
+router.get('/batches/product/:productId', requirePermissionOrRoles('stock', 'read', ['admin', 'stock_manager', 'warehouse_manager']), getProductBatches);
 
 // ========== SERIAL NUMBER ROUTES ==========
 router.route('/serial-numbers')
-  .get(getSerialNumbers)
-  .post(authorize('admin', 'stock_manager'), logAction('stock'), createSerialNumber);
+  .get(requirePermissionOrRoles('stock', 'read', ['admin', 'stock_manager', 'warehouse_manager']), getSerialNumbers)
+  .post(requirePermissionOrRoles('stock', 'create', ['admin', 'stock_manager', 'warehouse_manager']), logAction('stock'), createSerialNumber);
 
 router.route('/serial-numbers/:id')
-  .get(getSerialNumber)
-  .put(authorize('admin', 'stock_manager'), logAction('stock'), updateSerialNumber);
+  .get(requirePermissionOrRoles('stock', 'read', ['admin', 'stock_manager', 'warehouse_manager']), getSerialNumber)
+  .put(requirePermissionOrRoles('stock', 'update', ['admin', 'stock_manager', 'warehouse_manager']), logAction('stock'), updateSerialNumber);
 
-router.post('/serial-numbers/:id/sell', authorize('admin', 'stock_manager'), logAction('stock'), sellSerialNumber);
-router.post('/serial-numbers/:id/return', authorize('admin', 'stock_manager'), logAction('stock'), returnSerialNumber);
+router.post('/serial-numbers/:id/sell', requirePermissionOrRoles('stock', 'update', ['admin', 'stock_manager', 'warehouse_manager']), logAction('stock'), sellSerialNumber);
+router.post('/serial-numbers/:id/return', requirePermissionOrRoles('stock', 'update', ['admin', 'stock_manager', 'warehouse_manager']), logAction('stock'), returnSerialNumber);
 
-router.get('/serial-numbers/lookup/:serial', lookupSerialNumber);
-router.get('/serial-numbers/product/:productId/available', getAvailableSerials);
+router.get('/serial-numbers/lookup/:serial', requirePermissionOrRoles('stock', 'read', ['admin', 'stock_manager', 'warehouse_manager']), lookupSerialNumber);
+router.get('/serial-numbers/product/:productId/available', requirePermissionOrRoles('stock', 'read', ['admin', 'stock_manager', 'warehouse_manager']), getAvailableSerials);
 
 // ========== STOCK TRANSFER ROUTES ==========
 router.route('/transfers')
-  .get(getStockTransfers)
-  .post(authorize('admin', 'stock_manager'), logAction('stock'), createStockTransfer);
+  .get(requirePermissionOrRoles('stock_transfers', 'read', ['admin', 'stock_manager', 'warehouse_manager']), getStockTransfers)
+  .post(requirePermissionOrRoles('stock_transfers', 'create', ['admin', 'stock_manager', 'warehouse_manager']), logAction('stock'), createStockTransfer);
 
 router.route('/transfers/:id')
-  .get(getStockTransfer)
-  .post(authorize('admin'), approveStockTransfer);
+  .get(requirePermissionOrRoles('stock_transfers', 'read', ['admin', 'stock_manager', 'warehouse_manager']), getStockTransfer)
+  .post(requirePermissionOrRoles('stock_transfers', 'approve', ['admin']), approveStockTransfer);
 
-router.post('/transfers/:id/approve', authorize('admin'), logAction('stock'), approveStockTransfer);
-router.post('/transfers/:id/complete', authorize('admin', 'stock_manager'), logAction('stock'), completeStockTransfer);
-router.post('/transfers/:id/cancel', authorize('admin'), logAction('stock'), cancelStockTransfer);
+router.post('/transfers/:id/approve', requirePermissionOrRoles('stock_transfers', 'approve', ['admin']), logAction('stock'), approveStockTransfer);
+router.post('/transfers/:id/complete', requirePermissionOrRoles('stock_transfers', 'update', ['admin', 'stock_manager', 'warehouse_manager']), logAction('stock'), completeStockTransfer);
+router.post('/transfers/:id/cancel', requirePermissionOrRoles('stock_transfers', 'delete', ['admin']), logAction('stock'), cancelStockTransfer);
 
 // ========== STOCK AUDIT ROUTES ==========
 router.route('/audits')
-  .get(getStockAudits)
-  .post(authorize('admin', 'stock_manager'), logAction('stock'), createStockAudit);
+  .get(requirePermissionOrRoles('stock_audits', 'read', ['admin', 'stock_manager', 'warehouse_manager']), getStockAudits)
+  .post(requirePermissionOrRoles('stock_audits', 'create', ['admin', 'stock_manager', 'warehouse_manager']), logAction('stock'), createStockAudit);
 
 router.route('/audits/:id')
-  .get(getStockAudit);
+  .get(requirePermissionOrRoles('stock_audits', 'read', ['admin', 'stock_manager', 'warehouse_manager']), getStockAudit);
 
 // router.put('/audits/:id/items/:itemId', authorize('admin', 'stock_manager'), updateAuditItem); // Function not implemented
 // router.post('/audits/:id/complete', authorize('admin'), logAction('stock'), completeStockAudit); // Not implemented
@@ -187,17 +188,17 @@ router.route('/audits/:id')
 
 // ========== REORDER POINT ROUTES ==========
 router.route('/reorder-points')
-  .get(getReorderPoints)
-  .post(authorize('admin', 'stock_manager'), logAction('stock'), createReorderPoint);
+  .get(requirePermissionOrRoles('stock', 'read', ['admin', 'stock_manager', 'warehouse_manager']), getReorderPoints)
+  .post(requirePermissionOrRoles('stock', 'create', ['admin', 'stock_manager', 'warehouse_manager']), logAction('stock'), createReorderPoint);
 
 // Place static/specific routes before the parameterized :id route to avoid route conflicts
-router.get('/reorder-points/needing-reorder', getProductsNeedingReorder);
+router.get('/reorder-points/needing-reorder', requirePermissionOrRoles('stock', 'read', ['admin', 'stock_manager', 'warehouse_manager']), getProductsNeedingReorder);
 
 router.route('/reorder-points/:id')
-  .get(getReorderPoint)
-  .put(authorize('admin', 'stock_manager'), logAction('stock'), updateReorderPoint)
-  .delete(authorize('admin'), logAction('stock'), deleteReorderPoint);
-router.post('/reorder-points/bulk', authorize('admin', 'stock_manager'), logAction('stock'), bulkCreateReorderPoints);
+  .get(requirePermissionOrRoles('stock', 'read', ['admin', 'stock_manager', 'warehouse_manager']), getReorderPoint)
+  .put(requirePermissionOrRoles('stock', 'update', ['admin', 'stock_manager', 'warehouse_manager']), logAction('stock'), updateReorderPoint)
+  .delete(requirePermissionOrRoles('stock', 'delete', ['admin']), logAction('stock'), deleteReorderPoint);
+router.post('/reorder-points/bulk', requirePermissionOrRoles('stock', 'create', ['admin', 'stock_manager', 'warehouse_manager']), logAction('stock'), bulkCreateReorderPoints);
 
 // Auto-reorder routes
 const { 
@@ -205,8 +206,8 @@ const {
   triggerAutoReorderCheck 
 } = require('../controllers/reorderPointController');
 
-router.post('/reorder-points/apply-to-product', authorize('admin', 'stock_manager'), logAction('stock'), applyReorderPointToProduct);
-router.post('/reorder-points/trigger-auto-check', authorize('admin', 'stock_manager'), triggerAutoReorderCheck);
+router.post('/reorder-points/apply-to-product', requirePermissionOrRoles('stock', 'update', ['admin', 'stock_manager', 'warehouse_manager']), logAction('stock'), applyReorderPointToProduct);
+router.post('/reorder-points/trigger-auto-check', requirePermissionOrRoles('stock', 'update', ['admin', 'stock_manager', 'warehouse_manager']), triggerAutoReorderCheck);
 
 // ========== PURCHASE ORDER ROUTES ==========
 router.route('/purchase-orders')

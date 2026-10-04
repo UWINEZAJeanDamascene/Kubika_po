@@ -13,24 +13,25 @@ const {
   markAllAsRead,
   deleteNotification
 } = require('../controllers/notificationController');
-const { protect, authorize } = require('../middleware/auth');
+const { protect } = require('../middleware/auth');
+const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
 
 router.use(protect);
 
 // Settings management (must come before /:id routes)
 router.route('/settings')
-  .get(authorize('admin'), getSettings)
-  .put(authorize('admin'), updateSettings);
+  .get(requirePermissionOrRoles('notifications', 'read', ['admin']), getSettings)
+  .put(requirePermissionOrRoles('notifications', 'update', ['admin']), updateSettings);
 
 // Test endpoints
-router.post('/test-email', authorize('admin'), testEmail);
-router.post('/test-sms', authorize('admin'), testSMS);
+router.post('/test-email', requirePermissionOrRoles('notifications', 'update', ['admin']), testEmail);
+router.post('/test-sms', requirePermissionOrRoles('notifications', 'update', ['admin']), testSMS);
 
 // Manual summary
-router.post('/send-summary', authorize('admin'), sendManualSummary);
+router.post('/send-summary', requirePermissionOrRoles('notifications', 'send', ['admin']), sendManualSummary);
 
 // Manual payment reminder
-router.post('/send-payment-reminder', authorize('admin'), sendManualPaymentReminder);
+router.post('/send-payment-reminder', requirePermissionOrRoles('notifications', 'send', ['admin']), sendManualPaymentReminder);
 
 // Unread count
 router.get('/unread-count', getUnreadCount);

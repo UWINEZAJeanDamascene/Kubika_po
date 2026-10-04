@@ -20,7 +20,8 @@ const {
   publicQuotationPDF,
   markExpiredQuotations
 } = require('../controllers/quotationController');
-const { protect, authorize } = require('../middleware/auth');
+const { protect } = require('../middleware/auth');
+const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
 const logAction = require('../middleware/logAction');
 
 // Public token routes (no protect)
@@ -31,33 +32,33 @@ router.get('/public/:token/pdf', publicQuotationPDF);
 router.use(protect);
 
 router.route('/')
-  .get(getQuotations)
-  .post(authorize('admin', 'sales'), logAction('quotation'), createQuotation);
+  .get(requirePermissionOrRoles('quotations', 'read', ['admin', 'sales']), getQuotations)
+  .post(requirePermissionOrRoles('quotations', 'create', ['admin', 'sales']), logAction('quotation'), createQuotation);
 
 // PDF route must come BEFORE :id route
-router.get('/:id/pdf', generateQuotationPDF);
+router.get('/:id/pdf', requirePermissionOrRoles('quotations', 'read', ['admin', 'sales']), generateQuotationPDF);
 
 router.route('/:id')
-  .get(getQuotation)
-  .put(authorize('admin', 'sales'), logAction('quotation'), updateQuotation)
-  .delete(authorize('admin', 'sales'), logAction('quotation'), deleteQuotation);
+  .get(requirePermissionOrRoles('quotations', 'read', ['admin', 'sales']), getQuotation)
+  .put(requirePermissionOrRoles('quotations', 'update', ['admin', 'sales']), logAction('quotation'), updateQuotation)
+  .delete(requirePermissionOrRoles('quotations', 'delete', ['admin', 'sales']), logAction('quotation'), deleteQuotation);
 
 // Status transition routes
-router.post('/:id/send', authorize('admin', 'sales'), logAction('quotation'), sendQuotation);
-router.post('/:id/accept', authorize('admin'), logAction('quotation'), acceptQuotation);
-router.post('/:id/reject', authorize('admin'), logAction('quotation'), rejectQuotation);
+router.post('/:id/send', requirePermissionOrRoles('quotations', 'update', ['admin', 'sales']), logAction('quotation'), sendQuotation);
+router.post('/:id/accept', requirePermissionOrRoles('quotations', 'approve', ['admin']), logAction('quotation'), acceptQuotation);
+router.post('/:id/reject', requirePermissionOrRoles('quotations', 'approve', ['admin']), logAction('quotation'), rejectQuotation);
 // Deprecated - kept for backward compatibility
-router.put('/:id/approve', authorize('admin'), logAction('quotation'), approveQuotation);
-router.post('/:id/convert', authorize('admin', 'sales'), logAction('quotation'), convertToSalesOrder);
+router.put('/:id/approve', requirePermissionOrRoles('quotations', 'approve', ['admin']), logAction('quotation'), approveQuotation);
+router.post('/:id/convert', requirePermissionOrRoles('quotations', 'update', ['admin', 'sales']), logAction('quotation'), convertToSalesOrder);
 // Old convert route (kept for backward compatibility)
-router.post('/:id/convert-to-invoice', authorize('admin', 'sales'), logAction('quotation'), convertToInvoice);
+router.post('/:id/convert-to-invoice', requirePermissionOrRoles('quotations', 'update', ['admin', 'sales']), logAction('quotation'), convertToInvoice);
 // NEW WORKFLOW: Convert to Sales Order
-router.post('/:id/convert-to-so', authorize('admin', 'sales'), logAction('quotation'), convertToSalesOrder);
+router.post('/:id/convert-to-so', requirePermissionOrRoles('quotations', 'update', ['admin', 'sales']), logAction('quotation'), convertToSalesOrder);
 
 // Expiry enforcement (cron/manual)
-router.post('/expire', authorize('admin'), markExpiredQuotations);
+router.post('/expire', requirePermissionOrRoles('quotations', 'update', ['admin']), markExpiredQuotations);
 
-router.get('/client/:clientId', getClientQuotations);
-router.get('/product/:productId', getProductQuotations);
+router.get('/client/:clientId', requirePermissionOrRoles('quotations', 'read', ['admin', 'sales']), getClientQuotations);
+router.get('/product/:productId', requirePermissionOrRoles('quotations', 'read', ['admin', 'sales']), getProductQuotations);
 
 module.exports = router;

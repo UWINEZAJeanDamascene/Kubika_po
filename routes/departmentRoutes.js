@@ -12,7 +12,8 @@ const {
   assignEmployees,
   removeEmployee
 } = require('../controllers/departmentController');
-const { protect, authorize } = require('../middleware/auth');
+const { protect } = require('../middleware/auth');
+const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
 const logAction = require('../middleware/logAction');
 const { cacheMiddleware, cacheInvalidationMiddleware } = require('../middleware/cacheMiddleware');
 
@@ -23,20 +24,20 @@ const invalidateRef = cacheInvalidationMiddleware({ type: 'department', invalida
 router.use(protect);
 
 router.route('/')
-  .get(cacheRef, getDepartments)
-  .post(authorize('admin'), logAction('department'), invalidateRef, createDepartment);
+  .get(requirePermissionOrRoles('departments', 'read', ['admin']), cacheRef, getDepartments)
+  .post(requirePermissionOrRoles('departments', 'create', ['admin']), logAction('department'), invalidateRef, createDepartment);
 
 router.route('/:id')
-  .get(cacheRef, getDepartment)
-  .put(authorize('admin'), logAction('department'), invalidateRef, updateDepartment)
-  .delete(authorize('admin'), logAction('department'), invalidateRef, deleteDepartment);
+  .get(requirePermissionOrRoles('departments', 'read', ['admin']), cacheRef, getDepartment)
+  .put(requirePermissionOrRoles('departments', 'update', ['admin']), logAction('department'), invalidateRef, updateDepartment)
+  .delete(requirePermissionOrRoles('departments', 'delete', ['admin']), logAction('department'), invalidateRef, deleteDepartment);
 
-router.put('/:id/assign-users', authorize('admin'), logAction('department'), invalidateRef, assignUsers);
-router.put('/:id/remove-user/:userId', authorize('admin'), logAction('department'), invalidateRef, removeUser);
+router.put('/:id/assign-users', requirePermissionOrRoles('departments', 'update', ['admin']), logAction('department'), invalidateRef, assignUsers);
+router.put('/:id/remove-user/:userId', requirePermissionOrRoles('departments', 'update', ['admin']), logAction('department'), invalidateRef, removeUser);
 
 // Employee department routes
-router.get('/:id/employees', protect, getDepartmentEmployees);
-router.put('/:id/assign-employees', authorize('admin'), logAction('department'), invalidateRef, assignEmployees);
-router.put('/:id/remove-employee/:employeeId', authorize('admin'), logAction('department'), invalidateRef, removeEmployee);
+router.get('/:id/employees', requirePermissionOrRoles('departments', 'read', ['admin']), getDepartmentEmployees);
+router.put('/:id/assign-employees', requirePermissionOrRoles('departments', 'update', ['admin']), logAction('department'), invalidateRef, assignEmployees);
+router.put('/:id/remove-employee/:employeeId', requirePermissionOrRoles('departments', 'update', ['admin']), logAction('department'), invalidateRef, removeEmployee);
 
 module.exports = router;
