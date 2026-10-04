@@ -23,6 +23,55 @@ const { PermissionService, resolveUserRoles } = require('../middleware/authorize
 const cacheService = require('../services/cacheService');
 const emailService = require('../services/emailService');
 const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
+const { createHash } = require('crypto');
+const { dbClient } = require('../lib/prisma');
+
+function hashPosSalePayload(payload) {
+  return createHash('sha256').update(JSON.stringify(payload || {})).digest('hex');
+}
+
+async function replayPosSaleIfPresent(req, res, { companyId, requestKey, payloadHash }) {
+  if (!requestKey) return false;
+  const rows = await dbClient().$queryRawUnsafe(
+    'SELECT request_key AS "requestKey", created_by_id AS "createdById", payload_hash AS "payloadHash", invoice_id AS "invoiceId", status FROM pos_sale_requests WHERE company_id = $1 AND request_key = $2 LIMIT 1',
+    String(companyId), requestKey,
+  );
+  const record = rows[0];
+  if (!record) return false;
+
+  if (String(record.createdById) !== String(req.user.id) || record.payloadHash !== payloadHash) {
+    res.status(409).json({
+      success: false,
+      code: 'POS_IDEMPOTENCY_KEY_CONFLICT',
+      message: 'This checkout key was already used for a different sale. Resolve the previous attempt before starting another.',
+    });
+    return true;
+  }
+  if (record.status !== 'completed' || !record.invoiceId) {
+    res.status(409).json({
+      success: false,
+      code: 'POS_SALE_STILL_PROCESSING',
+      message: 'This sale is still being resolved. Retry the same checkout shortly; do not start a new sale yet.',
+    });
+    return true;
+  }
+
+  const invoice = await Invoice.findOne({ _id: record.invoiceId, company: companyId })
+    .populate('client lines.product createdBy');
+  if (!invoice) {
+    res.status(409).json({
+      success: false,
+      code: 'POS_IDEMPOTENT_SALE_UNAVAILABLE',
+      message: 'The previous checkout was recorded, but its invoice is unavailable. Contact an administrator before retrying.',
+    });
+    return true;
+  }
+  const tendered = Number(req.body?.paymentAmount) || 0;
+  const total = Number(invoice.grandTotal ?? invoice.totalAmount) || 0;
+  const changeDue = req.body?.paymentMethod === 'cash' ? Math.max(0, tendered - total) : 0;
+  res.status(200).json({ success: true, message: 'This checkout was already completed.', data: invoice, changeDue, replayed: true });
+  return true;
+}
 
 const sendDirectSaleEmail = async (invoice, companyId) => {
   try {
@@ -56,8 +105,18 @@ const sendDirectSaleEmail = async (invoice, companyId) => {
  * Journals posted: Dr Receivable / Cr Revenue + Dr COGS / Cr Inventory
  */
 exports.createDirectSale = async (req, res, next) => {
+  let companyId;
+  let requestKey = '';
+  let payloadHash = '';
   try {
-    const companyId = req.user.company._id;
+    companyId = req.user.company._id;
+    requestKey = String(req.get('Idempotency-Key') || '').trim();
+    if (requestKey && !/^[a-zA-Z0-9_-]{16,100}$/.test(requestKey)) {
+      return res.status(400).json({ success: false, code: 'POS_INVALID_IDEMPOTENCY_KEY', message: 'Checkout idempotency key is invalid.' });
+    }
+    payloadHash = hashPosSalePayload(req.body);
+    if (requestKey && await replayPosSaleIfPresent(req, res, { companyId, requestKey, payloadHash })) return;
+
     const invoiceCurrency = await CurrencyService.getCompanyBase(companyId);
     const {
       clientId,
@@ -288,6 +347,7 @@ exports.createDirectSale = async (req, res, next) => {
 
     // Determine payment status
     const amountTendered = paymentAmount == null || paymentAmount === '' ? 0 : Number(paymentAmount);
+    const normalizedPaymentReference = String(paymentReference || '').trim();
     const supportedPaymentMethods = ['cash', 'card', 'bank_transfer', 'mobile_money', 'cheque'];
     if (!Number.isFinite(amountTendered) || amountTendered < 0 || amountTendered > Number.MAX_SAFE_INTEGER) {
       return res.status(400).json({
@@ -311,6 +371,21 @@ exports.createDirectSale = async (req, res, next) => {
         success: false,
         code: 'ERR_INVALID_PAYMENT_METHOD',
         message: 'Select a supported payment method for the received amount',
+      });
+    }
+    if (amountTendered > 0 && ['bank_transfer', 'mobile_money', 'cheque'].includes(paymentMethod)
+      && !normalizedPaymentReference) {
+      return res.status(400).json({
+        success: false,
+        code: 'POS_PAYMENT_REFERENCE_REQUIRED',
+        message: 'Verify the payment outside KUBIKA and enter its transaction or cheque reference before recording it.',
+      });
+    }
+    if (normalizedPaymentReference.length > 120) {
+      return res.status(400).json({
+        success: false,
+        code: 'POS_PAYMENT_REFERENCE_TOO_LONG',
+        message: 'Payment reference must be 120 characters or fewer.',
       });
     }
     if (amountTendered > grandTotal && paymentMethod !== 'cash') {
@@ -342,6 +417,18 @@ exports.createDirectSale = async (req, res, next) => {
     const financialAccountCodes = new Set();
 
     await runInTransaction(async (session) => {
+      if (requestKey) {
+        const reservation = await dbClient().$queryRawUnsafe(
+          'INSERT INTO pos_sale_requests (company_id, request_key, created_by_id, payload_hash, status, created_at, updated_at) VALUES ($1, $2, $3, $4, \'processing\', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT (company_id, request_key) DO NOTHING RETURNING request_key AS "requestKey"',
+          String(companyId), requestKey, String(req.user.id), payloadHash,
+        );
+        if (!reservation.length) {
+          const error = new Error('This POS checkout request is already being processed.');
+          error.code = 'POS_IDEMPOTENCY_DUPLICATE';
+          throw error;
+        }
+      }
+
       if (!client) {
         client = await Client.create({
           company: companyId,
@@ -580,7 +667,7 @@ exports.createDirectSale = async (req, res, next) => {
         isAutoGenerated: true,
         sourceData: {
           bankAccountId: paymentBankAccount?._id || null,
-          paymentReference: paymentReference || null,
+          paymentReference: normalizedPaymentReference || null,
           paymentMethod: paymentMethod || null,
         },
       }];
@@ -625,7 +712,7 @@ exports.createDirectSale = async (req, res, next) => {
         invoice.payments.push({
           amount: paidAmount,
           paymentMethod: paymentMethod,
-          reference: paymentReference || '',
+          reference: normalizedPaymentReference,
           paidDate: new Date(),
           recordedBy: req.user.id
         });
@@ -643,6 +730,17 @@ exports.createDirectSale = async (req, res, next) => {
         client.outstandingBalance = (client.outstandingBalance || 0) + amountOutstanding;
       }
       await client.save({ session });
+      if (requestKey) {
+        const finalized = await dbClient().$executeRawUnsafe(
+          'UPDATE pos_sale_requests SET invoice_id = $3, status = \'completed\', updated_at = CURRENT_TIMESTAMP WHERE company_id = $1 AND request_key = $2 AND payload_hash = $4',
+          String(companyId), requestKey, String(invoice._id), payloadHash,
+        );
+        if (finalized !== 1) {
+          const error = new Error('The POS checkout receipt could not be finalized.');
+          error.code = 'POS_IDEMPOTENCY_FINALIZE_FAILED';
+          throw error;
+        }
+      }
     });
 
     // Journal posting used the outer sale transaction, so refresh reporting
@@ -673,6 +771,13 @@ exports.createDirectSale = async (req, res, next) => {
     });
 
   } catch (error) {
+    if (requestKey && ['POS_IDEMPOTENCY_DUPLICATE', 'P2002', '23505'].includes(String(error?.code))) {
+      try {
+        if (await replayPosSaleIfPresent(req, res, { companyId, requestKey, payloadHash })) return;
+      } catch (replayError) {
+        return next(replayError);
+      }
+    }
     if (error?.accountingPostingFailure || error?.code === 'POS_ACCOUNTING_POST_FAILED') {
       console.error('[createDirectSale] Accounting posting failed; sale rolled back:', error);
       return res.status(503).json({

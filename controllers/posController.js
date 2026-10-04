@@ -161,17 +161,20 @@ exports.createSale = async (req, res, next) => {
     if (payments && payments.length) {
       const invalidPayment = payments.some((payment) =>
         !Number.isFinite(Number(payment.amount)) || Number(payment.amount) <= 0
-        || !['cash', 'bank_transfer', 'cheque', 'mobile_money'].includes(payment.paymentMethod),
+        || !['cash', 'bank_transfer', 'cheque', 'mobile_money'].includes(payment.paymentMethod)
+        || (['bank_transfer', 'cheque', 'mobile_money'].includes(payment.paymentMethod)
+          && !String(payment.reference || '').trim())
+        || String(payment.reference || '').trim().length > 120,
       );
       if (invalidPayment) {
-        const error = new Error('Each POS payment must have a supported method and a positive amount.');
+        const error = new Error('Each POS payment must have a supported method, positive amount, and a reference for transfers, mobile money, or cheques.');
         error.statusCode = 400;
         throw error;
       }
       payments.forEach(p => invoice.payments.push({
         amount: p.amount,
         paymentMethod: p.paymentMethod,
-        reference: p.reference,
+        reference: String(p.reference || '').trim(),
         notes: p.notes,
         bankAccountId: p.bankAccountId,
         recordedBy: req.user.id
@@ -404,6 +407,13 @@ exports.addPayment = async (req, res, next) => {
         error.statusCode = 400;
         throw error;
       }
+      const normalizedReference = String(reference || '').trim();
+      if ((['bank_transfer', 'cheque', 'mobile_money'].includes(paymentMethod) && !normalizedReference)
+        || normalizedReference.length > 120) {
+        const error = new Error('Enter a payment reference for transfers, mobile money, or cheques (maximum 120 characters).');
+        error.statusCode = 400;
+        throw error;
+      }
       const remaining = Math.max(0, Number(invoice.roundedAmount || 0) - Number(invoice.amountPaid || 0));
       if (amount > remaining + 0.01) {
         const error = new Error('Payment cannot exceed the outstanding sale balance.');
@@ -423,7 +433,7 @@ exports.addPayment = async (req, res, next) => {
         if (!bankAccount?.ledgerAccountId) throw new Error('The selected bank account is unavailable or has no linked ledger account.');
       }
 
-      invoice.payments.push({ amount, paymentMethod, reference, notes, bankAccountId, recordedBy: req.user.id });
+      invoice.payments.push({ amount, paymentMethod, reference: normalizedReference, notes, bankAccountId, recordedBy: req.user.id });
       const savedPayment = invoice.payments[invoice.payments.length - 1];
       invoice.amountPaid = (invoice.amountPaid || 0) + amount;
       invoice.balance = Math.max(0, Number(invoice.roundedAmount || 0) - invoice.amountPaid);

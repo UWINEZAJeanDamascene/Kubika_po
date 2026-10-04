@@ -462,6 +462,23 @@ model PosHeldSale {
   @@map("pos_held_sales")
 }
 
+/// Durable idempotency ledger for POS checkout requests. The unique composite
+/// key prevents network retries from creating duplicate invoices or stock moves.
+model PosSaleRequest {
+  companyId   String   @map("company_id") @db.Char(24)
+  requestKey  String   @map("request_key") @db.VarChar(100)
+  createdById String   @map("created_by_id") @db.Char(24)
+  payloadHash String   @map("payload_hash") @db.Char(64)
+  invoiceId   String?  @map("invoice_id") @db.Char(24)
+  status      String   @default("processing")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@id([companyId, requestKey])
+  @@index([createdAt])
+  @@map("pos_sale_requests")
+}
+
 model InterestAccrual {
   id                    String   @id @db.Char(24)
   companyId             String   @map("company_id") @db.Char(24)
