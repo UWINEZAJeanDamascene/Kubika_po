@@ -20,7 +20,8 @@ const {
 } = require('../controllers/invoiceController');
 const { protect } = require('../middleware/auth');
 const { requirePermission } = require('../middleware/rbacMiddleware');
-const { requireAssignedPermissions } = require('../middleware/posAuthorization');
+const { PermissionService, resolveUserRoles } = require('../middleware/authorize');
+const Invoice = require('../models/Invoice');
 const logAction = require('../middleware/logAction');
 const { cacheMiddleware, cacheInvalidationMiddleware } = require('../middleware/cacheMiddleware');
 
@@ -58,7 +59,21 @@ router.post('/:id/payment', requirePermission('ar_receipts', 'create'), logActio
 router.post('/:id/write-off', requirePermission('ar_receipts', 'reverse'), logAction('invoice'), writeOffInvoiceBadDebt);
 
 // Cancel invoice (reverses stock)
-router.put('/:id/cancel', requireAssignedPermissions({ resource: 'sales_invoices', action: 'delete' }), logAction('invoice'), cancelInvoice);
+async function authorizeInvoiceCancellation(req, res, next) {
+  try {
+    const invoice = await Invoice.findOne({ _id: req.params.id, company: req.user.company._id }).select('posOrigin').lean();
+    if (!invoice) return next();
+    const action = invoice.posOrigin ? 'create' : 'delete';
+    const roles = await resolveUserRoles(req.user);
+    if (!roles.some((role) => PermissionService.check(role, 'sales_invoices', action))) {
+      return res.status(403).json({ success: false, error: 'FORBIDDEN', message: 'Your role cannot request this invoice cancellation.' });
+    }
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+}
+router.put('/:id/cancel', authorizeInvoiceCancellation, logAction('invoice'), cancelInvoice);
 
 // Save receipt metadata (SDC/Receipt info)
 router.post('/:id/receipt-metadata', requirePermission('sales_invoices', 'update'), saveReceiptMetadata);

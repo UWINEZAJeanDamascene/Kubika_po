@@ -14,9 +14,17 @@ const {
 const FIELD_MAP = {
   openedBy: { target: 'openedById', isId: true },
   openedById: { target: 'openedById', isId: true },
+  registerId: { target: 'registerId' },
+  registerName: { target: 'registerName' },
   status: { target: 'status' },
   openingFloat: { target: 'openingFloat' },
+  expectedCash: { target: 'expectedCash' },
   closingCount: { target: 'closingCount' },
+  cashVariance: { target: 'cashVariance' },
+  cashActivity: { target: 'cashActivity' },
+  handoverFromId: { target: 'handoverFromId', isId: true },
+  handoverToId: { target: 'handoverToId', isId: true },
+  closeNotes: { target: 'closeNotes' },
   openedAt: { target: 'openedAt' },
   closedAt: { target: 'closedAt' },
 };

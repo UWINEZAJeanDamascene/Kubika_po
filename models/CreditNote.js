@@ -14,6 +14,7 @@ const FIELD_MAP = {
   invoice: { target: 'invoiceId', isId: true },
   client: { target: 'clientId', isId: true },
   status: { target: 'status' },
+  posOrigin: { target: 'posOrigin' },
   creditDate: { target: 'creditDate' },
 };
 

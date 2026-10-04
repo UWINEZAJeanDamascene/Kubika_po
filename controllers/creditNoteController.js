@@ -15,6 +15,7 @@ const EBMSalesService = require("../services/ebmSalesService");
 const { emitDataChanged } = require("../lib/realtimeEvents");
 const PDFDocument = require("pdfkit");
 const EBMCode = require("../models/EBMCode");
+const { consumeApproval: consumePosManagerApproval } = require('./posManagerApprovalController');
 const {
   drawEbmCertificationBlock,
   drawTaxBreakdown,
@@ -964,21 +965,45 @@ exports.recordRefund = async (req, res, next) => {
         message: "Only confirmed/issued/applied credit notes can be refunded",
       });
 
+    const refundAmount = Number(amount);
+    if (!Number.isFinite(refundAmount) || refundAmount <= 0) {
+      return res.status(400).json({ success: false, message: 'Refund amount must be a positive number.' });
+    }
+    if (!['cash', 'bank', 'bank_transfer', 'mobile_money', 'cheque'].includes(String(paymentMethod || ''))) {
+      return res.status(400).json({ success: false, message: 'Select a supported refund payment method.' });
+    }
+
     const remaining = note.grandTotal - (note.amountRefunded || 0);
-    if (amount > remaining)
+    if (refundAmount > remaining)
       return res.status(400).json({
         success: false,
         message: "Refund amount exceeds credit note balance",
       });
 
+    if (note.posOrigin) {
+      await consumePosManagerApproval({
+        approvalId: req.body.posManagerApprovalId,
+        companyId,
+        cashierId: req.user.id,
+        action: 'refund',
+        subjectId: String(note._id),
+        payload: {
+          creditNoteId: String(note._id),
+          amount: refundAmount,
+          paymentMethod: String(paymentMethod),
+          reference: String(reference || '').trim(),
+        },
+      });
+    }
+
     // attach payment
     note.payments.push({
-      amount,
+      amount: refundAmount,
       paymentMethod,
       reference,
       refundedBy: req.user.id,
     });
-    note.amountRefunded = (note.amountRefunded || 0) + amount;
+    note.amountRefunded = (note.amountRefunded || 0) + refundAmount;
 
     // Adjust invoice payments (reduce amountPaid)
     const invoice = await Invoice.findOne({
@@ -986,7 +1011,7 @@ exports.recordRefund = async (req, res, next) => {
       company: companyId,
     });
     if (invoice) {
-      invoice.amountPaid = Math.max(0, (invoice.amountPaid || 0) - amount);
+      invoice.amountPaid = Math.max(0, (invoice.amountPaid || 0) - refundAmount);
       await invoice.save();
     }
 
@@ -998,12 +1023,12 @@ exports.recordRefund = async (req, res, next) => {
     if (client) {
       client.totalPurchases = Math.max(
         0,
-        (client.totalPurchases || 0) - amount,
+        (client.totalPurchases || 0) - refundAmount,
       );
       // If invoice existed and we decreased amountPaid, outstandingBalance may increase; keep consistent: recompute outstandingBalance as sum of invoices minus payments is complex; instead, adjust by -amount earlier when approving; now refund increases outstandingBalance by amount
       client.outstandingBalance = Math.max(
         0,
-        (client.outstandingBalance || 0) + amount,
+        (client.outstandingBalance || 0) + refundAmount,
       );
       await client.save();
     }
@@ -1039,12 +1064,12 @@ exports.recordRefund = async (req, res, next) => {
         lines: [
           JournalService.createDebitLine(
             DEFAULT_ACCOUNTS.accountsReceivable,
-            amount,
+            refundAmount,
             `Refund for Credit Note ${note.creditNoteNumber}`,
           ),
           JournalService.createCreditLine(
             cashAccount,
-            amount,
+            refundAmount,
             `Refund for Credit Note ${note.creditNoteNumber}`,
           ),
         ],
@@ -1062,7 +1087,7 @@ exports.recordRefund = async (req, res, next) => {
       try {
         await bankAccount.addTransaction({
           type: 'withdrawal',
-          amount,
+          amount: refundAmount,
           description: `Credit note refund: ${note.creditNoteNumber}`,
           date: new Date(),
           referenceNumber: note.creditNoteNumber,
@@ -1332,6 +1357,17 @@ exports.confirmCreditNote = async (req, res, next) => {
 
     console.log("DEBUG: About to run transaction");
     await runInTransaction(async (session) => {
+      if (creditNote.posOrigin) {
+        const refundAmount = Number(creditNote.totalAmount || creditNote.grandTotal || creditNote.total || 0);
+        await consumePosManagerApproval({
+          approvalId: req.body.posManagerApprovalId,
+          companyId,
+          cashierId: req.user.id,
+          action: 'refund',
+          subjectId: String(creditNote._id),
+          payload: { invoiceId: String(invoice._id), creditNoteId: String(creditNote._id), refundAmount },
+        });
+      }
       // Calculate totals for journal entries
       let totalSubtotal = 0;
       let totalTax = 0;

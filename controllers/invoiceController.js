@@ -19,6 +19,7 @@ const { DEFAULT_ACCOUNTS } = require("../constants/chartOfAccounts");
 const EBMProductService = require("../services/ebmProductService");
 const EBMSalesService = require("../services/ebmSalesService");
 const { parseBoundedPage } = require("../utils/querySafety");
+const { consumeApproval: consumePosManagerApproval } = require('./posManagerApprovalController');
 const {
   drawEbmCertificationBlock,
   drawTaxBreakdown,
@@ -1046,6 +1047,7 @@ exports.confirmInvoice = async (req, res, next) => {
       lines: 1,
       client: 1,
       status: 1,
+      posOrigin: 1,
       company: 1,
       referenceNo: 1,
       invoiceNumber: 1,
@@ -1848,6 +1850,7 @@ exports.cancelInvoice = async (req, res, next) => {
       lines: 1,
       client: 1,
       status: 1,
+      posOrigin: 1,
       company: 1,
       referenceNo: 1,
       invoiceNumber: 1,
@@ -1903,6 +1906,21 @@ exports.cancelInvoice = async (req, res, next) => {
         code: "ERR_DELIVERY_EXISTS",
         message:
           "Cannot cancel invoice. A confirmed delivery note already exists for this invoice.",
+      });
+    }
+
+    if (invoice.posOrigin) {
+      const normalizedReason = String(reason || '').trim();
+      if (normalizedReason.length < 5) {
+        return res.status(400).json({ success: false, code: 'POS_VOID_REASON_REQUIRED', message: 'Enter a clear reason before voiding this POS sale.' });
+      }
+      await consumePosManagerApproval({
+        approvalId: req.body.posManagerApprovalId,
+        companyId,
+        cashierId: req.user.id,
+        action: 'void',
+        subjectId: String(invoice._id),
+        payload: { invoiceId: String(invoice._id), reason: normalizedReason },
       });
     }
 
@@ -2587,7 +2605,7 @@ exports.writeOffInvoiceBadDebt = async (req, res, next) => {
     const { amount, reason, writeoffDate, notes } = req.body;
 
     // Validate invoice exists and is eligible
-    const Invoice = require('../models/Invoice');
+const Invoice = require('../models/Invoice');
     const invoice = await Invoice.findOne({ _id: id, company: companyId });
     if (!invoice) {
       return res.status(404).json({ success: false, message: 'Invoice not found' });

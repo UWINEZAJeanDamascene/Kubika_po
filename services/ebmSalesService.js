@@ -225,7 +225,9 @@ function getCustomerName(invoice) {
 }
 
 function buildQrString(data) {
-  return [data.rcptSign, data.intrlData, data.rcptNo, data.rcptDt]
+  // RRA defines rcptSign as the QR signature data. Do not concatenate the
+  // other receipt fields into the QR payload; display those separately.
+  return data.rcptSign || [data.intrlData, data.rcptNo, data.rcptDt]
     .filter(Boolean)
     .join("|");
 }
@@ -676,6 +678,11 @@ async function applySuccess(invoiceId, companyId, response, payload) {
     intrlData: data.intrlData || null,
     rcptNo: data.rcptNo != null ? String(data.rcptNo) : null,
     rcptDt,
+    sdcId: data.sdcId || null,
+    mrcNo: data.mrcNo || null,
+    curRcptNo: data.curRcptNo != null ? String(data.curRcptNo) : (payload.receipt?.curRcptNo || null),
+    totRcptNo: data.totRcptNo != null ? String(data.totRcptNo) : (payload.receipt?.totRcptNo || null),
+    rptNo: data.rptNo != null ? String(data.rptNo) : (payload.receipt?.rptNo || null),
     qrCode,
     submittedAt: new Date(),
     ebmStatus: "submitted",
@@ -687,9 +694,6 @@ async function applySuccess(invoiceId, companyId, response, payload) {
     prcOrdCd: payload.prcOrdCd || null,
     prchrAcptcYn: payload.prchrAcptcYn,
     invcNo: payload.invcNo,
-    curRcptNo: payload.receipt?.curRcptNo || null,
-    totRcptNo: payload.receipt?.totRcptNo || null,
-    rptNo: payload.receipt?.rptNo || null,
     salesPayload: payload,
   });
 }

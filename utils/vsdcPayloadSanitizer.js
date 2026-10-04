@@ -191,7 +191,12 @@ function extractSaveSalesFiscalData(response) {
   return {
     rcptSign: nested.rcptSign || receipt.rcptSign || raw.rcptSign || null,
     intrlData: nested.intrlData || receipt.intrlData || raw.intrlData || null,
-    rcptNo: nested.rcptNo ?? receipt.rcptNo ?? raw.rcptNo ?? null,
+    // RRA's v1.0.5 saveSales response returns the number as
+    // receipt.curRcptNo (not receipt.rcptNo). Keep legacy variants too.
+    rcptNo: nested.rcptNo ?? receipt.rcptNo ?? receipt.curRcptNo ?? raw.rcptNo ?? null,
+    curRcptNo: nested.curRcptNo ?? receipt.curRcptNo ?? nested.rcptNo ?? raw.rcptNo ?? null,
+    totRcptNo: nested.totRcptNo ?? receipt.totRcptNo ?? raw.totRcptNo ?? null,
+    rptNo: nested.rptNo ?? receipt.rptNo ?? raw.rptNo ?? null,
     rcptDt: nested.rcptDt || nested.vsdcRcptPbctDate || receipt.rcptPbctDt || response?.resultDt || null,
     sdcId: nested.sdcId || receipt.sdcId || raw.sdcId || null,
     mrcNo: nested.mrcNo || receipt.mrcNo || raw.mrcNo || null,

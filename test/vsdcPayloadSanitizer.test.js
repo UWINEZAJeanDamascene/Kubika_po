@@ -70,6 +70,33 @@ describe('VSDC payload sanitizer', () => {
     });
   });
 
+  it('reads fiscal receipt numbers and signature from the RRA v1.0.5 receipt object', () => {
+    const fiscal = extractSaveSalesFiscalData({
+      resultCd: '000',
+      data: {
+        receipt: {
+          curRcptNo: 41,
+          totRcptNo: 92,
+          rptNo: 7,
+          rcptPbctDt: '20261004121530',
+          intrlData: 'INTERNAL',
+          rcptSign: 'RRA-QR-SIGNATURE',
+          sdcId: 'SDC0000001',
+        },
+      },
+    });
+
+    expect(fiscal).toMatchObject({
+      rcptNo: 41,
+      curRcptNo: 41,
+      totRcptNo: 92,
+      rptNo: 7,
+      rcptDt: '20261004121530',
+      rcptSign: 'RRA-QR-SIGNATURE',
+      sdcId: 'SDC0000001',
+    });
+  });
+
   it('maps v1.0.5 purchase and TIN rejection codes', () => {
     expect(mapVsdcErrorCode('881')).toMatch(/Purchase confirmation is mandatory/i);
     expect(mapVsdcErrorCode('884')).toMatch(/Customer TIN is invalid/i);

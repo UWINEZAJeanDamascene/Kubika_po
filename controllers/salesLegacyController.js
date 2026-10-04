@@ -19,12 +19,14 @@ const { runInTransaction } = require('../services/transactionService');
 const inventoryService = require('../services/inventoryService');
 const JournalService = require('../services/journalService');
 const CurrencyService = require('../services/CurrencyService');
-const { PermissionService, resolveUserRoles } = require('../middleware/authorize');
 const cacheService = require('../services/cacheService');
 const emailService = require('../services/emailService');
 const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
 const { createHash } = require('crypto');
 const { dbClient } = require('../lib/prisma');
+const { consumeApproval: consumePosManagerApproval } = require('./posManagerApprovalController');
+const ebmService = require('../services/ebmService');
+const EBMSalesService = require('../services/ebmSalesService');
 
 function hashPosSalePayload(payload) {
   return createHash('sha256').update(JSON.stringify(payload || {})).digest('hex');
@@ -110,6 +112,10 @@ exports.createDirectSale = async (req, res, next) => {
   let payloadHash = '';
   try {
     companyId = req.user.company._id;
+    // Mock mode is intentionally manual so development/test checkouts never
+    // acquire fabricated fiscal receipts. Sandbox and production POS sales
+    // are submitted after the sale transaction commits.
+    const autoFiscalSubmission = ebmService.getConfig().mode !== 'mock';
     requestKey = String(req.get('Idempotency-Key') || '').trim();
     if (requestKey && !/^[a-zA-Z0-9_-]{16,100}$/.test(requestKey)) {
       return res.status(400).json({ success: false, code: 'POS_INVALID_IDEMPOTENCY_KEY', message: 'Checkout idempotency key is invalid.' });
@@ -148,12 +154,21 @@ exports.createDirectSale = async (req, res, next) => {
       });
     }
 
-    const activeTill = await TillSession.findOne({ company: companyId, openedBy: req.user.id, status: 'open' });
+    const requestedRegisterId = String(req.body.registerId || `legacy-${req.user.id}`);
+    const activeTill = await TillSession.findOne({
+      company: companyId,
+      openedBy: req.user.id,
+      registerId: requestedRegisterId,
+      status: 'open',
+    });
     if (!activeTill) {
       return res.status(400).json({
         success: false,
         message: 'Till session is required and must be open to record a POS sale'
       });
+    }
+    if (tillSession?.id && String(tillSession.id) !== String(activeTill._id)) {
+      return res.status(409).json({ success: false, code: 'POS_TILL_SESSION_CHANGED', message: 'The register shift changed. Refresh the POS and verify the active cashier session.' });
     }
 
     if (!warehouseId) {
@@ -214,15 +229,7 @@ exports.createDirectSale = async (req, res, next) => {
     const stockLevelByProduct = new Map(
       selectedWarehouseLevels.map((level) => [String(level.product_id), level]),
     );
-    let salePricingOverridePermission;
-    const canOverrideSalePricing = () => {
-      if (!salePricingOverridePermission) {
-        salePricingOverridePermission = resolveUserRoles(req.user).then((roles) =>
-          roles.some((role) => PermissionService.check(role, 'sales_invoices', 'update')),
-        );
-      }
-      return salePricingOverridePermission;
-    };
+    let requiresManagerApproval = false;
 
     for (const item of items) {
       const product = productsMap.get(String(item.productId));
@@ -235,6 +242,13 @@ exports.createDirectSale = async (req, res, next) => {
       const productPrice = Number(product.sellingPrice);
       const requestedUnitPrice = item.unitPrice == null ? productPrice : Number(item.unitPrice);
       const discountPct = item.discountPct == null ? 0 : Number(item.discountPct);
+      if (item.catalogUnitPrice != null && Math.abs(Number(item.catalogUnitPrice) - productPrice) > 0.000001) {
+        return res.status(409).json({
+          success: false,
+          code: 'POS_PRICE_CHANGED',
+          message: `${product.name} catalog price changed. Refresh the cart before completing this sale.`,
+        });
+      }
       if (!Number.isFinite(quantity) || quantity <= 0 || quantity > Number.MAX_SAFE_INTEGER
         || !Number.isFinite(productPrice) || productPrice < 0 || productPrice > Number.MAX_SAFE_INTEGER) {
         return res.status(400).json({
@@ -254,13 +268,7 @@ exports.createDirectSale = async (req, res, next) => {
       const unitPrice = requestedUnitPrice;
       const hasPriceOverride = Math.abs(unitPrice - productPrice) > 0.000001;
       if (hasPriceOverride || discountPct > 0) {
-        if (!(await canOverrideSalePricing())) {
-          return res.status(403).json({
-            success: false,
-            code: 'ERR_SALE_PRICE_OVERRIDE_FORBIDDEN',
-            message: 'Your role cannot override catalog prices or apply discounts',
-          });
-        }
+        requiresManagerApproval = true;
       }
       
       const isStockable = product.isStockable !== false;
@@ -335,6 +343,14 @@ exports.createDirectSale = async (req, res, next) => {
       return res.status(400).json({
         success: false,
         message: `Products not found: ${missingProducts.join(', ')}`,
+      });
+    }
+
+    if (requiresManagerApproval && !req.body.managerApprovalId) {
+      return res.status(403).json({
+        success: false,
+        code: 'POS_MANAGER_APPROVAL_REQUIRED',
+        message: 'A second manager must approve discounts or price overrides before this sale can be recorded.',
       });
     }
 
@@ -429,6 +445,19 @@ exports.createDirectSale = async (req, res, next) => {
         }
       }
 
+      if (requiresManagerApproval) {
+        const approvalPayload = { ...req.body };
+        delete approvalPayload.managerApprovalId;
+        await consumePosManagerApproval({
+          approvalId: req.body.managerApprovalId,
+          companyId,
+          cashierId: req.user.id,
+          action: 'discount',
+          subjectId: null,
+          payload: approvalPayload,
+        });
+      }
+
       if (!client) {
         client = await Client.create({
           company: companyId,
@@ -446,6 +475,8 @@ exports.createDirectSale = async (req, res, next) => {
         customerAddress: client.contact?.address || client.address,
         lines: invoiceLines,
         status: paymentStatus, // Already confirmed/paid status
+        posOrigin: true,
+        ebm: autoFiscalSubmission ? { ebmStatus: 'pending', retryCount: 0 } : {},
         currencyCode: invoiceCurrency,
         subtotal: subtotal,
         taxAmount: totalTax,
@@ -722,6 +753,26 @@ exports.createDirectSale = async (req, res, next) => {
         // JournalService. Do not create a second, unlinked transaction here.
       }
 
+      if (paidAmount > 0 && paymentMethod === 'cash') {
+        const activity = {
+          type: 'cash_sale',
+          amount: paidAmount,
+          invoiceId: String(invoice._id),
+          reference: invoice.referenceNo,
+          recordedBy: String(req.user.id),
+          recordedAt: new Date().toISOString(),
+        };
+        const updatedTill = await dbClient().$executeRawUnsafe(
+          'UPDATE till_sessions SET expected_cash = expected_cash + $1::numeric, cash_activity = cash_activity || $2::jsonb, updated_at = CURRENT_TIMESTAMP WHERE company_id = $3 AND id = $4 AND opened_by = $5 AND status = \'open\'',
+          paidAmount, JSON.stringify([activity]), String(companyId), String(activeTill._id), String(req.user.id),
+        );
+        if (updatedTill !== 1) {
+          const error = new Error('The till closed while this cash sale was being recorded. No sale was completed.');
+          error.code = 'POS_TILL_SESSION_CHANGED';
+          throw error;
+        }
+      }
+
       // Keep customer sales totals aligned with invoice revenue, including
       // credit sales and partially paid invoices.
       client.totalPurchases = (client.totalPurchases || 0) + grandTotal;
@@ -756,6 +807,12 @@ exports.createDirectSale = async (req, res, next) => {
 
     // Populate response
     await invoice.populate('client lines.product createdBy');
+
+    if (autoFiscalSubmission) {
+      // Fiscal communication must not roll back a completed sale. The service
+      // records failures and retryable payloads in the durable EBM queue.
+      EBMSalesService.submitInvoiceAsync(invoice._id, { companyId });
+    }
 
     // Send email notification
     const sendEmailOnCreate = req.body.sendEmail || false;

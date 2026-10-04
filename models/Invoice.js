@@ -14,6 +14,7 @@ const FIELD_MAP = {
   referenceNo: { target: 'referenceNo' },
   client: { target: 'clientId', isId: true },
   status: { target: 'status' },
+  posOrigin: { target: 'posOrigin' },
   badDebtWrittenOff: { target: 'badDebtWrittenOff' },
   writtenOffAt: { target: 'writtenOffAt' },
   writtenOffBy: { target: 'writtenOffById', isId: true },

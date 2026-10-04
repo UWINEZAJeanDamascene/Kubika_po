@@ -722,6 +722,7 @@ model Company {
   taxTransactions             TaxTransaction[]
   taxes                       Tax[]
   tillSessions                TillSession[]
+  posManagerApprovals          PosManagerApproval[]
   posHeldSales                PosHeldSale[]
   timesheets                  Timesheet[]
   users                       User[]
@@ -965,19 +966,51 @@ model TillSession {
   id           String            @id @db.Char(24)
   companyId    String            @map("company_id") @db.Char(24)
   openedById   String            @map("opened_by") @db.Char(24)
+  registerId   String            @default("legacy") @map("register_id")
+  registerName String            @default("Register") @map("register_name")
   status       TillSessionStatus @default(open)
   openingFloat Decimal           @default(0) @map("opening_float") @db.Decimal(19, 2)
+  expectedCash Decimal           @default(0) @map("expected_cash") @db.Decimal(19, 2)
   closingCount Decimal?          @map("closing_count") @db.Decimal(19, 2)
+  cashVariance Decimal?          @map("cash_variance") @db.Decimal(19, 2)
+  cashActivity Json              @default("[]") @map("cash_activity")
+  handoverFromId String?         @map("handover_from_id") @db.Char(24)
+  handoverToId   String?         @map("handover_to_id") @db.Char(24)
+  closeNotes     String?         @map("close_notes")
   openedAt     DateTime          @default(now()) @map("opened_at") @db.Timestamptz(3)
   closedAt     DateTime?         @map("closed_at") @db.Timestamptz(3)
   createdAt    DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt    DateTime          @updatedAt @map("updated_at") @db.Timestamptz(3)
   company      Company           @relation(fields: [companyId], references: [id], onDelete: Cascade)
   openedBy     User              @relation(fields: [openedById], references: [id])
+  handoverFrom TillSession?      @relation("TillHandover", fields: [handoverFromId], references: [id])
+  handovers    TillSession[]     @relation("TillHandover")
+  managerApprovals PosManagerApproval[]
 
-  @@index([companyId, openedById, status])
+  @@index([companyId, openedById, registerId, status])
   @@index([companyId, status, openedAt(sort: Desc)])
   @@map("till_sessions")
+}
+
+/// Short-lived, one-use, second-person approval for sensitive POS operations.
+model PosManagerApproval {
+  id            String    @id @db.Char(24)
+  companyId     String    @map("company_id") @db.Char(24)
+  cashierId     String    @map("cashier_id") @db.Char(24)
+  managerId     String    @map("manager_id") @db.Char(24)
+  tillSessionId String?   @map("till_session_id") @db.Char(24)
+  action        String    @db.VarChar(20)
+  subjectId     String?   @map("subject_id") @db.Char(24)
+  payloadHash   String    @map("payload_hash") @db.VarChar(64)
+  expiresAt     DateTime  @map("expires_at") @db.Timestamptz(3)
+  usedAt        DateTime? @map("used_at") @db.Timestamptz(3)
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  company       Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  tillSession   TillSession? @relation(fields: [tillSessionId], references: [id], onDelete: SetNull)
+
+  @@index([companyId, cashierId, action, expiresAt])
+  @@index([companyId, subjectId, action])
+  @@map("pos_manager_approvals")
 }
 
 /// Customer prepayments recognised as revenue over time. `recognitions` holds the
@@ -2066,6 +2099,7 @@ model Invoice {
   salesOrderId             String?                  @map("sales_order_id") @db.Char(24)
   deliveryNoteId           String?                  @map("delivery_note_id") @db.Char(24)
   status                   String                   @default("draft")
+  posOrigin                Boolean                  @default(false) @map("pos_origin")
   currencyCode             String                   @default("RWF") @map("currency_code")
   exchangeRate             Decimal                  @default(1) @map("exchange_rate") @db.Decimal(19, 6)
   subtotal                 Decimal                  @default(0) @db.Decimal(19, 2)
@@ -2174,6 +2208,7 @@ model CreditNote {
   reason                 String?
   type                   String           @default("return")
   status                 String           @default("draft")
+  posOrigin              Boolean          @default(false) @map("pos_origin")
   currencyCode           String           @default("RWF") @map("currency_code")
   subtotal               Decimal          @default(0) @db.Decimal(19, 2)
   taxAmount              Decimal          @default(0) @map("tax_amount") @db.Decimal(19, 2)

@@ -181,6 +181,7 @@ function invoiceToApi(row) {
     salesOrder: row.salesOrderId ?? null,
     deliveryNote: row.deliveryNoteId ?? null,
     status: row.status,
+    posOrigin: Boolean(row.posOrigin),
     badDebtWrittenOff: Boolean(row.badDebtWrittenOff),
     writtenOffAt: row.writtenOffAt ?? null,
     writtenOffBy: row.writtenOffById ?? null,
@@ -286,6 +287,7 @@ async function invoiceTranslateCreate(data) {
     salesOrderId: data.salesOrder ? toIdString(data.salesOrder) : null,
     deliveryNoteId: data.deliveryNote ? toIdString(data.deliveryNote) : null,
     status: data.status || 'draft',
+    posOrigin: data.posOrigin === true,
     currencyCode: data.currencyCode || data.currency || 'RWF',
     exchangeRate: data.exchangeRate ?? 1,
     subtotal: moneyStr(subtotal),
@@ -306,7 +308,7 @@ function invoiceTranslateUpdate(update = {}) {
   const data = mergeUpdatePayload(update);
   const out = {};
   const map = {
-    referenceNo: 'referenceNo', status: 'status', client: 'clientId',
+    referenceNo: 'referenceNo', status: 'status', posOrigin: 'posOrigin', client: 'clientId',
     customerTin: 'customerTin', customerName: 'customerName', customerAddress: 'customerAddress',
     quotation: 'quotationId', salesOrder: 'salesOrderId', deliveryNote: 'deliveryNoteId',
     currencyCode: 'currencyCode', currency: 'currencyCode', exchangeRate: 'exchangeRate',
@@ -651,6 +653,7 @@ function creditNoteToApi(row) {
     reason: row.reason ?? null,
     type: row.type,
     status: row.status,
+    posOrigin: Boolean(row.posOrigin),
     currencyCode: row.currencyCode,
     subtotal: qtyNum(row.subtotal),
     taxAmount: qtyNum(row.taxAmount),
@@ -1171,6 +1174,7 @@ const CREDIT_NOTE_HEADER = {
   invoice: 'invoiceId',
   client: 'clientId',
   status: 'status',
+  posOrigin: 'posOrigin',
   creditDate: 'creditDate',
   reason: 'reason',
   type: 'type',
