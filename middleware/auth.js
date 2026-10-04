@@ -162,7 +162,7 @@ const protect = async (req, res, next) => {
 
 // Role authorization
 const authorize = (...roles) => {
-  return async (req, res, next) => {
+  const middleware = async (req, res, next) => {
     try {
       // Check legacy single role string first
       if (req.user && req.user.role && roles.includes(req.user.role)) return next();
@@ -197,6 +197,8 @@ const authorize = (...roles) => {
       return res.status(500).json({ success: false, message: 'Authorization check failed' });
     }
   };
+  middleware.roleGuard = roles.map((role) => String(role).toLowerCase());
+  return middleware;
 };
 
 module.exports = { protect, authorize };

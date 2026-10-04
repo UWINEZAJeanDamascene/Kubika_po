@@ -1,7 +1,9 @@
 const { PermissionService, resolveUserRoles } = require("./authorize");
+const { registerPermission } = require("../utils/permissionCatalog");
 
 function requirePayrollPermission(action) {
-  return async (req, res, next) => {
+  registerPermission("payroll", action);
+  const middleware = async (req, res, next) => {
     try {
       if (!req.user) return res.status(401).json({ success: false, message: "Authentication required" });
       const roles = await resolveUserRoles(req.user);
@@ -19,6 +21,8 @@ function requirePayrollPermission(action) {
       return next(error);
     }
   };
+  middleware.rbacPermissionGuard = true;
+  return middleware;
 }
 
 module.exports = { requirePayrollPermission };

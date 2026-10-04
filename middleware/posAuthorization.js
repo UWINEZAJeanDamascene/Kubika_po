@@ -1,8 +1,15 @@
 const { PermissionService, resolveUserRoles } = require('./authorize');
+const { registerPermission } = require('../utils/permissionCatalog');
 
 /** Require each requested permission from at least one of the user's roles. */
 function requirePosPermissions(...permissions) {
-  return async (req, res, next) => {
+  for (const permission of permissions) {
+    if (permission && typeof permission === 'object') {
+      registerPermission(permission.resource, permission.action);
+    }
+  }
+
+  const middleware = async (req, res, next) => {
     try {
       const roles = await resolveUserRoles(req.user);
       const missing = permissions.filter(({ resource, action }) =>
@@ -28,6 +35,8 @@ function requirePosPermissions(...permissions) {
       });
     }
   };
+  middleware.rbacPermissionGuard = true;
+  return middleware;
 }
 
 module.exports = {

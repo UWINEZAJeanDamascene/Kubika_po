@@ -319,6 +319,17 @@ async function initializeServer() {
 
   // API versioning — mount at /api/v1 (primary) and /api (backward compat)
   const apiRouter = express.Router();
+  const { prepareMountedModule } = require('./middleware/modulePermissionFallback');
+  const mountApiRouter = apiRouter.use.bind(apiRouter);
+  // Register and guard new authenticated modules automatically. Routers with
+  // explicit resource/action checks retain their existing fine-grained rules.
+  apiRouter.use = function useApiModule(mountPath, ...handlers) {
+    const moduleRouter = typeof mountPath === 'string'
+      ? handlers.find((handler) => Array.isArray(handler?.stack))
+      : null;
+    if (moduleRouter) prepareMountedModule(moduleRouter, mountPath);
+    return mountApiRouter(mountPath, ...handlers);
+  };
 
   apiRouter.use('/auth', require('./routes/authRoutes'));
   apiRouter.use('/companies', require('./routes/companyRoutes'));

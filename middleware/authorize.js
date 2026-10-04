@@ -164,7 +164,7 @@ function buildAuthorizeMiddleware(checkFn, failureMessage) {
     } else if (typeof resourceOrPermissions === 'string' && typeof maybeAction === 'string') {
       registerPermission(resourceOrPermissions, maybeAction);
     }
-    return async (req, res, next) => {
+    const middleware = async (req, res, next) => {
       try {
         const user = req.user;
 
@@ -216,6 +216,8 @@ function buildAuthorizeMiddleware(checkFn, failureMessage) {
         });
       }
     };
+    middleware.rbacPermissionGuard = true;
+    return middleware;
   };
 }
 

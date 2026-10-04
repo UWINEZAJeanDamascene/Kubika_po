@@ -12,45 +12,29 @@ const {
   deleteEmployee,
 } = require('../controllers/employeeController');
 const { protect } = require('../middleware/auth');
-const { requirePayrollPermission } = require('../middleware/payrollPermission');
-
-// Keep legacy Admin/Manager/HR access while allowing tenant-defined payroll
-// roles to use Employee Master according to their payroll permissions.
-function payrollOrLegacy(action, legacyRoles = []) {
-  const checkPayrollPermission = requirePayrollPermission(action);
-  return (req, res, next) => {
-    const assignedRoleNames = [
-      req.user?.role,
-      ...(Array.isArray(req.user?.roles)
-        ? req.user.roles.map((role) => typeof role === 'string' ? role : role?.name)
-        : []),
-    ].filter(Boolean);
-    if (assignedRoleNames.some((name) => legacyRoles.includes(name))) return next();
-    return checkPayrollPermission(req, res, next);
-  };
-}
+const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
 
 router.use(protect);
 
 router.route('/')
-  .get(payrollOrLegacy('read', ['admin', 'manager', 'hr']), getEmployees)
-  .post(payrollOrLegacy('create', ['admin', 'manager', 'hr']), createEmployee);
+  .get(requirePermissionOrRoles('employees', 'read', ['admin', 'manager']), getEmployees)
+  .post(requirePermissionOrRoles('employees', 'create', ['admin', 'manager']), createEmployee);
 
 router.route('/next-id')
-  .get(payrollOrLegacy('create', ['admin', 'manager', 'hr']), getNextEmployeeId);
+  .get(requirePermissionOrRoles('employees', 'create', ['admin', 'manager']), getNextEmployeeId);
 
 router.route('/:id')
-  .get(payrollOrLegacy('read', ['admin', 'manager', 'hr']), getEmployeeById)
-  .put(payrollOrLegacy('update', ['admin', 'manager', 'hr']), updateEmployee)
-  .delete(payrollOrLegacy('delete', ['admin', 'manager']), deleteEmployee);
+  .get(requirePermissionOrRoles('employees', 'read', ['admin', 'manager']), getEmployeeById)
+  .put(requirePermissionOrRoles('employees', 'update', ['admin', 'manager']), updateEmployee)
+  .delete(requirePermissionOrRoles('employees', 'delete', ['admin', 'manager']), deleteEmployee);
 
 router.route('/:id/salary')
-  .put(payrollOrLegacy('update', ['admin', 'manager', 'hr']), changeSalary);
+  .put(requirePermissionOrRoles('employees', 'update', ['admin', 'manager']), changeSalary);
 
 router.route('/:id/salary-history')
-  .get(payrollOrLegacy('read', ['admin', 'manager', 'hr']), getSalaryHistory);
+  .get(requirePermissionOrRoles('employees', 'read', ['admin', 'manager']), getSalaryHistory);
 
 router.route('/:id/terminate')
-  .put(payrollOrLegacy('update', ['admin', 'manager', 'hr']), terminateEmployee);
+  .put(requirePermissionOrRoles('employees', 'update', ['admin', 'manager']), terminateEmployee);
 
 module.exports = router;

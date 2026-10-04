@@ -33,7 +33,7 @@ function requirePermissionOrRoles(resource, action, allowedRoles = []) {
   registerPermission(resource, action);
   const roleNames = new Set(allowedRoles.map((name) => String(name).toLowerCase()));
 
-  return async (req, res, next) => {
+  const middleware = async (req, res, next) => {
     try {
       if (!req.user) {
         return res.status(401).json({ success: false, error: 'UNAUTHORIZED', message: 'Authentication required' });
@@ -67,6 +67,8 @@ function requirePermissionOrRoles(resource, action, allowedRoles = []) {
       return res.status(500).json({ success: false, error: 'AUTHORIZATION_ERROR', message: 'Could not verify permissions.' });
     }
   };
+  middleware.rbacPermissionGuard = true;
+  return middleware;
 }
 
 module.exports = {
