@@ -9,9 +9,11 @@ function registerPermission(resourceValue, actionValue) {
   const resource = String(resourceValue || '').trim().toLowerCase();
   const action = String(actionValue || '').trim().toLowerCase();
   if (!resource || !action || resource === '*' || action === '*') return;
-  // `authorize('admin', 'stock_manager')` and similar calls are role gates,
-  // not resource/action permissions. Ignore those while collecting RBAC data.
-  if (SYSTEM_ROLE_NAMES.has(action)) return;
+  // Role gates use the role name as the first argument, e.g.
+  // `authorize('admin', 'stock_manager')`. Filter that resource position only:
+  // `admin` can also be a legitimate action on a business resource such as
+  // payroll, and must remain in the catalog for role creation.
+  if (SYSTEM_ROLE_NAMES.has(resource)) return;
 
   const actions = permissionsByResource.get(resource) || new Set();
   actions.add(action);
