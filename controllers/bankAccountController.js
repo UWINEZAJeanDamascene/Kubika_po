@@ -18,6 +18,7 @@ const {
   bankAccountToApi,
   bankAccountTranslateUpdate,
 } = require("../utils/bankingMappers");
+const { runInPrismaTransaction } = require("../services/transactionService");
 
 // OPENING BALANCE EQUITY account code for bank account opening balance entry
 // 3500 = Opening Balance Equity (allows direct posting for opening balance entries)
@@ -367,22 +368,127 @@ exports.updateBankAccount = async (req, res, next) => {
       delete requestedUpdates[field];
     });
     const updateData = bankAccountTranslateUpdate(requestedUpdates);
+    const openingBalanceChanged = requestedUpdates.openingBalance !== undefined
+      && Number(requestedUpdates.openingBalance) !== Number(account.openingBalance);
 
-    // If trying to update opening balance, require special permission or create adjustment
-    if (
-      requestedUpdates.openingBalance !== undefined &&
-      Number(requestedUpdates.openingBalance) !== Number(account.openingBalance)
-    ) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Cannot directly modify opening balance. Use adjustment transaction instead.",
+    if (openingBalanceChanged) {
+      const nextOpeningBalance = Number(requestedUpdates.openingBalance);
+      if (!Number.isFinite(nextOpeningBalance) || nextOpeningBalance < 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Opening balance must be a valid amount greater than or equal to zero.",
+        });
+      }
+
+      const [transactionCount, existingOpeningEntry] = await Promise.all([
+        BankTransaction.countDocuments({
+          $and: [
+            { $or: [{ companyId }, { company: companyId }] },
+            { $or: [{ bankAccountId: accountId }, { account: accountId }] },
+          ],
+        }),
+        JournalEntry.findOne({
+          company: companyId,
+          sourceType: { $in: ["bank_account_opening", "opening_balance"] },
+          sourceId: accountId,
+        }),
+      ]);
+
+      if (Number(account.openingBalance) !== 0 || transactionCount > 0 || existingOpeningEntry) {
+        return res.status(400).json({
+          success: false,
+          message: "This account already has opening-balance or transaction activity. Use Adjust Balance to change its current balance.",
+        });
+      }
+
+      if (nextOpeningBalance > 0 && requestedUpdates.isActive === false) {
+        return res.status(400).json({
+          success: false,
+          message: "Activate the account before posting its opening balance.",
+        });
+      }
+
+      if (nextOpeningBalance > 0) {
+        await ensureOpeningBalanceEquityAccount(companyId, req.user._id);
+      }
+
+      const openingBalanceDate = requestedUpdates.openingBalanceDate
+        ? new Date(requestedUpdates.openingBalanceDate)
+        : new Date();
+      if (Number.isNaN(openingBalanceDate.getTime())) {
+        return res.status(400).json({
+          success: false,
+          message: "Opening balance date is invalid.",
+        });
+      }
+
+      // Initial balance, journal entry, and the bank transaction generated from
+      // that entry must commit together so the displayed and ledger balances agree.
+      const updatedAccount = await runInPrismaTransaction(async (tx) => {
+        const [activityCount, openingEntry] = await Promise.all([
+          BankTransaction.countDocuments({
+            $and: [
+              { $or: [{ companyId }, { company: companyId }] },
+              { $or: [{ bankAccountId: accountId }, { account: accountId }] },
+            ],
+          }),
+          JournalEntry.findOne({
+            company: companyId,
+            sourceType: { $in: ["bank_account_opening", "opening_balance"] },
+            sourceId: accountId,
+          }),
+        ]);
+        if (activityCount > 0 || openingEntry) {
+          const error = new Error("This account already has opening-balance or transaction activity. Use Adjust Balance to change its current balance.");
+          error.statusCode = 400;
+          throw error;
+        }
+
+        const accountUpdates = { ...updateData };
+        delete accountUpdates.openingBalance;
+        delete accountUpdates.openingBalanceDate;
+        accountUpdates.openingBalance = String(nextOpeningBalance);
+        accountUpdates.openingBalanceDate = openingBalanceDate;
+
+        if (accountUpdates.isDefault === true) {
+          await tx.bankAccount.updateMany({
+            where: { companyId, id: { not: accountId } },
+            data: { isDefault: false },
+          });
+        }
+
+        await tx.bankAccount.updateMany({
+          where: { id: accountId, companyId },
+          data: accountUpdates,
+        });
+
+        if (nextOpeningBalance > 0) {
+          const ledgerAccountId = account.ledgerAccountId || "1100";
+          await JournalService.createEntry(companyId, req.user._id, {
+            date: openingBalanceDate,
+            description: `Opening balance: ${account.name}`,
+            sourceType: "bank_account_opening",
+            sourceId: accountId,
+            sourceReference: `OPENING-${account.accountNumber || accountId}`,
+            lines: [
+              JournalService.createDebitLine(ledgerAccountId, nextOpeningBalance, `Opening balance: ${account.name}`),
+              JournalService.createCreditLine(OPENING_BALANCE_EQUITY_CODE, nextOpeningBalance, `Opening balance: ${account.name}`),
+            ],
+            isAutoGenerated: true,
+            bankAccountId: accountId,
+          });
+        }
+
+        return tx.bankAccount.findFirst({ where: { id: accountId, companyId } });
       });
+
+      return res.json({ success: true, data: bankAccountToApi(updatedAccount) });
     }
 
-    // Opening balances are immutable through this form, even when the submitted
-    // value happens to equal the current value.
+    // The opening balance may only be initialized through the journal-backed
+    // path above; it is never overwritten by a regular account-details update.
     delete updateData.openingBalance;
+    delete updateData.openingBalanceDate;
 
     const updatedAccount = await dbClient().$transaction(async (tx) => {
       if (updateData.isDefault === true) {
@@ -564,7 +670,13 @@ exports.getBankAccountBalance = async (req, res, next) => {
       accountCodes: [ledgerAccountId],
       groupByAccountCode: false,
     });
-    const glBalance = Number(account.openingBalance?.toString?.() || account.openingBalance || 0) + (rows[0]?.debit || 0) - (rows[0]?.credit || 0);
+    const openingEntry = await JournalEntry.findOne({
+      company: companyId,
+      sourceType: { $in: ["bank_account_opening", "opening_balance"] },
+      sourceId: account._id,
+    });
+    const openingBalanceNotPosted = openingEntry ? 0 : Number(account.openingBalance?.toString?.() || account.openingBalance || 0);
+    const glBalance = openingBalanceNotPosted + (rows[0]?.debit || 0) - (rows[0]?.credit || 0);
     const difference = Math.round((bankTransactionBalance - glBalance) * 100) / 100;
     res.json({
       success: true,
