@@ -13,6 +13,11 @@ const journalAgg = require("../services/journalAggregationService");
 const JournalService = require("../services/journalService");
 const ChartOfAccount = require("../models/ChartOfAccount");
 const { DEFAULT_ACCOUNTS, CHART_OF_ACCOUNTS } = require("../constants/chartOfAccounts");
+const { dbClient } = require("../lib/prisma");
+const {
+  bankAccountToApi,
+  bankAccountTranslateUpdate,
+} = require("../utils/bankingMappers");
 
 // OPENING BALANCE EQUITY account code for bank account opening balance entry
 // 3500 = Opening Balance Equity (allows direct posting for opening balance entries)
@@ -343,11 +348,10 @@ exports.createBankAccount = async (req, res, next) => {
 // @access  Private
 exports.updateBankAccount = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
-
-    let account = await BankAccount.findOne({
-      _id: req.params.id,
-      company: companyId,
+    const companyId = String(req.user.company._id);
+    const accountId = String(req.params.id);
+    const account = await dbClient().bankAccount.findFirst({
+      where: { id: accountId, companyId },
     });
 
     if (!account) {
@@ -356,13 +360,18 @@ exports.updateBankAccount = async (req, res, next) => {
         .json({ success: false, message: "Bank account not found" });
     }
 
-    // Don't allow changing company or createdBy
-    const { company, createdBy, currentBalance, ...updateData } = req.body;
+    // Only fields in the bank account mapper can be changed. Tenant ownership,
+    // creator, and calculated balance values are never accepted from the client.
+    const requestedUpdates = { ...req.body };
+    ["company", "companyId", "createdBy", "createdById", "currentBalance", "cachedBalance", "cacheValid", "cacheLastComputed"].forEach((field) => {
+      delete requestedUpdates[field];
+    });
+    const updateData = bankAccountTranslateUpdate(requestedUpdates);
 
     // If trying to update opening balance, require special permission or create adjustment
     if (
-      updateData.openingBalance !== undefined &&
-      updateData.openingBalance !== account.openingBalance
+      requestedUpdates.openingBalance !== undefined &&
+      Number(requestedUpdates.openingBalance) !== Number(account.openingBalance)
     ) {
       return res.status(400).json({
         success: false,
@@ -371,12 +380,39 @@ exports.updateBankAccount = async (req, res, next) => {
       });
     }
 
-    Object.assign(account, updateData);
-    await account.save();
+    // Opening balances are immutable through this form, even when the submitted
+    // value happens to equal the current value.
+    delete updateData.openingBalance;
+
+    const updatedAccount = await dbClient().$transaction(async (tx) => {
+      if (updateData.isDefault === true) {
+        await tx.bankAccount.updateMany({
+          where: { companyId, id: { not: accountId } },
+          data: { isDefault: false },
+        });
+      }
+
+      const updated = await tx.bankAccount.updateMany({
+        where: { id: accountId, companyId },
+        data: updateData,
+      });
+      if (!updated.count) return null;
+
+      return tx.bankAccount.findFirst({
+        where: { id: accountId, companyId },
+      });
+    });
+
+    if (!updatedAccount) {
+      return res.status(404).json({
+        success: false,
+        message: "Bank account not found",
+      });
+    }
 
     res.json({
       success: true,
-      data: account,
+      data: bankAccountToApi(updatedAccount),
     });
   } catch (error) {
     next(error);
