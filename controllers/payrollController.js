@@ -9,6 +9,7 @@ const { parsePagination, paginationMeta } = require("../utils/pagination");
 const JournalEntry = require("../models/JournalEntry");
 const { runInPrismaTransaction } = require("../services/transactionService");
 const { dbClient } = require("../lib/prisma");
+const { payrollToApi } = require("../utils/phase10Mappers");
 const { generateObjectId } = require("../utils/objectId");
 const { PAYROLL_ACCOUNTS, assertJournalBalanced } = require("../constants/payrollAccounts");
 const { PermissionService, resolveUserRoles } = require("../middleware/authorize");
@@ -276,34 +277,60 @@ async function postPayrollAccrualJournals(companyId, userId, payroll, options = 
 // @access  Private
 exports.getPayrollRecords = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
+    const companyId = String(req.user.company._id);
     const { month, year, status, search } = req.query;
-
-    const mongoQuery = { company: companyId };
-
-    if (month && year) {
-      const payPeriodStart = new Date(parseInt(year), parseInt(month) - 1, 1);
-      const payPeriodEnd = new Date(parseInt(year), parseInt(month), 0);
-      mongoQuery.pay_period_start = { gte: payPeriodStart, lte: payPeriodEnd };
-    } else if (year) {
-      const payPeriodStart = new Date(parseInt(year), 0, 1);
-      const payPeriodEnd = new Date(parseInt(year), 11, 31);
-      mongoQuery.pay_period_start = { gte: payPeriodStart, lte: payPeriodEnd };
+    const { page, limit, skip } = parsePagination(req.query);
+    const where = { companyId };
+    const periodFilters = [];
+    if (month !== undefined && month !== "") {
+      const parsedMonth = Number(month);
+      if (!Number.isInteger(parsedMonth) || parsedMonth < 1 || parsedMonth > 12) {
+        return res.status(400).json({ success: false, message: "A valid payroll month is required" });
+      }
+      periodFilters.push({ period: { path: ["month"], equals: parsedMonth } });
+    }
+    if (year !== undefined && year !== "") {
+      const parsedYear = Number(year);
+      if (!Number.isInteger(parsedYear)) {
+        return res.status(400).json({ success: false, message: "A valid payroll year is required" });
+      }
+      periodFilters.push({ period: { path: ["year"], equals: parsedYear } });
+    }
+    if (periodFilters.length) where.AND = periodFilters;
+    if (status) where.recordStatus = String(status);
+    const normalizedSearch = String(search || "").trim();
+    if (normalizedSearch) {
+      where.OR = ["firstName", "lastName", "employeeId"].map((key) => ({
+        employee: {
+          path: [key],
+          string_contains: normalizedSearch,
+          mode: "insensitive",
+        },
+      }));
     }
 
-    if (status) mongoQuery.record_status = status;
-
-    const { page, limit, skip } = parsePagination(req.query);
-
-    const [total, payrollRecords] = await Promise.all([
-      Payroll.countDocuments(mongoQuery),
-      Payroll.find(mongoQuery)
-        .populate("createdBy", "name email")
-        .populate("approvedBy", "name email")
-        .sort({ payPeriodStart: -1, createdAt: -1 })
-        .skip(skip)
-        .limit(limit),
+    const [total, rows] = await Promise.all([
+      dbClient().payroll.count({ where }),
+      dbClient().payroll.findMany({
+        where,
+        orderBy: [{ payPeriodStart: "desc" }, { createdAt: "desc" }],
+        skip,
+        take: limit,
+      }),
     ]);
+    const payrollRecords = rows.map(payrollToApi);
+    const actorIds = [...new Set(payrollRecords.flatMap((record) => [record.createdBy, record.approvedBy]).filter(Boolean).map(String))];
+    if (actorIds.length) {
+      const actors = await dbClient().user.findMany({
+        where: { companyId, id: { in: actorIds } },
+        select: { id: true, name: true, email: true },
+      });
+      const actorsById = new Map(actors.map((actor) => [String(actor.id), { _id: actor.id, id: actor.id, name: actor.name, email: actor.email }]));
+      for (const record of payrollRecords) {
+        record.createdBy = actorsById.get(String(record.createdBy)) || record.createdBy;
+        record.approvedBy = actorsById.get(String(record.approvedBy)) || record.approvedBy;
+      }
+    }
 
     let totalGrossSalary = 0;
     let totalNetPay = 0;
