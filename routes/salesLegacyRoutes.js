@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { protect } = require('../middleware/auth');
 const logAction = require('../middleware/logAction');
-const { requirePosPermissions } = require('../middleware/posAuthorization');
+const { requirePosPermissions, requireAnyPosPermission } = require('../middleware/posAuthorization');
 const heldSaleController = require('../controllers/posHeldSaleController');
 const {
   createDirectSale,
@@ -13,13 +13,13 @@ const {
 // All routes require authentication
 router.use(protect);
 
-const canCreateSale = requirePosPermissions({ resource: 'sales_invoices', action: 'create' });
-const canReadPosCatalog = requirePosPermissions(
-  { resource: 'sales_invoices', action: 'create' },
+const canCreateSale = requirePosPermissions({ resource: 'point_of_sale', action: 'create' });
+const canReadPosCatalog = requireAnyPosPermission(
+  { resource: 'point_of_sale', action: 'read' },
   { resource: 'products', action: 'read' },
 );
-const canReadSale = requirePosPermissions({ resource: 'sales_invoices', action: 'read' });
-const canManageHeldSales = requirePosPermissions({ resource: 'sales_invoices', action: 'create' });
+const canReadSale = requirePosPermissions({ resource: 'point_of_sale', action: 'read' });
+const canManageHeldSales = requirePosPermissions({ resource: 'point_of_sale', action: 'create' });
 
 router.route('/held-sales')
   .get(canManageHeldSales, heldSaleController.listHeldSales)
