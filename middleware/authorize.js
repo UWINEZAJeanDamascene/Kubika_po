@@ -13,6 +13,10 @@ const { toIdString } = require('../utils/objectId');
 const { roleToApi } = require('../utils/authMappers');
 const { registerPermission, registerPermissionList } = require('../utils/permissionCatalog');
 
+const LEGACY_RESOURCE_ALIASES = {
+  payroll: new Set(['payroll_runs']),
+};
+
 /**
  * PermissionService - Checks if a role has a specific permission
  */
@@ -48,7 +52,7 @@ class PermissionService {
       }
 
       // Exact resource match
-      if (permission.resource === resource) {
+      if (permission.resource === resource || LEGACY_RESOURCE_ALIASES[resource]?.has(permission.resource)) {
         if (
           permission.actions.includes(action) ||
           (isSystemRole && permission.actions.includes('*'))

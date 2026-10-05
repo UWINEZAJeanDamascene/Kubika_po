@@ -28,7 +28,9 @@ const RESOURCE_ALIASES = new Map([
   ['/audit-trail', 'audit_trail'],
   ['/bank-accounts', 'bank_accounts'],
   ['/employee-advances', 'employee_advances'],
-  ['/payroll-runs', 'payroll_runs'],
+  // Payroll and payroll runs share the payroll permission contract in their
+  // explicit route guards, so keep the inferred fallback aligned with it.
+  ['/payroll-runs', 'payroll'],
   ['/timesheets', 'timesheets'],
   ['/petty-cash', 'petty_cash'],
   ['/ar-reconciliation', 'ar_reconciliation'],
