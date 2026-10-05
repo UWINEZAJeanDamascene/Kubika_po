@@ -11,6 +11,7 @@ const {
   previewPayrollRun,
   createFromRecords,
   getAvailablePeriods,
+  getAvailablePeriodRecords,
   remitPaye,
   remitRssb,
   generateBankTransfer,
@@ -37,6 +38,7 @@ router.route("/preview").get(requirePayrollPermission("read"), previewPayrollRun
 // Available periods — months that have finalised, unprocessed payroll records
 // (MUST be before /:id so it is not treated as an id param)
 router.route("/available-periods").get(requirePayrollPermission("read"), getAvailablePeriods);
+router.route("/available-periods/:year/:month/records").get(requirePayrollPermission("read"), getAvailablePeriodRecords);
 router.route("/compliance/deadlines").get(requirePayrollPermission("read"), getComplianceDeadlines);
 router.route("/operations/exceptions").get(requirePayrollPermission("read"), getOperationalExceptions);
 

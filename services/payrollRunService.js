@@ -570,16 +570,32 @@ static async getAvailablePeriods(companyId) {
       );
     }
 
-    // Find runs that are already posted — their records should be blocked
-    const payPeriodStart = new Date(filterYear, filterMonth - 1, 1);
-    const payPeriodEnd = new Date(filterYear, filterMonth, 0);
+    // The period JSON is authoritative. Legacy records may have a missing or
+    // stale pay_period_start, which previously made the picker show a period
+    // while this date-range query returned no employees.
+    let payrollRecords = await Payroll.findFinalisedUnassignedForPeriod(
+      companyId,
+      filterMonth,
+      filterYear,
+    );
 
-    const payrollRecords = await Payroll.find({
-      company: companyId,
-      record_status: "finalised",
-      payroll_run_id: null,
-      pay_period_start: { gte: payPeriodStart, lte: payPeriodEnd },
-    });
+    if (Array.isArray(data.employee_ids)) {
+      const requestedIds = data.employee_ids.map(String);
+      if (!requestedIds.length || new Set(requestedIds).size !== requestedIds.length) {
+        const error = new Error("Select at least one unique employee payroll record.");
+        error.code = "PAYROLL_RUN_EMPLOYEES_REQUIRED";
+        error.statusCode = 400;
+        throw error;
+      }
+      const eligibleById = new Map(payrollRecords.map((record) => [String(record._id), record]));
+      if (requestedIds.some((id) => !eligibleById.has(id))) {
+        const error = new Error("One or more selected employee payroll records are no longer eligible. Refresh the period and retry.");
+        error.code = "PAYROLL_RECORD_NOT_ELIGIBLE";
+        error.statusCode = 409;
+        throw error;
+      }
+      payrollRecords = requestedIds.map((id) => eligibleById.get(id));
+    }
 
     if (payrollRecords.length === 0) {
       const err = new Error(

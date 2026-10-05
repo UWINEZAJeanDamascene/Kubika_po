@@ -3,7 +3,7 @@
  */
 
 const { buildTenantModel } = require('../utils/masterDataCommon');
-const { prisma } = require('../lib/prisma');
+const { dbClient } = require('../lib/prisma');
 const { calculateRwandaPayroll } = require('../services/rwandaPayrollRules');
 const {
   payrollToApi,
@@ -37,6 +37,27 @@ const Payroll = buildTenantModel({
 
 Payroll.getMonthName = function(month) {
   return MONTH_NAMES[month] || '';
+};
+
+// Use the stored payroll period as the source of truth. Some older payroll
+// rows have valid period JSON but a missing or stale pay_period_start date.
+// Payroll-run eligibility and the period picker must still find those rows.
+Payroll.findFinalisedUnassignedForPeriod = async function(companyId, month, year) {
+  const normalizedMonth = Number(month);
+  const normalizedYear = Number(year);
+  const rows = await dbClient().payroll.findMany({
+    where: {
+      companyId: String(companyId),
+      recordStatus: 'finalised',
+      payrollRunId: null,
+      AND: [
+        { period: { path: ['month'], equals: normalizedMonth } },
+        { period: { path: ['year'], equals: normalizedYear } },
+      ],
+    },
+    orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+  });
+  return rows.map(payrollToApi);
 };
 
 Payroll.calculatePayroll = function(salary, options = {}) {

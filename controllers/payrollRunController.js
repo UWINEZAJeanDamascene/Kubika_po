@@ -22,6 +22,22 @@ const getAvailablePeriods = async (req, res, next) => {
   }
 };
 
+// Return the exact finalised, unassigned records represented by one picker
+// period. Match the canonical period JSON, not the optional legacy date field.
+const getAvailablePeriodRecords = async (req, res, next) => {
+  try {
+    const month = Number(req.params.month);
+    const year = Number(req.params.year);
+    if (!Number.isInteger(month) || month < 1 || month > 12 || !Number.isInteger(year)) {
+      return res.status(400).json({ success: false, message: "A valid payroll month and year are required" });
+    }
+    const records = await Payroll.findFinalisedUnassignedForPeriod(req.user.company._id, month, year);
+    return res.status(200).json({ success: true, data: records });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 // @desc    Get all payroll runs for company
 // @route   GET /api/payroll-runs
 // @access  Private
@@ -270,6 +286,9 @@ const createFromRecords = async (req, res, next) => {
       period_year: req.body.period_year
         ? parseInt(req.body.period_year, 10)
         : undefined,
+      employee_ids: Array.isArray(req.body.employee_ids)
+        ? req.body.employee_ids.map(String)
+        : undefined,
       salary_account_id: req.body.salary_account_id,
       tax_payable_account_id: req.body.tax_payable_account_id,
       bank_account_id: req.body.bank_account_id,
@@ -391,7 +410,8 @@ module.exports = {
   deletePayrollRun,
   previewPayrollRun,
   createFromRecords,
-  getAvailablePeriods,
+    getAvailablePeriods,
+    getAvailablePeriodRecords,
   remitPaye,
   remitRssb,
   generateBankTransfer,
