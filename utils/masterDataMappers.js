@@ -221,10 +221,16 @@ function clientInputToPrisma(data = {}) {
 }
 
 async function clientTranslateCreate(data) {
+  const base = tenantCreateBase(data);
+  let code = String(data.code || '').trim().toUpperCase();
+  if (!code) {
+    const { nextGlobalSequence } = require('../services/sequenceService');
+    code = `CLI-${await nextGlobalSequence(base.companyId, 'client_code', 5)}`;
+  }
   return {
-    ...tenantCreateBase(data),
+    ...base,
     ...clientInputToPrisma(data),
-    code: String(data.code || '').toUpperCase(),
+    code,
     contact: data.contact || {},
     isActive: data.isActive !== false,
     customFields: data.customFields || {},
@@ -308,10 +314,16 @@ function supplierInputToPrisma(data = {}) {
 }
 
 async function supplierTranslateCreate(data) {
+  const base = tenantCreateBase(data);
+  let code = String(data.code || '').trim().toUpperCase();
+  if (!code) {
+    const { nextGlobalSequence } = require('../services/sequenceService');
+    code = `SUP-${await nextGlobalSequence(base.companyId, 'supplier_code', 5)}`;
+  }
   return {
-    ...tenantCreateBase(data),
+    ...base,
     ...supplierInputToPrisma(data),
-    code: String(data.code || '').toUpperCase(),
+    code,
     contact: data.contact || {},
     isActive: data.isActive !== false,
     customFields: data.customFields || {},
