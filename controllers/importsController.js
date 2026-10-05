@@ -169,6 +169,46 @@ exports.history = async (req, res) => {
   res.json({ success: true, data: logs });
 };
 
+function removeImportReport(reportUrl, logId, kind) {
+  if (!reportUrl) return;
+  const filename = path.basename(String(reportUrl));
+  const expectedPrefix = `import-${kind}-${String(logId)}-`;
+  if (!filename.startsWith(expectedPrefix) || !filename.endsWith('.csv')) return;
+
+  const downloadsDir = path.resolve(__dirname, '..', 'downloads');
+  const filePath = path.resolve(downloadsDir, filename);
+  if (!filePath.startsWith(`${downloadsDir}${path.sep}`)) return;
+  try {
+    fs.unlinkSync(filePath);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+}
+
+exports.deleteHistory = async (req, res) => {
+  try {
+    const scope = { _id: req.params.id, companyId: companyId(req) };
+    const log = await ImportLog.findOne(scope).lean();
+    if (!log) return res.status(404).json({ success: false, message: 'Import history record not found.' });
+
+    if (['pending', 'processing'].includes(log.status)) {
+      return res.status(409).json({ success: false, message: 'An active import cannot be deleted.' });
+    }
+    if (!['failed', 'completed_with_errors'].includes(log.status)) {
+      return res.status(400).json({ success: false, message: 'Only failed imports or imports with errors can be deleted.' });
+    }
+
+    // Remove only report files generated for this exact tenant-owned import.
+    removeImportReport(log.errorReportUrl, log._id, 'errors');
+    removeImportReport(log.resultsReportUrl, log._id, 'results');
+    await ImportLog.findOneAndDelete(scope);
+
+    res.json({ success: true, data: { deleted: true } });
+  } catch (error) {
+    sendError(res, error);
+  }
+};
+
 exports.downloadErrorReport = async (req, res) => {
   const log = await ImportLog.findOne({ _id: req.params.id, companyId: companyId(req) }).lean();
   if (!log || !log.errorReportUrl) return res.status(404).json({ success: false, message: 'Error report not found.' });
