@@ -149,6 +149,12 @@ function parseNumber(value) {
   return Number(normalized);
 }
 
+function generateImportedMasterCode(prefix) {
+  const timePart = Date.now().toString(36).toUpperCase();
+  const randomPart = crypto.randomBytes(5).toString('hex').toUpperCase();
+  return `${prefix}-${timePart}-${randomPart}`;
+}
+
 function parseDateValue(value) {
   if (isBlank(value)) return null;
   const raw = String(value).trim();
@@ -958,8 +964,9 @@ async function upsertRow(entityType, companyId, userId, data, duplicateAction, c
       await Client.updateOne({ _id: existing._id, company: companyId }, { $set: payload });
       return { status: 'success', message: 'Updated duplicate customer.' };
     }
-    await Client.create(payload);
-    return { status: 'success', message: 'Created customer.' };
+    payload.code = generateImportedMasterCode('CLI');
+    const created = await Client.create(payload);
+    return { status: 'success', message: `Created customer (${created.code}).` };
   }
 
   if (entityType === 'suppliers') {
@@ -978,8 +985,9 @@ async function upsertRow(entityType, companyId, userId, data, duplicateAction, c
       await Supplier.updateOne({ _id: existing._id, company: companyId }, { $set: payload });
       return { status: 'success', message: 'Updated duplicate supplier.' };
     }
-    await Supplier.create(payload);
-    return { status: 'success', message: 'Created supplier.' };
+    payload.code = generateImportedMasterCode('SUP');
+    const created = await Supplier.create(payload);
+    return { status: 'success', message: `Created supplier (${created.code}).` };
   }
 
   if (entityType === 'employees') {
