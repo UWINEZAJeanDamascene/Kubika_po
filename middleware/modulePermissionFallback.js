@@ -54,7 +54,7 @@ const RESOURCE_ALIASES = new Map([
 
 const WORKFLOW_ACTIONS = new Set([
   'acknowledge', 'approve', 'archive', 'assign', 'calculate', 'cancel', 'close',
-  'confirm', 'dispatch', 'export', 'file', 'generate', 'import', 'lock', 'open',
+  'confirm', 'delete', 'dispatch', 'export', 'file', 'generate', 'import', 'lock', 'open',
   'pay', 'post', 'process', 'receive', 'reconcile', 'remit', 'reopen', 'resolve',
   'restore', 'return', 'reverse', 'retry', 'run', 'send', 'submit', 'sync', 'unlock',
   'verify', 'void',

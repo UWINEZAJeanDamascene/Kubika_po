@@ -19,6 +19,7 @@ router.post('/process', controller.process);
 router.get('/progress/:jobId', controller.progress);
 router.get('/history', controller.history);
 router.delete('/history/:id', controller.deleteHistory);
+router.post('/history/:id/delete', controller.deleteHistory);
 router.get('/history/:id/error-report', controller.downloadErrorReport);
 router.get('/history/:id/results-report', controller.downloadResultsReport);
 router.get('/download-template/:entityType', controller.downloadTemplate);
