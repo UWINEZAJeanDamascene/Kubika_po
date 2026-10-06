@@ -17,7 +17,6 @@ const Invoice = require('../models/Invoice');
 const Purchase = require('../models/Purchase');
 const Product = require('../models/Product');
 const Company = require('../models/Company');
-const RecurringInvoice = require('../models/RecurringInvoice');
 const emailService = require('./emailService');
 
 const { JOB_TYPES, isQueueAvailable } = require('./jobQueue');
@@ -230,67 +229,15 @@ const monthlySummaryProcessor = async (job) => {
 const recurringInvoiceProcessor = async (job) => {
   const { companyId, recurringInvoiceId } = job.data;
   console.log(`Processing recurring invoice ${recurringInvoiceId} for company ${companyId}`);
-  
-  const recurring = await RecurringInvoice.findOne({
-    _id: recurringInvoiceId,
-    company: companyId,
-    status: 'active'
+  const recurringService = require('./recurringService');
+  const invoice = await recurringService.generateForTemplate(recurringInvoiceId, {
+    companyId,
+    scheduled: true,
   });
-  
-  if (!recurring) {
-    return { success: false, reason: 'Recurring invoice not found or inactive' };
-  }
-  
-  // Check if it's time to generate
-  const now = new Date();
-  const nextRun = new Date(recurring.nextRunDate);
-  
-  if (nextRun > now) {
-    return { success: false, reason: 'Not time to generate yet' };
-  }
-  
-  // Generate the invoice
-  const invoice = await Invoice.create({
-    company: companyId,
-    client: recurring.client,
-    items: recurring.items,
-    subtotal: recurring.subtotal,
-    totalTax: recurring.totalTax,
-    grandTotal: recurring.grandTotal,
-    status: 'draft',
-    invoiceDate: now,
-    dueDate: new Date(now.getTime() + (recurring.paymentTerms || 30) * 24 * 60 * 60 * 1000),
-    recurringSource: recurring._id
-  });
-  
-  // Update next run date
-  const nextDate = new Date(now);
-  switch (recurring.frequency) {
-    case 'daily':
-      nextDate.setDate(nextDate.getDate() + 1);
-      break;
-    case 'weekly':
-      nextDate.setDate(nextDate.getDate() + 7);
-      break;
-    case 'monthly':
-      nextDate.setMonth(nextDate.getMonth() + 1);
-      break;
-    case 'quarterly':
-      nextDate.setMonth(nextDate.getMonth() + 3);
-      break;
-    case 'yearly':
-      nextDate.setFullYear(nextDate.getFullYear() + 1);
-      break;
-  }
-  
-  recurring.lastRunDate = now;
-  recurring.nextRunDate = nextDate;
-  await recurring.save();
-  
-  return { success: true, invoiceId: invoice._id };
+  return invoice
+    ? { success: true, invoiceId: invoice._id }
+    : { success: false, reason: 'Recurring invoice is not due or was already processed' };
 };
-
-
 /**
  * Email Worker
  */

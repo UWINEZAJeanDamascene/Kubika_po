@@ -2516,11 +2516,15 @@ model RecurringInvoiceLine {
   recurringInvoiceId String           @map("recurring_invoice_id") @db.Char(24)
   lineOrder          Int              @default(0) @map("line_order")
   productId          String           @map("product_id") @db.Char(24)
+  productName        String?          @map("product_name")
+  productCode        String?          @map("product_code")
   description        String?
   qty                Decimal          @db.Decimal(19, 4)
+  unit               String?
   unitPrice          Decimal          @map("unit_price") @db.Decimal(19, 6)
   discountPct        Decimal          @default(0) @map("discount_pct") @db.Decimal(19, 4)
   taxRate            Decimal          @default(0) @map("tax_rate") @db.Decimal(19, 4)
+  taxCode            String           @default("A") @map("tax_code")
   warehouseId        String?          @map("warehouse_id") @db.Char(24)
   product            Product          @relation(fields: [productId], references: [id])
   recurringInvoice   RecurringInvoice @relation(fields: [recurringInvoiceId], references: [id], onDelete: Cascade)

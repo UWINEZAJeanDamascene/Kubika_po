@@ -996,13 +996,15 @@ function recurringInvoiceLineToApi(row) {
   return {
     ...lineBase(row, {
       description: row.description ?? null,
-      productName,
-      productCode,
+      productName: row.productName ?? productName,
+      productCode: row.productCode ?? productCode,
       qty,
       quantity: qty,
       unitPrice,
+      unit: row.unit ?? null,
       discountPct,
       taxRate,
+      taxCode: row.taxCode || 'A',
       lineSubtotal,
       lineTax,
       lineTotal,
@@ -1431,10 +1433,14 @@ function recurringInvoiceTranslateCreate(data) {
   return genericTranslateCreate(data, RECURRING_INVOICE_HEADER, (line, idx, companyId) =>
     defaultLineCreate(line, idx, companyId, {
       description: line.description ?? null,
+      productName: line.productName ?? null,
+      productCode: line.productCode ?? null,
       qty: line.qty ?? line.quantity ?? 0,
+      unit: line.unit ?? null,
       unitPrice: line.unitPrice ?? 0,
       discountPct: line.discountPct ?? line.discount ?? 0,
       taxRate: line.taxRate ?? 0,
+      taxCode: line.taxCode || 'A',
       warehouseId: line.warehouse ? toIdString(line.warehouse) : null,
     }));
 }

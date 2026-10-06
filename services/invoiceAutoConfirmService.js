@@ -16,6 +16,8 @@ const EBMSalesService = require('./ebmSalesService');
 const { prisma } = require('../lib/prisma');
 const { resolveCogsUnitCost } = require('../utils/productCost');
 const { notifyPaymentReceived } = require('./notificationHelper');
+const { runInTransaction } = require('./transactionService');
+const { dbClient } = require('../lib/prisma');
 
 function confirmError(code, message, statusCode = 409) {
   const err = new Error(message);
@@ -24,7 +26,7 @@ function confirmError(code, message, statusCode = 409) {
   throw err;
 }
 
-async function confirmDraftInvoice(companyId, invoiceId, userId, { submitEbm = true } = {}) {
+async function confirmDraftInvoiceInTransaction(companyId, invoiceId, userId) {
   const invoice = await Invoice.findOne({ _id: invoiceId, company: companyId })
     .populate('lines.product client');
 
@@ -35,6 +37,12 @@ async function confirmDraftInvoice(companyId, invoiceId, userId, { submitEbm = t
   if (!invoice.lines || invoice.lines.length === 0) {
     confirmError('ERR_EMPTY_INVOICE', 'Invoice must have at least one line item before confirming', 400);
   }
+
+  const claim = await dbClient().invoice.updateMany({
+    where: { id: String(invoice._id), companyId: String(companyId), status: 'draft' },
+    data: { status: 'processing' },
+  });
+  if (claim.count !== 1) confirmError('ERR_INVOICE_CONFIRMED', 'Invoice is already being confirmed or is no longer a draft.', 409);
 
   const DeliveryNote = require('../models/DeliveryNote');
   const existingDeliveryNote = await DeliveryNote.findOne({
@@ -67,6 +75,13 @@ async function confirmDraftInvoice(companyId, invoiceId, userId, { submitEbm = t
 
     const isStockable = product.isStockable !== false;
     if (isStockable) {
+      if (product.trackingType && product.trackingType !== 'none') {
+        confirmError(
+          'ERR_TRACEABILITY_REQUIRED',
+          `Auto-confirm requires batch or serial assignments for ${product.name}. Keep the generated invoice as a draft and confirm it after assigning traceability.`,
+          409,
+        );
+      }
       hasStockableLines = true;
       const unitCost = await resolveCogsUnitCost(product, companyId);
       if (unitCost === 0) {
@@ -160,7 +175,7 @@ async function confirmDraftInvoice(companyId, invoiceId, userId, { submitEbm = t
     });
     invoice.revenueJournalEntry = revenueEntry._id;
   } catch (journalError) {
-    console.error('Error creating revenue journal entry:', journalError);
+    throw new Error(`Invoice revenue journal could not be created: ${journalError.message}`);
   }
 
   if (hasStockableLines && totalInvoiceCOGS > 0) {
@@ -180,7 +195,7 @@ async function confirmDraftInvoice(companyId, invoiceId, userId, { submitEbm = t
       });
       invoice.cogsJournalEntry = cogsEntry._id;
     } catch (journalError) {
-      console.error('Error creating COGS journal entry:', journalError);
+      throw new Error(`Invoice COGS journal could not be created: ${journalError.message}`);
     }
   }
 
@@ -191,8 +206,15 @@ async function confirmDraftInvoice(companyId, invoiceId, userId, { submitEbm = t
     if (product && product.isStockable) {
       const qty = line.qty || line.quantity || 0;
       if (qty > 0) {
-        const previousStock = product.currentStock || 0;
-        const newStock = Math.max(0, previousStock - qty);
+        const warehouseId = line.warehouse || product.defaultWarehouse || null;
+        const stockCommit = await warehouseService.commitReservedStock(
+          companyId,
+          product._id,
+          warehouseId,
+          qty,
+        );
+        const newStock = Number(stockCommit.currentStock);
+        const previousStock = newStock + Number(qty);
         await StockMovement.create({
           company: companyId,
           product: product._id,
@@ -211,9 +233,10 @@ async function confirmDraftInvoice(companyId, invoiceId, userId, { submitEbm = t
           performedBy: userId,
           movementDate: new Date(),
         });
-        product.currentStock = newStock;
-        product.lastSaleDate = new Date();
-        await product.save();
+        await dbClient().product.updateMany({
+          where: { id: String(product._id), companyId: String(companyId) },
+          data: { lastSaleDate: new Date() },
+        });
       }
     }
   }
@@ -227,8 +250,10 @@ async function confirmDraftInvoice(companyId, invoiceId, userId, { submitEbm = t
 
   const client = await Client.findOne({ _id: invoice.client, company: companyId });
   if (client) {
-    client.outstandingBalance += invoice.roundedAmount || 0;
-    await client.save();
+    await dbClient().client.updateMany({
+      where: { id: String(client._id), companyId: String(companyId) },
+      data: { outstandingBalance: { increment: Number(invoice.roundedAmount || 0) } },
+    });
   }
 
   if (invoice.quotation) {
@@ -240,30 +265,33 @@ async function confirmDraftInvoice(companyId, invoiceId, userId, { submitEbm = t
     });
   }
 
-  try {
-    await notifyPaymentReceived(companyId, invoice, 0);
-  } catch (e) {
-    console.error('notifyPaymentReceived failed', e);
-  }
-
-  try {
-    await cacheService.bumpCompanyFinancialCaches(companyId);
-  } catch (e) {
-    console.error('Cache invalidation failed:', e);
-  }
-
-  if (submitEbm) {
-    try {
-      return await EBMSalesService.submitInvoice(invoice._id, { companyId });
-    } catch (ebmError) {
-      console.error('EBM sales submission failed after invoice confirmation:', ebmError.message);
-      return ebmError.invoice || await Invoice.findOne({ _id: invoice._id, company: companyId })
-        .populate('client lines.product createdBy');
-    }
-  }
-
   return Invoice.findOne({ _id: invoice._id, company: companyId })
     .populate('client lines.product createdBy');
+}
+
+async function confirmDraftInvoice(companyId, invoiceId, userId, { submitEbm = true } = {}) {
+  const invoice = await runInTransaction(() =>
+    confirmDraftInvoiceInTransaction(companyId, invoiceId, userId));
+
+  try {
+    await notifyPaymentReceived(companyId, invoice, 0);
+  } catch (error) {
+    console.error('Invoice notification failed after commit:', error);
+  }
+  try {
+    await cacheService.bumpCompanyFinancialCaches(companyId);
+  } catch (error) {
+    console.error('Invoice cache invalidation failed after commit:', error);
+  }
+
+  if (!submitEbm) return invoice;
+  try {
+    return await EBMSalesService.submitInvoice(invoice._id, { companyId });
+  } catch (error) {
+    console.error('EBM sales submission failed after invoice confirmation:', error.message);
+    return error.invoice || Invoice.findOne({ _id: invoice._id, company: companyId })
+      .populate('client lines.product createdBy');
+  }
 }
 
 module.exports = { confirmDraftInvoice };
