@@ -19,6 +19,8 @@ const ALIASES = {
   nationalId: ['national_id', 'nid', 'id_number', 'identity_number'],
   basicSalary: ['salary', 'basic_salary', 'gross_salary', 'salaire', 'monthly_salary', 'base_pay'],
   managerEmployeeId: ['manager_employee_id', 'manager_id', 'supervisor_employee_id', 'reports_to'],
+  department: ['department_name', 'dept_name', 'dept'],
+  departmentCode: ['department_code', 'dept_code'],
   salaryEffectiveDate: ['salary_effective_date', 'pay_effective_date'],
   salaryCurrency: ['salary_currency', 'pay_currency'],
   transportAllowance: ['transport_allowance', 'transport'],

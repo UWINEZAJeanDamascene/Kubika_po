@@ -147,6 +147,29 @@ function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+async function resolveEmployeeDepartment(companyId, departmentName, departmentCode) {
+  const Department = require('../models/Department');
+  const byCode = !isBlank(departmentCode)
+    ? await Department.findOne({ company: companyId, code: String(departmentCode).trim().toUpperCase() }).lean()
+    : null;
+  const departmentValue = String(departmentName || '').trim();
+  const byNameOrCode = !isBlank(departmentValue)
+    ? await Department.findOne({
+      company: companyId,
+      $or: [
+        { name: new RegExp(`^${escapeRegExp(departmentValue)}$`, 'i') },
+        { code: departmentValue.toUpperCase() },
+      ],
+    }).lean()
+    : null;
+  if (!isBlank(departmentCode) && !byCode) throw new Error(`Department code not found: ${departmentCode}`);
+  if (!isBlank(departmentName) && !byNameOrCode) throw new Error(`Department not found by name or code: ${departmentName}`);
+  if (byCode && byNameOrCode && String(byCode._id) !== String(byNameOrCode._id)) {
+    throw new Error('Department name and department code refer to different departments.');
+  }
+  return byCode || byNameOrCode;
+}
+
 function parseNumber(value) {
   if (isBlank(value)) return null;
   const normalized = String(value).replace(/,/g, '').trim();
@@ -420,6 +443,14 @@ function cleanMappedRow(entityType, row, mapping) {
       if (clean[key]) clean[key] = clean[key].split(/\s+-\s+/, 1)[0].trim();
     }
   }
+  if (entityType === 'employees' && clean.laborType) {
+    const normalized = String(clean.laborType).toLowerCase().replace(/[^a-z]/g, '');
+    if (['na', 'notspecified', 'notapplicable', 'none', 'unknown'].includes(normalized)) clean.laborType = null;
+    if (['direct', 'directlabor', 'directlabour'].includes(normalized)) clean.laborType = 'direct';
+    else if (['indirect', 'indirectlabor', 'indirectlabour'].includes(normalized)) clean.laborType = 'indirect';
+    else if (['admin', 'administrative', 'office', 'support', 'indirectcost'].includes(normalized)) clean.laborType = 'indirect';
+    else if (['mixed', 'mixedlabor', 'mixedlabour'].includes(normalized)) clean.laborType = 'mixed';
+  }
   return clean;
 }
 
@@ -472,7 +503,7 @@ function validateCleanRow(entityType, clean, rowNumber) {
     if (!isBlank(clean.gender) && !['male', 'female', 'other'].includes(String(clean.gender).toLowerCase())) errors.push(buildValidationError(rowNumber, 'gender', 'Gender must be male, female, or other.', clean.gender));
     if (!isBlank(clean.employmentType) && !['full-time', 'part-time', 'contract', 'intern', 'casual'].includes(String(clean.employmentType).toLowerCase())) errors.push(buildValidationError(rowNumber, 'employmentType', 'Employment type must be full-time, part-time, contract, intern, or casual.', clean.employmentType));
     if (!isBlank(clean.taxStatus) && !['resident', 'non-resident'].includes(String(clean.taxStatus).toLowerCase())) errors.push(buildValidationError(rowNumber, 'taxStatus', 'Tax status must be resident or non-resident.', clean.taxStatus));
-    if (!isBlank(clean.laborType) && !['direct', 'indirect', 'mixed'].includes(String(clean.laborType).toLowerCase())) errors.push(buildValidationError(rowNumber, 'laborType', 'Labor type must be direct, indirect, or mixed.', clean.laborType));
+    if (!isBlank(clean.laborType) && !['direct', 'indirect'].includes(String(clean.laborType).toLowerCase())) errors.push(buildValidationError(rowNumber, 'laborType', 'Labor type is required and must be direct or indirect. Direct/indirect labor or labour wording is also accepted.', clean.laborType));
     if (!isBlank(clean.tinNumber) && !/^\d{9}$/.test(String(clean.tinNumber))) errors.push(buildValidationError(rowNumber, 'tinNumber', 'TIN Number must be 9 digits.', clean.tinNumber));
     if (!isBlank(clean.managerEmployeeId) && String(clean.managerEmployeeId).trim().toUpperCase() === String(clean.employeeId || '').trim().toUpperCase()) errors.push(buildValidationError(rowNumber, 'managerEmployeeId', 'An employee cannot be their own manager.', clean.managerEmployeeId));
   }
@@ -556,7 +587,13 @@ async function validateRelatedRecords(entityType, clean, companyId, cache) {
   };
   const byName = (name) => new RegExp(`^${escapeRegExp(String(name).trim())}$`, 'i');
   if (entityType === 'employees') {
-    if (clean.department && !await lookup('../models/Department', 'name', clean.department, { company: companyId, name: byName(clean.department) })) errors.push({ field: 'department', message: `Department not found: ${clean.department}` });
+    if (clean.department || clean.departmentCode) {
+      try {
+        await resolveEmployeeDepartment(companyId, clean.department, clean.departmentCode);
+      } catch (error) {
+        errors.push({ field: clean.departmentCode ? 'departmentCode' : 'department', message: error.message });
+      }
+    }
     if (clean.managerEmployeeId && !await lookup('../models/Employee', 'employeeId', clean.managerEmployeeId, { company: companyId, employeeId: String(clean.managerEmployeeId).trim().toUpperCase() })) errors.push({ field: 'managerEmployeeId', message: `Manager employee not found: ${clean.managerEmployeeId}` });
   }
   if (entityType === 'departments') {
@@ -1172,10 +1209,10 @@ async function upsertRow(entityType, companyId, userId, data, duplicateAction, c
 
   if (entityType === 'employees') {
     const Employee = require('../models/Employee');
-    const Department = require('../models/Department');
     const SalaryHistory = require('../models/SalaryHistory');
-    const department = data.department ? await Department.findOne({ company: companyId, name: new RegExp(`^${escapeRegExp(String(data.department).trim())}$`, 'i') }).lean() : null;
-    if (data.department && !department) throw new Error(`Department not found: ${data.department}`);
+    const laborType = String(data.laborType || '').trim().toLowerCase();
+    if (!['direct', 'indirect'].includes(laborType)) throw new Error('Every imported employee must have Labor Type set to direct or indirect.');
+    const department = await resolveEmployeeDepartment(companyId, data.department, data.departmentCode);
     const manager = data.managerEmployeeId ? await Employee.findOne({ company: companyId, employeeId: String(data.managerEmployeeId).trim().toUpperCase() }).select('_id employeeId').lean() : null;
     if (data.managerEmployeeId && !manager) throw new Error(`Manager employee not found: ${data.managerEmployeeId}`);
     const salaryEffectiveDate = parseDateValue(data.salaryEffectiveDate) || parseDateValue(data.hireDate);
@@ -1199,12 +1236,12 @@ async function upsertRow(entityType, companyId, userId, data, duplicateAction, c
       dateOfBirth: parseDateValue(data.dateOfBirth),
       gender: data.gender,
       employmentType: String(data.employmentType || 'full-time').toLowerCase(),
-      department: department?.name || data.department || null,
+      department: department?.name || null,
       departmentRef: department?._id || null,
       position: data.position,
       managerId: manager?._id || null,
       location: data.location,
-      laborType: data.laborType,
+      laborType,
       defaultDirectPercentage: isBlank(data.defaultDirectPercentage) ? null : parseNumber(data.defaultDirectPercentage),
       costCenter: data.costCenter,
       bankName: data.bankName,
