@@ -411,9 +411,9 @@ async function enrichProductRow(companyId, clean, context, rowNumber) {
 
   const taxDefault = context.company?.is_vat_registered === false ? 'A' : 'B';
   clean.taxTypeCode = String(clean.taxTypeCode || taxDefault).toUpperCase();
-  clean.taxRate = clean.taxTypeCode === 'B' && context.company?.is_vat_registered !== false && context.company?.isVatRegistered !== false
-    ? Number(context.company?.vat_rate_pct ?? context.company?.vatRatePct ?? context.company?.vatRate ?? 18)
-    : 0;
+  // RRA tax type B is the standard 18% VAT rate. An imported explicit B code
+  // must not become zero-rate just because the company VAT flag is unset or stale.
+  clean.taxRate = clean.taxTypeCode === 'B' ? 18 : 0;
 
   const unitCode = String(clean.quantityUnitCode || '').toUpperCase();
   clean.quantityUnitCode = unitCode;
@@ -1295,6 +1295,9 @@ async function writeOpeningGl(companyId, userId, rows) {
 function productPayload(companyId, userId, data) {
   const ebmQuantityUnit = String(data.quantityUnitCode || '').toUpperCase();
   const unit = String(data.unit || (ebmQuantityUnit === 'KGM' ? 'kg' : ebmQuantityUnit === 'U' ? 'pcs' : 'pcs')).toLowerCase();
+  const taxCode = String(data.taxTypeCode || 'A').trim().toUpperCase();
+  const importedTaxRate = parseNumber(data.taxRate);
+  const taxRate = importedTaxRate > 0 ? importedTaxRate : (taxCode === 'B' ? 18 : 0);
   return {
     company: companyId,
     name: data.name,
@@ -1321,15 +1324,15 @@ function productPayload(companyId, userId, data) {
     inventoryAccount: data.inventoryAccount || null,
     cogsAccount: data.cogsAccount || null,
     revenueAccount: data.revenueAccount || null,
-    taxCode: String(data.taxTypeCode || 'A').toUpperCase(),
-    taxRate: parseNumber(data.taxRate) || 0,
+    taxCode,
+    taxRate,
     ebm: {
-      taxTyCd: String(data.taxTypeCode || 'A').toUpperCase(),
+      taxTyCd: taxCode,
       itemClassCd: data.itemClassCode,
       pkgUnitCd: data.packagingUnitCode,
       qtyUnitCd: data.quantityUnitCode,
       itemClassCode: data.itemClassCode,
-      taxTypeCode: String(data.taxTypeCode || 'A').toUpperCase(),
+      taxTypeCode: taxCode,
       packagingUnitCode: data.packagingUnitCode,
       quantityUnitCode: data.quantityUnitCode
     },
@@ -1347,6 +1350,13 @@ async function upsertRow(entityType, companyId, userId, data, duplicateAction, c
     payload.category = await ensureCategory(companyId, data.category);
     const existing = await Product.findOne({ company: companyId, sku: payload.sku });
     if (existing && duplicateAction === 'skip') {
+      // Imports commonly use "skip" to add opening stock to an existing SKU;
+      // keep its tax setup in sync as well so POS computes the imported tax code.
+      if (String(existing.taxCode || '').toUpperCase() !== payload.taxCode || Number(existing.taxRate || 0) !== payload.taxRate) {
+        await Product.updateOne({ _id: existing._id, company: companyId }, {
+          $set: { taxCode: payload.taxCode, taxRate: payload.taxRate },
+        });
+      }
       if (warehouseId && String(existing.defaultWarehouse || '') !== String(warehouseId)) {
         await Product.updateOne({ _id: existing._id, company: companyId }, { $set: { defaultWarehouse: warehouseId } });
       }

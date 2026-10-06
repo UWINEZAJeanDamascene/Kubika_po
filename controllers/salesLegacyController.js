@@ -15,6 +15,14 @@ function escapeRegex(value) {
 function isObjectIdString(value) {
   return /^[0-9a-fA-F]{24}$/.test(String(value || '').trim());
 }
+
+function resolveProductTaxRate(product) {
+  const configuredRate = Number(product?.taxRate);
+  if (Number.isFinite(configuredRate) && configuredRate > 0) return configuredRate;
+  const taxCode = String(product?.taxCode || product?.ebm?.taxTyCd || product?.ebm?.taxTypeCode || '').trim().toUpperCase();
+  return taxCode === 'B' ? 18 : 0;
+}
+
 const { runInTransaction } = require('../services/transactionService');
 const inventoryService = require('../services/inventoryService');
 const JournalService = require('../services/journalService');
@@ -289,7 +297,7 @@ exports.createDirectSale = async (req, res, next) => {
       const subtotal = quantity * unitPrice;
       const discountAmount = subtotal * (discountPct / 100);
       const netAmount = subtotal - discountAmount;
-      const taxRate = product.taxRate == null ? 0 : Number(product.taxRate);
+      const taxRate = resolveProductTaxRate(product);
       if (!Number.isFinite(taxRate) || taxRate < 0 || taxRate > 100) {
         return res.status(422).json({
           success: false,
@@ -976,7 +984,7 @@ exports.getPosProducts = async (req, res, next) => {
         barcode: p.barcode,
         sellingPrice: toNumber(p.sellingPrice),
         unit: p.unit,
-        taxRate: toNumber(p.taxRate),
+        taxRate: resolveProductTaxRate(p),
         taxCode: p.taxCode || 'A',
         currentStock,
         onHandStock,
