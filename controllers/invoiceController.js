@@ -2,22 +2,18 @@ const Invoice = require("../models/Invoice");
 const Product = require("../models/Product");
 const Client = require("../models/Client");
 const StockMovement = require("../models/StockMovement");
-const InventoryBatch = require("../models/InventoryBatch");
 const InvoiceReceiptMetadata = require("../models/InvoiceReceiptMetadata");
-const ARReceipt = require("../models/ARReceipt");
-const ARReceiptAllocation = require("../models/ARReceiptAllocation");
 const PDFDocument = require("pdfkit");
 const notificationService = require("../services/notificationHelper");
 const emailService = require("../services/emailService");
 const Company = require("../models/Company");
 const cacheService = require("../services/cacheService");
 const { loadLineProducts, getLineProduct } = require("../utils/lineProducts");
-const { BankAccount, BankTransaction } = require("../models/BankAccount");
 const JournalService = require("../services/journalService");
 const { runInTransaction } = require("../services/transactionService");
+const { dbClient } = require("../lib/prisma");
+const { generateObjectId } = require("../utils/objectId");
 const { DEFAULT_ACCOUNTS } = require("../constants/chartOfAccounts");
-const EBMProductService = require("../services/ebmProductService");
-const EBMSalesService = require("../services/ebmSalesService");
 const { parseBoundedPage } = require("../utils/querySafety");
 const { consumeApproval: consumePosManagerApproval } = require('./posManagerApprovalController');
 const {
@@ -249,7 +245,11 @@ exports.createInvoice = async (req, res, next) => {
 
     // Support both lines (Module 6) and items (legacy)
     const invoiceLines = lines || items;
-    const currencyVal = "RWF";
+    const currencyVal = String(currencyCode || currency || "RWF").trim().toUpperCase();
+
+    if (!Array.isArray(invoiceLines) || invoiceLines.length === 0) {
+      return res.status(400).json({ success: false, code: "ERR_INVALID_INVOICE", message: "A customer and at least one invoice line are required." });
+    }
 
     // Get client details for TIN and address
     const client = await Client.findOne({ _id: clientId, company: companyId });
@@ -269,8 +269,6 @@ exports.createInvoice = async (req, res, next) => {
     // are still walked in order and the first failure still wins, so error
     // messages and their precedence are identical.
     const productMap = {};
-    await EBMProductService.assertProductsRegistered(companyId, invoiceLines.map((line) => line.product));
-
     const lineProductIds = [...new Set(
       invoiceLines.map((line) => line.product).filter(Boolean).map((id) => id.toString()),
     )];
@@ -296,21 +294,20 @@ exports.createInvoice = async (req, res, next) => {
         });
       }
       productMap[line.product.toString()] = product;
-      const qty = line.qty || line.quantity || 0;
-      if (product.currentStock < qty) {
-        return res.status(400).json({
-          success: false,
-          code: "ERR_INSUFFICIENT_STOCK",
-          message: `Insufficient stock for ${product.name}. Available: ${product.currentStock}, Required: ${qty}`,
-        });
+      const qty = Number(line.qty ?? line.quantity);
+      const unitPrice = Number(line.unitPrice);
+      const discountPct = Number(line.discountPct ?? line.discount ?? 0);
+      const taxRate = Number(line.taxRate ?? product.taxRate ?? 0);
+      if (!Number.isFinite(qty) || qty <= 0 || !Number.isFinite(unitPrice) || unitPrice < 0 || !Number.isFinite(discountPct) || discountPct < 0 || discountPct > 100 || !Number.isFinite(taxRate) || taxRate < 0 || taxRate > 100) {
+        return res.status(400).json({ success: false, code: "ERR_INVALID_INVOICE_LINE", message: `Invoice line for ${product.name} has an invalid quantity, price, discount, or tax rate.` });
       }
     }
 
     // Process lines with tax codes
     const processedLines = invoiceLines.map((line, index) => {
-      const qty = line.qty || line.quantity || 0;
-      const unitPrice = line.unitPrice || 0;
-      const discountPct = line.discountPct || line.discount || 0;
+      const qty = Number(line.qty ?? line.quantity);
+      const unitPrice = Number(line.unitPrice);
+      const discountPct = Number(line.discountPct ?? line.discount ?? 0);
       const subtotal = qty * unitPrice;
       const discountAmount = subtotal * (discountPct / 100);
       const netAmount = subtotal - discountAmount;
@@ -319,10 +316,10 @@ exports.createInvoice = async (req, res, next) => {
         line.taxRate != null
           ? line.taxRate
           : product?.taxRate != null
-            ? product.taxRate
+            ? Number(product.taxRate)
             : 0;
       const taxCode = line.taxCode || product?.taxCode || "A";
-      const taxAmount = netAmount * (taxRate / 100);
+      const taxAmount = Math.round((netAmount * (taxRate / 100) + Number.EPSILON) * 100) / 100;
       const totalWithTax = netAmount + taxAmount;
 
       return {
@@ -348,24 +345,28 @@ exports.createInvoice = async (req, res, next) => {
     });
 
     const invoice = await Invoice.create({
-      ...req.body,
       company: companyId,
       lines: processedLines,
       items: processedLines, // backwards compat
       client: clientId,
       quotation: quotation,
       currencyCode: currencyVal,
-      currency: currencyVal, // backwards compat
-      exchangeRate: exchangeRate || 1,
+      exchangeRate: Number(exchangeRate) > 0 ? Number(exchangeRate) : 1,
       customerTin: customerTin || client.taxId,
       customerName: customerName || client.name,
       customerAddress: customerAddress || client.contact?.address,
       dueDate: dueDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // Default 30 days
       invoiceDate: invoiceDate || new Date(),
-      createdBy: req.user.id,
+      createdBy: req.user.id || req.user._id,
+      status: "draft",
+      amountPaid: 0,
+      amountOutstanding: processedLines.reduce((sum, line) => sum + Number(line.lineTotal || 0), 0),
+      subtotal: processedLines.reduce((sum, line) => sum + Number(line.lineSubtotal || 0) - (Number(line.lineSubtotal || 0) * Number(line.discountPct || 0) / 100), 0),
+      taxAmount: processedLines.reduce((sum, line) => sum + Number(line.lineTax || 0), 0),
+      totalDiscount: processedLines.reduce((sum, line) => sum + (Number(line.lineSubtotal || 0) * Number(line.discountPct || 0) / 100), 0),
+      totalAEx: processedLines.filter((line) => line.taxCode === "A").reduce((sum, line) => sum + (Number(line.lineSubtotal || 0) * (1 - Number(line.discountPct || 0) / 100)), 0),
+      totalB18: processedLines.filter((line) => line.taxCode === "B").reduce((sum, line) => sum + (Number(line.lineSubtotal || 0) * (1 - Number(line.discountPct || 0) / 100)), 0),
     });
-
-    const hydratedInvoice = await hydrateInvoiceRelations(invoice);
 
     // Atomically consume inventory layers, create stock movements, update product stock,
     // and post COGS + Sales journal entries using the central transaction helper.
@@ -373,433 +374,8 @@ exports.createInvoice = async (req, res, next) => {
     const autoConfirm = req.body.autoConfirm || false;
 
     if (autoConfirm) {
-      await runInTransaction(async (trx) => {
-        // If trx is provided we run the transactional path, otherwise run the non-transactional fallback logic.
-        if (trx) {
-          let totalInvoiceCOGS = 0;
-
-          // One read for every line's product. FIFO consumption below stays
-          // sequential — it must, since each consume() draws down the layers the
-          // next one sees — but the lookups themselves have no such ordering
-          // requirement and were costing a round-trip each.
-          const confirmProductIds = [...new Set(
-            invoice.lines.map((l) => l.product && (l.product._id || l.product))
-              .filter(Boolean).map((id) => id.toString()),
-          )];
-          const confirmProducts = confirmProductIds.length
-            ? await Product.find({ _id: { $in: confirmProductIds }, company: companyId })
-            : [];
-          const confirmProductsById = new Map(confirmProducts.map((p) => [p._id.toString(), p]));
-
-          for (const line of invoice.lines) {
-            const lineProductId = line.product && (line.product._id || line.product);
-            const product = lineProductId ? confirmProductsById.get(lineProductId.toString()) : null;
-            if (!product) continue;
-
-            const inventoryService = require("../services/inventoryService");
-            const qty = line.qty || line.quantity || 0;
-            const consumeResult = await inventoryService.consume(
-              companyId,
-              product._id,
-              qty,
-              { method: "fifo", session: trx },
-            );
-            const itemCost = consumeResult.totalCost || 0;
-            totalInvoiceCOGS += itemCost;
-
-            const previousStock = product.currentStock || 0;
-            const newStock = previousStock - qty;
-
-            const unitCost = qty > 0 ? itemCost / qty : 0;
-
-            // Update line with COGS info - Module 6
-            line.unitCost = unitCost;
-            line.cogsAmount = itemCost;
-
-            const sm = new StockMovement({
-              company: companyId,
-              product: product._id,
-              type: "out",
-              reason: "sale",
-              quantity: qty,
-              previousStock,
-              newStock,
-              unitCost,
-              totalCost: itemCost,
-              referenceType: "invoice",
-              referenceNumber: invoice.referenceNo || invoice.invoiceNumber,
-              referenceDocument: invoice._id,
-              referenceModel: "Invoice",
-              notes: `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Sale`,
-              performedBy: req.user.id,
-              movementDate: new Date(),
-            });
-            await sm.save({ session: trx });
-
-            product.currentStock = newStock;
-            product.lastSaleDate = new Date();
-            await product.save({ session: trx });
-          }
-
-          // Save line updates
-          await invoice.save({ session: trx });
-
-          invoice.stockDeducted = true;
-          invoice.status = "confirmed";
-          invoice.confirmedDate = new Date();
-          invoice.confirmedBy = req.user.id;
-          await invoice.save({ session: trx });
-
-          client.outstandingBalance += parseFloat(invoice.roundedAmount) || 0;
-          await client.save({ session: trx });
-
-          // Create revenue journal entry - Module 6
-          try {
-            // Build revenue and COGS entries and post them atomically
-            const arAccount = await JournalService.getMappedAccountCode(
-              companyId,
-              "sales",
-              "accountsReceivable",
-              DEFAULT_ACCOUNTS.accountsReceivable,
-            );
-            const salesAcct = await JournalService.getMappedAccountCode(
-              companyId,
-              "sales",
-              "salesRevenue",
-              DEFAULT_ACCOUNTS.salesRevenue,
-            );
-            const vatAcct = await JournalService.getMappedAccountCode(
-              companyId,
-              "tax",
-              "vatOutput",
-              DEFAULT_ACCOUNTS.vatOutput,
-            );
-
-            const revenueLines = [];
-            revenueLines.push(
-              JournalService.createDebitLine(
-                arAccount,
-                invoice.roundedAmount || 0,
-                `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Receivable`,
-              ),
-            );
-            const subtotal =
-              (invoice.roundedAmount || 0) - (invoice.totalTax || 0);
-            if (subtotal > 0)
-              revenueLines.push(
-                JournalService.createCreditLine(
-                  salesAcct,
-                  subtotal,
-                  `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Revenue`,
-                ),
-              );
-            if ((invoice.totalTax || 0) > 0)
-              revenueLines.push(
-                JournalService.createCreditLine(
-                  vatAcct,
-                  invoice.totalTax || 0,
-                  `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - VAT`,
-                ),
-              );
-
-            const cogsLines = [];
-            const cogsAcct = await JournalService.getMappedAccountCode(
-              companyId,
-              "inventory",
-              "costOfGoodsSold",
-              DEFAULT_ACCOUNTS.costOfGoodsSold,
-            );
-            const invAcct = await JournalService.getMappedAccountCode(
-              companyId,
-              "purchases",
-              "inventory",
-              DEFAULT_ACCOUNTS.inventory,
-            );
-            cogsLines.push(
-              JournalService.createDebitLine(
-                cogsAcct,
-                totalInvoiceCOGS,
-                `COGS for Invoice ${invoice.referenceNo || invoice.invoiceNumber}`,
-              ),
-            );
-            cogsLines.push(
-              JournalService.createCreditLine(
-                invAcct,
-                totalInvoiceCOGS,
-                `Inventory reduction for Invoice ${invoice.referenceNo || invoice.invoiceNumber}`,
-              ),
-            );
-
-            const createdEntries = await JournalService.createEntriesAtomic(
-              companyId,
-              req.user.id,
-              [
-                {
-                  date: invoice.invoiceDate,
-                  description: `Invoice ${invoice.referenceNo || invoice.invoiceNumber} revenue`,
-                  sourceType: "invoice",
-                  sourceId: invoice._id,
-                  sourceReference: invoice.referenceNo || invoice.invoiceNumber,
-                  lines: revenueLines,
-                  isAutoGenerated: true,
-                },
-                {
-                  date: invoice.invoiceDate,
-                  description: `COGS for ${invoice.referenceNo || invoice.invoiceNumber}`,
-                  sourceType: "cogs",
-                  sourceId: invoice._id,
-                  sourceReference: invoice.referenceNo || invoice.invoiceNumber,
-                  lines: cogsLines,
-                  isAutoGenerated: true,
-                },
-              ],
-              { session: trx },
-            );
-
-            if (Array.isArray(createdEntries) && createdEntries.length > 0) {
-              invoice.revenueJournalEntry = createdEntries[0]._id;
-              if (createdEntries[1])
-                invoice.cogsJournalEntry = createdEntries[1]._id;
-            }
-          } catch (je) {
-            console.error(
-              "JournalService.createInvoiceEntry failed in transaction:",
-              je,
-            );
-          }
-
-          await invoice.save({ session: trx });
-        } else {
-          // Non-transactional fallback path
-          let totalInvoiceCOGS = 0;
-          const inventoryService = require("../services/inventoryService");
-          const __lineProducts0 = await loadLineProducts(Product, invoice.lines, companyId);
-          for (const line of invoice.lines) {
-            const product = getLineProduct(__lineProducts0, line);
-            if (!product) continue;
-            let consumeResult;
-            const qty = line.qty || line.quantity || 0;
-            try {
-              const batchesReservedAgg = await InventoryBatch.aggregate([
-                { $match: { company: companyId, product: product._id } },
-                {
-                  $group: {
-                    _id: null,
-                    reserved: { $sum: { $ifNull: ["$reservedQuantity", 0] } },
-                  },
-                },
-              ]);
-              const reserved =
-                (batchesReservedAgg[0] && batchesReservedAgg[0].reserved) || 0;
-              const available = (product.currentStock || 0) - reserved;
-              if (available < qty) {
-                return res.status(409).json({
-                  success: false,
-                  code: "ERR_INSUFFICIENT_STOCK",
-                  message: "Insufficient available stock to confirm invoice",
-                });
-              }
-
-              consumeResult = await inventoryService.consume(
-                companyId,
-                product._id,
-                qty,
-                { method: "fifo" },
-              );
-            } catch (cErr) {
-              if (cErr && cErr.code === "ERR_INSUFFICIENT_STOCK") {
-                return res.status(409).json({
-                  success: false,
-                  code: "ERR_INSUFFICIENT_STOCK",
-                  message: "Insufficient stock to confirm invoice",
-                });
-              }
-              throw cErr;
-            }
-            const itemCost = consumeResult.totalCost || 0;
-            totalInvoiceCOGS += itemCost;
-
-            const previousStock = product.currentStock || 0;
-            const newStock = previousStock - qty;
-
-            // Update line with COGS info - Module 6
-            line.unitCost =
-              itemCost > 0 && qty > 0 ? itemCost / qty : line.unitPrice;
-            line.cogsAmount = itemCost;
-
-            await StockMovement.create({
-              company: companyId,
-              product: product._id,
-              type: "out",
-              reason: "sale",
-              quantity: qty,
-              previousStock,
-              newStock,
-              unitCost: line.unitCost,
-              totalCost: itemCost,
-              referenceType: "invoice",
-              referenceNumber: invoice.referenceNo || invoice.invoiceNumber,
-              referenceDocument: invoice._id,
-              referenceModel: "Invoice",
-              notes: `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Sale`,
-              performedBy: req.user.id,
-              movementDate: new Date(),
-            });
-
-            product.currentStock = Math.max(0, newStock);
-            product.lastSaleDate = new Date();
-            await product.save();
-          }
-
-          // Save line updates
-          await invoice.save();
-
-          invoice.stockDeducted = true;
-          invoice.status = "confirmed";
-          invoice.confirmedDate = new Date();
-          invoice.confirmedBy = req.user.id;
-          await invoice.save();
-
-          client.outstandingBalance += parseFloat(invoice.roundedAmount) || 0;
-          await client.save();
-
-          // Create revenue journal entry - Module 6
-          try {
-            // Build revenue and COGS entries and post them atomically (non-transactional fallback)
-            const arAccount = await JournalService.getMappedAccountCode(
-              companyId,
-              "sales",
-              "accountsReceivable",
-              DEFAULT_ACCOUNTS.accountsReceivable,
-            );
-            const salesAcct = await JournalService.getMappedAccountCode(
-              companyId,
-              "sales",
-              "salesRevenue",
-              DEFAULT_ACCOUNTS.salesRevenue,
-            );
-            const vatAcct = await JournalService.getMappedAccountCode(
-              companyId,
-              "tax",
-              "vatOutput",
-              DEFAULT_ACCOUNTS.vatOutput,
-            );
-
-            const revenueLines = [];
-            revenueLines.push(
-              JournalService.createDebitLine(
-                arAccount,
-                invoice.roundedAmount || 0,
-                `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Receivable`,
-              ),
-            );
-            const subtotal =
-              (invoice.roundedAmount || 0) - (invoice.totalTax || 0);
-            if (subtotal > 0)
-              revenueLines.push(
-                JournalService.createCreditLine(
-                  salesAcct,
-                  subtotal,
-                  `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Revenue`,
-                ),
-              );
-            if ((invoice.totalTax || 0) > 0)
-              revenueLines.push(
-                JournalService.createCreditLine(
-                  vatAcct,
-                  invoice.totalTax || 0,
-                  `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - VAT`,
-                ),
-              );
-
-            const cogsLines = [];
-            const cogsAcct = await JournalService.getMappedAccountCode(
-              companyId,
-              "inventory",
-              "costOfGoodsSold",
-              DEFAULT_ACCOUNTS.costOfGoodsSold,
-            );
-            const invAcct = await JournalService.getMappedAccountCode(
-              companyId,
-              "purchases",
-              "inventory",
-              DEFAULT_ACCOUNTS.inventory,
-            );
-            cogsLines.push(
-              JournalService.createDebitLine(
-                cogsAcct,
-                totalInvoiceCOGS,
-                `COGS for Invoice ${invoice.referenceNo || invoice.invoiceNumber}`,
-              ),
-            );
-            cogsLines.push(
-              JournalService.createCreditLine(
-                invAcct,
-                totalInvoiceCOGS,
-                `Inventory reduction for Invoice ${invoice.referenceNo || invoice.invoiceNumber}`,
-              ),
-            );
-
-            const createdEntries = await JournalService.createEntriesAtomic(
-              companyId,
-              req.user.id,
-              [
-                {
-                  date: invoice.invoiceDate,
-                  description: `Invoice ${invoice.referenceNo || invoice.invoiceNumber} revenue`,
-                  sourceType: "invoice",
-                  sourceId: invoice._id,
-                  sourceReference: invoice.referenceNo || invoice.invoiceNumber,
-                  lines: revenueLines,
-                  isAutoGenerated: true,
-                },
-                {
-                  date: invoice.invoiceDate,
-                  description: `COGS for ${invoice.referenceNo || invoice.invoiceNumber}`,
-                  sourceType: "cogs",
-                  sourceId: invoice._id,
-                  sourceReference: invoice.referenceNo || invoice.invoiceNumber,
-                  lines: cogsLines,
-                  isAutoGenerated: true,
-                },
-              ],
-            );
-
-            if (Array.isArray(createdEntries) && createdEntries.length > 0) {
-              invoice.revenueJournalEntry = createdEntries[0]._id;
-              if (createdEntries[1])
-                invoice.cogsJournalEntry = createdEntries[1]._id;
-            }
-          } catch (je) {
-            console.error(
-              "JournalService.createInvoiceEntry failed (non-transactional):",
-              je,
-            );
-          }
-
-          // Create COGS journal entry - Module 6
-          try {
-            const cogsEntry = await JournalService.createSaleCOGSEntry(
-              companyId,
-              req.user.id,
-              {
-                invoiceId: invoice._id,
-                invoiceNumber: invoice.referenceNo || invoice.invoiceNumber,
-                date: invoice.invoiceDate,
-                totalCost: totalInvoiceCOGS,
-              },
-            );
-            invoice.cogsJournalEntry = cogsEntry._id;
-          } catch (je2) {
-            console.error(
-              "JournalService.createSaleCOGSEntry failed (non-transactional):",
-              je2,
-            );
-          }
-
-          await invoice.save();
-        }
-      });
+      invoice = await require('../services/invoiceAutoConfirmService')
+        .confirmDraftInvoice(companyId, invoice._id, req.user.id || req.user._id);
     }
 
     // Attempt to send invoice email to client if email exists
@@ -819,10 +395,6 @@ exports.createInvoice = async (req, res, next) => {
       }
     }
 
-    // Update client outstanding balance
-    client.outstandingBalance += parseFloat(invoice.roundedAmount) || 0;
-    await client.save();
-
     // Notify invoice created
     try {
       await notifyInvoiceCreated(companyId, invoice);
@@ -830,29 +402,9 @@ exports.createInvoice = async (req, res, next) => {
       console.error("notifyInvoiceCreated failed", e);
     }
 
-    let responseInvoice = invoice;
-    if (autoConfirm && invoice.status === "confirmed") {
-      try {
-        responseInvoice = await EBMSalesService.submitInvoice(invoice._id, {
-          companyId,
-        });
-      } catch (ebmError) {
-        console.error("EBM sales submission failed after auto-confirm:", ebmError.message);
-        if (ebmError.invoice) {
-          responseInvoice = ebmError.invoice;
-        } else {
-          responseInvoice = await Invoice.findOne({
-            _id: invoice._id,
-            company: companyId,
-          }).select({ client: 1, lines: 1, createdBy: 1, referenceNo: 1, status: 1, totalAmount: 1, company: 1 }).lean();
-          responseInvoice = await hydrateInvoiceRelations(responseInvoice);
-        }
-      }
-    }
-
     res.status(201).json({
       success: true,
-      data: responseInvoice,
+      data: await hydrateInvoiceRelations(invoice, companyId),
     });
   } catch (error) {
     next(error);
@@ -889,6 +441,9 @@ exports.updateInvoice = async (req, res, next) => {
 
     // Support both lines (Module 6) and items (legacy)
     const lines = req.body.lines || req.body.items;
+    if (lines !== undefined && (!Array.isArray(lines) || lines.length === 0)) {
+      return res.status(400).json({ success: false, code: "ERR_EMPTY_INVOICE", message: "A draft invoice must contain at least one line." });
+    }
 
     // If lines are updated, validate stock and products
     if (lines) {
@@ -909,13 +464,12 @@ exports.updateInvoice = async (req, res, next) => {
             message: `Product ${product.name} is inactive`,
           });
         }
-        const qty = line.qty || line.quantity || 0;
-        if (product.currentStock < qty) {
-          return res.status(400).json({
-            success: false,
-            code: "ERR_INSUFFICIENT_STOCK",
-            message: `Insufficient stock for ${product.name}. Available: ${product.currentStock}, Required: ${qty}`,
-          });
+        const qty = Number(line.qty ?? line.quantity);
+        const unitPrice = Number(line.unitPrice);
+        const discountPct = Number(line.discountPct ?? line.discount ?? 0);
+        const taxRate = Number(line.taxRate ?? product.taxRate ?? 0);
+        if (!Number.isFinite(qty) || qty <= 0 || !Number.isFinite(unitPrice) || unitPrice < 0 || !Number.isFinite(discountPct) || discountPct < 0 || discountPct > 100 || !Number.isFinite(taxRate) || taxRate < 0 || taxRate > 100) {
+          return res.status(400).json({ success: false, code: "ERR_INVALID_INVOICE_LINE", message: `Invoice line for ${product.name} has an invalid quantity, price, discount, or tax rate.` });
         }
       }
 
@@ -927,11 +481,17 @@ exports.updateInvoice = async (req, res, next) => {
         const subtotal = qty * unitPrice;
         const discountAmount = subtotal * (discountPct / 100);
         const netAmount = subtotal - discountAmount;
-        const taxRate = line.taxRate || 0;
-        const taxAmount = netAmount * (taxRate / 100);
+        const product = getLineProduct(__lineProducts1, line);
+        const taxRate = Number(line.taxRate ?? product?.taxRate ?? 0);
+        const taxAmount = Math.round((netAmount * (taxRate / 100) + Number.EPSILON) * 100) / 100;
         const totalWithTax = netAmount + taxAmount;
         return {
-          ...line,
+          product: normalizeId(line.product),
+          productName: line.productName || product?.name,
+          productCode: line.productCode || product?.sku,
+          description: line.description || product?.name,
+          unit: line.unit || product?.unit,
+          taxRate,
           qty: qty,
           quantity: qty,
           discountPct: discountPct,
@@ -981,11 +541,40 @@ exports.updateInvoice = async (req, res, next) => {
       );
     }
 
-    invoice = await Invoice.findOneAndUpdate(
-      { _id: req.params.id, company: companyId },
-      req.body,
-      { new: true, runValidators: true },
-    );
+    const allowedUpdates = {};
+    for (const key of ["client", "quotation", "salesOrder", "customerTin", "customerName", "customerAddress", "currencyCode", "exchangeRate", "invoiceDate", "dueDate", "terms", "notes"]) {
+      if (req.body[key] !== undefined) allowedUpdates[key] = req.body[key];
+    }
+    if (req.body.lines) {
+      for (const key of ["lines", "subtotal", "taxAmount", "totalDiscount", "totalAmount", "roundedAmount", "amountOutstanding"]) {
+        if (req.body[key] !== undefined) allowedUpdates[key] = req.body[key];
+      }
+    }
+    invoice = await runInTransaction(async () => {
+      const updated = await Invoice.findOneAndUpdate(
+        { _id: req.params.id, company: companyId },
+        allowedUpdates,
+        { new: true, runValidators: true },
+      );
+      if (req.body.lines || req.body.items) {
+        const invoiceId = normalizeId(updated._id);
+        const prisma = dbClient();
+        await prisma.invoiceLine.deleteMany({ where: { invoiceId, companyId: String(companyId) } });
+        await prisma.invoiceLine.createMany({ data: req.body.lines.map((line, lineOrder) => ({
+          id: generateObjectId(), companyId: String(companyId), invoiceId, lineOrder,
+          lineId: line.lineId || null, productId: normalizeId(line.product),
+          productName: line.productName || null, productCode: line.productCode || null,
+          description: line.description || null, qty: Number(line.qty), unit: line.unit || null,
+          unitPrice: Number(line.unitPrice), discountPct: Number(line.discountPct || 0),
+          taxRate: Number(line.taxRate || 0), taxCode: line.taxCode || "A",
+          lineSubtotal: Number(line.lineSubtotal || 0), lineTax: Number(line.lineTax || 0),
+          lineTotal: Number(line.lineTotal || 0), unitCost: Number(line.unitCost || 0),
+          cogsAmount: Number(line.cogsAmount || 0),
+          warehouseId: line.warehouse ? normalizeId(line.warehouse) : null,
+        })) });
+      }
+      return Invoice.findOne({ _id: req.params.id, company: companyId });
+    });
     invoice = await hydrateInvoiceRelations(invoice);
 
     res.json({
@@ -1039,800 +628,79 @@ exports.deleteInvoice = async (req, res, next) => {
 // @access  Private (admin, stock_manager)
 exports.confirmInvoice = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
-    const invoice = await Invoice.findOne({
-      _id: req.params.id,
-      company: companyId,
-    }).select({
-      lines: 1,
-      client: 1,
-      status: 1,
-      posOrigin: 1,
-      company: 1,
-      referenceNo: 1,
-      invoiceNumber: 1,
-      totalAmount: 1,
-      roundedAmount: 1,
-      amountPaid: 1,
-      grandTotal: 1,
-      taxAmount: 1,
-      subtotal: 1,
-    }).lean();
-
-    if (Array.isArray(invoice?.lines)) {
-      const productIds = [...new Set(invoice.lines.map((line) => normalizeId(line.product)).filter(Boolean))];
-      const productRows = productIds.length ? await Product.find({ _id: { $in: productIds } }, 'name sku unit taxRate taxCode isStockable').lean() : [];
-      const productMap = new Map(productRows.map((product) => [normalizeId(product._id), product]));
-      invoice.lines = invoice.lines.map((line) => ({
-        ...line,
-        product: productMap.get(normalizeId(line.product)) || line.product,
-      }));
-    }
-
-    if (!invoice) {
-      return res.status(404).json({
-        success: false,
-        message: "Invoice not found",
-      });
-    }
-
-    // Only draft invoices can be confirmed - Module 6 Business Rule
-    if (invoice.status !== "draft") {
-      return res.status(409).json({
-        success: false,
-        code: "ERR_INVOICE_CONFIRMED",
-        message:
-          "Cannot confirm invoice. Invoice is not in draft status. Edit confirmed invoice is blocked - cancel and create new.",
-      });
-    }
-
-    // Guard: must have at least one line item
-    if (!invoice.lines || invoice.lines.length === 0) {
-      return res.status(400).json({
-        success: false,
-        code: "ERR_EMPTY_INVOICE",
-        message: "Invoice must have at least one line item before confirming",
-      });
-    }
-
-    // Check if delivery note exists for this invoice - Module 6 Business Rule
-    const DeliveryNote = require("../models/DeliveryNote");
-    const existingDeliveryNote = await DeliveryNote.findOne({
-      invoice: invoice._id,
-      status: "confirmed",
-    });
-    if (existingDeliveryNote) {
-      return res.status(409).json({
-        success: false,
-        code: "ERR_DELIVERY_EXISTS",
-        message:
-          "Cannot confirm invoice. A confirmed delivery note already exists for this invoice.",
-      });
-    }
-
-    // Step 1: Pre-validation - Check products are active and stock available
-    const inventoryService = require("../services/inventoryService");
-    const warehouseService = require("../services/warehouseService");
-    let totalInvoiceCOGS = 0;
-    let hasStockableLines = false;
-
-    const __lineProducts2 = await loadLineProducts(Product, invoice.lines, companyId);
-    for (const line of invoice.lines) {
-      const product = getLineProduct(__lineProducts2, line);
-      if (!product) {
-        return res.status(400).json({
-          success: false,
-          message: `Product not found: ${line.product.name}`,
-        });
-      }
-
-      // Validate product is active - Module 6 Step 1
-      if (product.isActive === false) {
-        return res.status(400).json({
-          success: false,
-          code: "ERR_INACTIVE_PRODUCT",
-          message: `Product ${product.name} is inactive`,
-        });
-      }
-
-      const qty = line.qty || line.quantity || 0;
-
-      // Validate qty > 0 and unit_price >= 0 - Module 6 Step 1
-      if (qty <= 0) {
-        return res.status(400).json({
-          success: false,
-          code: "ERR_INVALID_LINE_QTY",
-          message: `Line quantity must be greater than 0`,
-        });
-      }
-
-      const unitPrice = line.unitPrice || 0;
-      if (unitPrice < 0) {
-        return res.status(400).json({
-          success: false,
-          code: "ERR_INVALID_UNIT_PRICE",
-          message: `Unit price cannot be negative`,
-        });
-      }
-
-      // Check if product is stockable
-      const isStockable = product.isStockable !== false;
-
-      if (isStockable) {
-        hasStockableLines = true;
-
-        // Step 2: Resolve COGS cost per line - FIFO or WAC (peek, NOT consume)
-        const { resolveCogsUnitCost } = require("../utils/productCost");
-        const unitCost = await resolveCogsUnitCost(product, companyId);
-
-        // Module 6 Step 5: If COGS cost is 0 for stockable product, it's an error
-        if (unitCost === 0) {
-          return res.status(500).json({
-            success: false,
-            code: "ERR_COST_LOOKUP_FAILED",
-            message: `COGS cost lookup failed for product ${product.name}. A stockable product with zero cost is a data integrity problem.`,
-          });
-        }
-
-        // Calculate cogsAmount for this line
-        const cogsAmount = qty * unitCost;
-        totalInvoiceCOGS += cogsAmount;
-
-        // Update line with COGS info - Module 6
-        line.unitCost = unitCost;
-        line.cogsAmount = cogsAmount;
-
-        // Step 1: Check stock availability at warehouse
-        const warehouseId = line.warehouse || product.defaultWarehouse;
-        let availableQty = 0;
-
-        if (warehouseId) {
-          // Get warehouse stock level
-          const stockLevel = await warehouseService.getStockLevel(
-            companyId,
-            product._id,
-            warehouseId,
-          );
-          availableQty = stockLevel.qty_available || 0;
-        } else {
-          // Use product's current stock
-          availableQty = product.currentStock || 0;
-        }
-
-        // Module 6 Step 1: If insufficient stock, return 409 INSUFFICIENT_STOCK
-        if (availableQty < qty) {
-          return res.status(409).json({
-            success: false,
-            code: "ERR_INSUFFICIENT_STOCK",
-            product_id: product._id,
-            message: `Insufficient stock for ${product.name}. Available: ${availableQty}, Required: ${qty}`,
-          });
-        }
-
-        // Step 3: Reserve stock - central helper
-        try {
-          const stockValidationService = require("../services/stockValidationService");
-          await stockValidationService.reserveForOrder(
-            companyId,
-            product._id,
-            qty,
-            warehouseId,
-          );
-        } catch (reserveErr) {
-          console.error("Stock reservation error:", reserveErr);
-          return res.status(409).json({
-            success: false,
-            code: "ERR_INSUFFICIENT_STOCK",
-            message: `Failed to reserve stock for ${product.name}`,
-          });
-        }
-      } else {
-        // Non-stockable product: unit_cost = 0, cogs_amount = 0
-        line.unitCost = 0;
-        line.cogsAmount = 0;
-      }
-    }
-
-    // Force a lines-array rewrite so unitCost/cogsAmount persist (in-place
-    // mutations keep the same array ref and are skipped by prismaCompat).
-    invoice.lines = invoice.lines.map((line) => {
-      const plain = typeof line.toObject === "function" ? line.toObject() : { ...line };
-      return {
-        ...plain,
-        product: line.product?._id || line.product,
-        warehouse: line.warehouse?._id || line.warehouse || plain.warehouse,
-        unitCost: line.unitCost,
-        cogsAmount: line.cogsAmount,
-      };
-    });
-    await invoice.save();
-
-    // Step 4: Post Entry A (Revenue Recognition) - Module 6
-    // Uses TaxAutomationService for centralized tax computation
-    const TaxAutomationService = require("../services/taxAutomationService");
-    const subtotal = parseFloat(invoice.subtotal) || 0;
-    const taxAmount = parseFloat(invoice.taxAmount) || 0;
-    const totalAmount = subtotal + taxAmount;
-
-    // Build line items for TaxAutomationService
-    const taxLines = invoice.lines.map((line) => {
-      const lineQty = line.qty || line.quantity || 0;
-      const lineUnitPrice = line.unitPrice || 0;
-      const lineDiscount = line.discount || 0;
-      const lineNet = lineQty * lineUnitPrice - lineDiscount;
-      return {
-        netAmount: lineNet,
-        taxRatePct: line.taxRate || 0,
-        productId: line.product?._id || line.product,
-      };
-    });
-
-    const salesTax = await TaxAutomationService.computeSalesTax(
-      companyId,
-      taxLines,
-      invoice.invoiceDate,
-    );
-
-    let revenueEntry = null;
-    try {
-      revenueEntry = await JournalService.createEntry(companyId, req.user.id, {
-        date: invoice.invoiceDate,
-        description: `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Revenue Recognition`,
-        sourceType: "invoice",
-        sourceId: invoice._id,
-        sourceReference: invoice.referenceNo || invoice.invoiceNumber,
-        lines: salesTax.journalLines,
-        isAutoGenerated: true,
-        sourceData: {
-          vatAmount: salesTax.totals.tax,
-          netAmount: salesTax.totals.net,
-          grossAmount: salesTax.totals.gross,
-          taxBreakdown: salesTax.lines,
-        },
-      });
-      invoice.revenueJournalEntry = revenueEntry._id;
-    } catch (journalError) {
-      console.error("Error creating revenue journal entry:", journalError);
-      // Don't fail if journal entry fails, but log it
-    }
-
-    // Step 5: Post Entry B (COGS Recognition) - Module 6
-    // Only for stockable products
-    let cogsEntryId = null;
-    if (hasStockableLines && totalInvoiceCOGS > 0) {
-      try {
-        const cogsEntry = await JournalService.createCOGSEntry(
-          companyId,
-          req.user.id,
-          {
-            invoiceId: invoice._id,
-            invoiceNumber: invoice.referenceNo || invoice.invoiceNumber,
-            clientName: invoice.client?.name || "Unknown Client",
-            date: invoice.invoiceDate,
-            totalCost: totalInvoiceCOGS,
-            lines: invoice.lines
-              .filter((l) => l.cogsAmount > 0)
-              .map((l) => ({
-                productId: l.product._id || l.product,
-                cogsAmount: l.cogsAmount,
-              })),
-          },
-        );
-        cogsEntryId = cogsEntry._id;
-        invoice.cogsJournalEntry = cogsEntry._id;
-      } catch (journalError) {
-        console.error("Error creating COGS journal entry:", journalError);
-      }
-    }
-
-    // Step 6: Update invoice status - Module 6
-    // Also deduct stock and create stock movements
-    invoice.status = "confirmed";
-    invoice.confirmedDate = new Date();
-    invoice.confirmedBy = req.user.id;
-    invoice.stockReserved = true;
-
-    // Deduct stock for each line
-    const __lineProducts3 = await loadLineProducts(Product, invoice.lines, companyId);
-    for (const line of invoice.lines) {
-      const product = getLineProduct(__lineProducts3, line);
-      if (product && product.isStockable !== false) {
-        const qty = line.qty || line.quantity || 0;
-        if (qty > 0) {
-          const previousStock = product.currentStock || 0;
-          const newStock = Math.max(0, previousStock - qty);
-
-          // Create stock movement
-          const StockMovement = require("../models/StockMovement");
-          const sm = new StockMovement({
-            company: companyId,
-            product: product._id,
-            type: "out",
-            reason: "sale",
-            quantity: qty,
-            previousStock,
-            newStock,
-            unitCost: line.unitCost || 0,
-            totalCost: line.cogsAmount || 0,
-            referenceType: "invoice",
-            referenceNumber: invoice.referenceNo || invoice.invoiceNumber,
-            referenceDocument: invoice._id,
-            referenceModel: "Invoice",
-            notes: `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Sale`,
-            performedBy: req.user.id,
-            movementDate: new Date(),
-          });
-          await sm.save();
-
-          // Update product stock
-          product.currentStock = newStock;
-          product.lastSaleDate = new Date();
-          await product.save();
-        }
-      }
-    }
-
-    invoice.stockDeducted = true;
-    await invoice.save();
-
-    // Explicit header update — guarantees status persists even if a prior
-    // mutable save omitted fields from the Prisma payload.
-    await Invoice.findByIdAndUpdate(invoice._id, {
-      $set: {
-        status: "confirmed",
-        stockDeducted: true,
-        ...(revenueEntry?._id ? { revenueJournalEntry: revenueEntry._id } : {}),
-        ...(cogsEntryId ? { cogsJournalEntry: cogsEntryId } : {}),
-      },
-    });
-
-    // Update client outstanding balance
-    const client = await Client.findOne({
-      _id: invoice.client?._id || invoice.client,
-      company: companyId,
-    });
-    if (client) {
-      const addAmount =
-        Number(invoice.roundedAmount) ||
-        Number(invoice.totalAmount) ||
-        Number(invoice.grandTotal) ||
-        0;
-      client.outstandingBalance = (Number(client.outstandingBalance) || 0) + addAmount;
-      await client.save();
-    }
-
-    // Update linked quotation if exists
-    if (invoice.quotation) {
-      const Quotation = require("../models/Quotation");
-      await Quotation.findByIdAndUpdate(invoice.quotation, {
-        status: "converted",
-        convertedToInvoice: invoice._id,
-        conversionDate: new Date(),
-      });
-    }
-
-    // Notify
-    try {
-      await notifyPaymentReceived(companyId, invoice, 0);
-    } catch (e) {
-      console.error("notifyPaymentReceived failed", e);
-    }
-
-    // Invalidate report cache
-    try {
-      await cacheService.bumpCompanyFinancialCaches(companyId);
-    } catch (e) {
-      console.error("Cache invalidation failed:", e);
-    }
-
-    // Respond with the confirmed invoice immediately; EBM/RRA can run async
-    // so the Confirm button does not hang for several seconds.
-    const responseInvoice = await Invoice.findOne({
-      _id: invoice._id,
-      company: companyId,
-    }).select({ client: 1, lines: 1, createdBy: 1, referenceNo: 1, status: 1, totalAmount: 1, company: 1 }).lean();
-    await hydrateInvoiceRelations(responseInvoice);
-
-    EBMSalesService.submitInvoiceAsync(invoice._id, { companyId });
-
-    res.json({
-      success: true,
-      message: "Invoice confirmed and stock reserved",
-      data: responseInvoice,
-    });
+    const companyId = String(req.user.company._id || req.user.company.id);
+    const userId = String(req.user.id || req.user._id);
+    const invoice = await require('../services/invoiceAutoConfirmService')
+      .confirmDraftInvoice(companyId, req.params.id, userId);
+    res.json({ success: true, message: 'Invoice confirmed successfully.', data: await hydrateInvoiceRelations(invoice, companyId) });
   } catch (error) {
-    next(error);
-  }
-};
-
-
-// @desc    Verify invoice customer TIN with RRA VSDC
-// @route   POST /api/sales-invoices/:id/ebm/verify-tin
-// @access  Private (admin, stock_manager, sales)
-exports.verifyInvoiceCustomerTin = async (req, res, next) => {
-  try {
-    const companyId = req.user.company._id;
-    const EBMTinService = require('../services/ebmCustomerTinService');
-    const result = await EBMTinService.verifyInvoiceCustomerTin(companyId, req.params.id, {
-      branchId: req.body.branchId || req.body.bhfId || '00',
-    });
-
-    res.json({
-      success: true,
-      data: result.invoice,
-      verification: result.verification,
-      message: 'Invoice customer TIN verified with RRA',
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-exports.submitInvoiceEbm = async (req, res, next) => {
-  try {
-    const companyId = req.user.company._id;
-    const variant = String(req.body.variant || req.body.receiptType || 'sale').toLowerCase();
-    const invoice = await EBMSalesService.submitInvoiceVariant(req.params.id, companyId, {
-      isProforma: variant === 'proforma' || variant === 'p',
-      isCopy: variant === 'copy' || variant === 'c',
-      branchId: req.body.branchId || req.body.bhfId || null,
-    });
-    res.json({
-      success: true,
-      data: invoice,
-      message: `Invoice submitted to RRA as ${variant}`,
-    });
-  } catch (error) {
-    if (error.invoice) {
-      return res.status(error.statusCode || 422).json({
-        success: false,
-        message: error.message,
-        data: error.invoice,
-        code: error.code || null,
-        resultCd: error.resultCd || error.response?.resultCd || null,
+    if (error.status || error.statusCode) {
+      return res.status(error.status || error.statusCode).json({
+        success: false, code: error.code || 'INVOICE_CONFIRMATION_FAILED', message: error.message,
       });
     }
     next(error);
   }
 };
+
 // @desc    Record payment for invoice
 // @route   POST /api/invoices/:id/payment
 // @access  Private (admin, stock_manager, sales)
 exports.recordPayment = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
-    const { amount, paymentMethod, reference, notes } = req.body;
-
-    const invoice = await Invoice.findOne({
-      _id: req.params.id,
-      company: companyId,
-    }).select({
-      lines: 1,
-      client: 1,
-      status: 1,
-      company: 1,
-      referenceNo: 1,
-      invoiceNumber: 1,
-      totalAmount: 1,
-      roundedAmount: 1,
-      amountPaid: 1,
-      grandTotal: 1,
-      taxAmount: 1,
-      subtotal: 1,
-      amountOutstanding: 1,
-      balance: 1,
-      payments: 1,
-      salesOrder: 1,
-    }).lean();
-
-    if (Array.isArray(invoice?.lines)) {
-      const productIds = [...new Set(invoice.lines.map((line) => normalizeId(line.product)).filter(Boolean))];
-      const productRows = productIds.length ? await Product.find({ _id: { $in: productIds } }, 'name sku unit taxRate taxCode isStockable').lean() : [];
-      const productMap = new Map(productRows.map((product) => [normalizeId(product._id), product]));
-      invoice.lines = invoice.lines.map((line) => ({
-        ...line,
-        product: productMap.get(normalizeId(line.product)) || line.product,
-      }));
+    const companyId = String(req.user.company._id || req.user.company.id);
+    const invoice = await Invoice.findOne({ _id: req.params.id, company: companyId });
+    if (!invoice) return res.status(404).json({ success: false, code: 'ERR_INVOICE_NOT_FOUND', message: 'Invoice not found.' });
+    if (!['sent', 'confirmed', 'partially_paid'].includes(invoice.status)) {
+      return res.status(409).json({ success: false, code: 'ERR_INVOICE_NOT_PAYABLE', message: 'Only a sent or confirmed invoice with an outstanding balance can receive payment.' });
     }
-
-    if (!invoice) {
-      return res.status(404).json({
-        success: false,
-        message: "Invoice not found",
-      });
+    const amountReceived = Number(req.body.amountReceived ?? req.body.amount);
+    if (!Number.isFinite(amountReceived) || amountReceived <= 0) {
+      return res.status(400).json({ success: false, code: 'ERR_INVALID_PAYMENT_AMOUNT', message: 'Payment amount must be a positive number.' });
     }
-
-    if (invoice.status === "cancelled") {
-      return res.status(400).json({
-        success: false,
-        code: "ERR_INVALID_STATUS_TRANSITION",
-        message: "Cannot record payment for cancelled invoice",
-      });
-    }
-
-    const payAmount = Number(amount);
-    if (!Number.isFinite(payAmount) || payAmount <= 0) {
-      return res.status(400).json({
-        success: false,
-        code: "ERR_INVALID_PAYMENT_AMOUNT",
-        message: "Payment amount must be a positive number",
-      });
-    }
-
-    const grandTotal = Number(
-      invoice.roundedAmount ?? invoice.totalAmount ?? invoice.grandTotal ?? 0,
-    );
-    const alreadyPaid = Number(invoice.amountPaid) || 0;
-    // Prefer total − paid as source of truth (avoids stale/string balance fields).
-    const outstanding = Math.round(Math.max(0, grandTotal - alreadyPaid) * 100) / 100;
-
-    if (outstanding <= 0) {
-      return res.status(400).json({
-        success: false,
-        code: "ERR_INVOICE_ALREADY_PAID",
-        message: "Invoice is already fully paid",
-      });
-    }
-
-    if (payAmount > outstanding + 0.009) {
-      return res.status(400).json({
-        success: false,
-        code: "ERR_PAYMENT_EXCEEDS_BALANCE",
-        message: `Payment amount exceeds invoice balance (outstanding: ${outstanding.toFixed(2)})`,
-      });
-    }
-
-    // Add payment (replace array so Json field persists on Prisma save)
-    const paymentEntry = {
-      amount: payAmount,
-      paymentMethod,
-      reference: reference || null,
-      notes: notes || null,
-      recordedBy: {
-        _id: req.user.id || req.user._id,
-        name: req.user.name || req.user.email || "User",
-      },
-      recordedAt: new Date().toISOString(),
-      paidDate: new Date().toISOString(),
+    const proxyResponse = {
+      statusCode: 200,
+      status(code) { this.statusCode = code; return this; },
+      json(body) { this.body = body; return this; },
     };
-    invoice.payments = [...(Array.isArray(invoice.payments) ? invoice.payments : []), paymentEntry];
-
-    const newPaid = Math.round((alreadyPaid + payAmount) * 100) / 100;
-    const newOutstanding = Math.round(Math.max(0, grandTotal - newPaid) * 100) / 100;
-    invoice.amountPaid = newPaid;
-    invoice.amountOutstanding = newOutstanding;
-    invoice.balance = newOutstanding;
-
-    // Auto-confirm if stock not yet deducted and payment is made
-    if (!invoice.stockDeducted && invoice.status === "draft") {
-      const __lineProducts4 = await loadLineProducts(Product, invoice.lines, companyId);
-      for (const line of invoice.lines) {
-        const product = getLineProduct(__lineProducts4, line);
-
-        if (product) {
-          const qty = line.qty || line.quantity || 0;
-          if (product.currentStock >= qty) {
-            const previousStock = product.currentStock;
-            const newStock = previousStock - qty;
-
-            await StockMovement.create({
-              company: companyId,
-              product: product._id,
-              type: "out",
-              reason: "sale",
-              quantity: qty,
-              previousStock,
-              newStock,
-              unitCost: line.unitPrice,
-              totalCost: line.totalWithTax,
-              referenceType: "invoice",
-              referenceNumber: invoice.referenceNo || invoice.invoiceNumber,
-              referenceDocument: invoice._id,
-              referenceModel: "Invoice",
-              notes: `Sale via invoice ${invoice.referenceNo || invoice.invoiceNumber}`,
-              performedBy: req.user.id,
-            });
-
-            product.currentStock = newStock;
-            product.lastSaleDate = new Date();
-            await product.save();
-          }
-        }
-      }
-
-      invoice.stockDeducted = true;
-      invoice.status = "confirmed";
-      invoice.confirmedDate = new Date();
-      invoice.confirmedBy = req.user.id;
+    const receiptController = require('./arReceiptController');
+    const receiptRequest = {
+      ...req,
+      body: {
+        client: normalizeId(invoice.client), amountReceived,
+        paymentMethod: req.body.paymentMethod || 'cash',
+        bankAccountId: req.body.bankAccountId || req.body.bankAccount || undefined,
+        receiptDate: req.body.receiptDate || new Date(),
+        currencyCode: invoice.currencyCode || 'RWF',
+        exchangeRate: req.body.exchangeRate || invoice.exchangeRate || 1,
+        reference: req.body.reference || null,
+        notes: req.body.notes || null,
+        allocations: [{ invoiceId: normalizeId(invoice._id), amount: amountReceived }],
+      },
+    };
+    await receiptController.createReceipt(receiptRequest, proxyResponse, (err) => { throw err; });
+    if (proxyResponse.statusCode >= 400 || proxyResponse.body?.success === false) {
+      return res.status(proxyResponse.statusCode).json(proxyResponse.body);
     }
-
-    // Payment status after any auto-confirm so we don't overwrite fully_paid
-    if (newOutstanding <= 0.009) {
-      invoice.status = "fully_paid";
-      invoice.paidDate = new Date();
-    } else if (newPaid > 0) {
-      invoice.status = "partially_paid";
+    const receiptId = proxyResponse.body?.data?._id;
+    if (!receiptId) throw new Error('Receipt was created without an identifier.');
+    await receiptController.postReceipt({
+      ...req,
+      params: { ...req.params, id: receiptId },
+      body: {},
+    }, proxyResponse, (err) => { throw err; });
+    if (proxyResponse.statusCode >= 400 || proxyResponse.body?.success === false) {
+      return res.status(proxyResponse.statusCode).json(proxyResponse.body);
     }
-
-    // Update client stats
-    const client = await Client.findOne({
-      _id: invoice.client?._id || invoice.client,
-      company: companyId,
-    });
-    if (client) {
-      client.totalPurchases = (Number(client.totalPurchases) || 0) + payAmount;
-      client.outstandingBalance = Math.max(
-        0,
-        (Number(client.outstandingBalance) || 0) - payAmount,
-      );
-      client.lastPurchaseDate = new Date();
-      await client.save();
-    }
-
-    await invoice.save();
-
-    const salesOrderId = invoice.salesOrder?._id || invoice.salesOrder?.id || invoice.salesOrder;
-    if (salesOrderId) {
-      try {
-        const { syncSalesOrderLifecycle } = require("../services/salesOrderLifecycleService");
-        await syncSalesOrderLifecycle(salesOrderId, companyId);
-      } catch (lifecycleError) {
-        console.error("Failed to sync Sales Order after invoice payment:", lifecycleError);
-      }
-    }
-
-    // Create journal entry for payment (Cash/Bank Debit, Accounts Receivable Credit)
-    let journalEntry = null;
-    try {
-      // Get bank account code if bank payment
-      let bankAccountCode = null;
-      if (
-        (paymentMethod === "bank_transfer" ||
-          paymentMethod === "cheque" ||
-          paymentMethod === "mobile_money") &&
-        req.body.bankAccountId
-      ) {
-        const bankAccount = await BankAccount.findOne({
-          _id: req.body.bankAccountId,
-          company: companyId,
-          isActive: true,
-        });
-        if (bankAccount && bankAccount.ledgerAccountId) {
-          bankAccountCode = bankAccount.ledgerAccountId;
-        }
-      }
-
-      journalEntry = await JournalService.createInvoicePaymentEntry(companyId, req.user.id, {
-        invoiceId: invoice._id,
-        invoiceNumber: invoice.invoiceNumber || invoice.referenceNo,
-        date: new Date(),
-        amount: payAmount,
-        paymentMethod: paymentMethod,
-        bankAccountCode: bankAccountCode,
-        bankAccountId: req.body.bankAccountId || null,
-        customerName: client?.name || "Customer",
-      });
-    } catch (journalError) {
-      console.error("Error creating journal entry for payment:", journalError);
-      // Don't fail the payment if journal entry fails
-    }
-
-    // Create bank transaction for ALL bank-based payment methods (bank_transfer, cheque, mobile_money)
-    // Uses addTransaction() so cachedBalance is properly reduced and balanceAfter is correct
-    let bankTransaction = null;
-    const bankPaymentMethods = ["bank_transfer", "cheque", "mobile_money"];
-    if (bankPaymentMethods.includes(paymentMethod) && req.body.bankAccountId) {
-      try {
-        const bankAccount = await BankAccount.findOne({
-          _id: req.body.bankAccountId,
-          company: companyId,
-          isActive: true,
-        });
-
-        if (bankAccount) {
-          bankTransaction = await bankAccount.addTransaction({
-            type: "deposit",
-            amount: payAmount,
-            description: `Payment received: Invoice #${invoice.invoiceNumber || invoice.referenceNo}`,
-            date: new Date(),
-            referenceNumber: reference || invoice.invoiceNumber || invoice.referenceNo,
-            paymentMethod,
-            status: "completed",
-            reference: invoice._id,
-            referenceType: "Invoice",
-            createdBy: req.user._id || req.user.id,
-            notes:
-              notes ||
-              `Payment for invoice ${invoice.invoiceNumber || invoice.referenceNo} from ${invoice.client?.name || "Customer"}`,
-            journalEntryId: journalEntry?._id || null,
-          });
-        }
-      } catch (bankError) {
-        console.error(
-          "Error creating bank transaction for invoice payment:",
-          bankError,
-        );
-        // Non-fatal — journal entry already posted
-      }
-    }
-
-    // Notify payment recorded
-    try {
-      await notifyPaymentReceived(companyId, invoice, payAmount);
-    } catch (e) {
-      console.error("notifyPaymentReceived failed", e);
-    }
-
-    // Invalidate report cache
-    try {
-      await cacheService.bumpCompanyFinancialCaches(companyId);
-    } catch (e) {
-      console.error("Cache invalidation failed:", e);
-    }
-
-    // Record AR tracking transaction for payment
-    try {
-      const ARTrackingService = require("../services/arTrackingService");
-      await ARTrackingService.recordPayment(
-        invoice,
-        payAmount,
-        paymentMethod,
-        req.user.id,
-      );
-    } catch (trackingError) {
-      console.error("AR tracking error for payment:", trackingError);
-    }
-
-    // Auto-create ARReceipt and allocation for system-generated ledger record
-    try {
-      const toMoney = (n) => (Math.round(Number(n) * 100) / 100).toFixed(2);
-      const receipt = new ARReceipt({
-        company: companyId,
-        client: invoice.client?._id || invoice.client,
-        receiptDate: new Date(),
-        paymentMethod: paymentMethod,
-        bankAccount: req.body.bankAccountId || null,
-        amountReceived: toMoney(payAmount),
-        currencyCode: invoice.currencyCode || "RWF",
-        exchangeRate: "1",
-        reference: reference || `Payment for Invoice ${invoice.invoiceNumber || invoice.referenceNo}`,
-        status: "posted",
-        postedBy: req.user.id,
-        postedAt: new Date(),
-        notes: notes || `System-generated receipt for invoice payment`,
-        createdBy: req.user.id,
-      });
-      await receipt.save();
-
-      // Create allocation linking receipt to the invoice
-      const allocation = new ARReceiptAllocation({
-        receipt: receipt._id,
-        invoice: invoice._id,
-        amountAllocated: toMoney(payAmount),
-        company: companyId,
-        createdBy: req.user.id,
-      });
-      await allocation.save();
-    } catch (arReceiptError) {
-      console.error("Error auto-creating AR receipt for invoice payment:", arReceiptError);
-      // Non-fatal — payment already recorded, journal entries posted
-    }
-
-    const fresh = await Invoice.findOne({
-      _id: invoice._id,
-      company: companyId,
-    }).select({ client: 1, lines: 1, createdBy: 1, referenceNo: 1, status: 1, totalAmount: 1, company: 1, payments: 1 }).lean();
-    await hydrateInvoiceRelations(fresh);
-
+    const freshInvoice = await Invoice.findOne({ _id: invoice._id, company: companyId });
+    await hydrateInvoiceRelations(freshInvoice, companyId);
     res.json({
       success: true,
-      message: "Payment recorded successfully",
-      data: fresh || invoice,
-      bankTransaction: bankTransaction,
+      message: 'Payment recorded and posted successfully.',
+      data: freshInvoice,
+      receipt: proxyResponse.body.data,
     });
-  } catch (error) {
-    next(error);
-  }
+  } catch (error) { next(error); }
 };
 
 // @desc    Cancel invoice (reverse stock and journal entries) - Module 6 Enhanced
@@ -1884,13 +752,11 @@ exports.cancelInvoice = async (req, res, next) => {
       });
     }
 
-    // Cannot cancel fully paid invoices - Module 6 Business Rule
-    if (invoice.status === "fully_paid") {
-      return res.status(400).json({
+    if (!invoice.posOrigin && (invoice.status !== "draft" || Number(invoice.amountPaid || 0) > 0 || invoice.stockDeducted)) {
+      return res.status(409).json({
         success: false,
-        code: "ERR_INVALID_STATUS_TRANSITION",
-        message:
-          "Cannot cancel fully paid invoice. Please contact administrator",
+        code: "ERR_CREDIT_NOTE_REQUIRED",
+        message: "An issued, paid, or inventory-posted invoice must be corrected with a credit note. Only an unposted draft can be cancelled.",
       });
     }
 
@@ -1997,8 +863,8 @@ exports.cancelInvoice = async (req, res, next) => {
     }
 
     invoice.status = "cancelled";
-    invoice.cancelledDate = new Date();
-    invoice.cancelledBy = req.user.id;
+    invoice.cancelledAt = new Date();
+    invoice.cancelledBy = req.user.id || req.user._id;
     invoice.cancellationReason = reason;
 
     await invoice.save();

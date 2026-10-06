@@ -205,6 +205,11 @@ function invoiceToApi(row) {
     date: row.invoiceDate,
     dueDate: row.dueDate,
     paidDate: row.paidDate ?? null,
+    confirmedAt: row.confirmedAt ?? null,
+    confirmedBy: row.confirmedById ?? null,
+    cancelledAt: row.cancelledAt ?? null,
+    cancelledBy: row.cancelledById ?? null,
+    cancellationReason: row.cancellationReason ?? null,
     revenueJournalEntry: row.revenueJournalEntryId ?? null,
     cogsJournalEntry: row.cogsJournalEntryId ?? null,
     stockDeducted: row.stockDeducted,
@@ -327,6 +332,8 @@ function invoiceTranslateUpdate(update = {}) {
     subtotal: 'subtotal', taxAmount: 'taxAmount', totalAmount: 'totalAmount',
     totalDiscount: 'totalDiscount', totalAEx: 'totalAEx', totalB18: 'totalB18',
     amountPaid: 'amountPaid', amountOutstanding: 'amountOutstanding',
+    confirmedAt: 'confirmedAt', confirmedBy: 'confirmedById',
+    cancelledAt: 'cancelledAt', cancelledBy: 'cancelledById', cancellationReason: 'cancellationReason',
     badDebtWrittenOff: 'badDebtWrittenOff', writtenOffAt: 'writtenOffAt',
     writtenOffBy: 'writtenOffById', badDebtReason: 'badDebtReason',
     invoiceDate: 'invoiceDate', dueDate: 'dueDate', paidDate: 'paidDate',
@@ -337,7 +344,7 @@ function invoiceTranslateUpdate(update = {}) {
   };
   const idTargets = new Set([
     'clientId', 'quotationId', 'salesOrderId', 'deliveryNoteId',
-    'revenueJournalEntryId', 'cogsJournalEntryId', 'writtenOffById',
+    'revenueJournalEntryId', 'cogsJournalEntryId', 'writtenOffById', 'confirmedById', 'cancelledById',
   ]);
   for (const [k, t] of Object.entries(map)) {
     if (data[k] !== undefined) {

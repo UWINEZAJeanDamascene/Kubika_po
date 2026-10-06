@@ -142,8 +142,9 @@ async function confirmDraftInvoiceInTransaction(companyId, invoiceId, userId) {
   const taxLines = invoice.lines.map((line) => {
     const lineQty = line.qty || line.quantity || 0;
     const lineUnitPrice = line.unitPrice || 0;
-    const lineDiscount = line.discount || 0;
-    const lineNet = lineQty * lineUnitPrice - lineDiscount;
+    const lineSubtotal = Number(line.lineSubtotal ?? (lineQty * lineUnitPrice));
+    const discountPct = Number(line.discountPct ?? 0);
+    const lineNet = Math.round((lineSubtotal * (1 - discountPct / 100) + Number.EPSILON) * 100) / 100;
     return {
       netAmount: lineNet,
       taxRatePct: line.taxRate || 0,
@@ -243,7 +244,9 @@ async function confirmDraftInvoiceInTransaction(companyId, invoiceId, userId) {
 
   await Invoice.findByIdAndUpdate(invoice._id, {
     status: 'confirmed',
-    stockDeducted: true,
+    stockDeducted: hasStockableLines,
+    confirmedAt: new Date(),
+    confirmedBy: userId,
     revenueJournalEntry: invoice.revenueJournalEntry,
     cogsJournalEntry: invoice.cogsJournalEntry,
   });
@@ -252,7 +255,7 @@ async function confirmDraftInvoiceInTransaction(companyId, invoiceId, userId) {
   if (client) {
     await dbClient().client.updateMany({
       where: { id: String(client._id), companyId: String(companyId) },
-      data: { outstandingBalance: { increment: Number(invoice.roundedAmount || 0) } },
+      data: { outstandingBalance: { increment: Number(invoice.totalAmount || invoice.grandTotal || 0) } },
     });
   }
 

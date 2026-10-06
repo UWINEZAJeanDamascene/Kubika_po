@@ -26,6 +26,11 @@ const FIELD_MAP = {
   totalAmount: { target: 'totalAmount' },
   amountPaid: { target: 'amountPaid' },
   amountOutstanding: { target: 'amountOutstanding' },
+  confirmedAt: { target: 'confirmedAt' },
+  confirmedBy: { target: 'confirmedById', isId: true },
+  cancelledAt: { target: 'cancelledAt' },
+  cancelledBy: { target: 'cancelledById', isId: true },
+  cancellationReason: { target: 'cancellationReason' },
   balance: { target: 'amountOutstanding' },
 };
 

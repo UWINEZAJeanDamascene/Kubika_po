@@ -1,0 +1,6 @@
+ALTER TABLE "invoices"
+  ADD COLUMN IF NOT EXISTS "confirmed_at" TIMESTAMPTZ(3),
+  ADD COLUMN IF NOT EXISTS "confirmed_by" CHAR(24),
+  ADD COLUMN IF NOT EXISTS "cancelled_at" TIMESTAMPTZ(3),
+  ADD COLUMN IF NOT EXISTS "cancelled_by" CHAR(24),
+  ADD COLUMN IF NOT EXISTS "cancellation_reason" TEXT;
