@@ -1,0 +1,5 @@
+ALTER TABLE "sales_orders"
+  ADD COLUMN IF NOT EXISTS "terms" TEXT;
+
+ALTER TABLE "invoices"
+  ADD COLUMN IF NOT EXISTS "terms" TEXT;

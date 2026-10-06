@@ -212,6 +212,7 @@ function invoiceToApi(row) {
     creditNotes: (row.creditNotes || []).map((cn) => (typeof cn === 'object' ? cn.id : cn)),
     payments: row.payments ?? [],
     ebm: row.ebm ?? {},
+    terms: row.terms ?? null,
     notes: row.notes ?? null,
     createdBy: row.createdById ?? null,
     lines,
@@ -263,6 +264,11 @@ async function invoiceTranslateCreate(data) {
   const linesSubtotal = mappedLines.reduce((s, l) => s + Number(l.lineSubtotal || 0), 0);
   const linesTax = mappedLines.reduce((s, l) => s + Number(l.lineTax || 0), 0);
   const linesTotal = mappedLines.reduce((s, l) => s + Number(l.lineTotal || 0), 0);
+  const lineDiscount = mappedLines.reduce((s, l) => s + Number(l.lineSubtotal || 0) * Number(l.discountPct || 0) / 100, 0);
+  const taxBaseA = mappedLines.filter((l) => l.taxCode === 'A')
+    .reduce((s, l) => s + Number(l.lineSubtotal || 0) * (1 - Number(l.discountPct || 0) / 100), 0);
+  const taxBaseB = mappedLines.filter((l) => l.taxCode === 'B')
+    .reduce((s, l) => s + Number(l.lineSubtotal || 0) * (1 - Number(l.discountPct || 0) / 100), 0);
 
   const subtotal = Number(data.subtotal) > 0 ? Number(data.subtotal) : linesSubtotal;
   const taxAmount = Number(data.taxAmount ?? data.totalTax) > 0
@@ -293,12 +299,16 @@ async function invoiceTranslateCreate(data) {
     subtotal: moneyStr(subtotal),
     taxAmount: moneyStr(taxAmount),
     totalAmount: moneyStr(totalAmount),
+    totalDiscount: moneyStr(data.totalDiscount ?? lineDiscount),
+    totalAEx: moneyStr(data.totalAEx ?? taxBaseA),
+    totalB18: moneyStr(data.totalB18 ?? taxBaseB),
     amountPaid: moneyStr(amountPaid),
     amountOutstanding: moneyStr(amountOutstanding),
     invoiceDate: data.invoiceDate || data.date || new Date(),
     dueDate: data.dueDate || new Date(),
     payments: data.payments ?? [],
     ebm: data.ebm ?? {},
+    terms: data.terms ?? null,
     notes: data.notes ?? null,
     lines: mappedLines.length ? { create: mappedLines } : undefined,
   };
@@ -313,11 +323,12 @@ function invoiceTranslateUpdate(update = {}) {
     quotation: 'quotationId', salesOrder: 'salesOrderId', deliveryNote: 'deliveryNoteId',
     currencyCode: 'currencyCode', currency: 'currencyCode', exchangeRate: 'exchangeRate',
     subtotal: 'subtotal', taxAmount: 'taxAmount', totalAmount: 'totalAmount',
+    totalDiscount: 'totalDiscount', totalAEx: 'totalAEx', totalB18: 'totalB18',
     amountPaid: 'amountPaid', amountOutstanding: 'amountOutstanding',
     badDebtWrittenOff: 'badDebtWrittenOff', writtenOffAt: 'writtenOffAt',
     writtenOffBy: 'writtenOffById', badDebtReason: 'badDebtReason',
     invoiceDate: 'invoiceDate', dueDate: 'dueDate', paidDate: 'paidDate',
-    payments: 'payments', ebm: 'ebm', notes: 'notes',
+    payments: 'payments', ebm: 'ebm', terms: 'terms', notes: 'notes',
     revenueJournalEntry: 'revenueJournalEntryId', cogsJournalEntry: 'cogsJournalEntryId',
     stockDeducted: 'stockDeducted', autoConfirm: 'autoConfirm',
     balance: 'amountOutstanding',
@@ -411,6 +422,7 @@ function salesOrderToApi(row) {
     deliveryNotes: row.deliveryNotes ?? [],
     invoices: row.invoices ?? [],
     pickPackId: row.pickPackId ?? null,
+    terms: row.terms ?? null,
     notes: row.notes ?? null,
     createdBy: row.createdById ?? null,
     lineCount,
@@ -899,6 +911,8 @@ function coerceQuotationDates(data) {
   if (next.expiryDate != null) {
     next.expiryDate = coerceDateTime(next.expiryDate);
   }
+  if (next.approvedDate != null) next.approvedDate = coerceDateTime(next.approvedDate);
+  if (next.conversionDate != null) next.conversionDate = coerceDateTime(next.conversionDate);
   return next;
 }
 
@@ -1086,6 +1100,11 @@ const QUOTATION_HEADER = {
   totalAmount: 'totalAmount',
   subtotalBase: 'subtotalBase',
   totalAmountBase: 'totalAmountBase',
+  approvedBy: 'approvedById',
+  approvedDate: 'approvedDate',
+  convertedToInvoice: 'convertedToInvoiceId',
+  convertedToSalesOrder: 'convertedToSalesOrderId',
+  conversionDate: 'conversionDate',
   terms: 'terms',
   notes: 'notes',
   customerAction: 'customerAction',
@@ -1109,6 +1128,7 @@ function quotationTranslateCreate(data) {
       lineDiscount: line.lineDiscount ?? 0,
       lineTotal: line.lineTotal ?? 0,
       lineTax: line.lineTax ?? line.taxAmount ?? 0,
+      extra: { ...(line.extra || {}), ...(line.taxCode ? { taxCode: line.taxCode } : {}) },
     }));
 }
 
@@ -1135,6 +1155,7 @@ const SALES_ORDER_HEADER = {
   stockReserved: 'stockReserved',
   isBackorder: 'isBackorder',
   pickPackId: 'pickPackId',
+  terms: 'terms',
   notes: 'notes',
 };
 

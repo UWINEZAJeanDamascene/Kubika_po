@@ -9,6 +9,8 @@ const PDFDocument = require('pdfkit');
 const jwt = require('jsonwebtoken');
 const emailService = require('../services/emailService');
 const { emitDataChanged } = require('../lib/realtimeEvents');
+const { runInTransaction } = require('../services/transactionService');
+const { dbClient } = require('../lib/prisma');
 const {
   notifyQuotationCreated,
   notifyQuotationApproved,
@@ -48,11 +50,27 @@ function mergeQuotationCustomerAction(existing, patch) {
   return { ...base, ...patch };
 }
 
+// prismaCompat's legacy findOneAndUpdate reads by filter and then updates by
+// id, so use a single SQL UPDATE predicate for lifecycle transitions that must
+// be safe under concurrent requests.
+async function transitionQuotation(id, companyId, expectedStatuses, data, extraWhere = {}) {
+  const result = await dbClient().quotation.updateMany({
+    where: {
+      id: String(id?._id || id),
+      companyId: String(companyId?._id || companyId),
+      status: Array.isArray(expectedStatuses) ? { in: expectedStatuses } : expectedStatuses,
+      ...extraWhere,
+    },
+    data,
+  });
+  return result.count > 0;
+}
+
 function tokenMatchesQuotation(quotation, token, expectedAction) {
   const meta = getQuotationPublicMeta(quotation);
   if (expectedAction === 'accept') return meta.publicAcceptToken === token;
   if (expectedAction === 'reject') return meta.publicRejectToken === token;
-  return false;
+  return meta.publicAcceptToken === token || meta.publicRejectToken === token;
 }
 
 function isQuotationTokenExpired(quotation) {
@@ -60,13 +78,19 @@ function isQuotationTokenExpired(quotation) {
   return publicTokenExpiresAt ? publicTokenExpiresAt < new Date() : false;
 }
 
+const getQuotationTokenSecret = () => {
+  if (process.env.JWT_SECRET) return process.env.JWT_SECRET;
+  if (process.env.NODE_ENV === 'production') throw new Error('JWT_SECRET must be configured for public quotation links.');
+  return 'dev-secret-for-downloads';
+};
+
 const generateActionToken = (quotationId, action) => {
-  const secret = process.env.JWT_SECRET || 'dev-secret-for-downloads';
+  const secret = getQuotationTokenSecret();
   return jwt.sign({ qid: quotationId, action }, secret, { expiresIn: '7d' });
 };
 
 const fetchQuotationByToken = async (token, expectedAction) => {
-  const secret = process.env.JWT_SECRET || 'dev-secret-for-downloads';
+  const secret = getQuotationTokenSecret();
   let payload;
   payload = jwt.verify(token, secret);
   const quotation = await Quotation.findById(payload.qid)
@@ -225,7 +249,7 @@ const renderQuotationPDF = (doc, quotation, company, currency) => {
 
   const totalsBoxWidth = Math.floor(availWidth * 0.36);
   const totalsX = left + availWidth - totalsBoxWidth;
-  const totalsY = y;
+  let totalsY = y;
   const totalsBoxHeight = 110;
   if (totalsY + totalsBoxHeight > bottomLimit) {
     drawFooter(pageNum);
@@ -235,6 +259,7 @@ const renderQuotationPDF = (doc, quotation, company, currency) => {
     y = doc.y;
     renderTableHeader(y);
     y += 34;
+    totalsY = y;
   }
 
   doc.rect(totalsX - 6, totalsY - 6, totalsBoxWidth + 12, totalsBoxHeight).strokeColor('#e5e7eb').lineWidth(0.5).stroke();
@@ -255,6 +280,24 @@ const renderQuotationPDF = (doc, quotation, company, currency) => {
   doc.text(`${Number(quotation.totalAmount || 0).toFixed(2)}`, totalsX + innerPad, ty, { width: totalsBoxWidth - innerPad * 2, align: 'right' });
   doc.font('Helvetica').fontSize(10);
 
+  let detailsY = totalsY + totalsBoxHeight + 18;
+  for (const [heading, content] of [['Terms and Conditions', quotation.terms], ['Notes', quotation.notes]]) {
+    if (!content) continue;
+    const text = String(content);
+    const height = doc.heightOfString(text, { width: availWidth - 16, fontSize: 9, lineGap: 2 }) + 24;
+    if (detailsY + height > bottomLimit) {
+      drawFooter(pageNum);
+      doc.addPage();
+      pageNum += 1;
+      renderHeader();
+      detailsY = doc.y + 12;
+    }
+    doc.font('Helvetica-Bold').fontSize(10).text(heading, left, detailsY);
+    detailsY += 14;
+    doc.font('Helvetica').fontSize(9).text(text, left, detailsY, { width: availWidth - 16, lineGap: 2 });
+    detailsY = doc.y + 10;
+  }
+
   drawFooter(pageNum);
 };
 
@@ -264,7 +307,7 @@ const renderQuotationPDF = (doc, quotation, company, currency) => {
 exports.publicAcceptQuotation = async (req, res, next) => {
   try {
     const { token } = req.params;
-    const secret = process.env.JWT_SECRET || 'dev-secret-for-downloads';
+    const secret = getQuotationTokenSecret();
     let payload;
     try {
       payload = jwt.verify(token, secret);
@@ -282,41 +325,25 @@ exports.publicAcceptQuotation = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Quotation is not in sent status' });
     }
 
-    const companyId = quotation.company;
-    const computed = await computeQuotationTotals({
-      lines: quotation.lines,
-      companyId,
-      currencyCode: quotation.currencyCode,
-      exchangeRate: quotation.exchangeRate,
-      quotationDate: quotation.quotationDate,
-    });
-
-    quotation.status = 'accepted';
-    quotation.approvedBy = null;
-    quotation.approvedDate = new Date();
-    quotation.currencyCode = computed.currencyCode;
-    quotation.baseCurrency = computed.baseCurrency;
-    quotation.exchangeRate = computed.exchangeRate;
-    quotation.lines = computed.lines;
-    quotation.subtotal = computed.totals.subtotal;
-    quotation.totalDiscount = computed.totals.totalDiscount;
-    quotation.taxAmount = computed.totals.taxAmount;
-    quotation.totalAmount = computed.totals.totalAmount;
-    quotation.subtotalBase = computed.totals.subtotalBase;
-    quotation.totalDiscountBase = computed.totals.totalDiscountBase;
-    quotation.taxAmountBase = computed.totals.taxAmountBase;
-    quotation.totalAmountBase = computed.totals.totalAmountBase;
-    quotation.customerAction = {
-      action: 'accepted',
-      name: req.body.name || null,
-      email: req.body.email || null,
-      comment: req.body.comment || null,
-      ip: req.ip,
-      actedAt: new Date(),
-    };
-    await quotation.save();
-
-    res.json({ success: true, message: 'Quotation accepted', data: quotation });
+    if (isQuotationExpired(quotation)) return res.status(409).json({ success: false, message: 'Quotation has expired.' });
+    const didAccept = await transitionQuotation(
+      quotation._id, quotation.company, 'sent', {
+        status: 'accepted',
+        approvedById: null,
+        approvedDate: new Date(),
+        customerAction: mergeQuotationCustomerAction(quotation.customerAction, {
+          action: 'accepted',
+          name: req.body.name || null,
+          email: req.body.email || null,
+          comment: req.body.comment || null,
+          ip: req.ip,
+          actedAt: new Date(),
+        }),
+      },
+    );
+    if (!didAccept) return res.status(409).json({ success: false, message: 'Quotation is no longer available for acceptance.' });
+    const accepted = await Quotation.findById(quotation._id);
+    res.json({ success: true, message: 'Quotation accepted', data: accepted });
   } catch (error) {
     next(error);
   }
@@ -330,194 +357,16 @@ exports.publicQuotationPDF = async (req, res, next) => {
     const { token } = req.params;
     const quotation = await fetchQuotationByToken(token, null);
     const company = quotation.company;
-    const currency = quotation.currencyCode || quotation.currency || company?.base_currency || 'USD';
-
+    const currency = quotation.currencyCode || company?.base_currency || 'RWF';
     const doc = new PDFDocument({ margin: 50 });
     const fileName = `quotation-${quotation.referenceNo || quotation._id}.pdf`;
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename=${fileName}`);
     doc.pipe(res);
-
-    const left = 48;
-    const right = 48;
-    const availWidth = doc.page.width - left - right;
-    const bottomLimit = doc.page.height - 80;
-    const colPercents = [0.06, 0.48, 0.08, 0.08, 0.16, 0.14];
-    const colWidths = colPercents.map(p => Math.floor(availWidth * p));
-    const sumCols = colWidths.reduce((s, v) => s + v, 0);
-    if (sumCols < availWidth) colWidths[colWidths.length - 1] += (availWidth - sumCols);
-
-    let pageNum = 1;
-    const drawFooter = (p) => {
-      const bottom = doc.page.height - 40;
-      doc.fontSize(8).fillColor('#9ca3af').font('Helvetica');
-      doc.text(`Generated: ${new Date().toLocaleString()}`, left, bottom, { align: 'left' });
-      doc.text(`Page ${p}`, 0, bottom, { align: 'right' });
-    };
-
-    const renderHeader = () => {
-      doc.fontSize(20).fillColor('#111827').text('QUOTATION', { align: 'center' });
-      doc.moveDown(0.4);
-
-      const companyName = company?.legal_name || company?.name || 'Company';
-      const companyTin = company?.tax_identification_number || company?.registration_number;
-      const companyAddress = company?.address?.street || '';
-      const companyPhone = company?.phone ? `Phone: ${company.phone}` : '';
-      const companyEmail = company?.email ? `Email: ${company.email}` : '';
-
-      const startY = doc.y;
-      const lineHeight = 14;
-      const leftLines = [
-        companyName,
-        companyTin ? `TIN: ${companyTin}` : null,
-        companyAddress,
-        companyPhone,
-        companyEmail,
-        '',
-        `Quotation Number: ${quotation.referenceNo}`,
-        `Date: ${new Date(quotation.quotationDate || quotation.createdAt).toLocaleDateString()}`,
-        `Valid Until: ${quotation.expiryDate ? new Date(quotation.expiryDate).toLocaleDateString() : 'N/A'}`,
-        `Status: ${quotation.status?.toUpperCase() || 'N/A'}`
-      ].filter(Boolean);
-
-      const clientX = left + Math.floor(availWidth * 0.55);
-      const rightLines = [
-        'Quotation To:',
-        quotation.client?.name || 'N/A',
-        quotation.client?.taxId ? `TIN: ${quotation.client.taxId}` : null,
-        quotation.client?.contact?.address || '',
-        quotation.client?.contact?.phone ? `Phone: ${quotation.client.contact.phone}` : null,
-        quotation.client?.contact?.email ? `Email: ${quotation.client.contact.email}` : null
-      ].filter(Boolean);
-
-      const maxLines = Math.max(leftLines.length, rightLines.length);
-      doc.fontSize(10).fillColor('#111827').font('Helvetica');
-      for (let i = 0; i < maxLines; i++) {
-        const yLine = startY + (i * lineHeight);
-        if (leftLines[i]) {
-          const isCompany = i === 0;
-          doc.font(isCompany ? 'Helvetica-Bold' : 'Helvetica');
-          doc.text(leftLines[i], left, yLine);
-        }
-        if (rightLines[i]) {
-          const isLabel = rightLines[i] === 'Quotation To:';
-          doc.font(isLabel ? 'Helvetica-Bold' : 'Helvetica');
-          doc.text(rightLines[i], clientX, yLine, { underline: isLabel });
-        }
-      }
-      doc.font('Helvetica');
-      doc.y = startY + (maxLines * lineHeight) + 8;
-    };
-
-    const renderTableHeader = (y) => {
-      doc.rect(left - 8, y, availWidth + 16, 28).fill('#111827');
-      doc.fillColor('#ffffff').fontSize(10).font('Helvetica-Bold');
-      let x = left;
-      const headers = ['No.', 'Description', 'Unit', 'Qty', `Unit rate ${currency}`, `Total With VAT ${currency}`];
-      headers.forEach((h, i) => {
-        const align = (i >= 2) ? 'right' : 'left';
-        doc.text(h, x, y + 8, { width: colWidths[i], align });
-        x += colWidths[i];
-      });
-      doc.fillColor('#111827').font('Helvetica');
-    };
-
-    renderHeader();
-    let y = doc.y;
-    renderTableHeader(y);
-    y += 34;
-
-    doc.fontSize(9).font('Helvetica');
-    for (let idx = 0; idx < (quotation.lines || []).length; idx++) {
-      const line = quotation.lines[idx];
-      const desc = line.product?.name || line.description || '';
-      const unit = line.unit || (line.product?.unit || '');
-      const qty = String(line.qty || line.quantity || '');
-      const unitPrice = `${currency} ${Number(line.unitPrice || 0).toFixed(2)}`;
-      const total = `${currency} ${Number(line.lineTotal || line.total || 0).toFixed(2)}`;
-
-      const hNo = doc.heightOfString(String(idx + 1), { width: colWidths[0] });
-      const hDesc = doc.heightOfString(String(desc), { width: colWidths[1] });
-      const hUnit = doc.heightOfString(String(unit), { width: colWidths[2] });
-      const hQty = doc.heightOfString(String(qty), { width: colWidths[3] });
-      const hUnitPrice = doc.heightOfString(String(unitPrice), { width: colWidths[4] });
-      const hTotal = doc.heightOfString(String(total), { width: colWidths[5] });
-      const rowHeight = Math.max(hNo, hDesc, hUnit, hQty, hUnitPrice, hTotal, 12);
-
-      if (y + rowHeight > bottomLimit) {
-        drawFooter(pageNum);
-        doc.addPage();
-        pageNum += 1;
-        renderHeader();
-        y = doc.y;
-        renderTableHeader(y);
-        y += 34;
-      }
-
-      if (idx % 2 === 0) {
-        doc.rect(left - 8, y - 6, availWidth + 16, rowHeight + 8).fill('#fbfbfc');
-        doc.fillColor('#111827');
-      }
-
-      let x = left;
-      doc.text(String(idx + 1), x, y, { width: colWidths[0] }); x += colWidths[0];
-      doc.text(String(desc), x, y, { width: colWidths[1] }); x += colWidths[1];
-      doc.text(String(unit), x, y, { width: colWidths[2], align: 'right' }); x += colWidths[2];
-      doc.text(qty, x, y, { width: colWidths[3], align: 'right' }); x += colWidths[3];
-      doc.text(unitPrice, x, y, { width: colWidths[4], align: 'right' }); x += colWidths[4];
-      doc.text(total, x, y, { width: colWidths[5], align: 'right' });
-
-      y += rowHeight + 8;
-    }
-
-    if (y + 120 > bottomLimit) {
-      drawFooter(pageNum);
-      doc.addPage();
-      pageNum += 1;
-      renderHeader();
-      y = doc.y;
-      renderTableHeader(y);
-      y += 34;
-    }
-
-    const totalsBoxWidth = Math.floor(availWidth * 0.36);
-    const totalsX = left + availWidth - totalsBoxWidth;
-    const totalsY = y;
-    const totalsBoxHeight = 110;
-    if (totalsY + totalsBoxHeight > bottomLimit) {
-      drawFooter(pageNum);
-      doc.addPage();
-      pageNum += 1;
-      renderHeader();
-      y = doc.y;
-      renderTableHeader(y);
-      y += 34;
-    }
-
-    doc.rect(totalsX - 6, totalsY - 6, totalsBoxWidth + 12, totalsBoxHeight).strokeColor('#e5e7eb').lineWidth(0.5).stroke();
-    const innerPad = 8;
-    let ty = totalsY + innerPad;
-    const lineGap = 22;
-    doc.fontSize(10);
-    doc.text(`Subtotal (${currency}):`, totalsX + innerPad, ty, { width: totalsBoxWidth - innerPad * 2, align: 'left' });
-    doc.text(`${Number(quotation.subtotal || 0).toFixed(2)}`, totalsX + innerPad, ty, { width: totalsBoxWidth - innerPad * 2, align: 'right' });
-    ty += lineGap;
-    doc.text(`Discount (${currency}):`, totalsX + innerPad, ty, { width: totalsBoxWidth - innerPad * 2, align: 'left' });
-    doc.text(`${Number(quotation.totalDiscount || 0).toFixed(2)}`, totalsX + innerPad, ty, { width: totalsBoxWidth - innerPad * 2, align: 'right' });
-    ty += lineGap;
-    doc.text(`Tax (${currency}):`, totalsX + innerPad, ty, { width: totalsBoxWidth - innerPad * 2, align: 'left' });
-    doc.text(`${Number(quotation.taxAmount || 0).toFixed(2)}`, totalsX + innerPad, ty, { width: totalsBoxWidth - innerPad * 2, align: 'right' });
-    ty += lineGap;
-    doc.font('Helvetica-Bold').fontSize(12).text(`Total (${currency}):`, totalsX + innerPad, ty, { width: totalsBoxWidth - innerPad * 2, align: 'left' });
-    doc.text(`${Number(quotation.totalAmount || 0).toFixed(2)}`, totalsX + innerPad, ty, { width: totalsBoxWidth - innerPad * 2, align: 'right' });
-    doc.font('Helvetica').fontSize(10);
-
-    y = totalsY + totalsBoxHeight + 12;
-
-    drawFooter(pageNum);
+    renderQuotationPDF(doc, quotation, company, currency);
     doc.end();
   } catch (error) {
-    console.error('publicQuotationPDF error', error.message);
+    if (res.headersSent) return res.end();
     return res.status(400).json({ success: false, message: error.message || 'Failed to generate PDF' });
   }
 };
@@ -549,7 +398,7 @@ exports.markExpiredQuotations = async (req, res, next) => {
 exports.publicRejectQuotation = async (req, res, next) => {
   try {
     const { token } = req.params;
-    const secret = process.env.JWT_SECRET || 'dev-secret-for-downloads';
+    const secret = getQuotationTokenSecret();
     let payload;
     try {
       payload = jwt.verify(token, secret);
@@ -563,12 +412,11 @@ exports.publicRejectQuotation = async (req, res, next) => {
     if (isQuotationTokenExpired(quotation)) {
       return res.status(400).json({ success: false, message: 'Token expired' });
     }
-    if (!['sent', 'pending_approval', 'draft'].includes(quotation.status)) {
+    if (quotation.status !== 'sent') {
       return res.status(400).json({ success: false, message: 'Quotation cannot be rejected in current status' });
     }
 
-    quotation.status = 'rejected';
-    quotation.customerAction = mergeQuotationCustomerAction(quotation.customerAction, {
+    const customerAction = mergeQuotationCustomerAction(quotation.customerAction, {
       action: 'rejected',
       name: req.body.name || null,
       email: req.body.email || null,
@@ -576,9 +424,13 @@ exports.publicRejectQuotation = async (req, res, next) => {
       ip: req.ip,
       actedAt: new Date(),
     });
-    await quotation.save();
+    const didReject = await transitionQuotation(quotation._id, quotation.company, 'sent', {
+      status: 'rejected', customerAction,
+    });
+    if (!didReject) return res.status(409).json({ success: false, message: 'Quotation is no longer available for rejection.' });
+    const rejected = await Quotation.findById(quotation._id);
 
-    res.json({ success: true, message: 'Quotation rejected', data: quotation });
+    res.json({ success: true, message: 'Quotation rejected', data: rejected });
   } catch (error) {
     next(error);
   }
@@ -613,6 +465,40 @@ const toNumber = (val) => {
   return Number.isFinite(n) ? n : 0;
 };
 
+const roundMoney = (value) => Math.round((value + Number.EPSILON) * 100) / 100;
+
+const validateQuotationLines = (lines) => {
+  if (!Array.isArray(lines) || lines.length === 0) return 'A quotation must contain at least one line.';
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] || {};
+    const qty = Number(line.qty ?? line.quantity);
+    const unitPrice = Number(line.unitPrice);
+    const discountPct = Number(line.discountPct ?? line.discount ?? 0);
+    const taxRate = line.taxRate == null ? 0 : Number(line.taxRate);
+    if (!line.product) return `Line ${index + 1}: product is required.`;
+    if (!Number.isFinite(qty) || qty <= 0) return `Line ${index + 1}: quantity must be greater than zero.`;
+    if (!Number.isFinite(unitPrice) || unitPrice < 0) return `Line ${index + 1}: unit price must be zero or greater.`;
+    if (!Number.isFinite(discountPct) || discountPct < 0 || discountPct > 100) {
+      return `Line ${index + 1}: discount must be between 0 and 100%.`;
+    }
+    if (!Number.isFinite(taxRate) || taxRate < 0 || taxRate > 100) {
+      return `Line ${index + 1}: tax rate must be between 0 and 100%.`;
+    }
+  }
+  return null;
+};
+
+const validateQuotationDates = (quotationDate, expiryDate) => {
+  const issued = quotationDate ? new Date(quotationDate) : new Date();
+  if (Number.isNaN(issued.getTime())) return 'Quotation date is invalid.';
+  if (expiryDate) {
+    const expires = new Date(expiryDate);
+    if (Number.isNaN(expires.getTime())) return 'Expiry date is invalid.';
+    if (expires < issued) return 'Expiry date cannot be before the quotation date.';
+  }
+  return null;
+};
+
 const computeQuotationTotals = async ({
   lines,
   companyId,
@@ -643,22 +529,22 @@ const computeQuotationTotals = async ({
   const processedLines = [];
   for (let i = 0; i < (lines || []).length; i++) {
     const line = lines[i];
-    const qty = toNumber(line.qty || line.quantity);
+    const qty = toNumber(line.qty ?? line.quantity);
     const unitPrice = toNumber(line.unitPrice);
-    const discountPct = toNumber(line.discountPct || line.discount);
-    const taxRate = toNumber(line.taxRate);
+    const discountPct = toNumber(line.discountPct ?? line.discount);
+    const productDoc = productCache.get(String(line.product));
+    const taxRate = line.taxRate == null ? toNumber(productDoc?.taxRate) : toNumber(line.taxRate);
 
-    const lineSubtotal = qty * unitPrice;
-    const lineDiscount = lineSubtotal * (discountPct / 100);
-    const net = lineSubtotal - lineDiscount;
-    const lineTax = net * (taxRate / 100);
-    const lineTotal = net + lineTax;
+    const lineSubtotal = roundMoney(qty * unitPrice);
+    const lineDiscount = roundMoney(lineSubtotal * (discountPct / 100));
+    const net = roundMoney(lineSubtotal - lineDiscount);
+    const lineTax = roundMoney(net * (taxRate / 100));
+    const lineTotal = roundMoney(net + lineTax);
 
     subtotal += lineSubtotal;
     totalDiscount += lineDiscount;
     taxAmount += lineTax;
 
-    let productDoc = productCache.get(String(line.product));
     if (!productDoc && line.product) {
       productDoc = await Product.findOne({ _id: line.product, company: companyId }).lean();
       if (productDoc) productCache.set(String(line.product), productDoc);
@@ -684,7 +570,10 @@ const computeQuotationTotals = async ({
     });
   }
 
-  const totalAmount = subtotal - totalDiscount + taxAmount;
+  subtotal = roundMoney(subtotal);
+  totalDiscount = roundMoney(totalDiscount);
+  taxAmount = roundMoney(taxAmount);
+  const totalAmount = roundMoney(subtotal - totalDiscount + taxAmount);
 
   return {
     currencyCode: currency,
@@ -696,10 +585,10 @@ const computeQuotationTotals = async ({
       totalDiscount,
       taxAmount,
       totalAmount,
-      subtotalBase: subtotal * rate,
-      totalDiscountBase: totalDiscount * rate,
-      taxAmountBase: taxAmount * rate,
-      totalAmountBase: totalAmount * rate,
+      subtotalBase: roundMoney(subtotal * rate),
+      totalDiscountBase: roundMoney(totalDiscount * rate),
+      taxAmountBase: roundMoney(taxAmount * rate),
+      totalAmountBase: roundMoney(totalAmount * rate),
     },
   };
 };
@@ -831,6 +720,15 @@ exports.createQuotation = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const { lines } = req.body;
+    const lineError = validateQuotationLines(lines);
+    if (lineError) return res.status(400).json({ success: false, message: lineError });
+    const dateError = validateQuotationDates(req.body.quotationDate, req.body.expiryDate);
+    if (dateError) return res.status(400).json({ success: false, message: dateError });
+
+    const client = await Client.findOne({ _id: req.body.client, company: companyId });
+    if (!client || client.isActive === false) {
+      return res.status(400).json({ success: false, message: 'Select an active customer belonging to this company.' });
+    }
 
     // Validate products are active
     const inactiveProducts = await validateQuotationProducts(lines, companyId);
@@ -860,8 +758,15 @@ exports.createQuotation = async (req, res, next) => {
     });
 
     const quotation = await Quotation.create({
-      ...req.body,
+      client: req.body.client,
+      quotationDate: req.body.quotationDate,
+      expiryDate: req.body.expiryDate || null,
+      currencyCode: req.body.currencyCode,
+      exchangeRate: req.body.exchangeRate,
+      terms: req.body.terms,
+      notes: req.body.notes,
       company: companyId,
+      status: 'draft',
       currencyCode: computed.currencyCode,
       baseCurrency: computed.baseCurrency,
       exchangeRate: computed.exchangeRate,
@@ -909,17 +814,26 @@ exports.updateQuotation = async (req, res, next) => {
       });
     }
 
-    // Only draft quotations can be fully edited
-    // For sent quotations, we reset to draft first
-    if (quotation.status === 'sent' && req.body.lines) {
-      // Editing a sent quotation requires reset to draft
-      req.body.status = 'draft';
-    } else if (!['draft'].includes(quotation.status)) {
+    // Issued quotations are commercial offers. Changes require a new revision;
+    // never silently withdraw a sent offer or alter customer-approved terms.
+    if (quotation.status !== 'draft') {
       return res.status(400).json({
         success: false,
         error: ERR_INVALID_STATUS_TRANSITION,
-        message: `Cannot update quotation with status: ${quotation.status}. Only draft quotations can be edited.`
+        message: `Cannot edit a quotation with status: ${quotation.status}. Only drafts can be edited; create a new quotation revision for issued offers.`
       });
+    }
+
+    const requestedLines = req.body.lines;
+    if (requestedLines) {
+      const lineError = validateQuotationLines(requestedLines);
+      if (lineError) return res.status(400).json({ success: false, message: lineError });
+    }
+    const dateError = validateQuotationDates(req.body.quotationDate ?? quotation.quotationDate, req.body.expiryDate ?? quotation.expiryDate);
+    if (dateError) return res.status(400).json({ success: false, message: dateError });
+    if (req.body.client) {
+      const client = await Client.findOne({ _id: req.body.client, company: companyId });
+      if (!client || client.isActive === false) return res.status(400).json({ success: false, message: 'Select an active customer belonging to this company.' });
     }
 
     // Validate products are active if lines are being updated
@@ -935,13 +849,18 @@ exports.updateQuotation = async (req, res, next) => {
       }
     }
 
-    let updatedPayload = { ...req.body };
+    // Explicit allowlist: clients cannot set lifecycle state, totals, ownership,
+    // approval metadata, conversion links, or the public-action tokens.
+    let updatedPayload = {};
+    for (const key of ['client', 'quotationDate', 'expiryDate', 'currencyCode', 'exchangeRate', 'terms', 'notes']) {
+      if (req.body[key] !== undefined) updatedPayload[key] = req.body[key];
+    }
 
-    if (req.body.lines) {
+    if (requestedLines) {
       const productCache = await loadLineProducts(Product, req.body.lines, companyId);
 
       const computed = await computeQuotationTotals({
-        lines: req.body.lines.map((line) => {
+        lines: requestedLines.map((line) => {
           const product = productCache.get(String(line.product));
           const taxRate = line.taxRate != null ? line.taxRate : (product?.taxRate != null ? product.taxRate : 0);
           return { ...line, taxRate };
@@ -970,12 +889,35 @@ exports.updateQuotation = async (req, res, next) => {
       };
     }
 
-    quotation = await Quotation.findOneAndUpdate(
-      { _id: req.params.id, company: companyId },
-      updatedPayload,
-      { new: true, runValidators: true }
-    )
-      .populate('client lines.product createdBy');
+    if (Object.keys(updatedPayload).length) {
+      quotation = await runInTransaction(async () => {
+        // Optimistic lock prevents two editors from silently overwriting each
+        // other's draft. The timestamp touch and line replacement commit as one.
+        const versionTime = new Date(Math.max(Date.now(), new Date(quotation.updatedAt).getTime() + 1));
+        const locked = await dbClient().quotation.updateMany({
+          where: {
+            id: String(quotation._id),
+            companyId: String(companyId),
+            status: 'draft',
+            updatedAt: quotation.updatedAt,
+          },
+          data: { updatedAt: versionTime },
+        });
+        if (!locked.count) {
+          const conflict = new Error('This quotation changed since you opened it. Refresh and reapply your changes.');
+          conflict.statusCode = 409;
+          throw conflict;
+        }
+        const current = await Quotation.findOne({ _id: req.params.id, company: companyId });
+        if (!current) throw new Error('Quotation not found');
+        Object.assign(current, updatedPayload);
+        await current.save();
+        await dbClient().quotation.update({ where: { id: String(current._id) }, data: { updatedAt: versionTime } });
+        await current.populate('client lines.product createdBy');
+        return current;
+      });
+    }
+    if (quotation) await quotation.populate('client lines.product createdBy');
 
     res.json({
       success: true,
@@ -1009,7 +951,12 @@ exports.deleteQuotation = async (req, res, next) => {
       });
     }
 
-    await quotation.deleteOne();
+    const deleted = await dbClient().quotation.deleteMany({
+      where: { id: String(quotation._id), companyId: String(companyId), status: 'draft' },
+    });
+    if (!deleted.count) {
+      return res.status(409).json({ success: false, error: ERR_INVALID_STATUS_TRANSITION, message: 'This quotation changed and can no longer be deleted as a draft.' });
+    }
 
     res.json({
       success: true,
@@ -1044,36 +991,48 @@ exports.sendQuotation = async (req, res, next) => {
       });
     }
 
-    // Only draft or pending_approval can move forward
-    if (!['draft', 'pending_approval'].includes(quotation.status)) {
+    if (isQuotationExpired(quotation)) {
+      if (['draft', 'pending_approval', 'sent'].includes(quotation.status)) {
+        await transitionQuotation(quotation._id, companyId, quotation.status, { status: 'expired' });
+      }
+      return res.status(409).json({ success: false, error: ERR_QUOTATION_EXPIRED, message: 'Expired quotations cannot be sent to customers.' });
+    }
+
+    // Sent offers may be resent by an authorized approver if email delivery
+    // failed; their commercial terms remain locked.
+    if (!['draft', 'pending_approval', 'sent'].includes(quotation.status)) {
       return res.status(400).json({
         success: false,
         error: ERR_INVALID_STATUS_TRANSITION,
-        message: `Cannot send quotation with status: ${quotation.status}. Only draft or pending_approval quotations can be sent.`
+        message: `Cannot send quotation with status: ${quotation.status}. Drafts and pending approvals can be sent; sent quotations can be resent.`
       });
     }
 
     // If user is not approver, move to pending_approval instead of sending
     if (!isApprover(req.user)) {
-      quotation.status = 'pending_approval';
-      await quotation.save();
+      if (quotation.status === 'sent') {
+        return res.status(409).json({ success: false, error: ERR_INVALID_STATUS_TRANSITION, message: 'A sent quotation cannot be resubmitted for approval.' });
+      }
+      const didSubmit = await transitionQuotation(quotation._id, companyId, ['draft', 'pending_approval'], { status: 'pending_approval' });
+      if (!didSubmit) return res.status(409).json({ success: false, error: ERR_INVALID_STATUS_TRANSITION, message: 'Quotation was changed by another user. Refresh and try again.' });
+      const pending = await Quotation.findById(quotation._id);
       return res.status(202).json({
         success: true,
         message: 'Quotation moved to pending approval. Approver must send to client.',
-        data: quotation
+        data: pending
       });
     }
 
-    quotation.status = 'sent';
     const acceptToken = generateActionToken(quotation._id.toString(), 'accept');
     const rejectToken = generateActionToken(quotation._id.toString(), 'reject');
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-    quotation.customerAction = mergeQuotationCustomerAction(quotation.customerAction, {
+    const customerAction = mergeQuotationCustomerAction(quotation.customerAction, {
       publicAcceptToken: acceptToken,
       publicRejectToken: rejectToken,
       publicTokenExpiresAt: expiresAt.toISOString(),
     });
-    await quotation.save();
+    const didSend = await transitionQuotation(quotation._id, companyId, ['draft', 'pending_approval', 'sent'], { status: 'sent', customerAction });
+    if (!didSend) return res.status(409).json({ success: false, error: ERR_INVALID_STATUS_TRANSITION, message: 'Quotation was changed by another user. Refresh and try again.' });
 
     const refreshed = await Quotation.findOne({ _id: quotation._id, company: companyId })
       .populate('client')
@@ -1143,32 +1102,15 @@ exports.acceptQuotation = async (req, res, next) => {
       });
     }
 
-    // Recompute totals at acceptance using stored lines/currency
-    const computed = await computeQuotationTotals({
-      lines: quotation.lines,
-      companyId,
-      currencyCode: quotation.currencyCode,
-      exchangeRate: quotation.exchangeRate,
-      quotationDate: quotation.quotationDate,
+    // Acceptance records agreement to the issued snapshot; never reprice here.
+    const didAccept = await transitionQuotation(quotation._id, companyId, 'sent', {
+      status: 'accepted', approvedById: String(req.user.id), approvedDate: new Date(),
     });
-
-    quotation.status = 'accepted';
-    quotation.approvedBy = req.user.id;
-    quotation.approvedDate = new Date();
-    quotation.currencyCode = computed.currencyCode;
-    quotation.baseCurrency = computed.baseCurrency;
-    quotation.exchangeRate = computed.exchangeRate;
-    quotation.lines = computed.lines;
-    quotation.subtotal = computed.totals.subtotal;
-    quotation.totalDiscount = computed.totals.totalDiscount;
-    quotation.taxAmount = computed.totals.taxAmount;
-    quotation.totalAmount = computed.totals.totalAmount;
-    quotation.subtotalBase = computed.totals.subtotalBase;
-    quotation.totalDiscountBase = computed.totals.totalDiscountBase;
-    quotation.taxAmountBase = computed.totals.taxAmountBase;
-    quotation.totalAmountBase = computed.totals.totalAmountBase;
-
-    await quotation.save();
+    if (!didAccept) {
+      return res.status(409).json({ success: false, error: ERR_INVALID_STATUS_TRANSITION, message: 'Quotation was changed by another user. Refresh and try again.' });
+    }
+    const accepted = await Quotation.findById(quotation._id);
+    Object.assign(quotation, accepted);
 
     // Send email notification
     if (req.body.sendEmail) {
@@ -1210,17 +1152,26 @@ exports.rejectQuotation = async (req, res, next) => {
       });
     }
 
-    // Only sent quotations can be rejected
-    if (!['draft', 'sent'].includes(quotation.status)) {
+    // Internal reviewers can decline a submitted draft or withdraw a sent offer.
+    if (!['pending_approval', 'sent'].includes(quotation.status)) {
       return res.status(400).json({
         success: false,
         error: ERR_INVALID_STATUS_TRANSITION,
-        message: `Cannot reject quotation with status: ${quotation.status}. Only draft or sent quotations can be rejected.`
+        message: `Cannot reject quotation with status: ${quotation.status}. Only pending or sent quotations can be rejected.`
       });
     }
 
-    quotation.status = 'rejected';
-    await quotation.save();
+    const didReject = await transitionQuotation(
+      quotation._id, companyId, quotation.status, {
+        status: 'rejected',
+        customerAction: mergeQuotationCustomerAction(quotation.customerAction, {
+          action: 'rejected', reason: req.body.reason || null, actedBy: req.user.id, actedAt: new Date(),
+        }),
+      },
+    );
+    if (!didReject) return res.status(409).json({ success: false, error: ERR_INVALID_STATUS_TRANSITION, message: 'Quotation was changed by another user. Refresh and try again.' });
+    const rejected = await Quotation.findById(quotation._id);
+    Object.assign(quotation, rejected);
 
     // Send email notification
     if (req.body.sendEmail) {
@@ -1300,16 +1251,17 @@ exports.convertToInvoice = async (req, res, next) => {
       const qty = parseFloat(line.qty || line.quantity || 0);
       const unitPrice = parseFloat(line.unitPrice || 0);
       const discountPct = parseFloat(line.discountPct || line.discount || 0);
-      const lineSubtotal = qty * unitPrice;
+      const lineSubtotal = Number(line.lineSubtotal ?? roundMoney(qty * unitPrice));
       const netAmount = lineSubtotal - (lineSubtotal * discountPct / 100);
-      const taxRate = parseFloat(line.taxRate != null ? line.taxRate : (line.product?.taxRate != null ? line.product.taxRate : 0));
+      const taxRate = Number(line.taxRate ?? line.product?.taxRate ?? 0);
       const taxCode = line.taxCode || line.product?.taxCode || 'A';
-      const lineTax = netAmount * (taxRate / 100);
-      const lineTotal = netAmount + lineTax;
+      const lineTax = Number(line.lineTax ?? roundMoney(netAmount * (taxRate / 100)));
+      const lineTotal = Number(line.lineTotal ?? roundMoney(netAmount + lineTax));
 
       return {
-        product: line.product,
-        productCode: line.itemCode || `ITEM-${idx + 1}`,
+        product: line.product?._id || line.product,
+        productName: line.productName || line.product?.name || line.description || '',
+        productCode: line.productSku || line.itemCode || line.product?.sku || `ITEM-${idx + 1}`,
         description: line.description || (line.product && line.product.name) || '',
         qty,
         unit: line.unit || (line.product && line.product.unit) || '',
@@ -1323,31 +1275,51 @@ exports.convertToInvoice = async (req, res, next) => {
       };
     });
 
-    const invoicePayload = {
-      company: companyId,
-      client: quotation.client,
-      quotation: quotation._id,
-      items: processedItems,
-      terms: quotation.terms,
-      notes: quotation.notes,
-      createdBy: req.user.id,
-      dueDate: req.body.dueDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) // 30 days default
-    };
+    const invoice = await runInTransaction(async () => {
+      // The conditional transition is a one-time claim. If a second request
+      // races this conversion it cannot create a second invoice.
+      const didClaim = await transitionQuotation(quotation._id, companyId, 'accepted',
+        { status: 'converted', conversionDate: new Date() },
+        { convertedToInvoiceId: null, convertedToSalesOrderId: null });
+      if (!didClaim) {
+        const conflict = new Error('Quotation has already been converted or changed. Refresh to see its current state.');
+        conflict.statusCode = 409;
+        conflict.code = ERR_QUOTATION_ALREADY_CONVERTED;
+        throw conflict;
+      }
+      const created = await Invoice.create({
+        company: companyId,
+        client: quotation.client?._id || quotation.client,
+        quotation: quotation._id,
+        items: processedItems,
+        subtotal: quotation.subtotal,
+        taxAmount: quotation.taxAmount,
+        totalAmount: quotation.totalAmount,
+        totalDiscount: quotation.totalDiscount,
+        totalAEx: processedItems.filter((line) => line.taxCode === 'A')
+          .reduce((sum, line) => sum + line.lineSubtotal * (1 - line.discountPct / 100), 0),
+        totalB18: processedItems.filter((line) => line.taxCode === 'B')
+          .reduce((sum, line) => sum + line.lineSubtotal * (1 - line.discountPct / 100), 0),
+        currencyCode: quotation.currencyCode,
+        exchangeRate: quotation.exchangeRate,
+        invoiceDate: new Date(),
+        terms: quotation.terms,
+        notes: quotation.notes,
+        createdBy: req.user.id,
+        dueDate: req.body.dueDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+      });
+      await dbClient().quotation.updateMany({
+        where: { id: String(quotation._id), companyId: String(companyId), status: 'converted', convertedToInvoiceId: null },
+        data: { convertedToInvoiceId: String(created._id) },
+      });
+      // The resulting invoice is a draft. AR/customer balances and stock must
+      // not move until the invoice is confirmed through the invoice workflow.
+      return created;
+    });
 
-    const invoice = await Invoice.create(invoicePayload);
-
-    // Update client outstanding balance
-    const client = await Client.findById(quotation.client);
-    if (client) {
-      client.outstandingBalance += parseFloat(invoice.roundedAmount) || 0;
-      await client.save();
-    }
-
-    // Update quotation
     quotation.status = 'converted';
     quotation.convertedToInvoice = invoice._id;
     quotation.conversionDate = new Date();
-    await quotation.save();
 
      await invoice.populate('client lines.product createdBy');
     res.status(201).json({
@@ -1355,6 +1327,8 @@ exports.convertToInvoice = async (req, res, next) => {
       message: 'Quotation converted to invoice successfully',
       data: invoice
     });
+    emitDataChanged(companyId, 'quotations');
+    emitDataChanged(companyId, 'invoices');
     // Notify quotation approved/converted
     try {
       await notifyQuotationApproved(companyId, quotation, invoice.invoiceNumber);
@@ -1429,34 +1403,53 @@ exports.convertToSalesOrder = async (req, res, next) => {
     const salesOrderLines = (quotation.lines || []).map(line => ({
       product: line.product?._id || line.product,
       description: line.description || (line.product && line.product.name) || '',
-      qty: parseFloat(line.qty || line.quantity || 0),
-      unitPrice: parseFloat(line.unitPrice || 0),
-      discountPct: parseFloat(line.discountPct || line.discount || 0),
-      taxRate: parseFloat(line.taxRate != null ? line.taxRate : (line.product?.taxRate != null ? line.product.taxRate : 0)),
-      taxCode: line.taxCode || line.product?.taxCode || 'A',
-      unit: line.unit || (line.product && line.product.unit) || ''
+      qty: Number(line.qty ?? line.quantity ?? 0),
+      unitPrice: Number(line.unitPrice ?? 0),
+      discountPct: Number(line.discountPct ?? line.discount ?? 0),
+      taxRate: Number(line.taxRate ?? line.product?.taxRate ?? 0),
+      lineTax: Number(line.lineTax ?? 0),
+      lineTotal: Number(line.lineTotal ?? 0),
+      unit: line.unit || line.product?.unit || '',
     }));
 
-    // Create sales order
-    const salesOrder = await SalesOrder.create({
-      company: companyId,
-      client: quotation.client,
-      quotation: quotation._id,
-      lines: salesOrderLines,
-      orderDate: new Date(),
-      expectedDate: expectedDate || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000), // 7 days default
-      terms: terms || quotation.terms,
-      notes: notes || quotation.notes,
-      currencyCode: quotation.currencyCode || 'USD',
-      createdBy: req.user.id,
-      status: 'draft' // Start as draft, needs to be confirmed to reserve stock
+    // A quote becomes a draft order: inventory is not reserved until that order
+    // is confirmed in the sales-order workflow.
+    const salesOrder = await runInTransaction(async () => {
+      const didClaim = await transitionQuotation(quotation._id, companyId, 'accepted',
+        { status: 'converted', conversionDate: new Date() },
+        { convertedToInvoiceId: null, convertedToSalesOrderId: null });
+      if (!didClaim) {
+        const conflict = new Error('Quotation has already been converted or changed. Refresh to see its current state.');
+        conflict.statusCode = 409;
+        conflict.code = ERR_QUOTATION_ALREADY_CONVERTED;
+        throw conflict;
+      }
+      const order = await SalesOrder.create({
+        company: companyId,
+        client: quotation.client?._id || quotation.client,
+        quotation: quotation._id,
+        lines: salesOrderLines,
+        orderDate: new Date(),
+        expectedDate: expectedDate || new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+        subtotal: quotation.subtotal,
+        taxAmount: quotation.taxAmount,
+        totalAmount: quotation.totalAmount,
+        exchangeRate: quotation.exchangeRate,
+        currencyCode: quotation.currencyCode || 'RWF',
+        terms: terms || quotation.terms,
+        notes: notes || quotation.notes,
+        createdBy: req.user.id,
+        status: 'draft',
+      });
+      await dbClient().quotation.updateMany({
+        where: { id: String(quotation._id), companyId: String(companyId), status: 'converted', convertedToSalesOrderId: null },
+        data: { convertedToSalesOrderId: String(order._id) },
+      });
+      return order;
     });
-
-    // Update quotation
     quotation.status = 'converted';
     quotation.convertedToSalesOrder = salesOrder._id;
     quotation.conversionDate = new Date();
-    await quotation.save();
 
     await salesOrder.populate('client lines.product createdBy');
 
@@ -1465,6 +1458,8 @@ exports.convertToSalesOrder = async (req, res, next) => {
       message: 'Quotation converted to sales order successfully',
       data: salesOrder
     });
+    emitDataChanged(companyId, 'quotations');
+    emitDataChanged(companyId, 'salesOrders');
 
     // Notify
     try {
@@ -1529,240 +1524,19 @@ exports.generateQuotationPDF = async (req, res, next) => {
       .populate('client')
       .populate('lines.product')
       .populate('createdBy');
+    if (!quotation) return res.status(404).json({ success: false, message: 'Quotation not found' });
 
-    if (!quotation) {
-      return res.status(404).json({
-        success: false,
-        message: 'Quotation not found'
-      });
-    }
-
-    // Create PDF document
+    const company = await Company.findById(companyId);
+    const currency = quotation.currencyCode || company?.base_currency || company?.baseCurrency || 'RWF';
     const doc = new PDFDocument({ margin: 50 });
-
-    // Set response headers
     const fileName = `quotation-${quotation.referenceNo || quotation._id}.pdf`;
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', `attachment; filename=${fileName}`);
-
-    // Pipe PDF to response
     doc.pipe(res);
-
-    // Layout helpers
-    const left = 48;
-    const right = 48;
-    const availWidth = doc.page.width - left - right;
-    const bottomLimit = doc.page.height - 80;
-    // Column percents for: No, Description, Unit, Qty, Unit rate FRW, Total With VAT FRW
-    // Tuned to avoid wrapping and keep totals column wide enough
-    const colPercents = [0.06, 0.48, 0.08, 0.08, 0.16, 0.14];
-    const colWidths = colPercents.map(p => Math.floor(availWidth * p));
-    // adjust rounding to fill available width
-    const sumCols = colWidths.reduce((s, v) => s + v, 0);
-    if (sumCols < availWidth) colWidths[colWidths.length - 1] += (availWidth - sumCols);
-
-    let pageNum = 1;
-    const drawFooter = (p) => {
-      const bottom = doc.page.height - 40;
-      doc.fontSize(8).fillColor('#9ca3af').font('Helvetica');
-      doc.text(`Generated: ${new Date().toLocaleString()}`, left, bottom, { align: 'left' });
-      doc.text(`Page ${p}`, 0, bottom, { align: 'right' });
-    };
-
-    const renderHeader = () => {
-      // Title
-      doc.fontSize(20).fillColor('#111827').text('QUOTATION', { align: 'center' });
-      doc.moveDown(0.6);
-
-      // Prepare left and right columns and render line-by-line so they stay parallel
-      const startY = doc.y;
-      const lineHeight = 14;
-      const leftLines = [
-        `Quotation Number: ${quotation.referenceNo}`,
-        `Date: ${new Date(quotation.quotationDate || quotation.createdAt).toLocaleDateString()}`,
-        `Valid Until: ${quotation.expiryDate ? new Date(quotation.expiryDate).toLocaleDateString() : 'N/A'}`,
-        `Status: ${quotation.status?.toUpperCase() || 'N/A'}`
-      ];
-
-      const clientX = left + Math.floor(availWidth * 0.55);
-      const rightLines = [];
-      rightLines.push('Quotation To:');
-      rightLines.push(quotation.client?.name || 'N/A');
-      rightLines.push(quotation.client?.taxId ? `TIN: ${quotation.client.taxId}` : '');
-      rightLines.push(quotation.client?.contact?.address || '');
-      rightLines.push(quotation.client?.contact?.phone ? `Phone: ${quotation.client.contact.phone}` : '');
-      rightLines.push(quotation.client?.contact?.email ? `Email: ${quotation.client.contact.email}` : '');
-
-      const maxLines = Math.max(leftLines.length, rightLines.length);
-      doc.fontSize(10).fillColor('#111827').font('Helvetica');
-      for (let i = 0; i < maxLines; i++) {
-        const yLine = startY + (i * lineHeight);
-        // left column
-        if (leftLines[i]) {
-          doc.text(leftLines[i], left, yLine);
-        }
-        // right column (first line underlined label)
-        if (rightLines[i]) {
-          if (i === 0) {
-            doc.text(rightLines[i], clientX, yLine, { underline: true });
-          } else {
-            doc.text(rightLines[i], clientX, yLine);
-          }
-        }
-      }
-
-      // Move doc.y below the taller column
-      doc.y = startY + (maxLines * lineHeight) + 8;
-    };
-
-    const renderTableHeader = (y) => {
-      doc.rect(left - 8, y, availWidth + 16, 28).fill('#111827');
-      doc.fillColor('#ffffff').fontSize(10).font('Helvetica-Bold');
-      let x = left;
-      const headers = ['No.', 'Description', 'Unit', 'Qty', 'Unit rate FRW', 'Total With VAT FRW'];
-      headers.forEach((h, i) => {
-        const align = (i >= 2) ? 'right' : 'left';
-        doc.text(h, x, y + 8, { width: colWidths[i], align });
-        x += colWidths[i];
-      });
-      doc.fillColor('#111827').font('Helvetica');
-    };
-
-    // Print header and table header
-    renderHeader();
-    let y = doc.y;
-    renderTableHeader(y);
-    y += 34;
-
-    // Lines
-    doc.fontSize(9).font('Helvetica');
-    for (let idx = 0; idx < quotation.lines.length; idx++) {
-      const line = quotation.lines[idx];
-      const desc = line.product?.name || line.description || '';
-      const unit = line.unit || (line.product?.unit || '');
-      const qty = String(line.qty || line.quantity || '');
-      const unitPrice = `RWF ${Number(line.unitPrice || 0).toFixed(2)}`;
-      const total = `RWF ${Number(line.lineTotal || line.total || 0).toFixed(2)}`;
-
-      // Measure heights for all cells (so rows expand for any wrapped column)
-      const hNo = doc.heightOfString(String(idx + 1), { width: colWidths[0] });
-      const hDesc = doc.heightOfString(String(desc), { width: colWidths[1] });
-      const hUnit = doc.heightOfString(String(unit), { width: colWidths[2] });
-      const hQty = doc.heightOfString(String(qty), { width: colWidths[3] });
-      const hUnitPrice = doc.heightOfString(String(unitPrice), { width: colWidths[4] });
-      const hTotal = doc.heightOfString(String(total), { width: colWidths[5] });
-      const rowHeight = Math.max(hNo, hDesc, hUnit, hQty, hUnitPrice, hTotal, 12);
-
-      // Page break if needed
-      if (y + rowHeight > bottomLimit) {
-        drawFooter(pageNum);
-        doc.addPage();
-        pageNum += 1;
-        renderHeader();
-        y = doc.y;
-        renderTableHeader(y);
-        y += 34;
-      }
-
-      // Alternating shading
-      if (idx % 2 === 0) {
-        doc.rect(left - 8, y - 6, availWidth + 16, rowHeight + 8).fill('#fbfbfc');
-        doc.fillColor('#111827');
-      }
-
-      // Render cells
-      let x = left;
-      doc.text(String(idx + 1), x, y, { width: colWidths[0] }); x += colWidths[0];
-      doc.text(String(desc), x, y, { width: colWidths[1] }); x += colWidths[1];
-      doc.text(String(unit), x, y, { width: colWidths[2], align: 'right' }); x += colWidths[2];
-      doc.text(qty, x, y, { width: colWidths[3], align: 'right' }); x += colWidths[3];
-      doc.text(unitPrice, x, y, { width: colWidths[4], align: 'right' }); x += colWidths[4];
-      doc.text(total, x, y, { width: colWidths[5], align: 'right' });
-
-      y += rowHeight + 8;
-    }
-
-    // Totals block (right aligned)
-    if (y + 100 > bottomLimit) {
-      drawFooter(pageNum);
-      doc.addPage();
-      pageNum += 1;
-      renderHeader();
-      y = doc.y;
-      renderTableHeader(y);
-      y += 34;
-    }
-
-    // Totals box placed below table, right-aligned, with fixed height to prevent overlap
-    const totalsBoxWidth = Math.floor(availWidth * 0.36);
-    const totalsX = left + availWidth - totalsBoxWidth;
-    const totalsY = y;
-    const totalsBoxHeight = 88;
-    // Page break if totals box would overflow
-    if (totalsY + totalsBoxHeight > bottomLimit) {
-      drawFooter(pageNum);
-      doc.addPage();
-      pageNum += 1;
-      renderHeader();
-      y = doc.y;
-      renderTableHeader(y);
-      y += 34;
-    }
-
-    // Draw totals box with left labels and right values
-    doc.rect(totalsX - 6, totalsY - 6, totalsBoxWidth + 12, totalsBoxHeight).strokeColor('#e5e7eb').lineWidth(0.5).stroke();
-    const innerPad = 8;
-    let ty = totalsY + innerPad;
-    doc.fontSize(10).text(`Total VAT Exclusive (RWF):`, totalsX + innerPad, ty, { width: totalsBoxWidth - innerPad * 2, align: 'left' });
-    doc.text(`${Number(quotation.subtotal || 0).toFixed(2)}`, totalsX + innerPad, ty, { width: totalsBoxWidth - innerPad * 2, align: 'right' });
-    ty += 20;
-    doc.text(`VAT (18%):`, totalsX + innerPad, ty, { width: totalsBoxWidth - innerPad * 2, align: 'left' });
-    doc.text(`${Number(quotation.taxAmount || 0).toFixed(2)}`, totalsX + innerPad, ty, { width: totalsBoxWidth - innerPad * 2, align: 'right' });
-    ty += 22;
-    doc.font('Helvetica-Bold').fontSize(12).text(`Value Total Amount (RWF):`, totalsX + innerPad, ty, { width: totalsBoxWidth - innerPad * 2, align: 'left' });
-    doc.text(`${Number(quotation.totalAmount || 0).toFixed(2)}`, totalsX + innerPad, ty, { width: totalsBoxWidth - innerPad * 2, align: 'right' });
-    doc.font('Helvetica').fontSize(10);
-    // Advance y past totals box
-    y = totalsY + totalsBoxHeight + 12;
-
-    y += 28;
-    // Terms & Notes
-    if (quotation.terms || quotation.notes) {
-      if (y + 120 > bottomLimit) {
-        drawFooter(pageNum);
-        doc.addPage();
-        pageNum += 1;
-        renderHeader();
-        y = doc.y;
-      }
-      doc.moveDown(1);
-      if (quotation.terms) {
-        doc.font('Helvetica-Bold').fontSize(10).text('Terms & Conditions:', left);
-        doc.font('Helvetica').fontSize(9).text(quotation.terms, { width: availWidth });
-        doc.moveDown(0.5);
-      }
-      if (quotation.notes) {
-        doc.font('Helvetica-Bold').fontSize(10).text('Notes:', left);
-        doc.font('Helvetica').fontSize(9).text(quotation.notes, { width: availWidth });
-      }
-    }
-
-    drawFooter(pageNum);
+    renderQuotationPDF(doc, quotation, company, currency);
     doc.end();
-
-    // Persist last generated PDF URL (best-effort)
-    try {
-      const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'http';
-      const host = req.headers['x-forwarded-host'] || req.headers.host;
-      if (host) {
-        const url = `${protocol}://${host}/api/quotations/${quotation._id}/pdf`;
-        quotation.lastGeneratedPdfUrl = url;
-        await quotation.save();
-      }
-    } catch (e) {
-      console.warn('[Quotation] Failed to save lastGeneratedPdfUrl', e.message);
-    }
   } catch (error) {
+    if (res.headersSent) return res.end();
     next(error);
   }
 };

@@ -2041,6 +2041,7 @@ model SalesOrder {
   deliveryNotes      Json             @default("[]") @map("delivery_notes")
   invoices           Json             @default("[]")
   pickPackId         String?          @map("pick_pack_id") @db.Char(24)
+  terms              String?
   notes              String?
   createdById        String?          @map("created_by") @db.Char(24)
   createdAt          DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
@@ -2125,6 +2126,7 @@ model Invoice {
   generatedFromRecurringId String?                  @map("generated_from_recurring_id") @db.Char(24)
   payments                 Json                     @default("[]")
   ebm                      Json                     @default("{}")
+  terms                    String?
   notes                    String?
   createdById              String?                  @map("created_by") @db.Char(24)
   createdAt                DateTime                 @default(now()) @map("created_at") @db.Timestamptz(3)

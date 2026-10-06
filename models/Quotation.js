@@ -15,6 +15,11 @@ const FIELD_MAP = {
   status: { target: 'status' },
   quotationDate: { target: 'quotationDate' },
   expiryDate: { target: 'expiryDate' },
+  approvedBy: { target: 'approvedById', isId: true },
+  approvedDate: { target: 'approvedDate' },
+  convertedToInvoice: { target: 'convertedToInvoiceId', isId: true },
+  convertedToSalesOrder: { target: 'convertedToSalesOrderId', isId: true },
+  conversionDate: { target: 'conversionDate' },
 };
 
 module.exports = buildDocumentModel({

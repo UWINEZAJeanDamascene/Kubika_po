@@ -1,4 +1,4 @@
-﻿-- Remove invalid inactive defaults, then repair duplicate defaults before adding the invariant.
+-- Remove invalid inactive defaults, then repair duplicate defaults before adding the invariant.
 UPDATE warehouses
 SET is_default = FALSE,
     updated_at = NOW()
