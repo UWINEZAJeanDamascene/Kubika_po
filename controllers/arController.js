@@ -1,7 +1,7 @@
 const ARService = require('../services/arService');
 
 /**
- * AR Controller - Read-Only Reporting Module
+ * AR Controller - AR aging and customer statement reporting.
  *
  * Core Principle: AR is an auto-generated ledger, NOT a transaction entry module.
  * All AR movements originate from source documents:

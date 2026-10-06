@@ -302,7 +302,7 @@ exports.getCurrentReceivables = async (req, res, next) => {
     // Note: amountOutstanding is Decimal128, so we need special handling
     const query = {
       company: companyId,
-      status: { $in: ['confirmed', 'partially_paid'] },
+      status: { $in: ['sent', 'confirmed', 'partially_paid'] },
       // Filter in SQL rather than pulling every confirmed invoice into Node.
       // `amountOutstanding` is a non-nullable Decimal defaulting to 0, so this
       // is exactly equivalent to the in-memory `parseFloat(...) > 0` below.
@@ -337,7 +337,7 @@ exports.getCurrentReceivables = async (req, res, next) => {
       params.push(String(clientId));
       clientPredicate = ` AND i.client_id = $${params.length}`;
     }
-    const whereSql = `i.company_id = $1 AND i.status IN ('confirmed', 'partially_paid') AND i.amount_outstanding > 0${clientPredicate}`;
+    const whereSql = `i.company_id = $1 AND i.status IN ('sent', 'confirmed', 'partially_paid') AND i.amount_outstanding > 0${clientPredicate}`;
     const [summaryRows, clientRows] = await Promise.all([
       dbClient().$queryRawUnsafe(
         `SELECT COALESCE(SUM(i.amount_outstanding), 0)::text AS "totalOutstanding",

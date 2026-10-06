@@ -97,7 +97,7 @@ const systemRoles = [
       { resource: 'purchase_orders', actions: ['read'] },
       { resource: 'reports', actions: ['read', 'create'] },
       { resource: 'bank_accounts', actions: ['read', 'create', 'update'] },
-      { resource: 'ar_receipts', actions: ['read', 'create', 'update'] },
+      { resource: 'ar_receipts', actions: ['read', 'create', 'update', 'reverse'] },
       { resource: 'ap_payments', actions: ['read', 'create', 'update'] },
       { resource: 'expenses', actions: ['read', 'create', 'update'] },
       { resource: 'budgets', actions: ['read', 'create', 'update'] },

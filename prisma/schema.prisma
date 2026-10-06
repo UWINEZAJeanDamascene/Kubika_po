@@ -2415,6 +2415,10 @@ model ARReceipt {
   unallocatedAmount     Decimal               @default(0) @map("unallocated_amount") @db.Decimal(19, 2)
   postedById            String?               @map("posted_by") @db.Char(24)
   postedAt              DateTime?             @map("posted_at") @db.Timestamptz(3)
+  reversedAt            DateTime?             @map("reversed_at") @db.Timestamptz(3)
+  reversedById          String?               @map("reversed_by") @db.Char(24)
+  reversalReason        String?               @map("reversal_reason")
+  notes                 String?
   createdById           String?               @map("created_by") @db.Char(24)
   createdAt             DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt             DateTime              @updatedAt @map("updated_at") @db.Timestamptz(3)

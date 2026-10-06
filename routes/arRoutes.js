@@ -4,27 +4,28 @@ const {
   getAgingReport,
   getClientStatement
 } = require('../controllers/arController');
+const receipts = require('../controllers/arReceiptController');
 const { protect } = require('../middleware/auth');
+const { requirePermission } = require('../middleware/rbacMiddleware');
 
 router.use(protect);
 
-/**
- * AR Routes - Read-Only Reporting Module
- *
- * Core Principle: AR is an auto-generated ledger, NOT a transaction entry module.
- * All AR movements originate from source documents:
- *   - Invoice confirmed          -> AR increases (Dr AR / Cr Sales)
- *   - Payment recorded on invoice -> AR decreases (Dr Cash/Bank / Cr AR)
- *   - Credit note issued         -> AR decreases (Dr Sales Returns / Cr AR)
- *   - Bad debt write-off on invoice -> AR decreases (Dr Bad Debt / Cr AR)
- *
- * These endpoints return reports only. No manual transaction entry here.
- */
+// Receipt transactions are controlled source documents; posting and reversal
+// write matching journal entries and update the invoice/customer subledgers.
+router.route('/receipts')
+  .get(requirePermission('ar_receipts', 'read'), receipts.getReceipts)
+  .post(requirePermission('ar_receipts', 'create'), receipts.createReceipt);
+router.route('/receipts/:id')
+  .get(requirePermission('ar_receipts', 'read'), receipts.getReceipt)
+  .put(requirePermission('ar_receipts', 'update'), receipts.updateReceipt);
+router.post('/receipts/:id/allocate', requirePermission('ar_receipts', 'update'), receipts.allocateReceipt);
+router.post('/receipts/:id/post', requirePermission('ar_receipts', 'create'), receipts.postReceipt);
+router.post('/receipts/:id/reverse', requirePermission('ar_receipts', 'reverse'), receipts.reverseReceipt);
 
 // Aging report (all outstanding invoices grouped by age)
-router.get('/aging', getAgingReport);
+router.get('/aging', requirePermission('ar_receipts', 'read'), getAgingReport);
 
 // Client statement (transaction history per customer)
-router.get('/statement/:client_id', getClientStatement);
+router.get('/statement/:client_id', requirePermission('ar_receipts', 'read'), getClientStatement);
 
 module.exports = router;

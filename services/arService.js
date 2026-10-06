@@ -34,15 +34,10 @@ class ARService {
         SELECT i.client_id,
                c.name AS client_name,
                c.code AS client_code,
-               GREATEST(
-                 i.amount_outstanding - COALESCE(SUM(a.amount_allocated), 0),
-                 0
-               )::double precision AS balance,
+               GREATEST(i.amount_outstanding, 0)::double precision AS balance,
                COALESCE(i.due_date, i.invoice_date)::date AS due_date
           FROM invoices i
           JOIN clients c ON c.id = i.client_id
-          LEFT JOIN ar_receipt_allocations a
-            ON a.invoice_id = i.id AND a.company_id = i.company_id
          WHERE i.company_id = $1
            AND i.status IN ('sent', 'confirmed', 'partially_paid')
            ${clientClause}
@@ -251,7 +246,11 @@ class ARService {
 
     const dateFilter = {};
     if (startDate) dateFilter.$gte = new Date(startDate);
-    if (endDate) dateFilter.$lte = new Date(endDate);
+    if (endDate) {
+      const inclusiveEnd = new Date(endDate);
+      if (/^\d{4}-\d{2}-\d{2}$/.test(String(endDate))) inclusiveEnd.setHours(23, 59, 59, 999);
+      dateFilter.$lte = inclusiveEnd;
+    }
 
     const invoiceQuery = {
       client: clientId,
@@ -280,6 +279,20 @@ class ARService {
       : [];
 
     const ledgerEvents = [];
+    // New payments are represented by posted AR receipts and their allocations.
+    // Older invoices can still have embedded-only payment history, so suppress
+    // just the matching legacy entries rather than dropping historical activity.
+    const receiptPaymentsByInvoice = new Map();
+    for (const allocation of allocations) {
+      const invoiceId = String(allocation.invoice?._id || allocation.invoice?.id || allocation.invoice || '');
+      const receiptId = String(allocation.receipt?._id || allocation.receipt?.id || allocation.receipt || '');
+      const receipt = receipts.find((item) => String(item._id) === receiptId);
+      if (!invoiceId || !receipt || !['posted'].includes(receipt.status)) continue;
+      const amounts = receiptPaymentsByInvoice.get(invoiceId) || [];
+      amounts.push(money(allocation.amountAllocated));
+      receiptPaymentsByInvoice.set(invoiceId, amounts);
+    }
+    let legacyPaymentTotal = 0;
     for (const inv of invoices) {
       const total = invoiceTotal(inv);
       if (total <= 0 && inv.status === 'cancelled') continue;
@@ -298,7 +311,16 @@ class ARService {
       for (const payment of embeddedPayments) {
         const amount = money(payment.amount ?? payment.amountReceived ?? payment.total);
         if (amount <= 0) continue;
+        const representedAmounts = receiptPaymentsByInvoice.get(String(inv._id)) || [];
+        const representedIndex = representedAmounts.findIndex((value) => Math.abs(value - amount) < 0.01);
+        if (representedIndex >= 0) {
+          representedAmounts.splice(representedIndex, 1);
+          continue;
+        }
         const payDate = payment.date || payment.paymentDate || payment.paidAt || inv.paidDate || inv.invoiceDate;
+        const payDateValue = new Date(payDate || 0);
+        if ((startDate && payDateValue < new Date(startDate)) || (endDate && payDateValue > dateFilter.$lte)) continue;
+        legacyPaymentTotal += amount;
         ledgerEvents.push({
           sortDate: new Date(payDate || 0),
           date: payDate,
@@ -385,9 +407,9 @@ class ARService {
     }));
 
     const totalInvoiced = mappedInvoices.reduce((sum, inv) => sum + inv.total, 0);
-    const totalPaidFromInvoices = mappedInvoices.reduce((sum, inv) => sum + inv.paid, 0);
     const totalPaidFromReceipts = mappedReceipts.reduce((sum, rec) => sum + rec.amount, 0);
-    const totalPaid = totalPaidFromInvoices > 0 ? totalPaidFromInvoices : totalPaidFromReceipts;
+    const totalPaidFromInvoices = mappedInvoices.reduce((sum, inv) => sum + inv.paid, 0);
+    const totalPaid = totalPaidFromReceipts + (legacyPaymentTotal > 0 ? legacyPaymentTotal : (totalPaidFromReceipts > 0 ? 0 : totalPaidFromInvoices));
     const totalOutstanding = mappedInvoices.reduce((sum, inv) => sum + inv.balance, 0);
 
     return {

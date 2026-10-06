@@ -20,6 +20,7 @@ function normalizeId(value) {
 
 function sourceDocumentType(sourceType = "") {
   const source = String(sourceType || "").toLowerCase();
+  if (source.startsWith("ar_receipt")) return "ar_receipt";
   if (source.includes("invoice") || source === "ar_receipt" || source === "payment") return "invoice";
   if (source.includes("credit_note")) return "credit_note";
   if (source.includes("purchase_order")) return "purchase_order";
@@ -33,6 +34,7 @@ function sourceDocumentType(sourceType = "") {
 
 function transactionTypeFor(sourceType = "", movementType) {
   const source = String(sourceType || "").toLowerCase();
+  if (source.startsWith("ar_receipt")) return source.includes("reversal") ? "customer_payment_reversal" : movementType === "debit" ? "customer_payment" : "other";
   if (source.includes("opening")) return "opening";
   if (source.includes("bank_transfer")) return movementType === "debit" ? "bank_transfer_in" : "bank_transfer_out";
   if (source.includes("payroll")) return "payroll";
@@ -144,7 +146,11 @@ async function latestBalance(companyId, bankAccountId, session = null) {
   }).sort({ date: -1, createdAt: -1, _id: -1 });
   if (session) query = query.session(session);
   const tx = await query.lean();
-  return toNumber(tx?.balance ?? tx?.balanceAfter);
+  if (tx) return toNumber(tx.balance ?? tx.balanceAfter);
+  let accountQuery = BankAccount.findOne({ _id: bankAccountId, company: companyId }).select("cachedBalance cacheValid openingBalance");
+  if (session) accountQuery = accountQuery.session(session);
+  const account = await accountQuery.lean();
+  return toNumber(account?.cacheValid ? account.cachedBalance : account?.openingBalance ?? account?.cachedBalance);
 }
 
 async function createFromJournalLine(entry, line, bankAccount, context = {}) {

@@ -324,6 +324,13 @@ const CHART_OF_ACCOUNTS = {
     normalBalance: "credit",
     allowDirectPosting: true,
   },
+  2860: {
+    name: "Customer Deposits and Advances",
+    type: "liability",
+    subtype: "current",
+    normalBalance: "credit",
+    allowDirectPosting: true,
+  },
 
   // Long Term Liabilities
   2900: {
@@ -705,6 +712,7 @@ const DEFAULT_ACCOUNTS = {
   salesRevenue: "4000",
   salesReturns: "4100",
   accountsReceivable: "1300",
+  customerAdvances: "2860",
 
   // Purchases
   purchases: "5100",
