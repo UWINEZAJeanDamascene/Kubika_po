@@ -9,6 +9,8 @@ const Warehouse = require('../models/Warehouse');
 const StockMovement = require('../models/StockMovement');
 const StockLevel = require('../models/StockLevel');
 const InventoryBatch = require('../models/InventoryBatch');
+const StockBatch = require('../models/StockBatch');
+const StockSerialNumber = require('../models/StockSerialNumber');
 const { createLayer } = require('./inventoryService');
 const JournalService = require('./journalService');
 const EBMStockService = require('./ebmStockService');
@@ -90,7 +92,13 @@ async function createOpeningStock({
   movementDate = new Date(),
   notes,
   branchId = null,
-  referenceNumber = null
+  referenceNumber = null,
+  batchNumber = null,
+  lotNumber = null,
+  manufactureDate = null,
+  expiryDate = null,
+  serialNumbers = [],
+  requireTrackingIdentifiers = false
 }) {
   const qty = toNumber(quantity);
   const cost = toNumber(unitCost);
@@ -113,6 +121,13 @@ async function createOpeningStock({
     if (!product) throw badRequest('Product not found', 404);
     if (!warehouse) throw badRequest('Warehouse not found', 404);
 
+    const trackingType = String(product.trackingType || 'none').toLowerCase();
+    const normalizedSerials = (serialNumbers || []).map((serial) => String(serial).trim().toUpperCase()).filter(Boolean);
+    if (requireTrackingIdentifiers && trackingType === 'batch' && !batchNumber) throw badRequest('Batch number is required for batch-tracked opening stock.');
+    if (requireTrackingIdentifiers && trackingType === 'serial' && normalizedSerials.length !== qty) throw badRequest(`Exactly ${qty} serial numbers are required for this product.`);
+    if (trackingType === 'serial' && normalizedSerials.length && normalizedSerials.length !== qty) throw badRequest(`Exactly ${qty} serial numbers are required for this product.`);
+    if (trackingType === 'serial' && new Set(normalizedSerials).size !== normalizedSerials.length) throw badRequest('Serial numbers must be unique.');
+
     await ensureNoDuplicateOpening(companyId, productId, warehouseId, session);
     await ensureNoStockExists(companyId, productId, warehouseId, session);
 
@@ -132,6 +147,9 @@ async function createOpeningStock({
         newStock,
         unitCost: cost,
         totalCost,
+        batchNumber: batchNumber || null,
+        lotNumber: lotNumber || null,
+        expiryDate: expiryDate || null,
         referenceType: 'opening_stock',
         referenceNumber: referenceNumber || `OPEN-${Date.now()}`,
         notes: notes || 'Opening Stock',
@@ -176,12 +194,50 @@ async function createOpeningStock({
         unitCost: cost,
         totalCost,
         status: 'active',
+        batchNumber: batchNumber || null,
+        lotNumber: lotNumber || null,
+        expiryDate: expiryDate || null,
+        manufacturingDate: manufactureDate || null,
         stockMovement: movementDoc._id,
         receivedDate: movementDate,
         notes: notes || 'Opening Stock',
         createdBy: userId
       }
     ], opts);
+
+    let trackedBatch = null;
+    if (trackingType === 'batch' || batchNumber) {
+      trackedBatch = await StockBatch.create({
+        company: companyId,
+        product: productId,
+        warehouse: warehouseId,
+        batchNo: String(batchNumber || `OPEN-${movementDoc._id}`).trim().toUpperCase(),
+        qtyReceived: qty,
+        qtyOnHand: qty,
+        unitCost: cost,
+        manufactureDate: manufactureDate || null,
+        expiryDate: expiryDate || null,
+        notes: notes || 'Imported opening stock batch',
+      }, opts);
+    }
+    if (trackingType === 'serial') {
+      const existingSerials = await StockSerialNumber.find({
+        company: companyId,
+        product: productId,
+        serialNo: { $in: normalizedSerials },
+      }).select('serialNo').lean();
+      if (existingSerials.length) throw badRequest(`Serial number already exists for this product: ${existingSerials[0].serialNo}`, 409, 'DUPLICATE_SERIAL_NUMBER');
+      await StockSerialNumber.create(normalizedSerials.map((serialNo) => ({
+        company: companyId,
+        serialNo,
+        product: productId,
+        warehouse: warehouseId,
+        batch: trackedBatch?._id || null,
+        unitCost: cost,
+        status: 'in_stock',
+        notes: notes || 'Imported opening stock serial number',
+      })), opts);
+    }
 
     // Create inventory layer for costing (FIFO/avg consumers)
     await createLayer(
@@ -238,6 +294,110 @@ async function createOpeningStock({
   return movement;
 }
 
+async function ensureImportedTrackingRecords({
+  companyId,
+  userId,
+  productId,
+  warehouseId,
+  quantity,
+  unitCost,
+  batchNumber = null,
+  lotNumber = null,
+  manufactureDate = null,
+  expiryDate = null,
+  serialNumbers = [],
+}) {
+  const serials = (serialNumbers || []).map((serial) => String(serial).trim().toUpperCase()).filter(Boolean);
+  if (!batchNumber && !lotNumber && !manufactureDate && !expiryDate && !serials.length) return;
+
+  await runInTransaction(async (trx) => {
+    const session = trx || null;
+    const opts = session ? { session } : {};
+    const product = await Product.findOne({ _id: productId, company: companyId });
+    const warehouse = await Warehouse.findOne({ _id: warehouseId, company: companyId });
+    if (!product || !warehouse) throw badRequest('Product or warehouse not found while attaching imported tracking identifiers.', 404);
+    const trackingType = String(product.trackingType || 'none').toLowerCase();
+    const qty = toNumber(quantity);
+    let trackedBatch = null;
+
+    if (trackingType === 'batch' || batchNumber) {
+      const batchNo = String(batchNumber || `OPEN-${productId}-${warehouseId}`).trim().toUpperCase();
+      trackedBatch = await StockBatch.findOne({ company: companyId, product: productId, warehouse: warehouseId, batchNo });
+      if (!trackedBatch) {
+        trackedBatch = await StockBatch.create({
+          company: companyId,
+          product: productId,
+          warehouse: warehouseId,
+          batchNo,
+          qtyReceived: qty,
+          qtyOnHand: qty,
+          unitCost: toNumber(unitCost),
+          manufactureDate: manufactureDate || null,
+          expiryDate: expiryDate || null,
+          notes: 'Imported opening stock batch',
+        }, opts);
+      } else {
+        const batchUpdates = {};
+        if (manufactureDate) batchUpdates.manufactureDate = manufactureDate;
+        if (expiryDate) batchUpdates.expiryDate = expiryDate;
+        if (Object.keys(batchUpdates).length) {
+          await StockBatch.updateOne({ _id: trackedBatch._id, company: companyId }, { $set: batchUpdates }, opts);
+        }
+      }
+    }
+
+    if (serials.length) {
+      if (trackingType !== 'serial') throw badRequest('Serial identifiers require a serial-tracked product.');
+      const existing = await StockSerialNumber.find({ company: companyId, product: productId, serialNo: { $in: serials } }).select('serialNo').lean();
+      const existingSet = new Set(existing.map((row) => String(row.serialNo).toUpperCase()));
+      const missing = serials.filter((serial) => !existingSet.has(serial));
+      if (missing.length) {
+        await StockSerialNumber.create(missing.map((serialNo) => ({
+          company: companyId,
+          serialNo,
+          product: productId,
+          warehouse: warehouseId,
+          batch: trackedBatch?._id || null,
+          unitCost: toNumber(unitCost),
+          status: 'in_stock',
+          notes: 'Imported opening stock serial number',
+        })), opts);
+      }
+      if (trackedBatch) {
+        await StockSerialNumber.updateMany({
+          company: companyId,
+          product: productId,
+          serialNo: { $in: serials },
+          batch: null,
+        }, { $set: { batch: trackedBatch._id } }, opts);
+      }
+    }
+
+    // Backfill the InventoryBatch record made by an earlier import run so both
+    // the standard batch view and tracked-batch view retain the identifiers.
+    const existingOpening = await StockMovement.findOne({ company: companyId, product: productId, warehouse: warehouseId, reason: 'initial_stock' }).select('_id').lean();
+    if (existingOpening) {
+      const { dbClient } = require('../lib/prisma');
+      const inventoryBatch = await dbClient().inventoryBatch.findFirst({
+        where: { companyId: String(companyId), productId: String(productId), warehouseId: String(warehouseId), stockMovementId: String(existingOpening._id) },
+        select: { id: true },
+      });
+      if (inventoryBatch) {
+        await dbClient().inventoryBatch.update({
+          where: { id: inventoryBatch.id },
+          data: {
+            ...(batchNumber ? { batchNumber } : {}),
+            ...(lotNumber ? { lotNumber } : {}),
+            ...(manufactureDate ? { manufacturingDate: manufactureDate } : {}),
+            ...(expiryDate ? { expiryDate } : {}),
+          },
+        });
+      }
+    }
+  });
+}
+
 module.exports = {
-  createOpeningStock
+  createOpeningStock,
+  ensureImportedTrackingRecords,
 };

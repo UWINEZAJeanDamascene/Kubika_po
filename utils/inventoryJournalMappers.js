@@ -637,8 +637,11 @@ const STOCK_BATCH_INPUT = {
 };
 
 async function stockBatchTranslateCreate(data) {
+  const base = tenantCreateBase(data);
+  // StockBatch has no created_by column in the Prisma schema.
+  delete base.createdById;
   return {
-    ...tenantCreateBase(data),
+    ...base,
     ...pickMapped(data, STOCK_BATCH_INPUT, { idFields: ['productId', 'warehouseId', 'grnId'] }),
   };
 }
@@ -683,8 +686,11 @@ const STOCK_SERIAL_INPUT = {
 };
 
 async function stockSerialNumberTranslateCreate(data) {
+  const base = tenantCreateBase(data);
+  // StockSerialNumber has no created_by column in the Prisma schema.
+  delete base.createdById;
   return {
-    ...tenantCreateBase(data),
+    ...base,
     ...pickMapped(data, STOCK_SERIAL_INPUT, {
       idFields: ['productId', 'warehouseId', 'grnId', 'batchId'],
     }),

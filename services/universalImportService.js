@@ -259,6 +259,11 @@ function parseNumber(value) {
   return Number(normalized);
 }
 
+function parseImportedSerialNumbers(value) {
+  if (isBlank(value)) return [];
+  return String(value).split(/[;,|\r\n]+/).map((serial) => serial.trim().toUpperCase()).filter(Boolean);
+}
+
 function generateImportedMasterCode(prefix) {
   const timePart = Date.now().toString(36).toUpperCase();
   const randomPart = crypto.randomBytes(5).toString('hex').toUpperCase();
@@ -565,11 +570,11 @@ function validateCleanRow(entityType, clean, rowNumber) {
   if (!isBlank(clean.phone) && !/^(\+250|250|0)?7[2389]\d{7}$/.test(String(clean.phone).replace(/\s+/g, ''))) {
     errors.push(buildValidationError(rowNumber, 'phone', `Phone must be a valid Rwandan number - found '${clean.phone}'.`, clean.phone));
   }
-  for (const key of ['hireDate', 'terminationDate', 'dateOfBirth', 'salaryEffectiveDate', 'purchaseDate', 'inServiceDate', 'warrantyStartDate', 'warrantyEndDate', 'asOfDate', 'dueDate', 'periodStart', 'periodEnd']) {
-    if (!isBlank(clean[key]) && !parseDateValue(clean[key])) {
-      errors.push(buildValidationError(rowNumber, key, `${key} must be a valid date - found '${clean[key]}'.`, clean[key]));
+    for (const key of ['hireDate', 'terminationDate', 'dateOfBirth', 'salaryEffectiveDate', 'purchaseDate', 'inServiceDate', 'warrantyStartDate', 'warrantyEndDate', 'manufactureDate', 'expiryDate', 'asOfDate', 'dueDate', 'periodStart', 'periodEnd']) {
+      if (!isBlank(clean[key]) && !parseDateValue(clean[key])) {
+        errors.push(buildValidationError(rowNumber, key, `${key} must be a valid date - found '${clean[key]}'.`, clean[key]));
+      }
     }
-  }
   if (!isBlank(clean.accountType) && !['asset', 'liability', 'equity', 'revenue', 'expense', 'cogs'].includes(String(clean.accountType).toLowerCase())) {
     errors.push(buildValidationError(rowNumber, 'accountType', `Account type must be Asset, Liability, Equity, Revenue, or Expense - found '${clean.accountType}'.`, clean.accountType));
   }
@@ -650,6 +655,31 @@ function validateCleanRow(entityType, clean, rowNumber) {
     if (!isBlank(clean.isStockable) && !['true', 'false', 'yes', 'no', '1', '0'].includes(String(clean.isStockable).toLowerCase())) {
       errors.push(buildValidationError(rowNumber, 'isStockable', 'Stockable must be TRUE or FALSE.', clean.isStockable));
     }
+    const trackingType = String(clean.trackingType || 'none').trim().toLowerCase();
+    const serialNumbers = parseImportedSerialNumbers(clean.serialNumbers);
+    const manufactureDate = parseDateValue(clean.manufactureDate);
+    const expiryDate = parseDateValue(clean.expiryDate);
+    if (manufactureDate && expiryDate && expiryDate < manufactureDate) {
+      errors.push(buildValidationError(rowNumber, 'expiryDate', 'Expiry Date cannot be earlier than Manufacture Date.', clean.expiryDate));
+    }
+    if (openingQuantity > 0 && trackingType === 'batch' && isBlank(clean.batchNumber)) {
+      errors.push(buildValidationError(rowNumber, 'batchNumber', 'Batch Number is required for opening stock on a batch-tracked product.', clean.batchNumber));
+    }
+    if (openingQuantity <= 0 && (!isBlank(clean.batchNumber) || !isBlank(clean.lotNumber) || !isBlank(clean.manufactureDate) || !isBlank(clean.expiryDate))) {
+      errors.push(buildValidationError(rowNumber, 'openingStockQuantity', 'Batch and lot identifiers require a positive Opening Stock Quantity.', clean.openingStockQuantity));
+    }
+    if (trackingType === 'serial' && openingQuantity > 0) {
+      if (!Number.isInteger(openingQuantity)) errors.push(buildValidationError(rowNumber, 'openingStockQuantity', 'Serial-tracked opening stock quantity must be a whole number.', clean.openingStockQuantity));
+      if (serialNumbers.length !== openingQuantity) errors.push(buildValidationError(rowNumber, 'serialNumbers', `Enter exactly ${openingQuantity} unique serial numbers for this product.`, clean.serialNumbers));
+    } else if (serialNumbers.length) {
+      errors.push(buildValidationError(rowNumber, 'serialNumbers', 'Serial numbers can only be imported for serial-tracked products with opening stock.', clean.serialNumbers));
+    }
+    if (new Set(serialNumbers).size !== serialNumbers.length) {
+      errors.push(buildValidationError(rowNumber, 'serialNumbers', 'Serial numbers in this row must be unique.', clean.serialNumbers));
+    }
+    if (trackingType !== 'batch' && trackingType !== 'serial' && (!isBlank(clean.batchNumber) || !isBlank(clean.lotNumber) || !isBlank(clean.manufactureDate) || !isBlank(clean.expiryDate))) {
+      errors.push(buildValidationError(rowNumber, 'trackingType', 'Set Tracking Type to batch or serial to import batch or lot identifiers.', clean.trackingType));
+    }
     if (!isBlank(clean.barcode) && !isBlank(clean.barcodeType)) {
       const barcode = String(clean.barcode).trim();
       const type = String(clean.barcodeType).toUpperCase();
@@ -674,6 +704,35 @@ async function validateRelatedRecords(entityType, clean, companyId, cache) {
     return cache.get(key);
   };
   const byName = (name) => new RegExp(`^${escapeRegExp(String(name).trim())}$`, 'i');
+  if (entityType === 'products' && String(clean.trackingType || '').toLowerCase() === 'serial') {
+    const serials = parseImportedSerialNumbers(clean.serialNumbers);
+    if (serials.length) {
+      const product = await lookup('../models/Product', 'sku', clean.sku, {
+        company: companyId,
+        sku: String(clean.sku || '').trim().toUpperCase(),
+      });
+      const seen = cache.get('product-import-serials') || new Set();
+      cache.set('product-import-serials', seen);
+      for (const serial of serials) {
+        const key = `${String(clean.sku || '').trim().toUpperCase()}:${serial}`;
+        if (seen.has(key)) errors.push({ field: 'serialNumbers', message: `Serial number ${serial} appears more than once for product ${clean.sku}.` });
+        seen.add(key);
+      }
+      if (product) {
+        const StockSerialNumber = require('../models/StockSerialNumber');
+        const existingSerials = await StockSerialNumber.find({ company: companyId, product: product._id, serialNo: { $in: serials } }).select('serialNo').lean();
+        const existingSet = new Set(existingSerials.map((row) => String(row.serialNo).toUpperCase()));
+        const absentSerials = serials.filter((serial) => !existingSet.has(serial));
+        const cacheKey = `product-import-existing-serials:${String(product._id)}`;
+        const cachedExisting = cache.get(cacheKey) || new Set();
+        for (const serial of absentSerials) {
+          if (cachedExisting.has(serial)) errors.push({ field: 'serialNumbers', message: `Serial number ${serial} is already assigned to this product by another row in this import.` });
+          cachedExisting.add(serial);
+        }
+        cache.set(cacheKey, cachedExisting);
+      }
+    }
+  }
   if (entityType === 'employees') {
     if (clean.department || clean.departmentCode) {
       try {
@@ -914,7 +973,22 @@ async function captureProductOpeningStock(companyId, userId, productId, data) {
     warehouse: warehouse._id,
     reason: 'initial_stock',
   }).select('_id').lean();
-  if (existingOpening) return 'already_captured';
+  if (existingOpening) {
+    await OpeningStockService.ensureImportedTrackingRecords({
+      companyId,
+      userId,
+      productId,
+      warehouseId: warehouse._id,
+      quantity,
+      unitCost: parseNumber(data.costPrice) || 0,
+      batchNumber: data.batchNumber,
+      lotNumber: data.lotNumber,
+      manufactureDate: parseDateValue(data.manufactureDate),
+      expiryDate: parseDateValue(data.expiryDate),
+      serialNumbers: parseImportedSerialNumbers(data.serialNumbers),
+    });
+    return 'already_captured';
+  }
 
   await OpeningStockService.createOpeningStock({
     companyId,
@@ -923,6 +997,12 @@ async function captureProductOpeningStock(companyId, userId, productId, data) {
     warehouseId: warehouse._id,
     quantity,
     unitCost: parseNumber(data.costPrice) || 0,
+    batchNumber: data.batchNumber,
+    lotNumber: data.lotNumber,
+    manufactureDate: parseDateValue(data.manufactureDate),
+    expiryDate: parseDateValue(data.expiryDate),
+    serialNumbers: parseImportedSerialNumbers(data.serialNumbers),
+    requireTrackingIdentifiers: true,
     notes: 'Opening stock included with product import'
   });
   return 'captured';
@@ -1269,6 +1349,16 @@ async function upsertRow(entityType, companyId, userId, data, duplicateAction, c
     if (existing && duplicateAction === 'skip') {
       if (warehouseId && String(existing.defaultWarehouse || '') !== String(warehouseId)) {
         await Product.updateOne({ _id: existing._id, company: companyId }, { $set: { defaultWarehouse: warehouseId } });
+      }
+      if (['batch', 'serial'].includes(String(data.trackingType || '').toLowerCase())
+        && (data.batchNumber || parseImportedSerialNumbers(data.serialNumbers).length)) {
+        await Product.updateOne({ _id: existing._id, company: companyId }, {
+          $set: {
+            trackingType: String(data.trackingType).toLowerCase(),
+            trackBatch: String(data.trackingType).toLowerCase() === 'batch',
+            trackSerialNumbers: String(data.trackingType).toLowerCase() === 'serial',
+          },
+        });
       }
       const stockStatus = await captureProductOpeningStock(companyId, userId, existing._id, data);
       await linkImportedProductToSupplier(companyId, existing._id, payload.supplier, data);
