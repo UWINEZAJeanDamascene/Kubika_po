@@ -616,6 +616,7 @@ function stockBatchToApi(row) {
     grn: row.grnId ?? null,
     qtyReceived: decimalToNumber(row.qtyReceived, 0),
     qtyOnHand: decimalToNumber(row.qtyOnHand, 0),
+    reservedQuantity: decimalToNumber(row.reservedQuantity, 0),
     unitCost: decimalToNumber(row.unitCost, 0),
     manufactureDate: row.manufactureDate ?? null,
     expiryDate: row.expiryDate ?? null,

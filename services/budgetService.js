@@ -109,9 +109,6 @@ class BudgetService {
       .select('role roles department');
 
     if (!user) return false;
-    if (user.role === 'platform_admin' || user.role === 'admin' || user.role === 'company_admin') {
-      return true;
-    }
 
     const roleNames = new Set();
     if (user.role) roleNames.add(user.role);
@@ -144,7 +141,7 @@ class BudgetService {
     if (approverType === 'department_head') {
       if (normalizedRoleNames.has('department_head')) {
         const budget = await Budget.findOne({ _id: approval.budget_id, company_id: companyId }).select('department');
-        if (!budget?.department || !user.department) return true;
+        if (!budget?.department || !user.department) return false;
         return budget.department.toString() === user.department.toString();
       }
       return false;
@@ -268,6 +265,53 @@ class BudgetService {
     return getBudgetActualMap(companyId, accountIds, periodStart, periodEnd);
   }
 
+  static async calculateLineActualTotal({ companyId, budgetId, lines, periodStart, periodEnd }) {
+    const startDate = new Date(periodStart);
+    const endDate = new Date(periodEnd);
+    if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime()) || startDate > endDate) return 0;
+    if (endDate.getUTCHours() === 0 && endDate.getUTCMinutes() === 0 && endDate.getUTCSeconds() === 0 && endDate.getUTCMilliseconds() === 0) {
+      endDate.setUTCHours(23, 59, 59, 999);
+    }
+    const candidates = (lines || []).filter(line => {
+      const monthStart = new Date(Date.UTC(Number(line.period_year), Number(line.period_month) - 1, 1));
+      const monthEnd = new Date(Date.UTC(Number(line.period_year), Number(line.period_month), 0, 23, 59, 59, 999));
+      return monthStart <= endDate && monthEnd >= startDate;
+    });
+    if (!candidates.length) return 0;
+
+    const projectLines = candidates.filter(line => line.project_id);
+    const projectConsumptions = projectLines.length
+      ? await BudgetActualConsumption.find({
+          company_id: companyId,
+          budget_id: budgetId,
+          budget_line_id: { $in: projectLines.map(line => String(line._id)) },
+          document_date: { $gte: startDate, $lte: endDate },
+        }).lean()
+      : [];
+    let total = (projectConsumptions || []).reduce((sum, row) => sum + Number(row.amount || 0), 0);
+
+    const companyLinesByPeriod = new Map();
+    for (const line of candidates.filter(item => !item.project_id)) {
+      const key = `${line.period_year}-${line.period_month}`;
+      if (!companyLinesByPeriod.has(key)) companyLinesByPeriod.set(key, []);
+      companyLinesByPeriod.get(key).push(line);
+    }
+    const periodTotals = await Promise.all([...companyLinesByPeriod.entries()].map(async ([key, periodLines]) => {
+      const [year, month] = key.split('-').map(Number);
+      const monthStart = new Date(Date.UTC(year, month - 1, 1));
+      const monthEnd = new Date(Date.UTC(year, month, 0, 23, 59, 59, 999));
+      const actuals = await this.calculateBudgetActualByAccount({
+        companyId,
+        accountIds: [...new Set(periodLines.map(line => String(line.account_id)))],
+        periodStart: monthStart > startDate ? monthStart : startDate,
+        periodEnd: monthEnd < endDate ? monthEnd : endDate,
+      });
+      return periodLines.reduce((sum, line) => sum + Number(actuals[String(line.account_id)] || 0), 0);
+    }));
+    total += periodTotals.reduce((sum, amount) => sum + amount, 0);
+    return total;
+  }
+
   // ── CREATE ───────────────────────────────────────────────────────────
   static async create(companyId, data, userId) {
     const budgetData = {
@@ -362,11 +406,10 @@ class BudgetService {
       // Get actual spending from journal entries
       const periodStart = budget.periodStart || new Date(budget.fiscal_year, 0, 1);
       const periodEnd = budget.periodEnd || new Date(budget.fiscal_year, 11, 31, 23, 59, 59);
-      const accountIds = [...new Set(lines.map(l => l.account_id?.toString()).filter(Boolean))];
-
-      const totalActual = await BudgetService.calculateBudgetActualTotals({
+      const totalActual = await BudgetService.calculateLineActualTotal({
         companyId,
-        accountIds,
+        budgetId: budget._id,
+        lines,
         periodStart,
         periodEnd,
       });
@@ -436,10 +479,14 @@ class BudgetService {
       throw new Error('NOT_FOUND');
     }
 
+    if (currentBudget.status !== 'draft') {
+      throw new Error('BUDGET_NOT_DRAFT');
+    }
+
     // Only allow updating safe fields
     const allowed = ['name', 'code', 'description', 'purpose', 'tags', 'type', 'department',
       'owner_id', 'entity_id', 'parent_budget_id', 'notes', 'amount', 'periodStart', 'periodEnd', 'periodType',
-      'status', 'budget_cycle', 'base_currency', 'exchange_rate_type', 'exchange_rate',
+      'budget_cycle', 'base_currency', 'exchange_rate_type', 'exchange_rate',
       'allow_multi_currency', 'allocation_method'];
     const updateData = {};
     const changedFields = [];
@@ -539,12 +586,18 @@ class BudgetService {
       throw new Error('NOT_FOUND');
     }
 
-    if (budget.status === 'locked' || budget.status === 'closed') {
-      throw new Error('BUDGET_LOCKED');
+    if (budget.status !== 'draft') {
+      throw new Error(budget.status === 'locked' || budget.status === 'closed' ? 'BUDGET_LOCKED' : 'BUDGET_NOT_DRAFT');
     }
 
-    if (budget.status === 'view_only') {
-      throw new Error('BUDGET_VIEW_ONLY');
+    for (const [index, line] of lines.entries()) {
+      const month = Number(line.period_month);
+      const year = Number(line.period_year);
+      const amount = Number(line.budgeted_amount);
+      if (!Number.isInteger(month) || month < 1 || month > 12 || !Number.isInteger(year) || year < 1900 || year > 9999) {
+        throw new Error(`INVALID_BUDGET_LINE_PERIOD:${index + 1}`);
+      }
+      if (!Number.isFinite(amount) || amount < 0) throw new Error(`INVALID_BUDGET_LINE_AMOUNT:${index + 1}`);
     }
 
     const affectedProjectIds = new Set();
@@ -687,68 +740,13 @@ class BudgetService {
     });
 
     if (approval) {
-      // Process workflow approval step
       if (budget.status !== 'pending_approval') {
         throw new Error('BUDGET_NOT_PENDING_APPROVAL');
       }
-
-      const currentStep = approval.steps[approval.current_step - 1];
-      if (!currentStep) {
-        throw new Error('NO_APPROVAL_STEP');
-      }
-
-      // Record the approval action
-      approval.actions.push({
-        step_number: approval.current_step,
-        action: 'approved',
-        action_by: userId,
-        action_at: new Date(),
-        comments: ''
-      });
-
-      // Check if this is the final step
-      if (approval.current_step >= approval.total_steps) {
-        // Final approval - approve the budget
-        approval.status = 'approved';
-        approval.final_approved_by = userId;
-        await approval.save();
-
-        // Update budget to approved
-        const approvedBudget = await Budget.findByIdAndUpdate(budgetId, {
-          status: 'approved',
-          approved_by: userId,
-          approved_at: new Date()
-        }, { new: true });
-        await BudgetService.syncProjectTotalsForBudget(companyId, budgetId);
-        return approvedBudget;
-      } else {
-        // Move to next step
-        approval.current_step += 1;
-        approval.status = 'in_progress';
-        await approval.save();
-
-        return {
-          workflow: true,
-          step_approved: true,
-          current_step: approval.current_step,
-          total_steps: approval.total_steps,
-          budget: await Budget.findById(budgetId)
-        };
-      }
+      return this.approveStep(companyId, approval._id, userId);
     }
 
-    // Direct approval (no workflow) - only from draft
-    if (budget.status !== 'draft') {
-      throw new Error('BUDGET_NOT_DRAFT');
-    }
-
-    const approvedBudget = await Budget.findByIdAndUpdate(budgetId, {
-      status: 'approved',
-      approved_by: userId,
-      approved_at: new Date()
-    }, { new: true });
-    await BudgetService.syncProjectTotalsForBudget(companyId, budgetId);
-    return approvedBudget;
+    throw new Error(budget.status === 'draft' ? 'APPROVAL_REQUIRED' : 'BUDGET_NOT_PENDING_APPROVAL');
   }
 
   // ── REJECT ───────────────────────────────────────────────────────────
@@ -1339,11 +1337,10 @@ class BudgetService {
       const periodStart = budget.periodStart || new Date(budget.fiscal_year, 0, 1);
       const periodEnd = budget.periodEnd || new Date(budget.fiscal_year, 11, 31, 23, 59, 59);
 
-      const accountIds = [...new Set(lines.map(l => l.account_id.toString()))];
-
-      const actualAmount = await BudgetService.calculateBudgetActualTotals({
+      const actualAmount = await BudgetService.calculateLineActualTotal({
         companyId,
-        accountIds,
+        budgetId: budget._id,
+        lines,
         periodStart,
         periodEnd,
       });
@@ -1426,11 +1423,10 @@ class BudgetService {
         ? new Date(filters.periodEnd)
         : (budget.periodEnd || new Date(budget.fiscal_year, 11, 31, 23, 59, 59));
 
-      const accountIds = [...new Set(lines.map(l => l.account_id.toString()))];
-
-      const actualAmount = await BudgetService.calculateBudgetActualTotals({
+      const actualAmount = await BudgetService.calculateLineActualTotal({
         companyId,
-        accountIds,
+        budgetId: budget._id,
+        lines,
         periodStart,
         periodEnd,
       });
@@ -1488,11 +1484,17 @@ class BudgetService {
 
     const startDate = new Date(periodStart);
     const endDate = new Date(periodEnd);
+    if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime()) || startDate > endDate) {
+      throw new Error('INVALID_PERIOD_RANGE');
+    }
+    // Treat date-only report boundaries as inclusive UTC calendar dates.
+    if (typeof periodStart === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(periodStart)) startDate.setUTCHours(0, 0, 0, 0);
+    if (typeof periodEnd === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(periodEnd)) endDate.setUTCHours(23, 59, 59, 999);
     const startYear = startDate.getFullYear();
     const endYear = endDate.getFullYear();
 
     // Get all budget lines for this budget scoped to company
-    const budgetLines = await BudgetLine.find({
+    const candidateLines = await BudgetLine.find({
       company_id: companyId,
       budget_id: budgetId,
       period_year: {
@@ -1500,6 +1502,11 @@ class BudgetService {
         $lte: endYear
       }
     }).lean();
+    const budgetLines = candidateLines.filter((line) => {
+      const monthStart = new Date(Date.UTC(Number(line.period_year), Number(line.period_month) - 1, 1));
+      const monthEnd = new Date(Date.UTC(Number(line.period_year), Number(line.period_month), 0, 23, 59, 59, 999));
+      return monthStart <= endDate && monthEnd >= startDate;
+    });
 
     if (!budgetLines.length) {
       return {
@@ -1512,20 +1519,8 @@ class BudgetService {
       };
     }
 
-    // Get unique account IDs from budget lines
+    // Resolve account labels and project dimensions for transparent reporting.
     const accountIds = [...new Set(budgetLines.map(l => l.account_id.toString()))];
-
-    // Get actual totals from journal for each account in period
-    // scoped to this company only
-    const actualMap = await BudgetService.calculateBudgetActualByAccount({
-      companyId,
-      accountIds,
-      periodStart: startDate,
-      periodEnd: endDate,
-    });
-
-    // Build lookup map for actuals
-    const actualLookup = actualMap;
 
     // Get account codes for reference
     const accountCodes = await ChartOfAccount.find({
@@ -1537,10 +1532,58 @@ class BudgetService {
       accountMap[acc._id.toString()] = acc;
     }
 
+    const projectIds = [...new Set(budgetLines.map(line => line.project_id?.toString()).filter(Boolean))];
+    const projects = projectIds.length
+      ? await Project.find({ _id: { $in: projectIds }, company_id: companyId }).select('_id name project_code wbs_code')
+      : [];
+    const projectMap = Object.fromEntries((projects || []).map(project => [String(project._id), project]));
+
+    // Project expenses use their explicit budget-line consumption ledger so
+    // costs from another project using the same GL account are not attributed here.
+    const projectLineIds = budgetLines.filter(line => line.project_id).map(line => String(line._id));
+    const consumptionRows = projectLineIds.length
+      ? await BudgetActualConsumption.find({
+          company_id: companyId,
+          budget_id: budgetId,
+          budget_line_id: { $in: projectLineIds },
+          document_date: { $gte: startDate, $lte: endDate },
+        }).lean()
+      : [];
+    const consumptionByLine = new Map();
+    for (const consumption of consumptionRows || []) {
+      const key = String(consumption.budget_line_id);
+      consumptionByLine.set(key, (consumptionByLine.get(key) || 0) + Number(consumption.amount || 0));
+    }
+
+    // Company/dept lines have no project dimension on journal lines. Match each
+    // monthly budget line to only its overlapping calendar slice to avoid repeating
+    // an annual total against every month.
+    const actualByLine = new Map();
+    const accountLinesByPeriod = new Map();
+    for (const line of budgetLines.filter(item => !item.project_id)) {
+      const periodKey = `${line.period_year}-${line.period_month}`;
+      if (!accountLinesByPeriod.has(periodKey)) accountLinesByPeriod.set(periodKey, []);
+      accountLinesByPeriod.get(periodKey).push(line);
+    }
+    await Promise.all([...accountLinesByPeriod.entries()].map(async ([periodKey, lines]) => {
+      const [year, month] = periodKey.split('-').map(Number);
+      const monthStart = new Date(Date.UTC(year, month - 1, 1));
+      const monthEnd = new Date(Date.UTC(year, month, 0, 23, 59, 59, 999));
+      const actuals = await BudgetService.calculateBudgetActualByAccount({
+        companyId,
+        accountIds: [...new Set(lines.map(line => String(line.account_id)))],
+        periodStart: monthStart > startDate ? monthStart : startDate,
+        periodEnd: monthEnd < endDate ? monthEnd : endDate,
+      });
+      for (const line of lines) actualByLine.set(String(line._id), Number(actuals[String(line.account_id)] || 0));
+    }));
+
     // Merge budget lines with actuals
     const lines = budgetLines.map(budgetLine => {
       const account = accountMap[budgetLine.account_id.toString()];
-      const actualAmount = Number(actualLookup[budgetLine.account_id.toString()] || 0);
+      const actualAmount = budgetLine.project_id
+        ? Number(consumptionByLine.get(String(budgetLine._id)) || 0)
+        : Number(actualByLine.get(String(budgetLine._id)) || 0);
 
       const budgetedAmount = Number(budgetLine.budgeted_amount.toString());
       const variance = budgetedAmount - actualAmount;
@@ -1555,6 +1598,9 @@ class BudgetService {
         account_id: budgetLine.account_id,
         account_code: account?.code || '',
         account_name: account?.name || '',
+        project_id: budgetLine.project_id || null,
+        project: budgetLine.project_id ? projectMap[String(budgetLine.project_id)] || null : null,
+        wbs_code: budgetLine.wbs_code || null,
         period_month: budgetLine.period_month,
         period_year: budgetLine.period_year,
         budgeted_amount: budgetedAmount,
@@ -2140,6 +2186,10 @@ class BudgetService {
       throw new Error('BUDGET_NOT_FOUND');
     }
 
+    if (budget.status !== 'draft') {
+      throw new Error('BUDGET_NOT_DRAFT');
+    }
+
     // Check if already has pending approval
     const existingApproval = await BudgetApproval.findOne({
       company_id: companyId,
@@ -2153,6 +2203,9 @@ class BudgetService {
 
     // Calculate total budget amount
     const budgetLines = await BudgetLine.find({ company_id: companyId, budget_id: budget_id });
+    if (!budgetLines.length) {
+      throw new Error('BUDGET_LINES_REQUIRED');
+    }
     const totalAmount = budgetLines.reduce((sum, line) => {
       return sum + (line.budgeted_amount ? parseFloat(line.budgeted_amount.toString()) : 0);
     }, 0);
@@ -2215,6 +2268,25 @@ class BudgetService {
       ];
     }
 
+    if (!budget.department) {
+      steps = steps.map(step => step.approver_type === 'department_head'
+        ? { ...step, approver_type: 'any_manager' }
+        : step);
+    }
+
+    if (!Array.isArray(steps) || steps.length === 0) throw new Error('APPROVAL_STEPS_REQUIRED');
+    const validApproverTypes = new Set(['user', 'specific_user', 'role', 'any_manager', 'department_head']);
+    steps = steps.map((step, index) => {
+      const approverType = String(step.approver_type || '').toLowerCase();
+      const requiredApprovals = Number(step.required_approvals ?? 1);
+      if (!step.step_name || !validApproverTypes.has(approverType)) throw new Error('INVALID_APPROVAL_STEP');
+      if (!Number.isInteger(requiredApprovals) || requiredApprovals < 1) throw new Error('INVALID_REQUIRED_APPROVALS');
+      if (['user', 'specific_user'].includes(approverType) && requiredApprovals > 1) throw new Error('INVALID_REQUIRED_APPROVALS');
+      if (['user', 'specific_user'].includes(approverType) && !step.approver_id) throw new Error('APPROVER_USER_REQUIRED');
+      if (approverType === 'role' && !step.approver_role) throw new Error('APPROVER_ROLE_REQUIRED');
+      return { ...step, step_number: index + 1, approver_type: approverType, required_approvals: requiredApprovals };
+    });
+
     // Create approval record
     const approval = new BudgetApproval({
       company_id: companyId,
@@ -2274,12 +2346,18 @@ class BudgetService {
       throw new Error('CANNOT_RESUBMIT');
     }
 
+    if (String(approval.requested_by) !== String(userId)) {
+      throw new Error('ONLY_REQUESTER_CAN_RESUBMIT');
+    }
+    const budget = await Budget.findOne({ _id: approval.budget_id, company_id: companyId });
+    if (!budget || budget.status !== 'draft') throw new Error('BUDGET_NOT_DRAFT');
+
     // Update approval status back to pending
     approval.status = 'pending';
     approval.current_step = 1;
     approval.actions.push({
       step_number: 1,
-      action: 'approved', // Resubmission is treated as a new submission
+      action: 'resubmitted',
       action_by: userId,
       action_at: new Date(),
       comments: comments || 'Resubmitted for approval'
@@ -2337,6 +2415,10 @@ class BudgetService {
       throw new Error('APPROVAL_NOT_ACTIVE');
     }
 
+    if (String(approval.requested_by) === String(userId)) {
+      throw new Error('BUDGET_SELF_APPROVAL_NOT_ALLOWED');
+    }
+
     const currentStep = approval.steps[approval.current_step - 1];
     if (!currentStep) {
       throw new Error('APPROVAL_STEP_NOT_FOUND');
@@ -2356,7 +2438,7 @@ class BudgetService {
     const alreadyApproved = approval.actions.some(
       a => a.step_number === approval.current_step &&
            a.action === 'approved' &&
-           a.action_by.toString() === userId
+           String(a.action_by) === String(userId)
     );
     if (alreadyApproved) {
       throw new Error('ALREADY_APPROVED');
@@ -2371,6 +2453,31 @@ class BudgetService {
       comments: comments
     });
 
+    const latestResubmissionIndex = approval.actions.reduce((found, action, index) =>
+      action.action === 'resubmitted' ? index : found, -1);
+    const stepApprovals = approval.actions.filter((action, index) => index > latestResubmissionIndex &&
+      action.step_number === approval.current_step && action.action === 'approved'
+    );
+    const distinctApprovers = new Set(stepApprovals.map(action => String(action.action_by)));
+    const requiredApprovals = Math.max(1, Number(currentStep.required_approvals || 1));
+    if (distinctApprovers.size < requiredApprovals) {
+      await approval.save();
+      await Budget.findByIdAndUpdate(approval.budget_id, {
+        current_approval_step: approval.current_step,
+        total_approval_steps: approval.total_steps,
+      });
+      return {
+        workflow: true,
+        step_approved: true,
+        step_complete: false,
+        approvals_received: distinctApprovers.size,
+        approvals_required: requiredApprovals,
+        current_step: approval.current_step,
+        total_steps: approval.total_steps,
+        approval,
+      };
+    }
+
     // Check if this is the final step
     if (approval.current_step >= approval.total_steps) {
       approval.status = 'approved';
@@ -2381,13 +2488,19 @@ class BudgetService {
       await Budget.findByIdAndUpdate(approval.budget_id, {
         status: 'approved',
         approved_by: userId,
-        approved_at: new Date()
+        approved_at: new Date(),
+        current_approval_step: approval.current_step,
+        total_approval_steps: approval.total_steps,
       });
       await BudgetService.syncProjectTotalsForBudget(companyId, approval.budget_id);
     } else {
       approval.current_step += 1;
       approval.status = 'in_progress';
       await approval.save();
+      await Budget.findByIdAndUpdate(approval.budget_id, {
+        current_approval_step: approval.current_step,
+        total_approval_steps: approval.total_steps,
+      });
     }
 
     return approval;
@@ -2406,6 +2519,8 @@ class BudgetService {
     if (!['pending', 'in_progress'].includes(approval.status)) {
       throw new Error('APPROVAL_NOT_ACTIVE');
     }
+
+    await this.assertWorkflowStepActionAllowed(companyId, approval, userId, 'can_reject');
 
     // Record the rejection action
     approval.actions.push({
@@ -2430,6 +2545,40 @@ class BudgetService {
     return approval;
   }
 
+  static async assertWorkflowStepActionAllowed(companyId, approval, userId, capability) {
+    if (String(approval.requested_by) === String(userId)) {
+      throw new Error('BUDGET_SELF_APPROVAL_NOT_ALLOWED');
+    }
+    const step = approval.steps[approval.current_step - 1];
+    if (!step) throw new Error('APPROVAL_STEP_NOT_FOUND');
+    if (step[capability] === false) throw new Error('APPROVAL_ACTION_NOT_ALLOWED');
+    const allowed = await this.canUserApproveWorkflowStep(companyId, approval, step, userId);
+    if (!allowed) throw new Error('APPROVER_NOT_AUTHORIZED');
+    return step;
+  }
+
+  static async requestChanges(companyId, approvalId, userId, changesRequired) {
+    const approval = await BudgetApproval.findOne({ _id: approvalId, company_id: companyId });
+    if (!approval) throw new Error('APPROVAL_NOT_FOUND');
+    if (!['pending', 'in_progress'].includes(approval.status)) throw new Error('APPROVAL_NOT_ACTIVE');
+    await this.assertWorkflowStepActionAllowed(companyId, approval, userId, 'can_request_changes');
+    approval.actions.push({
+      step_number: approval.current_step,
+      action: 'requested_changes',
+      action_by: userId,
+      action_at: new Date(),
+      comments: changesRequired,
+    });
+    approval.status = 'changes_requested';
+    await approval.save();
+    await Budget.findByIdAndUpdate(approval.budget_id, {
+      status: 'draft',
+      rejectionReason: changesRequired,
+      updated_at: new Date(),
+    });
+    return approval;
+  }
+
   // ── BUDGET TRANSFERS ─────────────────────────────────────────────────
   static async createTransfer(companyId, budgetId, data, userId) {
     const { from_line_id, to_line_id, amount, transfer_date, reason, notes } = data;
@@ -2449,6 +2598,9 @@ class BudgetService {
       throw new Error('TRANSFER_INVALID_DATA');
     }
 
+    const transferAmount = Number(amount);
+    if (!Number.isFinite(transferAmount) || transferAmount <= 0) throw new Error('TRANSFER_INVALID_DATA');
+
     if (from_line_id === to_line_id) {
       throw new Error('TRANSFER_SAME_LINE');
     }
@@ -2461,6 +2613,37 @@ class BudgetService {
 
     if (!fromLine || !toLine) {
       throw new Error('NOT_FOUND');
+    }
+
+    const pendingFromLine = await BudgetTransfer.find({
+      company_id: companyId,
+      budget_id: budgetId,
+      from_line_id: from_line_id,
+      status: 'pending',
+    });
+    const requestedFromLine = (pendingFromLine || []).reduce((sum, item) => sum + Number(item.amount || 0), 0);
+    const sourceAvailable = Math.max(0,
+      parseFloat(fromLine.budgeted_amount?.toString() || '0') -
+      parseFloat(fromLine.encumbered_amount?.toString() || '0') -
+      parseFloat(fromLine.actual_amount?.toString() || '0') - requestedFromLine
+    );
+    if (transferAmount > sourceAvailable) throw new Error('INSUFFICIENT_BUDGET');
+
+    const duplicatePendingTransfer = await BudgetTransfer.findOne({
+      company_id: companyId,
+      budget_id: budgetId,
+      from_line_id,
+      to_line_id,
+      status: 'pending',
+    });
+    if (duplicatePendingTransfer) throw new Error('TRANSFER_ALREADY_PENDING');
+
+    const periodLock = await BudgetPeriodLock.findOne({ company_id: companyId, budget_id: budgetId });
+    for (const line of [fromLine, toLine]) {
+      const lock = periodLock?.locked_periods?.find(period =>
+        Number(period.year) === Number(line.period_year) && Number(period.month) === Number(line.period_month)
+      );
+      if (lock && !lock.allow_transfers) throw new Error('BUDGET_PERIOD_LOCKED');
     }
 
     // Get account details
@@ -2481,7 +2664,7 @@ class BudgetService {
       to_account_id: toLine.account_id,
       to_account_code: toAccount?.code || '',
       to_account_name: toAccount?.name || '',
-      amount: amount,
+      amount: transferAmount,
       transfer_date: transfer_date ? new Date(transfer_date) : new Date(),
       reason: reason,
       notes: notes || '',
@@ -2524,6 +2707,8 @@ class BudgetService {
       throw new Error('TRANSFER_ALREADY_PROCESSED');
     }
 
+    if (String(transfer.requested_by) === String(userId)) throw new Error('TRANSFER_SELF_APPROVAL_NOT_ALLOWED');
+
     // Get the source line to check available balance
     const fromLine = await BudgetLine.findById(transfer.from_line_id);
     if (!fromLine) {
@@ -2534,7 +2719,10 @@ class BudgetService {
     const transferAmount = parseFloat(transfer.amount.toString());
     const currentBudgeted = parseFloat(fromLine.budgeted_amount?.toString() || '0');
 
-    if (transferAmount > currentBudgeted) {
+    const committed = parseFloat(fromLine.encumbered_amount?.toString() || '0');
+    const actual = parseFloat(fromLine.actual_amount?.toString() || '0');
+    const available = Math.max(0, currentBudgeted - committed - actual);
+    if (transferAmount > available) {
       throw new Error('INSUFFICIENT_BUDGET');
     }
 
@@ -2542,6 +2730,14 @@ class BudgetService {
     const toLine = await BudgetLine.findById(transfer.to_line_id);
     if (!toLine) {
       throw new Error('DESTINATION_LINE_NOT_FOUND');
+    }
+
+    const periodLock = await BudgetPeriodLock.findOne({ company_id: companyId, budget_id: transfer.budget_id });
+    for (const line of [fromLine, toLine]) {
+      const lock = periodLock?.locked_periods?.find(period =>
+        Number(period.year) === Number(line.period_year) && Number(period.month) === Number(line.period_month)
+      );
+      if (lock && !lock.allow_transfers) throw new Error('BUDGET_PERIOD_LOCKED');
     }
 
     // Subtract from source
@@ -2559,6 +2755,8 @@ class BudgetService {
     transfer.approved_at = new Date();
     transfer.executed_at = new Date();
     await transfer.save();
+    const impactedProjectIds = [...new Set([fromLine.project_id, toLine.project_id].filter(Boolean).map(String))];
+    if (impactedProjectIds.length) await projectService.updateBudgetSpentForProjects(companyId, impactedProjectIds);
     return transfer;
   }
 

@@ -373,6 +373,7 @@ function salesOrderLineToApi(row) {
     qty: qtyNum(row.qty),
     qtyReserved: qtyNum(row.qtyReserved),
     qtyPicked: qtyNum(row.qtyPicked),
+    qtyShipped: qtyNum(row.qtyShipped),
     qtyDelivered: qtyNum(row.qtyDelivered),
     qtyInvoiced: qtyNum(row.qtyInvoiced),
     unit: row.unit ?? null,
@@ -725,6 +726,7 @@ function deliveryNoteToApi(row) {
     return {
       _id: l.id,
       invoiceLineId: l.invoiceLineId ?? null,
+      salesOrderLineId: l.salesOrderLineId ?? null,
       product,
       productName,
       productCode: l.productCode ?? (product && typeof product === 'object' ? product.sku : null) ?? null,
@@ -1210,6 +1212,7 @@ function salesOrderTranslateCreate(data) {
       qty: line.qty ?? line.quantity ?? 0,
       qtyReserved: line.qtyReserved ?? 0,
       qtyPicked: line.qtyPicked ?? 0,
+      qtyShipped: line.qtyShipped ?? 0,
       qtyDelivered: line.qtyDelivered ?? 0,
       qtyInvoiced: line.qtyInvoiced ?? 0,
       unit: line.unit ?? null,
@@ -1317,6 +1320,7 @@ function deliveryNoteTranslateCreate(data) {
   return genericTranslateCreate(data, DELIVERY_NOTE_HEADER, (line, idx, companyId) =>
     defaultLineCreate(line, idx, companyId, {
       invoiceLineId: line.invoiceLineId ? toIdString(line.invoiceLineId) : null,
+      salesOrderLineId: line.salesOrderLineId ? toIdString(line.salesOrderLineId) : null,
       productName: line.productName ?? null,
       productCode: line.productCode ?? null,
       unit: line.unit ?? null,

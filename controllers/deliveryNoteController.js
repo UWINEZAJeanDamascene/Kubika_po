@@ -1051,10 +1051,10 @@ exports.confirmDelivery = async (req, res, next) => {
         // qty_available (currentStock - reservedQuantity) stays accurate.
         // Clamp at 0 so a stale/partial reservation never produces a negative value.
         const currentReserved = Number(product.reservedQuantity) || 0;
-        const reservationToRelease = Math.min(
+        const reservationToRelease = deliveryNote.salesOrder ? Math.min(
           Number(line.qtyToDeliver),
           currentReserved,
-        );
+        ) : 0;
         await Product.findByIdAndUpdate(
           product._id,
           {
@@ -1064,15 +1064,25 @@ exports.confirmDelivery = async (req, res, next) => {
         );
 
         // ── Decrement StockLevel for this product/warehouse (dispatch) ────────
+        const warehouseLevel = await StockLevel.findOne({
+          company_id: companyId,
+          product_id: product._id,
+          warehouse_id: deliveryNote.warehouse._id,
+        }).lean();
+        const warehouseReserved = Number(warehouseLevel?.qty_reserved) || 0;
+        const warehouseReservationRelease = deliveryNote.sourceType === 'pick_pack'
+          ? Math.min(warehouseReserved, Number(line.qtyToDeliver))
+          : 0;
         const stockLevelUpdate = await StockLevel.updateMany(
           {
             company_id: companyId,
             product_id: product._id,
             warehouse_id: deliveryNote.warehouse._id,
             qty_on_hand: { $gte: Number(line.qtyToDeliver) },
+            qty_reserved: { $gte: warehouseReservationRelease },
           },
           {
-            $inc: { qty_on_hand: -Number(line.qtyToDeliver) },
+            $inc: { qty_on_hand: -Number(line.qtyToDeliver), qty_reserved: -warehouseReservationRelease },
             $set: {
               last_movement_at: new Date(),
               last_movement_type: "dispatch",
@@ -1083,6 +1093,21 @@ exports.confirmDelivery = async (req, res, next) => {
           const stockError = new Error(`Warehouse stock changed before delivery for ${line.productName}. Refresh availability and retry.`);
           stockError.statusCode = 409;
           throw stockError;
+        }
+
+        if (deliveryNote.salesOrder && line.salesOrderLineId) {
+          const { dbClient } = require('../lib/prisma');
+          const shippedQty = Number(line.qtyToDeliver);
+          const reservedCondition = deliveryNote.sourceType === 'pick_pack' ? ` AND qty_reserved >= $2::numeric` : '';
+          const shippedUpdate = await dbClient().$executeRawUnsafe(
+            `UPDATE sales_order_lines SET qty_shipped = qty_shipped + $2::numeric, qty_reserved = GREATEST(qty_reserved - LEAST(qty_reserved, $2::numeric), 0) WHERE id = $1 AND company_id = $3 AND qty_shipped + $2::numeric <= qty${reservedCondition}`,
+            String(line.salesOrderLineId), shippedQty, String(companyId),
+          );
+          if (shippedUpdate !== 1) {
+            const orderLineError = new Error(`Sales order quantity or reservation changed for ${line.productName}; refresh the order and retry.`);
+            orderLineError.statusCode = 409;
+            throw orderLineError;
+          }
         }
 
         // ========== STEP 4: CREATE STOCK MOVEMENT (dispatch) ==========
@@ -1472,6 +1497,20 @@ exports.markDelivered = async (req, res, next) => {
     deliveryNote.status = 'delivered';
 
     await deliveryNote.save();
+    if (deliveryNote.salesOrder) {
+      const { dbClient } = require('../lib/prisma');
+      for (const line of deliveryNote.lines || []) {
+        if (!line.salesOrderLineId) continue;
+        const deliveredQty = Number(line.qtyToDeliver || line.deliveredQty || 0);
+        const updated = await dbClient().$executeRaw`
+          UPDATE sales_order_lines
+          SET qty_delivered = qty_delivered + ${deliveredQty}
+          WHERE id = ${String(line.salesOrderLineId)}
+            AND company_id = ${String(companyId)}
+            AND qty_delivered + ${deliveredQty} <= qty_shipped`;
+        if (updated !== 1) throw new Error(`Could not update delivered quantity for ${line.productName}; shipped quantity may not cover this delivery.`);
+      }
+    }
     await syncSalesOrderLifecycle(deliveryNote.salesOrder, companyId);
 
     res.status(200).json({
@@ -1584,13 +1623,13 @@ exports.cancelDeliveryNote = async (req, res, next) => {
         const newStock = previousStock + Number(line.deliveredQty);
         await Product.findByIdAndUpdate(
           product._id,
-          { $inc: { currentStock: Number(line.deliveredQty) } },
+          { $inc: { currentStock: Number(line.deliveredQty), ...(deliveryNote.salesOrder ? { reservedQuantity: Number(line.deliveredQty) } : {}) } },
           { session },
         );
 
         const stockLevelRestore = await StockLevel.updateMany(
           { company_id: companyId, product_id: product._id, warehouse_id: deliveryNote.warehouse._id },
-          { $inc: { qty_on_hand: Number(line.deliveredQty) }, $set: { last_movement_at: new Date(), last_movement_type: 'return_in' } },
+          { $inc: { qty_on_hand: Number(line.deliveredQty), ...(deliveryNote.sourceType === 'pick_pack' ? { qty_reserved: Number(line.deliveredQty) } : {}) }, $set: { last_movement_at: new Date(), last_movement_type: 'return_in' } },
         );
         if (stockLevelRestore.matchedCount !== 1) throw new Error(`Warehouse stock record is missing for ${line.productName}; cancellation was rolled back.`);
 
@@ -1650,6 +1689,17 @@ exports.cancelDeliveryNote = async (req, res, next) => {
           });
           if (qtyRestore.count !== 1) throw new Error(`Invoice delivered quantity could not be reversed for ${line.productName}.`);
         }
+        if (deliveryNote.salesOrder && line.salesOrderLineId) {
+          const { dbClient } = require('../lib/prisma');
+          const reversal = await dbClient().$executeRaw`
+            UPDATE sales_order_lines
+            SET qty_shipped = qty_shipped - ${Number(line.deliveredQty)},
+                qty_reserved = qty_reserved + ${deliveryNote.salesOrder ? Number(line.deliveredQty) : 0}
+            WHERE id = ${String(line.salesOrderLineId)}
+              AND company_id = ${String(companyId)}
+              AND qty_shipped >= ${Number(line.deliveredQty)}`;
+          if (reversal !== 1) throw new Error(`Sales order shipped quantity could not be reversed for ${line.productName}.`);
+        }
       }
 
       // ========== Reverse COGS adjustment if exists ==========
@@ -1708,6 +1758,8 @@ exports.cancelDeliveryNote = async (req, res, next) => {
     });
 
     await hydrateDeliveryNoteRelations(deliveryNote);
+
+    if (deliveryNote.salesOrder) await syncSalesOrderLifecycle(deliveryNote.salesOrder, companyId);
 
     emitDataChanged(companyId, "deliveryNotes", { affectsStock: true });
     // Cancellation both restores stock and posts a COGS reversal journal

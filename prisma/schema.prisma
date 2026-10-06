@@ -2073,6 +2073,7 @@ model SalesOrderLine {
   qty           Decimal    @db.Decimal(19, 4)
   qtyReserved   Decimal    @default(0) @map("qty_reserved") @db.Decimal(19, 4)
   qtyPicked     Decimal    @default(0) @map("qty_picked") @db.Decimal(19, 4)
+  qtyShipped    Decimal    @default(0) @map("qty_shipped") @db.Decimal(19, 4)
   qtyDelivered  Decimal    @default(0) @map("qty_delivered") @db.Decimal(19, 4)
   qtyInvoiced   Decimal    @default(0) @map("qty_invoiced") @db.Decimal(19, 4)
   unit          String?
@@ -2415,6 +2416,7 @@ model DeliveryNoteLine {
   deliveryNoteId String       @map("delivery_note_id") @db.Char(24)
   lineOrder      Int          @default(0) @map("line_order")
   invoiceLineId  String?      @map("invoice_line_id") @db.Char(24)
+  salesOrderLineId String?    @map("sales_order_line_id") @db.Char(24)
   productId      String       @map("product_id") @db.Char(24)
   productName    String?      @map("product_name")
   productCode    String?      @map("product_code")
@@ -2431,6 +2433,7 @@ model DeliveryNoteLine {
   product        Product      @relation(fields: [productId], references: [id])
 
   @@index([deliveryNoteId])
+  @@index([salesOrderLineId])
   @@map("delivery_note_lines")
 }
 

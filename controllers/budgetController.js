@@ -1,5 +1,24 @@
 const BudgetService = require("../services/budgetService");
 
+function validateApprovalSteps(steps) {
+  if (!Array.isArray(steps) || steps.length === 0) return "At least one approval step is required";
+  const approverTypes = new Set(["user", "specific_user", "role", "any_manager", "department_head"]);
+  for (let i = 0; i < steps.length; i += 1) {
+    const step = steps[i];
+    const approverType = String(step.approver_type || "").toLowerCase();
+    const required = Number(step.required_approvals ?? 1);
+    if (!step.step_name || !approverTypes.has(approverType)) return `Step ${i + 1} has an invalid approver type or is missing a name`;
+    if (!Number.isInteger(required) || required < 1) return `Step ${i + 1} must require at least one approval`;
+    if (["user", "specific_user"].includes(approverType) && required > 1) return `Step ${i + 1} has one named approver, so it cannot require multiple approvals`;
+    if (["user", "specific_user"].includes(approverType) && !step.approver_id) return `Step ${i + 1} must select an approver`;
+    if (approverType === "role" && !step.approver_role) return `Step ${i + 1} must select an approver role`;
+    step.approver_type = approverType;
+    step.required_approvals = required;
+    step.step_number = i + 1;
+  }
+  return null;
+}
+
 // ── CREATE ─────────────────────────────────────────────────────────────
 exports.createBudget = async (req, res) => {
   try {
@@ -89,6 +108,7 @@ exports.updateBudget = async (req, res) => {
     if (error.message === "NOT_FOUND") {
       return res.status(404).json({ error: "Budget not found" });
     }
+    if (error.message === "BUDGET_NOT_DRAFT") return res.status(409).json({ error: "Only draft budgets can be edited" });
     res.status(400).json({ error: error.message });
   }
 };
@@ -138,6 +158,7 @@ exports.upsertLines = async (req, res) => {
     if (error.message === "BUDGET_LOCKED") {
       return res.status(400).json({ error: "Budget is locked or closed" });
     }
+    if (error.message === "BUDGET_NOT_DRAFT") return res.status(409).json({ error: "Only draft budgets can be edited" });
     if (error.message === "ACCOUNT_NOT_FOUND") {
       return res
         .status(400)
@@ -186,9 +207,10 @@ exports.approveBudget = async (req, res) => {
     if (error.message === "NOT_FOUND") {
       return res.status(404).json({ error: "Budget not found" });
     }
-    if (error.message === "BUDGET_NOT_DRAFT") {
-      return res.status(400).json({ error: "Can only approve draft budgets" });
-    }
+    if (error.message === "APPROVAL_REQUIRED") return res.status(409).json({ error: "Submit this draft through the approval workflow before it can be approved" });
+    if (error.message === "BUDGET_NOT_PENDING_APPROVAL") return res.status(409).json({ error: "Budget is not awaiting approval" });
+    if (error.message === "APPROVER_NOT_AUTHORIZED") return res.status(403).json({ error: "You are not authorized for the current workflow step" });
+    if (error.message === "BUDGET_SELF_APPROVAL_NOT_ALLOWED") return res.status(403).json({ error: "The requester cannot approve their own budget" });
     res.status(400).json({ error: error.message });
   }
 };
@@ -489,9 +511,10 @@ exports.createTransfer = async (req, res) => {
     if (error.message === "BUDGET_LINE_NOT_FOUND") {
       return res.status(404).json({ error: "One or both budget lines not found" });
     }
-    if (error.message === "TRANSFER_INSUFFICIENT_BUDGET") {
+    if (["TRANSFER_INSUFFICIENT_BUDGET", "INSUFFICIENT_BUDGET"].includes(error.message)) {
       return res.status(400).json({ error: "Insufficient budget in source line" });
     }
+    if (error.message === "BUDGET_PERIOD_LOCKED") return res.status(409).json({ error: "A source or destination budget period is locked for transfers" });
     if (error.message === "TRANSFER_ALREADY_PENDING") {
       return res.status(400).json({ error: "A transfer between these lines is already pending" });
     }
@@ -531,6 +554,10 @@ exports.approveTransfer = async (req, res) => {
     if (error.message === "TRANSFER_NOT_PENDING") {
       return res.status(400).json({ error: "Transfer is not in pending status" });
     }
+    if (error.message === "TRANSFER_ALREADY_PROCESSED") return res.status(409).json({ error: "Transfer has already been processed" });
+    if (error.message === "TRANSFER_SELF_APPROVAL_NOT_ALLOWED") return res.status(403).json({ error: "The transfer requester cannot approve their own transfer" });
+    if (error.message === "BUDGET_PERIOD_LOCKED") return res.status(409).json({ error: "A source or destination budget period is locked for transfers" });
+    if (error.message === "INSUFFICIENT_BUDGET") return res.status(409).json({ error: "The source line has insufficient uncommitted budget" });
     res.status(400).json({ error: error.message });
   }
 };
@@ -817,9 +844,12 @@ exports.submitForApproval = async (req, res) => {
     if (error.message === "APPROVAL_ALREADY_PENDING" || error.message === "ALREADY_PENDING_APPROVAL") {
       return res.status(400).json({ error: "An approval is already pending for this item" });
     }
+    if (error.message === "BUDGET_NOT_DRAFT") return res.status(409).json({ error: "Only draft budgets can be submitted" });
+    if (error.message === "BUDGET_LINES_REQUIRED") return res.status(400).json({ error: "Add at least one budget line before submitting" });
     if (error.message === "APPROVER_NOT_AUTHORIZED") {
       return res.status(403).json({ error: "You are not authorized to approve the current workflow step" });
     }
+    if (error.message === "BUDGET_SELF_APPROVAL_NOT_ALLOWED") return res.status(403).json({ error: "The requester cannot approve their own budget" });
     res.status(400).json({ error: error.message });
   }
 };
@@ -850,6 +880,7 @@ exports.approveStep = async (req, res) => {
     if (error.message === "ALREADY_APPROVED") {
       return res.status(400).json({ error: "You have already approved this step" });
     }
+    if (error.message === "BUDGET_SELF_APPROVAL_NOT_ALLOWED") return res.status(403).json({ error: "The requester cannot approve their own budget" });
     res.status(400).json({ error: error.message });
   }
 };
@@ -875,6 +906,8 @@ exports.rejectApproval = async (req, res) => {
     if (error.message === "APPROVAL_NOT_ACTIVE") {
       return res.status(400).json({ error: "Approval is not in an active state" });
     }
+    if (["APPROVER_NOT_AUTHORIZED", "BUDGET_SELF_APPROVAL_NOT_ALLOWED"].includes(error.message)) return res.status(403).json({ error: "You are not authorized to reject this workflow step" });
+    if (error.message === "APPROVAL_ACTION_NOT_ALLOWED") return res.status(403).json({ error: "Rejection is not allowed at this approval step" });
     res.status(400).json({ error: error.message });
   }
 };
@@ -900,6 +933,8 @@ exports.requestChanges = async (req, res) => {
     if (error.message === "APPROVAL_NOT_ACTIVE") {
       return res.status(400).json({ error: "Approval is not in an active state" });
     }
+    if (["APPROVER_NOT_AUTHORIZED", "BUDGET_SELF_APPROVAL_NOT_ALLOWED"].includes(error.message)) return res.status(403).json({ error: "You are not authorized to request changes at this step" });
+    if (error.message === "APPROVAL_ACTION_NOT_ALLOWED") return res.status(403).json({ error: "Changes cannot be requested at this approval step" });
     res.status(400).json({ error: error.message });
   }
 };
@@ -1352,17 +1387,8 @@ exports.createWorkflowConfig = async (req, res) => {
       });
     }
 
-    // Validate steps
-    for (let i = 0; i < steps.length; i++) {
-      const step = steps[i];
-      if (!step.step_name || !step.approver_type) {
-        return res.status(400).json({
-          error: `Step ${i + 1} must have step_name and approver_type`,
-        });
-      }
-      // Ensure step_number is sequential
-      step.step_number = i + 1;
-    }
+    const stepError = validateApprovalSteps(steps);
+    if (stepError) return res.status(400).json({ error: stepError });
 
     // If setting as default, unset any existing default for this type
     if (is_default) {
@@ -1434,12 +1460,12 @@ exports.updateWorkflowConfig = async (req, res) => {
       return res.status(404).json({ error: "Workflow configuration not found" });
     }
 
-    // Re-validate step numbers if steps provided
-    if (steps && steps.length > 0) {
-      for (let i = 0; i < steps.length; i++) {
-        steps[i].step_number = i + 1;
-      }
+    if (steps !== undefined) {
+      const stepError = validateApprovalSteps(steps);
+      if (stepError) return res.status(400).json({ error: stepError });
     }
+
+    // Re-validate step numbers if steps provided
 
     // If setting as default, unset any existing default for this type
     if (is_default && !config.is_default) {

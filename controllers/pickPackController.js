@@ -2,7 +2,9 @@ const PickPack = require('../models/PickPack');
 const SalesOrder = require('../models/SalesOrder');
 const Product = require('../models/Product');
 const Warehouse = require('../models/Warehouse');
-const InventoryBatch = require('../models/InventoryBatch');
+const StockLevel = require('../models/StockLevel');
+const StockBatch = require('../models/StockBatch');
+const StockSerialNumber = require('../models/StockSerialNumber');
 const { emitDataChanged } = require('../lib/realtimeEvents');
 
 // Error codes
@@ -36,8 +38,8 @@ async function hydratePickPackRelations(docOrDocs) {
     warehouseIds.length ? require('../models/Warehouse').find({ _id: { $in: warehouseIds } }, 'name code address').lean() : [],
     assignedToIds.length ? require('../models/User').find({ _id: { $in: assignedToIds } }, 'name email').lean() : [],
     createdByIds.length ? require('../models/User').find({ _id: { $in: createdByIds } }, 'name email').lean() : [],
-    productIds.length ? Product.find({ _id: { $in: productIds } }, 'name sku unit barcode location').lean() : [],
-    batchIds.length ? InventoryBatch.find({ _id: { $in: batchIds } }, 'batchNo expiryDate').lean() : [],
+    productIds.length ? Product.find({ _id: { $in: productIds } }, 'name sku unit barcode location trackingType').lean() : [],
+    batchIds.length ? StockBatch.find({ _id: { $in: batchIds } }, 'batchNo expiryDate').lean() : [],
   ]);
 
   const salesOrderMap = new Map(salesOrders.map((so) => [normalizeId(so._id), so]));
@@ -232,17 +234,29 @@ exports.createPickPack = async (req, res, next) => {
     }
     
     // Check if PickPack already exists for this SO
-    const existing = await PickPack.findOne({ salesOrder: salesOrderId, company: companyId });
-    if (existing && !['cancelled', 'ready_for_delivery'].includes(existing.status)) {
+    const existing = await PickPack.findOne({ salesOrder: salesOrderId, company: companyId, status: { $ne: 'cancelled' } }).sort({ createdAt: -1 });
+    let reusableHoldByLine = new Map();
+    if (existing) {
+      const DeliveryNote = require('../models/DeliveryNote');
+      const priorNote = existing.deliveryNote
+        ? await DeliveryNote.findOne({ _id: normalizeId(existing.deliveryNote), company: companyId }).lean()
+        : null;
+      if (existing.status !== 'ready_for_delivery' || priorNote?.status !== 'delivered') {
       return res.status(400).json({
         success: false,
         error: ERR_INVALID_STATUS,
-        message: 'Pick & Pack task already exists for this Sales Order'
+        message: `Pick & Pack task ${existing.referenceNo} already exists for this Sales Order. Complete or cancel it before creating another task.`
       });
+      }
+      for (const priorLine of existing.lines || []) {
+        const shipped = (priorNote.lines || []).filter((noteLine) => String(noteLine.salesOrderLineId || '') === String(priorLine.salesOrderLineId)).reduce((sum, noteLine) => sum + Number(noteLine.qtyToDeliver || 0), 0);
+        reusableHoldByLine.set(String(priorLine.salesOrderLineId), Math.max(0, Number(priorLine.qtyToPick || 0) - shipped));
+      }
     }
     
     // Build pick pack lines from sales order lines with reserved stock
     const lines = [];
+    const reservationByProduct = new Map();
     for (const line of salesOrder.lines) {
       const product = line.product;
       if (!product || !product.isStockable) continue;
@@ -250,10 +264,23 @@ exports.createPickPack = async (req, res, next) => {
       // Only pick reserved quantity
       const qtyToPick = line.qtyReserved || 0;
       if (qtyToPick <= 0) continue;
+
+      const productId = normalizeId(line.product);
+      const orderWarehouseId = normalizeId(line.warehouse);
+      if (orderWarehouseId && orderWarehouseId !== String(warehouseId)) {
+        return res.status(422).json({ success: false, code: 'ERR_PICK_WAREHOUSE_MISMATCH', message: `${product.name} is assigned to a different warehouse on the sales order.` });
+      }
+      const orderLineId = String(line._id || line.id || line.lineId || '');
+      const reusableHold = Math.min(Number(qtyToPick), reusableHoldByLine.get(orderLineId) || 0);
+      const additionalReservation = Math.max(0, Number(qtyToPick) - reusableHold);
+      const reservationKey = `${productId}:${warehouseId}`;
+      const existingReservation = reservationByProduct.get(reservationKey);
+      if (existingReservation) existingReservation.quantity += additionalReservation;
+      else reservationByProduct.set(reservationKey, { productId, warehouseId: String(warehouseId), quantity: additionalReservation, level: null });
       
       lines.push({
-        salesOrderLineId: line.lineId,
-        product: line.product._id,
+        salesOrderLineId: orderLineId,
+        product: productId,
         warehouse: warehouseId,
         qtyToPick: qtyToPick,
         qtyPicked: 0,
@@ -268,6 +295,18 @@ exports.createPickPack = async (req, res, next) => {
         success: false,
         message: 'No stockable items to pick for this sales order'
       });
+    }
+
+    for (const reservation of reservationByProduct.values()) {
+      if (reservation.quantity <= 0) continue;
+      const level = await StockLevel.findOne({ company_id: companyId, product_id: reservation.productId, warehouse_id: reservation.warehouseId }).lean();
+      const onHand = Number(level?.qty_on_hand) || 0;
+      const alreadyReserved = Number(level?.qty_reserved) || 0;
+      const available = Math.max(0, onHand - alreadyReserved);
+      if (!level || available < reservation.quantity) {
+        return res.status(409).json({ success: false, code: 'ERR_PICK_WAREHOUSE_STOCK', message: `${salesOrder.referenceNo} has ${reservation.quantity} reserved for ${lines.find((item) => item.product === reservation.productId)?.description || 'a product'}, but only ${available} is available in the selected warehouse.` });
+      }
+      reservation.level = { onHand, alreadyReserved };
     }
     
     // Create PickPack
@@ -284,10 +323,35 @@ exports.createPickPack = async (req, res, next) => {
       createdBy: req.user.id
     });
 
+    const reservedLevels = [];
+    for (const reservation of reservationByProduct.values()) {
+      if (reservation.quantity <= 0) continue;
+      const result = await StockLevel.updateMany(
+        { company_id: companyId, product_id: reservation.productId, warehouse_id: reservation.warehouseId, qty_on_hand: reservation.level.onHand, qty_reserved: reservation.level.alreadyReserved },
+        { $inc: { qty_reserved: reservation.quantity } },
+      );
+      if (result.matchedCount !== 1) {
+        for (const applied of reservedLevels) {
+          await StockLevel.updateMany({ company_id: companyId, product_id: applied.productId, warehouse_id: applied.warehouseId, qty_reserved: { $gte: applied.quantity } }, { $inc: { qty_reserved: -applied.quantity } });
+        }
+        await pickPack.deleteOne();
+        return res.status(409).json({ success: false, code: 'ERR_PICK_STOCK_CHANGED', message: 'Warehouse availability changed while assigning the pick task. Refresh stock and retry.' });
+      }
+      reservedLevels.push(reservation);
+    }
+
     // Link pick pack and move SO into picking
     salesOrder.status = 'picking';
     salesOrder.pickPackId = pickPack._id;
-    await salesOrder.save();
+    try {
+      await salesOrder.save();
+    } catch (saveError) {
+      for (const applied of reservedLevels) {
+        await StockLevel.updateMany({ company_id: companyId, product_id: applied.productId, warehouse_id: applied.warehouseId, qty_reserved: { $gte: applied.quantity } }, { $inc: { qty_reserved: -applied.quantity } });
+      }
+      await pickPack.deleteOne();
+      throw saveError;
+    }
 
     const hydratedPickPack = await hydratePickPackRelations(pickPack);
     
@@ -318,7 +382,7 @@ exports.assignPickPack = async (req, res, next) => {
         message: 'Pick & Pack task not found'
       });
     }
-    
+
     if (['cancelled', 'ready_for_delivery'].includes(pickPack.status)) {
       return res.status(400).json({
         success: false,
@@ -421,31 +485,57 @@ exports.pickItems = async (req, res, next) => {
       });
     }
     
+    const pickedQuantity = Number(qtyPicked);
+    const plannedQuantity = Number(line.qtyToPick);
+    if (!Number.isFinite(pickedQuantity) || pickedQuantity < 0) {
+      return res.status(422).json({ success: false, code: 'ERR_INVALID_PICK_QTY', message: 'Picked quantity must be a valid non-negative number.' });
+    }
     // Validate picked quantity
-    if (qtyPicked > line.qtyToPick) {
+    if (pickedQuantity > plannedQuantity) {
       return res.status(400).json({
         success: false,
         message: `Cannot pick more than ${line.qtyToPick} units`
       });
     }
+
+    const productId = normalizeId(line.product);
+    const product = await Product.findOne({ _id: productId, company: companyId }).select({ trackingType: 1, isStockable: 1 }).lean();
+    if (!product) return res.status(404).json({ success: false, code: 'ERR_PICK_PRODUCT_NOT_FOUND', message: 'The product on this pick line is no longer available.' });
+
+    if ((product.trackingType || 'none') === 'batch' && pickedQuantity > 0 && !batchId) {
+      return res.status(422).json({ success: false, code: 'ERR_PICK_BATCH_REQUIRED', message: 'Select an available batch/lot before recording a picked batch-tracked product.' });
+    }
+    if (batchId) {
+      const batch = await StockBatch.findOne({
+        _id: batchId,
+        company: companyId,
+        product: productId,
+        warehouse: normalizeId(line.warehouse) || normalizeId(pickPack.warehouse),
+      });
+      if (!batch || batch.isQuarantined) return res.status(422).json({ success: false, code: 'ERR_INVALID_PICK_BATCH', message: 'The selected batch is quarantined or does not belong to this product and warehouse.' });
+      const available = Number(batch.qtyOnHand) - Number(batch.reservedQuantity || 0);
+      if (pickedQuantity > available) return res.status(409).json({ success: false, code: 'ERR_INSUFFICIENT_BATCH_STOCK', message: `The selected batch has only ${Math.max(0, available)} available.` });
+      line.batchId = batchId;
+      line.batchNo = batch.batchNo || null;
+    }
+
+    const normalizedSerials = Array.isArray(serialNumbers) ? serialNumbers.map(String) : [];
+    if ((product.trackingType || 'none') === 'serial' && normalizedSerials.length !== pickedQuantity) {
+      return res.status(422).json({ success: false, code: 'ERR_SERIAL_COUNT_MISMATCH', message: `Select exactly ${pickedQuantity} in-stock serial number(s) for this line.` });
+    }
+    if ((product.trackingType || 'none') === 'serial' && pickedQuantity > 0) {
+      if (new Set(normalizedSerials).size !== normalizedSerials.length) return res.status(422).json({ success: false, code: 'ERR_DUPLICATE_PICK_SERIAL', message: 'A serial number can only be picked once on this line.' });
+      const warehouseId = normalizeId(line.warehouse) || normalizeId(pickPack.warehouse);
+      const serials = await StockSerialNumber.find({ _id: { $in: normalizedSerials }, company: companyId, product: productId, warehouse: warehouseId, status: 'in_stock' }).lean();
+      if (serials.length !== normalizedSerials.length) return res.status(409).json({ success: false, code: 'ERR_PICK_SERIAL_UNAVAILABLE', message: 'One or more serial numbers are unavailable, already picked, or belong to another warehouse.' });
+      line.serialNumbers = normalizedSerials;
+    }
     
-    line.qtyPicked = qtyPicked;
     line.pickedBy = req.user.id;
     line.pickedAt = new Date();
     line.pickingNotes = notes;
     
-    if (batchId) {
-      const batch = await InventoryBatch.findById(batchId);
-      if (batch) {
-        line.batchId = batchId;
-        line.batchNo = batch.batchNo;
-      }
-    }
-    
-    if (serialNumbers && serialNumbers.length > 0) {
-      line.serialNumbers = serialNumbers;
-    }
-    
+    line.qtyPicked = pickedQuantity;
     await pickPack.save();
     
     res.status(200).json({
@@ -484,17 +574,12 @@ exports.completePicking = async (req, res, next) => {
     }
     
     // Check if all lines are picked
-    const notFullyPicked = pickPack.lines.filter((line) => {
-      const picked = Number(line.qtyPicked) || 0;
-      const toPick = Number(line.qtyToPick) || 0;
-      return picked < toPick;
-    });
-    if (notFullyPicked.length > 0) {
+    const totalPicked = pickPack.lines.reduce((sum, line) => sum + (Number(line.qtyPicked) || 0), 0);
+    if (totalPicked <= 0) {
       return res.status(400).json({
         success: false,
         error: ERR_INVALID_STATUS,
-        message: 'Not all items have been picked',
-        notPickedLines: notFullyPicked.map(l => ({ lineId: l._id, qtyToPick: l.qtyToPick, qtyPicked: l.qtyPicked }))
+        message: 'Pick at least one unit before completing. Unpicked quantities will remain on backorder.',
       });
     }
     
@@ -586,14 +671,19 @@ exports.packItems = async (req, res, next) => {
     }
     
     // Validate packed quantity
-    if (qtyPacked > line.qtyPicked) {
+    const packedQuantity = Number(qtyPacked);
+    const pickedQuantity = Number(line.qtyPicked);
+    if (!Number.isFinite(packedQuantity) || packedQuantity < 0) {
+      return res.status(422).json({ success: false, code: 'ERR_INVALID_PACK_QTY', message: 'Packed quantity must be a valid non-negative number.' });
+    }
+    if (packedQuantity > pickedQuantity) {
       return res.status(400).json({
         success: false,
         message: `Cannot pack more than ${line.qtyPicked} picked units`
       });
     }
     
-    line.qtyPacked = qtyPacked;
+    line.qtyPacked = packedQuantity;
     line.packedBy = req.user.id;
     line.packedAt = new Date();
     line.packingNotes = notes;
@@ -631,6 +721,12 @@ exports.completePacking = async (req, res, next) => {
         message: 'Pick & Pack task not found'
       });
     }
+
+    if (pickPack.status === 'ready_for_delivery' && pickPack.deliveryNote) {
+      const DeliveryNote = require('../models/DeliveryNote');
+      const deliveryNote = await DeliveryNote.findOne({ _id: normalizeId(pickPack.deliveryNote), company: companyId }).lean();
+      return res.status(200).json({ success: true, message: 'Packing was already completed; the existing delivery note is linked.', data: { pickPack, deliveryNote } });
+    }
     
     if (!['picked', 'packed'].includes(pickPack.status)) {
       return res.status(400).json({
@@ -640,14 +736,12 @@ exports.completePacking = async (req, res, next) => {
       });
     }
     
-    // Check if all lines are packed
-    const notFullyPacked = hydratedPickPack.lines.filter(line => line.qtyPacked < line.qtyToPick);
-    if (notFullyPacked.length > 0) {
+    const totalPacked = (hydratedPickPack.lines || []).reduce((sum, line) => sum + (Number(line.qtyPacked) || 0), 0);
+    if (totalPacked <= 0) {
       return res.status(400).json({
         success: false,
         error: ERR_INVALID_STATUS,
-        message: 'Not all items have been packed',
-        notPackedLines: notFullyPacked.map(l => ({ lineId: l._id, qtyToPick: l.qtyToPick, qtyPacked: l.qtyPacked }))
+        message: 'Pack at least one picked unit before completing. The remaining quantities stay reserved for a later shipment.',
       });
     }
     
@@ -694,8 +788,9 @@ exports.completePacking = async (req, res, next) => {
         }
 
         const qtyToDeliver = Number(line.qtyPacked) || 0;
-        const unitPrice = Number(soLine?.unitPrice) || Number(line.product?.sellingPrice) || 0;
-        deliveryLines.push({
+      const unitPrice = soLine?.unitPrice != null ? Number(soLine.unitPrice) : Number(line.product?.sellingPrice) || 0;
+      deliveryLines.push({
+          salesOrderLineId: String(soLine?._id || soLine?.id || line.salesOrderLineId || ''),
           product: productId,
           productName,
           productCode,
@@ -918,12 +1013,68 @@ exports.cancelPickPack = async (req, res, next) => {
       });
     }
     
+    if (pickPack.status === 'cancelled') {
+      return res.status(400).json({ success: false, error: ERR_INVALID_STATUS, message: 'This Pick & Pack task is already cancelled.' });
+    }
     if (pickPack.status === 'ready_for_delivery') {
-      return res.status(400).json({
-        success: false,
-        error: ERR_INVALID_STATUS,
-        message: 'Cannot cancel task that is already ready for delivery'
-      });
+      const DeliveryNote = require('../models/DeliveryNote');
+      const deliveryNote = await DeliveryNote.findOne({ _id: normalizeId(pickPack.deliveryNote), company: companyId });
+      if (deliveryNote && !['draft', 'cancelled'].includes(deliveryNote.status)) {
+        return res.status(409).json({ success: false, error: ERR_INVALID_STATUS, message: `Delivery note ${deliveryNote.referenceNo} is ${deliveryNote.status}; resolve it through the delivery workflow before cancelling this task.` });
+      }
+      if (deliveryNote?.status === 'draft') await deliveryNote.deleteOne();
+    }
+
+    const reservationGroups = new Map();
+    for (const line of pickPack.lines || []) {
+      const productId = normalizeId(line.product);
+      const warehouseId = normalizeId(line.warehouse) || normalizeId(pickPack.warehouse);
+      const qty = Number(line.qtyToPick) || 0;
+      if (!productId || !warehouseId || qty <= 0) continue;
+      const key = `${productId}:${warehouseId}`;
+      const reservation = reservationGroups.get(key);
+      if (reservation) reservation.quantity += qty;
+      else reservationGroups.set(key, { productId, warehouseId, quantity: qty });
+    }
+    for (const reservation of reservationGroups.values()) {
+      const level = await StockLevel.findOne({ company_id: companyId, product_id: reservation.productId, warehouse_id: reservation.warehouseId }).lean();
+      if ((Number(level?.qty_reserved) || 0) < reservation.quantity) {
+        return res.status(409).json({ success: false, code: 'ERR_PICK_RESERVATION_CHANGED', message: 'Warehouse reservation changed. Refresh the task and reconcile inventory before cancelling it.' });
+      }
+      reservation.expectedReserved = Number(level.qty_reserved);
+    }
+    const releasedReservations = [];
+    for (const reservation of reservationGroups.values()) {
+      const result = await StockLevel.updateMany(
+        { company_id: companyId, product_id: reservation.productId, warehouse_id: reservation.warehouseId, qty_reserved: reservation.expectedReserved },
+        { $inc: { qty_reserved: -reservation.quantity } },
+      );
+      if (result.matchedCount !== 1) {
+        for (const released of releasedReservations) {
+          await StockLevel.updateMany({ company_id: companyId, product_id: released.productId, warehouse_id: released.warehouseId }, { $inc: { qty_reserved: released.quantity } });
+        }
+        return res.status(409).json({ success: false, code: 'ERR_PICK_RESERVATION_CHANGED', message: 'Warehouse reservation changed while cancelling. Refresh and retry.' });
+      }
+      releasedReservations.push(reservation);
+    }
+
+    // A cancelled task releases the order-level reservation as well as its
+    // warehouse hold so the same quantity can be reserved on a later attempt.
+    for (const line of pickPack.lines || []) {
+      const qty = Number(line.qtyToPick) || 0;
+      const salesOrderLineId = String(line.salesOrderLineId || '');
+      if (qty <= 0 || !salesOrderLineId) continue;
+      const { dbClient } = require('../lib/prisma');
+      await dbClient().$executeRaw`
+        UPDATE sales_order_lines
+        SET qty_reserved = GREATEST(qty_reserved - ${qty}, 0)
+        WHERE id = ${salesOrderLineId} AND company_id = ${String(companyId)}`;
+    }
+    for (const reservation of reservationGroups.values()) {
+      await Product.findOneAndUpdate(
+        { _id: reservation.productId, company: companyId, reservedQuantity: { $gte: reservation.quantity } },
+        { $inc: { reservedQuantity: -reservation.quantity } },
+      );
     }
     
     pickPack.status = 'cancelled';
@@ -932,6 +1083,15 @@ exports.cancelPickPack = async (req, res, next) => {
     pickPack.cancellationReason = reason || 'Cancelled by user';
     
     await pickPack.save();
+
+    const salesOrderId = normalizeId(pickPack.salesOrder);
+    if (salesOrderId) {
+      await SalesOrder.findOneAndUpdate(
+        { _id: salesOrderId, company: companyId, status: { $in: ['picking', 'packed'] } },
+        { $set: { status: 'confirmed', isBackorder: true } },
+        { new: true },
+      );
+    }
     
     emitDataChanged(companyId, 'pickPacks');
     res.status(200).json({

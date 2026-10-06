@@ -1,4 +1,6 @@
 const SalesOrder = require('../models/SalesOrder');
+const PickPack = require('../models/PickPack');
+const DeliveryNote = require('../models/DeliveryNote');
 const Client = require('../models/Client');
 const Product = require('../models/Product');
 const { loadLineProducts, getLineProduct } = require('../utils/lineProducts');
@@ -89,6 +91,28 @@ const toNumber = (value) => {
   return Number.isFinite(n) ? n : 0;
 };
 
+const roundMoney = (value) => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
+
+const validateOrderLines = (lines, { allowEmpty = false } = {}) => {
+  if (!Array.isArray(lines) || (!allowEmpty && lines.length === 0)) return 'Add at least one order line.';
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] || {};
+    const qty = Number(line.qty);
+    const unitPrice = line.unitPrice === undefined || line.unitPrice === null || line.unitPrice === ''
+      ? null : Number(line.unitPrice);
+    const discountPct = line.discountPct === undefined || line.discountPct === null || line.discountPct === ''
+      ? 0 : Number(line.discountPct);
+    const taxRate = line.taxRate === undefined || line.taxRate === null || line.taxRate === ''
+      ? null : Number(line.taxRate);
+    if (!line.product) return `Select a product for line ${index + 1}.`;
+    if (!Number.isFinite(qty) || qty <= 0) return `Quantity on line ${index + 1} must be greater than zero.`;
+    if (unitPrice !== null && (!Number.isFinite(unitPrice) || unitPrice < 0)) return `Unit price on line ${index + 1} must be zero or greater.`;
+    if (!Number.isFinite(discountPct) || discountPct < 0 || discountPct > 100) return `Discount on line ${index + 1} must be between 0 and 100%.`;
+    if (taxRate !== null && (!Number.isFinite(taxRate) || taxRate < 0 || taxRate > 100)) return `Tax rate on line ${index + 1} must be between 0 and 100%.`;
+  }
+  return null;
+};
+
 /**
  * Price the lines and roll them up into the header totals. Quantities, prices,
  * discounts and tax rates come from the request; everything else is derived, so
@@ -101,17 +125,19 @@ const priceLines = (lines = []) => {
   const priced = lines.map((line) => {
     const qty = toNumber(line.qty);
     const unitPrice = toNumber(line.unitPrice);
-    const gross = qty * unitPrice;
-    const net = gross - gross * (toNumber(line.discountPct) / 100);
-    const lineTax = net * (toNumber(line.taxRate) / 100);
+    const gross = roundMoney(qty * unitPrice);
+    const net = roundMoney(gross - gross * (toNumber(line.discountPct) / 100));
+    const lineTax = roundMoney(net * (toNumber(line.taxRate) / 100));
 
     subtotal += net;
     taxAmount += lineTax;
 
-    return { ...line, qty, unitPrice, lineTax, lineTotal: net + lineTax };
+    return { ...line, qty, unitPrice, lineTax, lineTotal: roundMoney(net + lineTax) };
   });
 
-  return { lines: priced, totals: { subtotal, taxAmount, totalAmount: subtotal + taxAmount } };
+  subtotal = roundMoney(subtotal);
+  taxAmount = roundMoney(taxAmount);
+  return { lines: priced, totals: { subtotal, taxAmount, totalAmount: roundMoney(subtotal + taxAmount) } };
 };
 
 // @desc    Get all sales orders
@@ -226,6 +252,9 @@ exports.createSalesOrder = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const { client, lines, orderDate, expectedDate, deliveryAddress, shippingMethod, terms, notes, quotation, currencyCode, exchangeRate } = req.body;
+
+    const lineValidationError = validateOrderLines(lines);
+    if (lineValidationError) return res.status(422).json({ success: false, code: 'ERR_INVALID_SALES_ORDER_LINES', message: lineValidationError });
     
     // Validate client exists
     const clientDoc = await Client.findOne({ _id: client, company: companyId });
@@ -274,13 +303,16 @@ exports.createSalesOrder = async (req, res, next) => {
         description: line.description || product.name,
         qty: line.qty,
         unit: line.unit || product.unit,
-        unitPrice: line.unitPrice || product.sellingPrice,
+        unitPrice: line.unitPrice === undefined || line.unitPrice === null || line.unitPrice === '' ? product.sellingPrice : line.unitPrice,
         discountPct: line.discountPct || 0,
-        taxRate: line.taxRate || product.taxRate || 0,
+        taxRate: line.taxRate === undefined || line.taxRate === null || line.taxRate === '' ? (product.taxRate ?? 0) : line.taxRate,
         warehouse: line.warehouse || null,
         status: 'pending'
       });
     }
+
+    const invalidDerivedRate = processedLines.find((line) => !Number.isFinite(Number(line.taxRate)) || Number(line.taxRate) < 0 || Number(line.taxRate) > 100);
+    if (invalidDerivedRate) return res.status(422).json({ success: false, code: 'ERR_INVALID_TAX_RATE', message: `Tax rate for ${invalidDerivedRate.description} must be between 0 and 100%.` });
     
     const priced = priceLines(processedLines);
 
@@ -346,6 +378,11 @@ exports.updateSalesOrder = async (req, res, next) => {
         message: `Cannot update sales order with status: ${salesOrder.status}. Only draft orders can be edited.`
       });
     }
+
+    if (lines !== undefined) {
+      const lineValidationError = validateOrderLines(lines);
+      if (lineValidationError) return res.status(422).json({ success: false, code: 'ERR_INVALID_SALES_ORDER_LINES', message: lineValidationError });
+    }
     
     // Process lines if provided
     if (lines) {
@@ -360,19 +397,26 @@ exports.updateSalesOrder = async (req, res, next) => {
             message: `Product not found: ${line.product}`
           });
         }
+
+        if (line.warehouse) {
+          const warehouse = await Warehouse.findOne({ _id: line.warehouse, company: companyId }).select({ _id: 1 }).lean();
+          if (!warehouse) return res.status(404).json({ success: false, code: 'ERR_SALES_ORDER_WAREHOUSE_NOT_FOUND', message: `Warehouse not found: ${line.warehouse}` });
+        }
         
         processedLines.push({
           product: line.product,
           description: line.description || product.name,
           qty: line.qty,
           unit: line.unit || product.unit,
-          unitPrice: line.unitPrice || product.sellingPrice,
+          unitPrice: line.unitPrice === undefined || line.unitPrice === null || line.unitPrice === '' ? product.sellingPrice : line.unitPrice,
           discountPct: line.discountPct || 0,
-          taxRate: line.taxRate || product.taxRate || 0,
+          taxRate: line.taxRate === undefined || line.taxRate === null || line.taxRate === '' ? (product.taxRate ?? 0) : line.taxRate,
           warehouse: line.warehouse || null,
           status: 'pending'
         });
       }
+      const invalidDerivedRate = processedLines.find((line) => !Number.isFinite(Number(line.taxRate)) || Number(line.taxRate) < 0 || Number(line.taxRate) > 100);
+      if (invalidDerivedRate) return res.status(422).json({ success: false, code: 'ERR_INVALID_TAX_RATE', message: `Tax rate for ${invalidDerivedRate.description} must be between 0 and 100%.` });
       const priced = priceLines(processedLines);
       salesOrder.lines = priced.lines;
       salesOrder.subtotal = priced.totals.subtotal;
@@ -459,12 +503,20 @@ exports.confirmSalesOrder = async (req, res, next) => {
       });
     }
 
-    if (!salesOrder.canTransitionTo('confirmed')) {
+    const resumingBackorder = salesOrder.status === 'confirmed' && salesOrder.isBackorder === true;
+    if (!salesOrder.canTransitionTo('confirmed') && !resumingBackorder) {
       return res.status(400).json({
         success: false,
         error: ERR_INVALID_STATUS_TRANSITION,
         message: `Cannot confirm sales order with status: ${salesOrder.status}`
       });
+    }
+
+    if (resumingBackorder) {
+      const openTask = await PickPack.findOne({ salesOrder: salesOrder._id, company: companyId, status: { $nin: ['cancelled', 'ready_for_delivery'] } }).select({ referenceNo: 1 }).lean();
+      if (openTask) return res.status(409).json({ success: false, error: ERR_INVALID_STATUS_TRANSITION, message: `Complete or cancel Pick & Pack ${openTask.referenceNo} before reserving the backorder.` });
+      const unresolvedNote = await DeliveryNote.findOne({ salesOrder: salesOrder._id, company: companyId, status: { $nin: ['delivered', 'cancelled'] } }).select({ referenceNo: 1, status: 1 }).lean();
+      if (unresolvedNote) return res.status(409).json({ success: false, error: ERR_INVALID_STATUS_TRANSITION, message: `Resolve delivery note ${unresolvedNote.referenceNo} (${unresolvedNote.status}) before reserving the backorder.` });
     }
 
     const backorderItems = [];
@@ -483,7 +535,11 @@ exports.confirmSalesOrder = async (req, res, next) => {
         continue;
       }
 
-      const qtyNeeded = toNumber(line.qty);
+      const qtyNeeded = Math.max(0, toNumber(line.qty) - toNumber(line.qtyShipped) - toNumber(line.qtyReserved));
+      if (qtyNeeded <= 0) {
+        updatedLines.push(nextLine);
+        continue;
+      }
       const currentStock = toNumber(product.currentStock);
       const reservedQty = toNumber(product.reservedQuantity);
       const availableStock = currentStock - reservedQty;
@@ -518,7 +574,7 @@ exports.confirmSalesOrder = async (req, res, next) => {
         });
       }
 
-      nextLine.qtyReserved = qtyToReserve;
+      nextLine.qtyReserved = toNumber(line.qtyReserved) + qtyToReserve;
       nextLine.status = lineStatus;
       updatedLines.push(nextLine);
     }
@@ -527,9 +583,7 @@ exports.confirmSalesOrder = async (req, res, next) => {
     salesOrder.lines = updatedLines;
     salesOrder.status = 'confirmed';
     salesOrder.stockReserved = true;
-    if (backorderItems.length > 0) {
-      salesOrder.isBackorder = true;
-    }
+    salesOrder.isBackorder = backorderItems.length > 0;
 
     await salesOrder.save();
 
@@ -579,6 +633,19 @@ exports.cancelSalesOrder = async (req, res, next) => {
         error: ERR_INVALID_STATUS_TRANSITION,
         message: `Cannot cancel sales order with status: ${salesOrder.status}`
       });
+    }
+
+    if (['delivered', 'invoiced'].includes(salesOrder.status)) {
+      return res.status(409).json({ success: false, error: ERR_INVALID_STATUS_TRANSITION, message: 'This order has already been delivered or invoiced. Use the delivery return or credit-note workflow to reverse completed activity.' });
+    }
+
+    const activePickPack = await PickPack.findOne({ salesOrder: salesOrder._id, company: companyId, status: { $ne: 'cancelled' } }).select({ referenceNo: 1 }).lean();
+    if (activePickPack) {
+      return res.status(409).json({ success: false, error: ERR_INVALID_STATUS_TRANSITION, message: `Cancel Pick & Pack ${activePickPack.referenceNo} first so its warehouse reservation can be released.` });
+    }
+    const activeDeliveryNote = await DeliveryNote.findOne({ salesOrder: salesOrder._id, company: companyId, status: { $ne: 'cancelled' } }).select({ referenceNo: 1, status: 1 }).lean();
+    if (activeDeliveryNote) {
+      return res.status(409).json({ success: false, error: ERR_INVALID_STATUS_TRANSITION, message: `Resolve delivery note ${activeDeliveryNote.referenceNo} (${activeDeliveryNote.status}) before cancelling this order.` });
     }
     
     // Release reserved stock
