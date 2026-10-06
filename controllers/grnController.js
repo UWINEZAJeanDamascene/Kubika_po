@@ -473,6 +473,10 @@ exports.confirmGRN = async (req, res, next) => {
             { status: 400 },
           );
         }
+        const normalizedSerials = line.serialNumbers.map((serial) => String(serial).trim().toUpperCase());
+        if (new Set(normalizedSerials).size !== normalizedSerials.length) {
+          throw Object.assign(new Error(`Serial numbers must be unique within the receipt for product ${product.name}`), { status: 400 });
+        }
       }
     }
 
@@ -527,8 +531,13 @@ exports.confirmGRN = async (req, res, next) => {
 
         if (stockBatch) {
           // Update existing batch
-          stockBatch.qtyOnHand =
-            (Number(stockBatch.qtyOnHand) || 0) + Number(line.qtyReceived);
+          const oldQty = Number(stockBatch.qtyOnHand) || 0;
+          const receivedQty = Number(line.qtyReceived) || 0;
+          stockBatch.qtyOnHand = oldQty + receivedQty;
+          stockBatch.qtyReceived = (Number(stockBatch.qtyReceived) || 0) + receivedQty;
+          stockBatch.unitCost = stockBatch.qtyOnHand > 0
+            ? ((oldQty * (Number(stockBatch.unitCost) || 0)) + (receivedQty * (Number(line.unitCost) || 0))) / stockBatch.qtyOnHand
+            : Number(line.unitCost) || 0;
           // Update manufacture and expiry dates if provided
           if (lineMfgDate) {
             stockBatch.manufactureDate = lineMfgDate;

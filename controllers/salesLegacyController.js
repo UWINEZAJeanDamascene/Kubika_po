@@ -7,6 +7,9 @@ const Company = require('../models/Company');
 const { BankAccount } = require('../models/BankAccount');
 const TillSession = require('../models/TillSession');
 const StockLevel = require('../models/StockLevel');
+const StockSerialNumber = require('../models/StockSerialNumber');
+const StockBatch = require('../models/StockBatch');
+const InventoryBatch = require('../models/InventoryBatch');
 
 function escapeRegex(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -38,6 +41,55 @@ const EBMSalesService = require('../services/ebmSalesService');
 
 function hashPosSalePayload(payload) {
   return createHash('sha256').update(JSON.stringify(payload || {})).digest('hex');
+}
+
+async function consumeTrackedBatches(companyId, productId, warehouseId, quantity, session) {
+  const batches = await StockBatch.find({
+    company: companyId,
+    product: productId,
+    warehouse: warehouseId,
+    qtyOnHand: { $gt: 0 },
+    isQuarantined: false,
+  }).sort({ expiryDate: 1, createdAt: 1 }).session(session);
+  const eligible = batches.filter((batch) => !batch.expiryDate || new Date(batch.expiryDate) >= new Date());
+  const available = eligible.reduce((sum, batch) => sum + Number(batch.qtyOnHand || 0), 0);
+  if (available < quantity) {
+    const error = new Error(`Insufficient non-quarantined, non-expired batch stock. Available: ${available}, required: ${quantity}`);
+    error.code = 'INSUFFICIENT_STOCK';
+    throw error;
+  }
+
+  let remaining = quantity;
+  const allocations = [];
+  let totalCost = 0;
+  for (const batch of eligible) {
+    if (remaining <= 0) break;
+    const taken = Math.min(remaining, Number(batch.qtyOnHand || 0));
+    if (taken <= 0) continue;
+    batch.qtyOnHand = Number(batch.qtyOnHand) - taken;
+    await batch.save({ session });
+    const unitCost = Number(batch.unitCost || 0);
+    allocations.push({ batchNo: batch.batchNo, quantity: taken, unitCost });
+    totalCost += taken * unitCost;
+
+    let batchRemaining = taken;
+    const legacyBatches = await InventoryBatch.find({
+      company: companyId, product: productId, warehouse: warehouseId,
+      batchNumber: batch.batchNo, availableQuantity: { $gt: 0 },
+    }).sort({ receivedDate: 1 }).session(session);
+    for (const legacy of legacyBatches) {
+      if (batchRemaining <= 0) break;
+      const legacyTake = Math.min(batchRemaining, Number(legacy.availableQuantity || 0));
+      legacy.availableQuantity = Number(legacy.availableQuantity) - legacyTake;
+      legacy.quantity = Math.max(0, Number(legacy.quantity || 0) - legacyTake);
+      legacy.totalCost = Number(legacy.quantity) * Number(legacy.unitCost || 0);
+      legacy.updateStatus?.();
+      await legacy.save({ session });
+      batchRemaining -= legacyTake;
+    }
+    remaining -= taken;
+  }
+  return { allocations, totalCost, quantity };
 }
 
 async function replayPosSaleIfPresent(req, res, { companyId, requestKey, payloadHash }) {
@@ -218,7 +270,7 @@ exports.createDirectSale = async (req, res, next) => {
         _id: { $in: productIds },
         company: companyId,
       })
-        .select('name sku sellingPrice unit taxRate taxCode currentStock isStockable averageCost trackingType')
+        .select('name sku sellingPrice unit taxRate taxCode currentStock isStockable averageCost trackingType trackSerialNumbers trackBatch')
         .lean();
       productsBatch.forEach((p) => productsMap.set(p._id.toString(), p));
     } catch (batchErr) {
@@ -280,6 +332,33 @@ exports.createDirectSale = async (req, res, next) => {
       }
       
       const isStockable = product.isStockable !== false;
+      const serialNumbers = Array.isArray(item.serialNumbers)
+        ? item.serialNumbers.map((serial) => String(serial).trim().toUpperCase()).filter(Boolean)
+        : [];
+      const productTrackingType = product.trackingType === 'serial' || product.trackSerialNumbers
+        ? 'serial'
+        : product.trackingType === 'batch' || product.trackBatch
+          ? 'batch'
+          : (product.trackingType || 'none');
+      if (isStockable && productTrackingType === 'serial') {
+        if (serialNumbers.length !== quantity || new Set(serialNumbers).size !== serialNumbers.length) {
+          return res.status(400).json({ success: false, code: 'POS_SERIALS_REQUIRED', message: `Enter exactly ${quantity} unique serial number(s) for ${product.name}.` });
+        }
+        const availableSerials = await StockSerialNumber.find({
+          company: companyId,
+          product: product._id,
+          warehouse: warehouseId,
+          serialNo: { $in: serialNumbers },
+          status: { $in: ['in_stock', 'returned'] },
+        }).select('_id serialNo').lean();
+        if (availableSerials.length !== serialNumbers.length) {
+          const found = new Set(availableSerials.map((serial) => String(serial.serialNo).toUpperCase()));
+          const unavailable = serialNumbers.filter((serial) => !found.has(serial));
+          return res.status(409).json({ success: false, code: 'POS_SERIAL_UNAVAILABLE', message: `Serial number(s) unavailable in this warehouse for ${product.name}: ${unavailable.join(', ')}` });
+        }
+      } else if (serialNumbers.length) {
+        return res.status(400).json({ success: false, code: 'POS_SERIALS_NOT_ALLOWED', message: `${product.name} is not configured for serial tracking.` });
+      }
       if (isStockable) {
         const stockLevel = stockLevelByProduct.get(String(product._id));
         const availableStock = stockLevel
@@ -342,6 +421,7 @@ exports.createDirectSale = async (req, res, next) => {
           lineData: {
             productName: product.name,
             unitCost: Number(product.averageCost) || 0,
+            serialNumbers,
           },
         });
       }
@@ -509,7 +589,7 @@ exports.createDirectSale = async (req, res, next) => {
       const productUpdates = [];
 
       for (const stockUpdate of stockUpdates) {
-        const { product, quantity, warehouseId: selectedWarehouseId } = stockUpdate;
+        const { product, quantity, warehouseId: selectedWarehouseId, lineData } = stockUpdate;
         const stockLevel = stockLevelByProduct.get(String(product._id));
         const reserved = Number(stockLevel?.qty_reserved || 0);
         const stockLevelUpdate = await StockLevel.updateMany(
@@ -535,7 +615,8 @@ exports.createDirectSale = async (req, res, next) => {
         let unitCost = 0;
         let cogsAmount = 0;
 
-        if (trackingType === 'none' || trackingType === 'batch') {
+        let batchAllocations = [];
+        if (trackingType === 'none') {
           try {
             const consumeResult = await inventoryService.consume(
               companyId,
@@ -560,9 +641,37 @@ exports.createDirectSale = async (req, res, next) => {
             unitCost = product.averageCost || 0;
             cogsAmount = unitCost * quantity;
           }
+        } else if (trackingType === 'batch') {
+          const batchConsumption = await consumeTrackedBatches(
+            companyId, product._id, selectedWarehouseId, quantity, session,
+          );
+          batchAllocations = batchConsumption.allocations;
+          unitCost = quantity > 0 ? batchConsumption.totalCost / quantity : 0;
+          cogsAmount = batchConsumption.totalCost;
+          await inventoryService.reduceLayers(companyId, product._id, quantity, {
+            session,
+            warehouse: selectedWarehouseId,
+          });
         } else if (trackingType === 'serial') {
           unitCost = product.averageCost ? Number(product.averageCost.toString()) : 0;
           cogsAmount = unitCost * quantity;
+          const serialNumbers = lineData.serialNumbers || [];
+          const serialUpdate = await StockSerialNumber.updateMany(
+            {
+              company: companyId,
+              product: product._id,
+              warehouse: selectedWarehouseId,
+              serialNo: { $in: serialNumbers },
+              status: { $in: ['in_stock', 'returned'] },
+            },
+            { $set: { status: 'dispatched', dispatchedVia: invoice._id } },
+            { session },
+          );
+          if (serialUpdate.modifiedCount !== serialNumbers.length) {
+            const error = new Error(`One or more serial numbers for ${product.name} are no longer available`);
+            error.code = 'POS_SERIAL_UNAVAILABLE';
+            throw error;
+          }
         }
 
         totalCOGS += cogsAmount;
@@ -590,6 +699,8 @@ exports.createDirectSale = async (req, res, next) => {
           referenceDocument: invoice._id,
           referenceModel: 'Invoice',
           referenceNumber: invoice.referenceNo,
+          batchNumber: batchAllocations.map((allocation) => `${allocation.batchNo}:${allocation.quantity}`).join(', ') || undefined,
+          serialNumbers: lineData.serialNumbers || [],
           notes: `Direct sale - Invoice ${invoice.referenceNo}`,
           performedBy: req.user.id,
           movementDate: new Date(),
@@ -950,7 +1061,7 @@ exports.getPosProducts = async (req, res, next) => {
     // Keyset pagination uses the indexed sort key and a single look-ahead row.
     // It avoids a full matching-row count and work proportional to page depth.
     const fetchedProducts = await Product.find(query)
-      .select('name sku sellingPrice unit taxRate taxCode currentStock averageCost barcode category isStockable')
+      .select('name sku sellingPrice unit taxRate taxCode currentStock averageCost barcode category isStockable trackingType trackSerialNumbers trackBatch')
       .sort({ name: 1, _id: 1 })
       .limit(resultLimit + 1);
     const hasMore = fetchedProducts.length > resultLimit;
@@ -991,7 +1102,10 @@ exports.getPosProducts = async (req, res, next) => {
         reservedStock,
         averageCost: toNumber(p.averageCost),
         category: p.category,
-        isAvailable: currentStock > 0 || p.isStockable === false
+        isAvailable: currentStock > 0 || p.isStockable === false,
+        trackingType: p.trackingType === 'serial' || p.trackSerialNumbers
+          ? 'serial'
+          : p.trackingType === 'batch' || p.trackBatch ? 'batch' : (p.trackingType || 'none'),
       };
     });
 

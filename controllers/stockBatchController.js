@@ -1,6 +1,7 @@
 ﻿const StockBatch = require('../models/StockBatch');
 const Product = require('../models/Product');
 const Warehouse = require('../models/Warehouse');
+const StockSerialNumber = require('../models/StockSerialNumber');
 
 const STOCK_BATCH_LIST_SELECT = [
   '_id', 'company', 'batchNo', 'product', 'warehouse', 'qtyReceived', 'qtyOnHand',
@@ -79,6 +80,10 @@ exports.createStockBatch = async (req, res, next) => {
     const companyId = req.user.company._id;
     const { batchNo, product, warehouse, grn, qtyReceived, qtyOnHand, unitCost, manufactureDate, expiryDate, isQuarantined, notes } = req.body;
 
+    if (Number(qtyReceived || 0) !== 0 || Number(qtyOnHand || 0) !== 0) {
+      return res.status(400).json({ success: false, code: 'BATCH_RECEIPT_REQUIRED', message: 'Batch quantities must be created through a stock receipt or opening stock transaction.' });
+    }
+
     // Validate product exists and tracks batches
     const productDoc = await Product.findOne({ _id: product, company: companyId });
     if (!productDoc) {
@@ -145,10 +150,21 @@ exports.updateStockBatch = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Batch not found' });
     }
 
+    if (qtyOnHand !== undefined && Number(qtyOnHand) !== Number(batch.qtyOnHand)) {
+      return res.status(400).json({
+        success: false,
+        code: 'BATCH_QUANTITY_MOVEMENT_REQUIRED',
+        message: 'Batch on-hand quantity is controlled by stock movements. Create a receipt or stock adjustment to change it.',
+      });
+    }
+    if (batchNo && batchNo.toUpperCase() !== batch.batchNo) {
+      return res.status(400).json({ success: false, code: 'BATCH_IDENTITY_IMMUTABLE', message: 'Batch numbers are immutable after receipt to preserve traceability.' });
+    }
+    if (unitCost !== undefined && Number(unitCost) !== Number(batch.unitCost)) {
+      return res.status(400).json({ success: false, code: 'BATCH_COST_IMMUTABLE', message: 'Batch cost is fixed at receipt. Record a cost adjustment through the approved accounting workflow.' });
+    }
+
     // Update fields
-    if (batchNo) batch.batchNo = batchNo.toUpperCase();
-    if (qtyOnHand !== undefined) batch.qtyOnHand = qtyOnHand;
-    if (unitCost !== undefined) batch.unitCost = unitCost;
     if (manufactureDate !== undefined) batch.manufactureDate = manufactureDate;
     if (expiryDate !== undefined) batch.expiryDate = expiryDate;
     if (isQuarantined !== undefined) batch.isQuarantined = isQuarantined;
@@ -180,8 +196,17 @@ exports.deleteStockBatch = async (req, res, next) => {
     }
 
     // Check if batch has quantity
-    if (batch.qtyOnHand > 0) {
-      return res.status(400).json({ success: false, message: 'Cannot delete batch with remaining quantity' });
+    if (Number(batch.qtyOnHand) > 0 || Number(batch.qtyReceived) > 0) {
+      return res.status(400).json({ success: false, message: 'Received batch history is retained for traceability and cannot be deleted.' });
+    }
+
+    const linkedSerialCount = await StockSerialNumber.countDocuments({ company: companyId, batch: batch._id });
+    if (linkedSerialCount > 0) {
+      return res.status(409).json({
+        success: false,
+        code: 'BATCH_HAS_SERIAL_HISTORY',
+        message: 'This batch has serial-number traceability history and cannot be deleted.',
+      });
     }
 
     await batch.deleteOne();

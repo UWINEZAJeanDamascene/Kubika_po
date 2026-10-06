@@ -254,6 +254,10 @@ exports.receiveStock = async (req, res, next) => {
       }
 
       const serialTracked = product.trackingType === 'serial' || product.trackSerialNumbers;
+      const batchTracked = product.trackingType === 'batch' || product.trackBatch;
+      if (batchTracked && !String(batchNumber || '').trim()) {
+        throw Object.assign(new Error('A batch number is required for this batch-tracked product'), { status: 400 });
+      }
       if (serialTracked && (!Number.isInteger(qty) || serialNumbers.length !== qty)) {
         throw Object.assign(new Error(`This product requires exactly ${qty} unique serial number(s)`), { status: 400 });
       }
@@ -275,7 +279,7 @@ exports.receiveStock = async (req, res, next) => {
 
       // If product tracks batches, create or update batch
       let batch = null;
-      if (product.trackBatch || batchNumber || lotNumber) {
+      if (batchTracked || batchNumber || lotNumber) {
         const batchQuery = {
           company: companyId,
           product: productId,
@@ -347,7 +351,7 @@ exports.receiveStock = async (req, res, next) => {
 
       let serialBatch = null;
       const batchNo = String(batchNumber || lotNumber || '').trim();
-      if (serialNumbers.length && batchNo) {
+      if ((serialNumbers.length || batchTracked) && batchNo) {
         const stockBatchQuery = StockBatch.findOne({
           company: companyId, product: productId, warehouse: warehouse._id, batchNo,
         });
