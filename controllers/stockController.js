@@ -2,10 +2,13 @@
 const cacheService = require('../services/cacheService');
 const { wantsCursor, cursorFilter, cursorSort, cursorPage } = require('../utils/cursorPagination');
 const StockMovement = require('../models/StockMovement');
+const StockLevel = require('../models/StockLevel');
 const Product = require('../models/Product');
 const Supplier = require('../models/Supplier');
 const Warehouse = require('../models/Warehouse');
 const InventoryBatch = require('../models/InventoryBatch');
+const StockBatch = require('../models/StockBatch');
+const StockSerialNumber = require('../models/StockSerialNumber');
 const JournalService = require('../services/journalService');
 const { runInTransaction } = require('../services/transactionService');
 const EBMStockService = require('../services/ebmStockService');
@@ -28,6 +31,26 @@ const STOCK_LEVEL_SORT_COLUMNS = {
 const LIKE_ESCAPE = /[\\%_]/g;
 function escapeLike(value) {
   return String(value).replace(LIKE_ESCAPE, (char) => `\\${char}`);
+}
+
+function normalizeSerialNumbers(value) {
+  const entries = Array.isArray(value) ? value : (value ? String(value).split(/[\r\n,;|]+/) : []);
+  const normalized = entries.map((entry) => String(entry).trim()).filter(Boolean);
+  if (new Set(normalized).size !== normalized.length) {
+    throw Object.assign(new Error('Serial numbers must be unique within a receipt'), { status: 400 });
+  }
+  return normalized;
+}
+
+async function markReversedMovements(rows, companyId) {
+  if (!rows.length) return rows;
+  const ids = rows.map((row) => row._id);
+  const reversals = await StockMovement.find({ company: companyId, reversalOfMovement: { $in: ids } }).select('reversalOfMovement');
+  const reversedIds = new Set(reversals.map((row) => String(row.reversalOfMovement)));
+  return rows.map((row) => ({
+    ...row.toObject(),
+    isReversed: reversedIds.has(String(row._id)),
+  }));
 }
 
 async function getActiveWarehouseOptions(companyId) {
@@ -94,6 +117,7 @@ exports.getStockMovements = async (req, res, next) => {
     const STOCK_MOVEMENT_LIST_SELECT = [
       '_id', 'company', 'product', 'type', 'reason', 'quantity', 'unitCost', 'totalCost',
       'warehouse', 'referenceType', 'referenceNumber', 'notes', 'movementDate', 'ebm',
+      'batchNumber', 'lotNumber', 'expiryDate', 'serialNumbers', 'reversalOfMovement',
       'createdAt', 'updatedAt'
     ].join(' ');
 
@@ -115,7 +139,7 @@ exports.getStockMovements = async (req, res, next) => {
         .limit(pageSize + 1);
 
       const { data, pagination } = cursorPage(rows, pageSize, 'movementDate');
-      return res.json({ success: true, count: data.length, data, pagination });
+      return res.json({ success: true, count: data.length, data: await markReversedMovements(data, companyId), pagination });
     }
 
     const total = await StockMovement.countDocuments(query);
@@ -133,7 +157,7 @@ exports.getStockMovements = async (req, res, next) => {
       total,
       pages: Math.ceil(total / limit),
       currentPage: page,
-      data: movements
+      data: await markReversedMovements(movements, companyId)
     });
   } catch (error) {
     console.error('adjustStock error:', error);
@@ -183,8 +207,22 @@ exports.receiveStock = async (req, res, next) => {
       lotNumber,
       expiryDate,
       warehouse: warehouseId,
+      referenceNumber,
+      serialNumbers: serialNumbersInput,
       notes
     } = req.body;
+    const qty = Number(quantity);
+    const cost = Number(unitCost);
+    const serialNumbers = normalizeSerialNumbers(serialNumbersInput);
+    if (!String(referenceNumber || '').trim()) {
+      throw Object.assign(new Error('A source reference number is required for stock receipts'), { status: 400 });
+    }
+    if (!Number.isFinite(qty) || qty <= 0) {
+      throw Object.assign(new Error('Quantity must be a finite number greater than zero'), { status: 400 });
+    }
+    if (!Number.isFinite(cost) || cost < 0) {
+      throw Object.assign(new Error('Unit cost must be a finite non-negative number'), { status: 400 });
+    }
 
     // Use central transaction helper for receive
     const result = await runInTransaction(async (trx) => {
@@ -201,18 +239,38 @@ exports.receiveStock = async (req, res, next) => {
       // Get or create default warehouse if not specified
       let warehouse = null;
       if (warehouseId) {
-        const wq = Warehouse.findOne({ _id: warehouseId, company: companyId });
+        const wq = Warehouse.findOne({ _id: warehouseId, company: companyId, isActive: { $ne: false } });
         warehouse = useSession ? await wq.session(trx) : await wq;
         if (!warehouse) {
           throw Object.assign(new Error('Warehouse not found'), { status: 404 });
         }
       } else {
-        const wq = Warehouse.findOne({ company: companyId, isDefault: true });
+        const wq = Warehouse.findOne({ company: companyId, isDefault: true, isActive: { $ne: false } });
         warehouse = useSession ? await wq.session(trx) : await wq;
         if (!warehouse) {
           const wq2 = Warehouse.findOne({ company: companyId, isActive: true });
           warehouse = useSession ? await wq2.session(trx) : await wq2;
         }
+      }
+
+      const serialTracked = product.trackingType === 'serial' || product.trackSerialNumbers;
+      if (serialTracked && (!Number.isInteger(qty) || serialNumbers.length !== qty)) {
+        throw Object.assign(new Error(`This product requires exactly ${qty} unique serial number(s)`), { status: 400 });
+      }
+      if (!serialTracked && serialNumbers.length) {
+        throw Object.assign(new Error('Serial numbers can only be received for serial-tracked products'), { status: 400 });
+      }
+      if (serialNumbers.length) {
+        const serialQuery = StockSerialNumber.findOne({
+          company: companyId, product: productId, serialNo: { $in: serialNumbers },
+        });
+        const existingSerial = useSession ? await serialQuery.session(trx) : await serialQuery;
+        if (existingSerial) {
+          throw Object.assign(new Error(`Serial number ${existingSerial.serialNo} already exists for this product`), { status: 409 });
+        }
+      }
+      if (!warehouse) {
+        throw Object.assign(new Error('An active warehouse is required to receive stock'), { status: 400 });
       }
 
       // If product tracks batches, create or update batch
@@ -231,10 +289,10 @@ exports.receiveStock = async (req, res, next) => {
         batch = useSession ? await bq.session(trx) : await bq;
 
         if (batch) {
-          batch.quantity += quantity;
-          batch.availableQuantity += quantity;
-          batch.unitCost = unitCost || batch.unitCost;
-          batch.totalCost = batch.quantity * batch.unitCost;
+          batch.quantity = Number(batch.quantity || 0) + qty;
+          batch.availableQuantity = Number(batch.availableQuantity || 0) + qty;
+          batch.unitCost = cost || batch.unitCost;
+          batch.totalCost = Number(batch.quantity) * Number(batch.unitCost);
           batch.updateStatus();
           await batch.save(opts);
         } else {
@@ -242,13 +300,13 @@ exports.receiveStock = async (req, res, next) => {
             company: companyId,
             product: productId,
             warehouse: warehouse?._id,
-            quantity,
-            availableQuantity: quantity,
+            quantity: qty,
+            availableQuantity: qty,
             batchNumber,
             lotNumber,
             expiryDate,
-            unitCost: unitCost || 0,
-            totalCost: quantity * (unitCost || 0),
+            unitCost: cost,
+            totalCost: qty * cost,
             supplier: supplierId,
             status: 'active',
             createdBy: req.user.id
@@ -261,7 +319,7 @@ exports.receiveStock = async (req, res, next) => {
       }
 
       const previousStock = Number(product.currentStock || 0);
-      const newStock = previousStock + Number(quantity);
+      const newStock = previousStock + qty;
 
       // Create stock movement
       const movement = await StockMovement.create({
@@ -269,29 +327,83 @@ exports.receiveStock = async (req, res, next) => {
         product: productId,
         type: 'in',
         reason: 'purchase',
-        quantity,
+        quantity: qty,
         previousStock,
         newStock,
-        unitCost,
-        totalCost: quantity * unitCost,
+        unitCost: cost,
+        totalCost: qty * cost,
         supplier: supplierId,
         batchNumber,
         lotNumber,
         expiryDate,
         referenceType: 'purchase_order',
+        referenceNumber: String(referenceNumber).trim(),
+        serialNumbers,
         warehouse: warehouse?._id,
         notes,
         performedBy: req.user.id,
         movementDate: new Date()
       });
 
+      let serialBatch = null;
+      const batchNo = String(batchNumber || lotNumber || '').trim();
+      if (serialNumbers.length && batchNo) {
+        const stockBatchQuery = StockBatch.findOne({
+          company: companyId, product: productId, warehouse: warehouse._id, batchNo,
+        });
+        serialBatch = useSession ? await stockBatchQuery.session(trx) : await stockBatchQuery;
+        if (serialBatch) {
+          const oldQty = Number(serialBatch.qtyOnHand || 0);
+          const received = Number(serialBatch.qtyReceived || 0);
+          serialBatch.qtyOnHand = oldQty + qty;
+          serialBatch.qtyReceived = received + qty;
+          serialBatch.unitCost = serialBatch.qtyOnHand > 0
+            ? ((oldQty * Number(serialBatch.unitCost || 0)) + (qty * cost)) / serialBatch.qtyOnHand
+            : cost;
+          if (expiryDate) serialBatch.expiryDate = expiryDate;
+          await serialBatch.save(opts);
+        } else {
+          serialBatch = await StockBatch.create({
+            company: companyId,
+            batchNo,
+            product: productId,
+            warehouse: warehouse._id,
+            qtyReceived: qty,
+            qtyOnHand: qty,
+            unitCost: cost,
+            expiryDate,
+            notes: notes || `Received via stock movement ${movement._id}`,
+          });
+          if (useSession) serialBatch = await StockBatch.findById(serialBatch._id).session(trx);
+        }
+      }
+
+      if (serialNumbers.length) {
+        for (const serialNo of serialNumbers) {
+          await StockSerialNumber.create({
+            company: companyId,
+            serialNo,
+            product: productId,
+            warehouse: warehouse._id,
+            batch: serialBatch?._id,
+            unitCost: cost,
+            status: 'in_stock',
+            notes: `Received via stock movement ${movement._id}`,
+          });
+        }
+      }
+
       // Update product stock and average cost (coerce numeric values)
-      const totalValue = (Number(product.currentStock || 0) * Number(product.averageCost || 0)) + (Number(quantity) * Number(unitCost));
+      const totalValue = (Number(product.currentStock || 0) * Number(product.averageCost || 0)) + (qty * cost);
       product.currentStock = newStock;
       product.averageCost = totalValue / (Number(newStock) || 1);
       product.lastSupplyDate = new Date();
       if (supplierId) product.supplier = supplierId;
       await product.save(opts);
+
+      // POS and warehouse reports read StockLevel, so keep this warehouse row
+      // in the same transaction as the product aggregate and movement ledger.
+      await StockLevel.recalculateWAC(companyId, productId, warehouse._id, qty, cost);
 
       // Update supplier if provided
       if (supplierId) {
@@ -301,7 +413,7 @@ exports.receiveStock = async (req, res, next) => {
           const productObjId = product._id;
           const isProductAlreadyLinked = supplier.productsSupplied.some((p) => p.toString() === productObjId.toString());
           if (!isProductAlreadyLinked) supplier.productsSupplied.push(productObjId);
-          supplier.totalPurchases = (supplier.totalPurchases || 0) + (quantity * unitCost);
+          supplier.totalPurchases = (supplier.totalPurchases || 0) + (qty * cost);
           supplier.lastPurchaseDate = new Date();
           await supplier.save(opts);
         }
@@ -339,17 +451,35 @@ exports.adjustStock = async (req, res, next) => {
       quantity,
       reason,
       type,
+      referenceNumber,
       notes
     } = req.body;
+    const qty = Number(quantity);
+    if (!Number.isFinite(qty) || qty <= 0) {
+      throw Object.assign(new Error('Quantity must be a finite number greater than zero'), { status: 400 });
+    }
+    if (!['in', 'out'].includes(type)) {
+      throw Object.assign(new Error('Adjustment type must be in or out'), { status: 400 });
+    }
+    const normalizedReason = reason === 'transfer'
+      ? (type === 'in' ? 'transfer_in' : 'transfer_out')
+      : reason;
+    if (!String(referenceNumber || '').trim()) {
+      throw Object.assign(new Error('A source reference number is required for stock adjustments'), { status: 400 });
+    }
 
     const result = await runInTransaction(async (trx) => {
       const useSession = !!trx;
       const opts = useSession ? { session: trx } : {};
 
       // Validate reason
-      const validReasons = ['damage', 'loss', 'theft', 'expired', 'correction', 'transfer'];
-      if (!validReasons.includes(reason)) {
+      const validReasons = ['damage', 'loss', 'theft', 'expired', 'correction', 'transfer_in', 'transfer_out'];
+      if (!validReasons.includes(normalizedReason)) {
         throw Object.assign(new Error('Invalid adjustment reason'), { status: 400 });
+      }
+      if ((normalizedReason === 'transfer_in' && type !== 'in')
+        || (normalizedReason === 'transfer_out' && type !== 'out')) {
+        throw Object.assign(new Error('Transfer reason must match the stock direction'), { status: 400 });
       }
 
       // Get product
@@ -357,16 +487,70 @@ exports.adjustStock = async (req, res, next) => {
       const product = useSession ? await pq.session(trx) : await pq;
       if (!product) throw Object.assign(new Error('Product not found'), { status: 404 });
 
+      let warehouse = null;
+      if (req.body.warehouse) {
+        const warehouseQuery = Warehouse.findOne({ _id: req.body.warehouse, company: companyId, isActive: { $ne: false } });
+        warehouse = useSession ? await warehouseQuery.session(trx) : await warehouseQuery;
+        if (!warehouse) throw Object.assign(new Error('Active warehouse not found'), { status: 404 });
+      } else {
+        const defaultQuery = Warehouse.findOne({ company: companyId, isDefault: true, isActive: { $ne: false } });
+        warehouse = useSession ? await defaultQuery.session(trx) : await defaultQuery;
+        if (!warehouse) {
+          const activeQuery = Warehouse.findOne({ company: companyId, isActive: { $ne: false } }).sort({ name: 1 });
+          warehouse = useSession ? await activeQuery.session(trx) : await activeQuery;
+        }
+      if (!warehouse) throw Object.assign(new Error('An active warehouse is required to adjust stock'), { status: 400 });
+      }
+
+      let originalMovement = null;
+      if (req.body.reversalOfMovement) {
+        const originalQuery = StockMovement.findOne({
+          _id: req.body.reversalOfMovement,
+          company: companyId,
+          type: 'adjustment',
+          referenceType: 'adjustment',
+        });
+        originalMovement = useSession ? await originalQuery.session(trx) : await originalQuery;
+        if (!originalMovement) {
+          throw Object.assign(new Error('Only an adjustment movement can be reversed from stock movements'), { status: 400 });
+        }
+        if (originalMovement.reversalOfMovement) {
+          throw Object.assign(new Error('A reversal movement cannot itself be reversed'), { status: 400 });
+        }
+        if (String(originalMovement.product) !== String(productId)
+          || String(originalMovement.warehouse) !== String(warehouse._id)) {
+          throw Object.assign(new Error('A reversal must use the original product and warehouse'), { status: 400 });
+        }
+        const alreadyReversedQuery = StockMovement.findOne({ company: companyId, reversalOfMovement: originalMovement._id });
+        const alreadyReversed = useSession ? await alreadyReversedQuery.session(trx) : await alreadyReversedQuery;
+        if (alreadyReversed) {
+          throw Object.assign(new Error('This movement has already been reversed'), { status: 409 });
+        }
+        const originalDelta = Number(originalMovement.newStock) - Number(originalMovement.previousStock);
+        const requiredType = originalDelta > 0 ? 'out' : 'in';
+        if (type !== requiredType || Math.abs(originalDelta) !== qty) {
+          throw Object.assign(new Error('A reversal must exactly offset the original stock quantity'), { status: 400 });
+        }
+      }
+
+      const stockLevel = await StockLevel.getOrCreate(companyId, productId, warehouse._id);
+      const warehousePreviousStock = Number(stockLevel.qty_on_hand || 0);
+      const warehouseReserved = Number(stockLevel.qty_reserved || 0);
+
       const previousStock = Number(product.currentStock || 0);
       let newStock;
+      let newWarehouseStock;
 
       if (type === 'in') {
-        newStock = previousStock + Number(quantity);
+        newStock = previousStock + qty;
+        newWarehouseStock = warehousePreviousStock + qty;
       } else if (type === 'out') {
-        if (Number(quantity) > previousStock) {
-          throw Object.assign(new Error('Adjustment quantity exceeds current stock'), { status: 400 });
+        const warehouseAvailable = Math.max(0, warehousePreviousStock - warehouseReserved);
+        if (qty > warehouseAvailable || qty > previousStock) {
+          throw Object.assign(new Error(`Adjustment quantity exceeds available stock in ${warehouse.name}. Available: ${Math.min(warehouseAvailable, previousStock)}`), { status: 400 });
         }
-        newStock = previousStock - Number(quantity);
+        newStock = previousStock - qty;
+        newWarehouseStock = warehousePreviousStock - qty;
       } else {
         throw Object.assign(new Error('Invalid adjustment type'), { status: 400 });
       }
@@ -377,14 +561,16 @@ exports.adjustStock = async (req, res, next) => {
         company: companyId,
         product: productId,
         type: 'adjustment',
-        reason,
-        quantity,
+        reason: normalizedReason,
+        quantity: qty,
         previousStock,
         newStock,
         unitCost,
-        totalCost: unitCost * Number(quantity),
-        warehouse: req.body.warehouse || undefined,
+        totalCost: unitCost * qty,
+        warehouse: warehouse._id,
         referenceType: 'adjustment',
+        referenceNumber: String(referenceNumber).trim(),
+        reversalOfMovement: originalMovement?._id,
         notes,
         performedBy: req.user.id,
         movementDate: new Date()
@@ -394,19 +580,31 @@ exports.adjustStock = async (req, res, next) => {
       product.currentStock = newStock;
       await product.save(opts);
 
+      const oldWarehouseValue = warehousePreviousStock * Number(stockLevel.avg_cost || 0);
+      stockLevel.qty_on_hand = newWarehouseStock;
+      if (type === 'in') {
+        stockLevel.avg_cost = newWarehouseStock > 0
+          ? (oldWarehouseValue + qty * unitCost) / newWarehouseStock
+          : unitCost;
+      }
+      stockLevel.total_value = newWarehouseStock * Number(stockLevel.avg_cost || 0);
+      stockLevel.last_movement_at = movement.movementDate;
+      stockLevel.last_movement_type = type === 'in' ? 'adjustment_positive' : 'adjustment_negative';
+      await stockLevel.save(opts);
+
       // Keep FIFO cost layers aligned with the new stock level, otherwise a sale
       // of this quantity later fails costing with "insufficient stock".
       if (type === 'in') {
         await inventoryService.createLayer(
           companyId,
           productId,
-          Number(quantity),
+          qty,
           unitCost,
           { sourceType: 'adjustment', sourceId: movement._id },
-          { session: trx || null, userId: req.user.id, warehouse: req.body.warehouse || null },
+          { session: trx || null, userId: req.user.id, warehouse: warehouse._id },
         );
       } else {
-        await inventoryService.reduceLayers(companyId, productId, Number(quantity), { session: trx || null });
+        await inventoryService.reduceLayers(companyId, productId, qty, { session: trx || null, warehouse: warehouse._id });
       }
 
       await JournalService.createStockAdjustmentEntry(companyId, req.user.id, {
@@ -415,8 +613,8 @@ exports.adjustStock = async (req, res, next) => {
         adjustmentType: type === 'in' ? 'increase' : 'decrease',
         productName: product.name,
         productId: product._id,
-        warehouseId: req.body.warehouse,
-        reason,
+        warehouseId: warehouse._id,
+        reason: normalizedReason,
         date: movement.movementDate
       }, opts);
 
@@ -560,6 +758,34 @@ exports.getStockSummary = async (req, res, next) => {
     });
   } catch (error) {
     next(error);
+  }
+};
+
+exports.reverseStockMovement = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const movement = await StockMovement.findOne({ _id: req.params.id, company: companyId });
+    if (!movement) return res.status(404).json({ success: false, message: 'Stock movement not found' });
+    if (movement.type !== 'adjustment' || movement.referenceType !== 'adjustment' || movement.reversalOfMovement) {
+      return res.status(400).json({ success: false, message: 'Only an unreversed manual stock adjustment can be reversed here' });
+    }
+    const delta = Number(movement.newStock) - Number(movement.previousStock);
+    if (!delta) return res.status(400).json({ success: false, message: 'This movement has no stock change to reverse' });
+    req.body = {
+      product: movement.product,
+      warehouse: movement.warehouse,
+      quantity: Math.abs(delta),
+      type: delta > 0 ? 'out' : 'in',
+      reason: movement.reason === 'transfer_in' ? 'transfer_out'
+        : movement.reason === 'transfer_out' ? 'transfer_in'
+          : movement.reason,
+      referenceNumber: `REV-${movement.referenceNumber || movement._id}`,
+      reversalOfMovement: movement._id,
+      notes: `Reversal of stock movement ${movement._id}`,
+    };
+    return exports.adjustStock(req, res, next);
+  } catch (error) {
+    return next(error);
   }
 };
 

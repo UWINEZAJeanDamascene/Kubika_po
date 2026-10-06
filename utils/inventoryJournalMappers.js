@@ -125,11 +125,13 @@ function stockMovementToApi(row) {
     warehouse: row.warehouseId ?? null,
     batchNumber: row.batchNumber ?? null,
     lotNumber: row.lotNumber ?? null,
+    serialNumbers: Array.isArray(row.serialNumbers) ? row.serialNumbers : [],
     expiryDate: row.expiryDate ?? null,
     referenceType: row.referenceType ?? null,
     referenceNumber: row.referenceNumber ?? null,
     referenceDocument: row.referenceDocumentId ?? null,
     referenceModel: row.referenceModel ?? null,
+    reversalOfMovement: row.reversalOfMovementId ?? null,
     notes: row.notes ?? null,
     performedBy: row.performedById ?? null,
     movementDate: row.movementDate,
@@ -164,11 +166,13 @@ const STOCK_MOVEMENT_INPUT = {
   warehouse: 'warehouseId',
   batchNumber: 'batchNumber',
   lotNumber: 'lotNumber',
+  serialNumbers: 'serialNumbers',
   expiryDate: 'expiryDate',
   referenceType: 'referenceType',
   referenceNumber: 'referenceNumber',
   referenceDocument: 'referenceDocumentId',
   referenceModel: 'referenceModel',
+  reversalOfMovement: 'reversalOfMovementId',
   notes: 'notes',
   performedBy: 'performedById',
   movementDate: 'movementDate',
@@ -192,7 +196,7 @@ function normalizeMovementReason(data, reason) {
 
 async function stockMovementTranslateCreate(data) {
   const mapped = pickMapped(data, STOCK_MOVEMENT_INPUT, {
-    idFields: ['productId', 'supplierId', 'warehouseId', 'performedById', 'referenceDocumentId'],
+    idFields: ['productId', 'supplierId', 'warehouseId', 'performedById', 'referenceDocumentId', 'reversalOfMovementId'],
   });
   if (mapped.reason !== undefined) mapped.reason = normalizeMovementReason(data, mapped.reason);
 
@@ -209,7 +213,7 @@ async function stockMovementTranslateCreate(data) {
 
 function stockMovementTranslateUpdate(update = {}) {
   return pickMapped(mergeUpdatePayload(update), STOCK_MOVEMENT_INPUT, {
-    idFields: ['productId', 'supplierId', 'warehouseId', 'performedById', 'referenceDocumentId'],
+    idFields: ['productId', 'supplierId', 'warehouseId', 'performedById', 'referenceDocumentId', 'reversalOfMovementId'],
   });
 }
 

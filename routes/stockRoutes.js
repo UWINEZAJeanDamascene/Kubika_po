@@ -5,6 +5,7 @@ const {
   getStockMovement,
   receiveStock,
   adjustStock,
+  reverseStockMovement,
   createOpeningStock,
   getProductStockMovements,
   getStockSummary,
@@ -35,6 +36,7 @@ router.route('/movements')
   .post(requirePermissionOrRoles('stock', 'create', ['admin']), logAction('stock'), receiveStock);
 
 router.get('/movements/:id', requirePermissionOrRoles('stock', 'read', ['admin']), cacheStockReads, getStockMovement);
+router.post('/movements/:id/reverse', requirePermissionOrRoles('stock', 'update', ['admin']), logAction('stock'), reverseStockMovement);
 router.put('/movements/:id', requirePermissionOrRoles('stock', 'update', ['admin']), logAction('stock'), updateStockMovement);
 router.delete('/movements/:id', requirePermissionOrRoles('stock', 'delete', ['admin']), logAction('stock'), deleteStockMovement);
 router.get('/product/:productId/movements', requirePermissionOrRoles('stock', 'read', ['admin']), cacheStockReads, getProductStockMovements);

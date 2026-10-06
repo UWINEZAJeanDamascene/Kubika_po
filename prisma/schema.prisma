@@ -1521,11 +1521,13 @@ model StockMovement {
   warehouseId         String?             @map("warehouse_id") @db.Char(24)
   batchNumber         String?             @map("batch_number")
   lotNumber           String?             @map("lot_number")
+  serialNumbers       Json                @default("[]") @map("serial_numbers")
   expiryDate          DateTime?           @map("expiry_date") @db.Timestamptz(3)
   referenceType       String?             @map("reference_type")
   referenceNumber     String?             @map("reference_number")
   referenceDocumentId String?             @map("reference_document_id") @db.Char(24)
   referenceModel      String?             @map("reference_model")
+  reversalOfMovementId String?            @map("reversal_of_movement_id") @db.Char(24)
   notes               String?
   performedById       String?             @map("performed_by") @db.Char(24)
   movementDate        DateTime            @default(now()) @map("movement_date") @db.Timestamptz(3)
@@ -1536,11 +1538,14 @@ model StockMovement {
   product             Product?            @relation(fields: [productId], references: [id])
   supplier            Supplier?           @relation(fields: [supplierId], references: [id])
   warehouse           Warehouse?          @relation(fields: [warehouseId], references: [id])
+  reversalOf          StockMovement?      @relation("StockMovementReversal", fields: [reversalOfMovementId], references: [id], onDelete: SetNull)
+  reversedMovements   StockMovement[]     @relation("StockMovementReversal")
 
   @@index([companyId, movementDate(sort: Desc)])
   @@index([companyId, productId, movementDate(sort: Desc)])
   @@index([companyId, type, reason, movementDate])
   @@index([companyId, type, createdAt(sort: Desc)])
+  @@unique([reversalOfMovementId])
   @@index([companyId, productId, movementDate(sort: Desc)], map: "idx_stock_movements_product_company")
   @@map("stock_movements")
 }

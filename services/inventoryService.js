@@ -39,7 +39,8 @@ async function reduceLayers(companyId, productId, qty, options = {}) {
   const layers = await InventoryLayer.find({
     company: companyId,
     product: productId,
-    qtyRemaining: { $gt: 0 }
+    qtyRemaining: { $gt: 0 },
+    ...(options.warehouse ? { warehouse: options.warehouse } : {}),
   })
     .sort({ receiptDate: 1 })
     .session(session);
