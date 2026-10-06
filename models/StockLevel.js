@@ -7,6 +7,7 @@ const { prisma, dbClient } = require('../lib/prisma');
 const { makeCompatModel, translateFilter, translateSort, IMPOSSIBLE, toId } = require('../utils/prismaCompat');
 const { getCompanyId } = require('../utils/prismaTenant');
 const { decimalToNumber } = require('../utils/decimalHelpers');
+const { generateObjectId } = require('../utils/objectId');
 const {
   stockLevelToApi,
   stockLevelTranslateCreate,
@@ -57,7 +58,7 @@ function wrapStockLevelDoc(apiDoc) {
   doc.save = async function save() {
     const payload = stockLevelTranslateUpdate({ $set: doc });
     const row = await dbClient().stockLevel.update({
-      where: { id: String(doc._id) },
+      where: { id: String(doc._id), companyId: String(doc.company_id) },
       data: payload,
     });
     const next = stockLevelToApi(row);
@@ -130,39 +131,52 @@ model.getOrCreate = async function getOrCreate(companyId, productId, warehouseId
   const cid = toId(companyId);
   const pid = toId(productId);
   const wid = toId(warehouseId);
-  let row = await dbClient().stockLevel.findUnique({
+  const row = await dbClient().stockLevel.upsert({
     where: { companyId_productId_warehouseId: { companyId: cid, productId: pid, warehouseId: wid } },
-  });
-  if (row) return wrapStockLevelDoc(stockLevelToApi(row));
-  row = await dbClient().stockLevel.create({
-    data: {
-      ...(await stockLevelTranslateCreate({
-        company_id: cid,
-        product_id: pid,
-        warehouse_id: wid,
-        qty_on_hand: 0,
-        qty_reserved: 0,
-        qty_on_order: 0,
-        avg_cost: 0,
-        total_value: 0,
-      })),
+    create: {
+      id: generateObjectId(),
+      companyId: cid,
+      productId: pid,
+      warehouseId: wid,
+      qtyOnHand: 0,
+      qtyReserved: 0,
+      qtyOnOrder: 0,
+      avgCost: 0,
+      totalValue: 0,
     },
+    update: {},
   });
   return wrapStockLevelDoc(stockLevelToApi(row));
 };
 
 model.recalculateWAC = async function recalculateWAC(companyId, productId, warehouseId, receivedQty, receivedCost) {
-  const doc = await model.getOrCreate(companyId, productId, warehouseId);
-  const oldQty = doc.qty_on_hand;
-  const oldAvg = doc.avg_cost;
-  const newQty = oldQty + receivedQty;
-  const newAvg = newQty > 0 ? ((oldQty * oldAvg) + (receivedQty * receivedCost)) / newQty : receivedCost;
-  doc.qty_on_hand = Math.round(newQty * 10000) / 10000;
-  doc.avg_cost = Math.round(newAvg * 1000000) / 1000000;
-  doc.total_value = Math.round(doc.qty_on_hand * doc.avg_cost * 100) / 100;
-  doc.last_movement_at = new Date();
-  doc.last_movement_type = 'receipt';
-  return doc.save();
+  const qty = Number(receivedQty);
+  const cost = Number(receivedCost);
+  if (!Number.isFinite(qty) || qty <= 0 || !Number.isFinite(cost) || cost < 0) {
+    throw new Error('A stock receipt requires a positive quantity and a non-negative unit cost');
+  }
+  const cid = toId(companyId);
+  const pid = toId(productId);
+  const wid = toId(warehouseId);
+  const rows = await dbClient().$queryRaw`
+    INSERT INTO stock_levels (id, company_id, product_id, warehouse_id, qty_on_hand, qty_reserved, qty_on_order, avg_cost, total_value, last_movement_at, last_movement_type, created_at, updated_at)
+    VALUES (${generateObjectId()}, ${cid}, ${pid}, ${wid}, ${qty}, 0, 0, ${cost}, ROUND(${qty} * ${cost}, 2), NOW(), 'receipt', NOW(), NOW())
+    ON CONFLICT (company_id, product_id, warehouse_id)
+    DO UPDATE SET
+      avg_cost = CASE
+        WHEN stock_levels.qty_on_hand + EXCLUDED.qty_on_hand > 0
+          THEN ((stock_levels.qty_on_hand * stock_levels.avg_cost) + (EXCLUDED.qty_on_hand * EXCLUDED.avg_cost)) / (stock_levels.qty_on_hand + EXCLUDED.qty_on_hand)
+        ELSE EXCLUDED.avg_cost
+      END,
+      qty_on_hand = stock_levels.qty_on_hand + EXCLUDED.qty_on_hand,
+      total_value = ROUND((stock_levels.qty_on_hand + EXCLUDED.qty_on_hand) * CASE
+        WHEN stock_levels.qty_on_hand + EXCLUDED.qty_on_hand > 0
+          THEN ((stock_levels.qty_on_hand * stock_levels.avg_cost) + (EXCLUDED.qty_on_hand * EXCLUDED.avg_cost)) / (stock_levels.qty_on_hand + EXCLUDED.qty_on_hand)
+        ELSE EXCLUDED.avg_cost
+      END, 2),
+      last_movement_at = NOW(), last_movement_type = 'receipt', updated_at = NOW()
+    RETURNING *`;
+  return wrapStockLevelDoc(stockLevelToApi(rows[0]));
 };
 
 model.validateAvailable = async function validateAvailable(companyId, productId, warehouseId, requiredQty) {

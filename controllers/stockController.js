@@ -16,18 +16,6 @@ const OpeningStockService = require('../services/openingStockService');
 const inventoryService = require('../services/inventoryService');
 const { parseBoundedPage } = require('../utils/querySafety');
 
-const STOCK_LEVEL_SORT_COLUMNS = {
-  productName: 'p.name',
-  productSku: 'p.sku',
-  quantity: 'ib.quantity',
-  availableQuantity: 'ib.available_quantity',
-  reservedQuantity: 'ib.reserved_quantity',
-  unitCost: 'ib.unit_cost',
-  totalCost: 'ib.total_cost',
-  expiryDate: 'ib.expiry_date',
-  warehouseName: 'w.name',
-};
-
 const LIKE_ESCAPE = /[\\%_]/g;
 function escapeLike(value) {
   return String(value).replace(LIKE_ESCAPE, (char) => `\\${char}`);
@@ -825,133 +813,116 @@ exports.updateStockMovement = async (req, res, next) => {
 exports.getStockLevels = async (req, res, next) => {
   try {
     const companyId = String(req.user.company._id);
-    const {
-      warehouse,
-      product,
-      lowStock,
-      search,
-      page = 1,
-      limit = 50,
-      sortBy = 'productName',
-      order = 'asc',
-    } = req.query;
-    const pageNum = Math.max(1, parseInt(page, 10) || 1);
-    const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 50));
+    const { page, limit } = parseBoundedPage(req.query, { defaultLimit: 50, maxLimit: 100 });
+    const { warehouse, product, lowStock, search, status } = req.query;
+    const pageNum = page;
+    const limitNum = limit;
     const skip = (pageNum - 1) * limitNum;
-    const sortColumn = STOCK_LEVEL_SORT_COLUMNS[sortBy] || STOCK_LEVEL_SORT_COLUMNS.productName;
-    const sortDirection = String(order).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
-
-    // The fallback is still useful for products whose stock has not been
-    // materialised into inventory_batches. Its reads are bounded and warehouse
-    // options are served from the shared reference-data cache.
-    const batchWhere = ['ib.company_id = $1'];
+    const allowedSortColumns = {
+      productName: 'p.name',
+      productSku: 'p.sku',
+      quantity: 'sl.qty_on_hand',
+      availableQuantity: 'GREATEST(sl.qty_on_hand - sl.qty_reserved, 0)',
+      reservedQuantity: 'sl.qty_reserved',
+      unitCost: 'sl.avg_cost',
+      totalCost: 'sl.total_value',
+      warehouseName: 'w.name',
+      lastMovement: 'sl.last_movement_at',
+    };
+    const sortColumn = allowedSortColumns[req.query.sortBy] || allowedSortColumns.productName;
+    const sortDirection = String(req.query.order).toLowerCase() === 'desc' ? 'DESC' : 'ASC';
+    const where = ['sl.company_id = $1', 'p.company_id = $1', 'w.company_id = $1', 'p.is_archived = FALSE'];
     const params = [companyId];
     const addParam = (value) => {
       params.push(value);
       return `$${params.length}`;
     };
-    if (warehouse) batchWhere.push(`ib.warehouse_id = ${addParam(String(warehouse))}`);
-    if (product) batchWhere.push(`ib.product_id = ${addParam(String(product))}`);
-    if (lowStock === 'true') batchWhere.push('ib.available_quantity <= (ib.quantity * 0.2)');
+    if (warehouse) where.push(`sl.warehouse_id = ${addParam(String(warehouse))}`);
+    if (product) where.push(`sl.product_id = ${addParam(String(product))}`);
     if (search && String(search).trim()) {
-      const term = addParam(escapeLike(String(search).trim()));
-      batchWhere.push(`(p.name ILIKE ${term} || '%' ESCAPE '\\' OR p.sku ILIKE ${term} || '%' ESCAPE '\\' OR w.name ILIKE ${term} || '%' ESCAPE '\\')`);
+      const term = addParam(`%${escapeLike(String(search).trim())}%`);
+      where.push(`(p.name ILIKE ${term} ESCAPE '\\' OR p.sku ILIKE ${term} ESCAPE '\\' OR w.name ILIKE ${term} ESCAPE '\\' OR w.code ILIKE ${term} ESCAPE '\\')`);
     }
-    const whereSql = batchWhere.join(' AND ');
-    const countSql = `
-      SELECT COUNT(*)::int AS total
-      FROM inventory_batches ib
-      LEFT JOIN products p ON p.id = ib.product_id
-      LEFT JOIN warehouses w ON w.id = ib.warehouse_id
+    const available = 'GREATEST(sl.qty_on_hand - sl.qty_reserved, 0)';
+    if (lowStock === 'true') where.push(`sl.qty_on_hand > 0 AND ${available} <= p.low_stock_threshold`);
+    if (status === 'out_of_stock') where.push('sl.qty_on_hand <= 0');
+    if (status === 'low_stock') where.push(`sl.qty_on_hand > 0 AND ${available} <= p.low_stock_threshold`);
+    if (status === 'in_stock') where.push(`${available} > p.low_stock_threshold`);
+    const whereSql = where.join(' AND ');
+    const fromSql = `
+      FROM stock_levels sl
+      JOIN products p ON p.id = sl.product_id AND p.company_id = sl.company_id
+      JOIN warehouses w ON w.id = sl.warehouse_id AND w.company_id = sl.company_id
+      LEFT JOIN categories c ON c.id = p.category_id AND c.company_id = p.company_id
       WHERE ${whereSql}`;
-    const pageSql = `
-      SELECT ib.id AS "_id", ib.product_id AS "productId", p.name AS "productName",
-             p.sku AS "productSku", ib.warehouse_id AS "warehouseId", w.name AS "warehouseName",
-             ib.quantity::double precision AS quantity,
-             ib.available_quantity::double precision AS "availableQuantity",
-             ib.reserved_quantity::double precision AS "reservedQuantity",
-             ib.unit_cost::double precision AS "unitCost",
-             ib.total_cost::double precision AS "totalCost",
-             ib.batch_number AS "batchNumber", ib.expiry_date AS "expiryDate",
-             ib.status, ib.updated_at AS "lastMovement"
-      FROM inventory_batches ib
-      LEFT JOIN products p ON p.id = ib.product_id
-      LEFT JOIN warehouses w ON w.id = ib.warehouse_id
-      WHERE ${whereSql}
-      ORDER BY ${sortColumn} ${sortDirection}, ib.id ASC
+    const dataSql = `
+      SELECT sl.id AS "_id", sl.product_id AS "productId", p.name AS "productName", p.sku AS "productSku",
+             p.category_id AS "categoryId", c.name AS "categoryName", p.unit,
+             sl.warehouse_id AS "warehouseId", w.name AS "warehouseName", w.is_active AS "warehouseActive",
+             sl.qty_on_hand::double precision AS "currentStock",
+             sl.qty_reserved::double precision AS "reservedQuantity",
+             ${available}::double precision AS "availableQuantity",
+             sl.avg_cost::double precision AS "averageCost",
+             sl.total_value::double precision AS "totalValue",
+             p.low_stock_threshold::double precision AS "lowStockThreshold",
+             p.is_active AS "isActive", sl.last_movement_at AS "lastMovementAt",
+             CASE WHEN sl.qty_on_hand <= 0 THEN 'out_of_stock'
+                  WHEN ${available} <= p.low_stock_threshold THEN 'low_stock'
+                  ELSE 'in_stock' END AS status
+      ${fromSql}
+      ORDER BY ${sortColumn} ${sortDirection} NULLS LAST, sl.id ASC
       LIMIT ${limitNum} OFFSET ${skip}`;
-
-    const [countRows, batchRows] = await Promise.all([
+    const summarySql = `
+      SELECT COUNT(*)::int AS "stockRecordCount",
+             COUNT(DISTINCT sl.product_id)::int AS "totalProducts",
+             COALESCE(SUM(sl.qty_on_hand), 0)::double precision AS "totalQuantity",
+             COALESCE(SUM(sl.qty_reserved), 0)::double precision AS "totalReserved",
+             COALESCE(SUM(${available}), 0)::double precision AS "totalAvailable",
+             COALESCE(SUM(sl.total_value), 0)::double precision AS "totalValue",
+             COUNT(*) FILTER (WHERE sl.qty_on_hand > 0 AND ${available} <= p.low_stock_threshold)::int AS "lowStockCount",
+             COUNT(*) FILTER (WHERE sl.qty_on_hand <= 0)::int AS "outOfStockCount",
+             COALESCE(SUM(sl.total_value) FILTER (WHERE sl.qty_on_hand > 0 AND ${available} <= p.low_stock_threshold), 0)::double precision AS "valueAtRisk",
+             (SELECT jsonb_build_object('productName', top_product.name, 'productSku', top_product.sku, 'totalValue', top_level.total_value::double precision)
+                FROM stock_levels top_level
+                JOIN products top_product ON top_product.id = top_level.product_id AND top_product.company_id = top_level.company_id
+                JOIN warehouses top_warehouse ON top_warehouse.id = top_level.warehouse_id AND top_warehouse.company_id = top_level.company_id
+                LEFT JOIN categories top_category ON top_category.id = top_product.category_id AND top_category.company_id = top_product.company_id
+                WHERE ${whereSql.replaceAll('sl.', 'top_level.').replaceAll('p.', 'top_product.').replaceAll('w.', 'top_warehouse.').replaceAll('c.', 'top_category.')}
+                ORDER BY top_level.total_value DESC, top_level.id ASC LIMIT 1) AS "topValueItem"
+      ${fromSql}`;
+    const countSql = `SELECT COUNT(*)::int AS total ${fromSql}`;
+    const [countRows, dataRows, summaryRows, warehouses] = await Promise.all([
       dbClient().$queryRawUnsafe(countSql, ...params),
-      dbClient().$queryRawUnsafe(pageSql, ...params),
+      dbClient().$queryRawUnsafe(dataSql, ...params),
+      dbClient().$queryRawUnsafe(summarySql, ...params),
+      getActiveWarehouseOptions(companyId),
     ]);
+    const summary = summaryRows[0] || {};
+    const data = dataRows.map((row) => ({
+      ...row,
+      category: row.categoryId ? { _id: row.categoryId, name: row.categoryName } : null,
+      defaultWarehouse: { _id: row.warehouseId, name: row.warehouseName },
+      warehouse: { _id: row.warehouseId, name: row.warehouseName, isActive: row.warehouseActive },
+      product: { _id: row.productId, name: row.productName, sku: row.productSku },
+    }));
     const total = Number(countRows[0]?.total || 0);
-    const warehouses = await getActiveWarehouseOptions(companyId);
 
-    if (total === 0) {
-      const productWhere = ['p.company_id = $1', '(p.current_stock > 0 OR p.default_warehouse_id IS NOT NULL)'];
-      const productParams = [companyId];
-      const addProductParam = (value) => {
-        productParams.push(value);
-        return `$${productParams.length}`;
-      };
-      if (product) productWhere.push(`p.id = ${addProductParam(String(product))}`);
-      if (search && String(search).trim()) {
-        const term = addProductParam(escapeLike(String(search).trim()));
-        productWhere.push(`(p.name ILIKE ${term} || '%' ESCAPE '\\' OR p.sku ILIKE ${term} || '%' ESCAPE '\\')`);
-      }
-      if (lowStock === 'true') productWhere.push('p.current_stock <= p.low_stock_threshold');
-      const productWhereSql = productWhere.join(' AND ');
-      const productSort = {
-        productName: 'p.name',
-        productSku: 'p.sku',
-        quantity: 'p.current_stock',
-        availableQuantity: 'p.current_stock',
-        unitCost: 'p.cost_price',
-      }[sortBy] || 'p.name';
-      const [productCountRows, products] = await Promise.all([
-        dbClient().$queryRawUnsafe(`SELECT COUNT(*)::int AS total FROM products p WHERE ${productWhereSql}`, ...productParams),
-        dbClient().$queryRawUnsafe(`
-          SELECT p.id AS "_id", p.name AS "productName", p.sku AS "productSku",
-                 p.default_warehouse_id AS "warehouseId", w.name AS "warehouseName",
-                 p.current_stock::double precision AS quantity,
-                 p.current_stock::double precision AS "availableQuantity",
-                 0::double precision AS "reservedQuantity",
-                 COALESCE(NULLIF(p.cost_price, 0), p.average_cost)::double precision AS "unitCost",
-                 (p.current_stock * COALESCE(NULLIF(p.cost_price, 0), p.average_cost))::double precision AS "totalCost"
-          FROM products p
-          LEFT JOIN warehouses w ON w.id = p.default_warehouse_id
-          WHERE ${productWhereSql}
-          ORDER BY ${productSort} ${sortDirection}, p.id ASC
-          LIMIT ${limitNum} OFFSET ${skip}`, ...productParams),
-      ]);
-      const productTotal = Number(productCountRows[0]?.total || 0);
-      if (productTotal > 0) {
-        return res.json({
-          success: true,
-          data: products.map((row) => ({
-            ...row,
-            product: row._id,
-            warehouse: row.warehouseId || warehouses[0]?._id || null,
-            warehouseId: row.warehouseId || warehouses[0]?._id || null,
-            warehouseName: row.warehouseName || warehouses[0]?.name || 'Unassigned',
-            status: 'active',
-            source: 'product',
-          })),
-          warehouses,
-          pagination: { total: productTotal, page: pageNum, limit: limitNum, pages: Math.ceil(productTotal / limitNum) },
-        });
-      }
-    }
-
-    return res.json({
+    res.json({
       success: true,
-      data: batchRows.map((row) => ({
-        ...row,
-        product: `${row.productName || ''} (${row.productSku || ''})`.trim(),
-        warehouse: row.warehouseName || null,
-      })),
+      data,
       warehouses,
+      summary: {
+        stockRecordCount: Number(summary.stockRecordCount || 0),
+        totalProducts: Number(summary.totalProducts || 0),
+        totalQuantity: Number(summary.totalQuantity || 0),
+        totalReserved: Number(summary.totalReserved || 0),
+        totalAvailable: Number(summary.totalAvailable || 0),
+        totalValue: Number(summary.totalValue || 0),
+        lowStockCount: Number(summary.lowStockCount || 0),
+        outOfStockCount: Number(summary.outOfStockCount || 0),
+        valueAtRisk: Number(summary.valueAtRisk || 0),
+        topValueItem: summary.topValueItem || null,
+      },
       pagination: { total, page: pageNum, limit: limitNum, pages: Math.ceil(total / limitNum) },
     });
   } catch (error) {
