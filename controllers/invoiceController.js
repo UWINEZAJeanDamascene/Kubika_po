@@ -887,6 +887,38 @@ exports.cancelInvoice = async (req, res, next) => {
   }
 };
 
+// Verify the invoice customer's TIN with the configured EBM service.
+exports.verifyInvoiceCustomerTin = async (req, res, next) => {
+  try {
+    const companyId = String(req.user.company._id || req.user.company.id);
+    const result = await require('../services/ebmCustomerTinService').verifyInvoiceCustomerTin(
+      companyId,
+      req.params.id,
+      { branchId: req.body.branchId || req.body.bhfId || '00' },
+    );
+    res.json({ success: true, data: result.invoice, verification: result.verification });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Submit a confirmed invoice to RRA/EBM and return the persisted submission state.
+exports.submitInvoiceEbm = async (req, res, next) => {
+  try {
+    const companyId = String(req.user.company._id || req.user.company.id);
+    const invoice = await require('../services/ebmSalesService').submitInvoice(req.params.id, {
+      companyId,
+      branchId: req.body.branchId || req.body.bhfId || null,
+    });
+    res.json({ success: true, message: 'Invoice submitted to EBM.', data: await hydrateInvoiceRelations(invoice, companyId) });
+  } catch (error) {
+    if (error.invoice) {
+      error.data = await hydrateInvoiceRelations(error.invoice, String(req.user.company._id || req.user.company.id));
+    }
+    next(error);
+  }
+};
+
 // @desc    Save receipt metadata
 // @route   POST /api/invoices/:id/receipt-metadata
 // @access  Private (admin)
