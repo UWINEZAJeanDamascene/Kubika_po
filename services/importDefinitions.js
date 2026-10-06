@@ -165,15 +165,31 @@ const ENTITY_DEFINITIONS = {
     label: 'Budget',
     uniqueField: null,
     fields: [
-      { key: 'accountCode', label: 'Account Code', required: true, section: 'Budget', example: '6100', instructions: 'Existing account code.' },
-      { key: 'budgetName', label: 'Budget Name', required: false, section: 'Budget', example: 'FY2026 Operating Budget', instructions: 'Groups lines into this named draft budget for the fiscal year.' },
+      { key: 'accountCode', label: 'Account Code', required: true, section: 'Budget', example: '6100', instructions: 'Existing chart-of-accounts entry; code, exact name, or ID is accepted.' },
+      { key: 'budgetName', label: 'Budget Name', required: true, section: 'Budget', example: 'FY2026 Operating Budget', instructions: 'Budget name; rows with the same name and fiscal year are grouped.' },
+      { key: 'budgetCode', label: 'Budget Code', required: false, section: 'Budget', example: 'OPEX-2026', instructions: 'Optional budget code.' },
       { key: 'budgetDescription', label: 'Budget Description', required: false, section: 'Budget', example: 'Annual operating plan', instructions: 'Optional description applied when the budget is created.' },
-      { key: 'budgetType', label: 'Budget Type', required: false, section: 'Budget', example: 'expense', instructions: 'Optional budget type; defaults to expense.' },
+      { key: 'budgetPurpose', label: 'Budget Purpose', required: false, section: 'Budget', example: 'Fund planned operating costs', instructions: 'Optional purpose.' },
+      { key: 'budgetNotes', label: 'Budget Notes', required: false, section: 'Budget', example: 'Review quarterly', instructions: 'Optional notes.' },
+      { key: 'budgetTags', label: 'Budget Tags', required: false, section: 'Budget', example: 'region,operations', instructions: 'Optional comma-separated tags.' },
+      { key: 'budgetType', label: 'Budget Type', required: true, section: 'Budget', example: 'expense', instructions: 'expense, opex, capex, project, revenue, or profit.' },
       { key: 'budgetCycle', label: 'Budget Cycle', required: false, section: 'Budget', example: 'fixed_year', instructions: 'Optional: fixed_year or rolling. Defaults to fixed_year.' },
       { key: 'budgetCategory', label: 'Budget Category', required: false, section: 'Budget', example: 'Operations', instructions: 'Optional category used to organize the budget.' },
+      { key: 'fiscalYear', label: 'Fiscal Year', required: true, section: 'Budget', example: '2026', instructions: 'Four-digit fiscal year.' },
+      { key: 'periodType', label: 'Period Type', required: false, section: 'Budget', example: 'yearly', instructions: 'monthly, quarterly, yearly, or custom.' },
+      { key: 'periodStart', label: 'Period Start', required: false, section: 'Budget', example: '2026-01-01', instructions: 'Optional date in YYYY-MM-DD format.' },
+      { key: 'periodEnd', label: 'Period End', required: false, section: 'Budget', example: '2026-12-31', instructions: 'Optional date in YYYY-MM-DD format.' },
+      { key: 'budgetOwner', label: 'Budget Owner', required: false, section: 'Budget', example: 'owner@example.com', instructions: 'Existing user email, name, or ID.' },
+      { key: 'parentBudget', label: 'Parent Budget', required: false, section: 'Budget', example: 'Corporate Budget', instructions: 'Existing parent budget name, code, or ID.' },
+      { key: 'entity', label: 'Entity', required: false, section: 'Budget', example: 'Main Company', instructions: 'Existing company/entity name, code, or ID.' },
+      { key: 'baseCurrency', label: 'Base Currency', required: false, section: 'Budget', example: 'RWF', instructions: 'Currency code, for example RWF or USD.' },
+      { key: 'exchangeRateType', label: 'Exchange Rate Type', required: false, section: 'Budget', example: 'spot', instructions: 'fixed, spot, or average.' },
+      { key: 'exchangeRate', label: 'Exchange Rate', required: false, section: 'Budget', example: '1', instructions: 'Positive numeric rate.' },
+      { key: 'allowMultiCurrency', label: 'Allow Multi-Currency', required: false, section: 'Budget', example: 'false', instructions: 'TRUE or FALSE.' },
+      { key: 'allocationMethod', label: 'Allocation Method', required: false, section: 'Budget', example: 'manual', instructions: 'manual, top_down, bottom_up, or percentage_split.' },
       { key: 'period', label: 'Period', required: true, section: 'Budget', example: '2026-05', instructions: 'Budget month and year.' },
       { key: 'budgetedAmount', label: 'Budgeted Amount', required: true, section: 'Budget', example: '2500000', instructions: 'Non-negative amount, numbers only.' },
-      { key: 'department', label: 'Department', required: false, section: 'Budget', example: 'Operations', instructions: 'Optional existing department name for the budget.' },
+      { key: 'department', label: 'Department', required: false, section: 'Budget', example: 'Operations', instructions: 'Optional existing department name, code, or ID.' },
       { key: 'lineCategory', label: 'Line Category', required: false, section: 'Budget', example: 'Operating costs', instructions: 'Optional category for this account and period line.' },
       { key: 'lineNotes', label: 'Line Notes', required: false, section: 'Budget', example: 'Includes routine supplies', instructions: 'Optional notes for this budget line.' }
     ]
@@ -217,7 +233,7 @@ function getEntityDefinition(entityType) {
 }
 
 function listEntityDefinitions() {
-  return Object.entries(ENTITY_DEFINITIONS).map(([key, value]) => ({
+  return Object.entries(ENTITY_DEFINITIONS).filter(([, value]) => !value.aliasOf).map(([key, value]) => ({
     key,
     label: value.label,
     fields: value.fields
