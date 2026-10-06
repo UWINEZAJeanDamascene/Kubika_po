@@ -1,6 +1,41 @@
 const Category = require('../models/Category');
 const Product = require('../models/Product');
 
+const CATEGORY_FIELDS = ['name', 'description', 'parent', 'defaultInventoryAccount', 'defaultCogsAccount', 'defaultRevenueAccount', 'isActive', 'customFields'];
+
+function normalizeCategoryPayload(body = {}) {
+  const payload = {};
+  for (const field of CATEGORY_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(body, field)) payload[field] = body[field];
+  }
+  if (payload.name !== undefined) payload.name = String(payload.name || '').trim();
+  if (payload.description !== undefined && payload.description !== null) payload.description = String(payload.description).trim();
+  if (payload.parent === '') payload.parent = null;
+  return payload;
+}
+
+async function validateParent(companyId, parentId, categoryId = null) {
+  if (!parentId) return null;
+  const visited = new Set();
+  let currentId = String(parentId);
+  while (currentId) {
+    if (categoryId && currentId === String(categoryId)) return 'A category cannot be its own parent or a descendant of itself';
+    if (visited.has(currentId)) return 'The selected parent has an invalid category cycle';
+    visited.add(currentId);
+    const parent = await Category.findOne({ _id: currentId, company: companyId }).select('_id parent').lean();
+    if (!parent) return 'Parent category not found';
+    currentId = parent.parent ? String(parent.parent) : null;
+  }
+  return null;
+}
+
+async function validateSiblingName(companyId, name, parentId, excludedId = null) {
+  if (!name) return 'Category name is required';
+  const siblings = await Category.find({ company: companyId, parent: parentId || null }).select('_id name').lean();
+  const duplicate = siblings.some((item) => String(item._id) !== String(excludedId || '') && String(item.name).trim().toLocaleLowerCase() === name.toLocaleLowerCase());
+  return duplicate ? 'A category with this name already exists under the selected parent' : null;
+}
+
 // @desc    Get all categories
 // @route   GET /api/categories
 // @access  Private
@@ -85,22 +120,13 @@ exports.getCategory = async (req, res, next) => {
 exports.createCategory = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { name } = req.body;
-    
-    // Allow duplicate category names per request - uniqueness enforced at DB only if needed
-    
-    req.body.company = companyId;
-    req.body.createdBy = req.user.id;
+    const payload = normalizeCategoryPayload(req.body);
+    const nameError = await validateSiblingName(companyId, payload.name, payload.parent);
+    if (nameError) return res.status(400).json({ success: false, message: nameError });
+    const parentError = await validateParent(companyId, payload.parent);
+    if (parentError) return res.status(400).json({ success: false, message: parentError });
 
-    // Validate parent existence (if provided) and rely on model hook for depth
-    if (req.body.parent) {
-      const parent = await Category.findOne({ _id: req.body.parent, company: companyId });
-      if (!parent) {
-        return res.status(400).json({ success: false, message: 'Parent category not found' });
-      }
-    }
-
-    const category = await Category.create(req.body);
+    const category = await Category.create({ ...payload, company: companyId, createdBy: req.user.id });
 
     res.status(201).json({
       success: true,
@@ -126,28 +152,22 @@ exports.createCategory = async (req, res, next) => {
 exports.updateCategory = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { name } = req.body;
-    
-    // Allow updating name even if duplicates exist
-    
-    // If parent is provided, verify it exists and belongs to company
-    if (req.body.parent) {
-      const parent = await Category.findOne({ _id: req.body.parent, company: companyId });
-      if (!parent) {
-        return res.status(400).json({ success: false, message: 'Parent category not found' });
-      }
-    }
-
-    // Apply update then re-load to trigger hooks/validation
+    const payload = normalizeCategoryPayload(req.body);
     let category = await Category.findOne({ _id: req.params.id, company: companyId });
     if (!category) {
       return res.status(404).json({ success: false, message: 'Category not found' });
     }
+    const nextParent = Object.prototype.hasOwnProperty.call(payload, 'parent') ? payload.parent : category.parent;
+    const nextName = payload.name === undefined ? category.name : payload.name;
+    const nameError = await validateSiblingName(companyId, nextName, nextParent, category._id);
+    if (nameError) return res.status(400).json({ success: false, message: nameError });
+    const parentError = await validateParent(companyId, nextParent, category._id);
+    if (parentError) return res.status(400).json({ success: false, message: parentError });
 
-    Object.assign(category, req.body);
+    Object.assign(category, payload);
     await category.save();
 
-    category = await Category.findById(category._id).populate('createdBy', 'name email');
+    category = await Category.findOne({ _id: category._id, company: companyId }).populate('createdBy', 'name email');
 
     if (!category) {
       return res.status(404).json({
@@ -182,11 +202,13 @@ exports.deleteCategory = async (req, res, next) => {
     // Check if category has products
     const productsCount = await Product.countDocuments({ category: req.params.id, company: companyId });
 
-    if (productsCount > 0) {
+    const childrenCount = await Category.countDocuments({ parent: req.params.id, company: companyId });
+
+    if (productsCount > 0 || childrenCount > 0) {
         return res.status(409).json({
           success: false,
           code: 'CATEGORY_IN_USE',
-          message: `Cannot delete category. It has ${productsCount} product(s) associated with it.`
+          message: `Cannot delete category while it has ${productsCount} product(s) or ${childrenCount} child categor${childrenCount === 1 ? 'y' : 'ies'}. Reassign or remove them first.`
         });
     }
 

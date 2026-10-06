@@ -4,6 +4,34 @@ const Product = require('../models/Product');
 const EBMBranchService = require('../services/ebmBranchService');
 const { Prisma } = require('@prisma/client');
 const { prisma } = require('../lib/prisma');
+const { warehouseTranslateCreate, warehouseTranslateUpdate } = require('../utils/masterDataMappers');
+
+const WAREHOUSE_FIELDS = ['name', 'code', 'description', 'location', 'inventoryAccount', 'isActive', 'isDefault', 'customFields', 'rraBranchId'];
+
+function warehousePayload(body = {}) {
+  const payload = {};
+  for (const field of WAREHOUSE_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(body, field)) payload[field] = body[field];
+  }
+  if (payload.name !== undefined) payload.name = String(payload.name || '').trim();
+  if (payload.code !== undefined) payload.code = String(payload.code || '').trim().toUpperCase();
+  if (payload.description !== undefined && payload.description !== null) payload.description = String(payload.description).trim();
+  return payload;
+}
+
+function isUniqueConflict(error) {
+  return error?.code === 'P2002' || error?.code === '23505' || error?.code === 11000;
+}
+
+async function warehouseHasStock(companyId, warehouseId) {
+  const [level, inventoryBatch, stockBatch, serial] = await Promise.all([
+    prisma.stockLevel.findFirst({ where: { companyId: asId(companyId), warehouseId: asId(warehouseId), OR: [{ qtyOnHand: { gt: 0 } }, { qtyReserved: { gt: 0 } }] }, select: { id: true } }),
+    prisma.inventoryBatch.findFirst({ where: { companyId: asId(companyId), warehouseId: asId(warehouseId), OR: [{ availableQuantity: { gt: 0 } }, { reservedQuantity: { gt: 0 } }] }, select: { id: true } }),
+    prisma.stockBatch.findFirst({ where: { companyId: asId(companyId), warehouseId: asId(warehouseId), OR: [{ qtyOnHand: { gt: 0 } }, { reservedQuantity: { gt: 0 } }] }, select: { id: true } }),
+    prisma.stockSerialNumber.findFirst({ where: { companyId: asId(companyId), warehouseId: asId(warehouseId), status: { in: ['in_stock', 'reserved', 'returned'] } }, select: { id: true } }),
+  ]);
+  return Boolean(level || inventoryBatch || stockBatch || serial);
+}
 
 function asId(value) {
   if (!value) return null;
@@ -18,12 +46,12 @@ async function getWarehouseStockSummaries(companyId, warehouseIds) {
     SELECT
       warehouse_id AS "warehouseId",
       COUNT(DISTINCT product_id)::int AS "totalProducts",
-      COALESCE(SUM(available_quantity), 0) AS "totalQuantity",
-      COALESCE(SUM(available_quantity * unit_cost), 0) AS "totalValue"
-    FROM inventory_batches
+      COALESCE(SUM(GREATEST(qty_on_hand - qty_reserved, 0)), 0) AS "totalQuantity",
+      COALESCE(SUM(total_value), 0) AS "totalValue"
+    FROM stock_levels
     WHERE company_id = ${asId(companyId)}
       AND warehouse_id IN (${Prisma.join(ids)})
-      AND status <> 'exhausted'
+      AND qty_on_hand > 0
     GROUP BY warehouse_id
   `;
 
@@ -56,7 +84,9 @@ function withStockSummary(warehouse, summaries) {
 exports.getWarehouses = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { page = 1, limit = 20, search, isActive } = req.query;
+    const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 20));
+    const { search, isActive } = req.query;
 
     const query = { company: companyId };
 
@@ -128,11 +158,17 @@ exports.createWarehouse = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
 
-    const warehouse = await Warehouse.create({
-      ...req.body,
-      company: companyId,
-      createdBy: req.user.id
+    const payload = warehousePayload(req.body);
+    if (!payload.name || !payload.code) return res.status(400).json({ success: false, message: 'Warehouse name and code are required' });
+    if (payload.isDefault && payload.isActive === false) return res.status(400).json({ success: false, message: 'An inactive warehouse cannot be the default warehouse' });
+    const data = await warehouseTranslateCreate({ ...payload, company: companyId, createdBy: req.user.id });
+    const row = await prisma.$transaction(async (tx) => {
+      const existingDefault = await tx.warehouse.findFirst({ where: { companyId: asId(companyId), isDefault: true } });
+      const shouldBeDefault = data.isActive && (data.isDefault || !existingDefault);
+      if (shouldBeDefault) await tx.warehouse.updateMany({ where: { companyId: asId(companyId), isDefault: true }, data: { isDefault: false } });
+      return tx.warehouse.create({ data: { ...data, isDefault: shouldBeDefault } });
     });
+    const warehouse = await Warehouse.findOne({ _id: row.id, company: companyId });
 
     if (warehouse.rraBranchId) {
       EBMBranchService.registerBranch(companyId, warehouse, req.user.id).catch((err) => {
@@ -145,6 +181,7 @@ exports.createWarehouse = async (req, res, next) => {
       data: warehouse
     });
   } catch (error) {
+    if (isUniqueConflict(error)) return res.status(409).json({ success: false, code: 'WAREHOUSE_CODE_EXISTS', message: 'A warehouse with this code already exists for this company' });
     next(error);
   }
 };
@@ -165,31 +202,35 @@ exports.updateWarehouse = async (req, res, next) => {
       });
     }
 
+    const payload = warehousePayload(req.body);
     // Prevent deactivating a warehouse that still holds stock
-    if (req.body.hasOwnProperty('isActive') && req.body.isActive === false && warehouse.isActive) {
-      const hasStock = await InventoryBatch.exists({ company: companyId, warehouse: warehouse._id, availableQuantity: { $gt: 0 } });
-      if (hasStock) {
+    if (payload.isActive === false && warehouse.isActive) {
+      if (await warehouseHasStock(companyId, warehouse._id)) {
         return res.status(409).json({
           success: false,
           code: 'WAREHOUSE_HAS_STOCK',
-          message: 'Cannot deactivate warehouse while it holds stock'
+          message: 'Cannot deactivate warehouse while it holds on-hand, reserved, batch, or serialized stock'
         });
       }
     }
 
-    // If setting as default, unset other defaults
-    if (req.body.isDefault && !warehouse.isDefault) {
-      await Warehouse.updateMany(
-        { company: companyId, _id: { $ne: warehouse._id } },
-        { isDefault: false }
-      );
+    if (payload.isDefault === true && (payload.isActive === false || !warehouse.isActive)) {
+      return res.status(400).json({ success: false, message: 'An inactive warehouse cannot be the default warehouse' });
     }
-
-    warehouse = await Warehouse.findByIdAndUpdate(
-      req.params.id,
-      req.body,
-      { new: true, runValidators: true }
-    );
+    if (payload.isActive === false && warehouse.isDefault) {
+      return res.status(409).json({ success: false, code: 'DEFAULT_WAREHOUSE', message: 'Choose another active default warehouse before deactivating this one' });
+    }
+    const update = warehouseTranslateUpdate(payload);
+    const id = asId(warehouse._id);
+    await prisma.$transaction(async (tx) => {
+      if (update.isDefault === false && warehouse.isDefault) {
+        const anotherDefault = await tx.warehouse.findFirst({ where: { companyId: asId(companyId), id: { not: id }, isActive: true, isDefault: true }, select: { id: true } });
+        if (!anotherDefault) throw Object.assign(new Error('The company must keep one active default warehouse'), { code: 'DEFAULT_REQUIRED' });
+      }
+      if (update.isDefault === true) await tx.warehouse.updateMany({ where: { companyId: asId(companyId), isDefault: true, id: { not: id } }, data: { isDefault: false } });
+      await tx.warehouse.update({ where: { id }, data: update });
+    });
+    warehouse = await Warehouse.findOne({ _id: id, company: companyId });
 
     if (warehouse.rraBranchId) {
       EBMBranchService.registerBranch(companyId, warehouse, req.user.id).catch((err) => {
@@ -202,6 +243,8 @@ exports.updateWarehouse = async (req, res, next) => {
       data: warehouse
     });
   } catch (error) {
+    if (error?.code === 'DEFAULT_REQUIRED') return res.status(409).json({ success: false, code: 'DEFAULT_WAREHOUSE_REQUIRED', message: error.message });
+    if (isUniqueConflict(error)) return res.status(409).json({ success: false, code: 'WAREHOUSE_DEFAULT_CONFLICT', message: 'Another warehouse became the default at the same time. Refresh and try again.' });
     next(error);
   }
 };
@@ -223,42 +266,38 @@ exports.deleteWarehouse = async (req, res, next) => {
     }
 
     // Check if warehouse has stock
-    const hasStock = await InventoryBatch.exists({
-      company: companyId,
-      warehouse: warehouse._id,
-      availableQuantity: { $gt: 0 }
-    });
+    const hasStock = await warehouseHasStock(companyId, warehouse._id);
 
     if (hasStock) {
-      return res.status(400).json({
+      return res.status(409).json({
         success: false,
-        message: 'Cannot delete warehouse with existing stock. Transfer stock first.'
+        code: 'WAREHOUSE_HAS_STOCK',
+        message: 'Cannot deactivate warehouse while it holds on-hand, reserved, batch, or serialized stock. Transfer or clear the stock first.'
       });
     }
 
-    // Check if it's the last warehouse
-    const warehouseCount = await Warehouse.countDocuments({ company: companyId });
+    // Warehouses are referenced by movement history and other documents. Retire them instead of hard deleting history.
+    const warehouseCount = await Warehouse.countDocuments({ company: companyId, isActive: true });
     if (warehouseCount <= 1) {
-      return res.status(400).json({
+      return res.status(409).json({
         success: false,
-        message: 'Cannot delete the last warehouse'
+        code: 'LAST_ACTIVE_WAREHOUSE',
+        message: 'Cannot deactivate the last active warehouse'
       });
     }
-
-    // If it's the default warehouse, set another one as default
-    if (warehouse.isDefault) {
-      const anotherWarehouse = await Warehouse.findOne({ company: companyId, _id: { $ne: warehouse._id } });
-      if (anotherWarehouse) {
-        anotherWarehouse.isDefault = true;
-        await anotherWarehouse.save();
+    await prisma.$transaction(async (tx) => {
+      const replacement = await tx.warehouse.findFirst({ where: { companyId: asId(companyId), id: { not: asId(warehouse._id) }, isActive: true }, orderBy: [{ isDefault: 'desc' }, { createdAt: 'asc' }] });
+      if (!replacement) throw new Error('No active warehouse is available to replace this warehouse');
+      if (warehouse.isDefault) {
+        await tx.warehouse.update({ where: { id: replacement.id }, data: { isDefault: true } });
       }
-    }
-
-    await warehouse.deleteOne();
+      await tx.product.updateMany({ where: { companyId: asId(companyId), defaultWarehouseId: asId(warehouse._id) }, data: { defaultWarehouseId: replacement.id } });
+      await tx.warehouse.update({ where: { id: asId(warehouse._id) }, data: { isActive: false, isDefault: false } });
+    });
 
     res.json({
       success: true,
-      message: 'Warehouse deleted successfully'
+      message: 'Warehouse deactivated. Its transaction history has been retained.'
     });
   } catch (error) {
     next(error);
