@@ -142,6 +142,10 @@ function isBlank(value) {
   return value === undefined || value === null || String(value).trim() === '';
 }
 
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 function parseNumber(value) {
   if (isBlank(value)) return null;
   const normalized = String(value).replace(/,/g, '').trim();
@@ -423,7 +427,7 @@ function validateCleanRow(entityType, clean, rowNumber) {
     }
   }
 
-  for (const key of ['sellingPrice', 'costPrice', 'openingStockQuantity', 'reorderLevel', 'reorderQuantity', 'weight', 'creditLimit', 'openingBalance', 'basicSalary', 'debitBalance', 'creditBalance', 'cost', 'accumulatedDepreciation', 'usefulLifeYears', 'budgetedAmount', 'quantity', 'costPerUnit', 'amountOutstanding']) {
+  for (const key of ['sellingPrice', 'costPrice', 'openingStockQuantity', 'reorderLevel', 'reorderQuantity', 'weight', 'creditLimit', 'openingBalance', 'basicSalary', 'transportAllowance', 'housingAllowance', 'otherAllowances', 'defaultDirectPercentage', 'debitBalance', 'creditBalance', 'cost', 'accumulatedDepreciation', 'salvageValue', 'decliningRate', 'insuredValue', 'usefulLifeYears', 'budgetedAmount', 'quantity', 'costPerUnit', 'amountOutstanding']) {
     if (!isBlank(clean[key]) && Number.isNaN(parseNumber(clean[key]))) {
       errors.push(buildValidationError(rowNumber, key, `${key} must be a number - found '${clean[key]}'.`, clean[key]));
     }
@@ -441,13 +445,47 @@ function validateCleanRow(entityType, clean, rowNumber) {
   if (!isBlank(clean.phone) && !/^(\+250|250|0)?7[2389]\d{7}$/.test(String(clean.phone).replace(/\s+/g, ''))) {
     errors.push(buildValidationError(rowNumber, 'phone', `Phone must be a valid Rwandan number - found '${clean.phone}'.`, clean.phone));
   }
-  for (const key of ['hireDate', 'purchaseDate', 'asOfDate', 'dueDate']) {
+  for (const key of ['hireDate', 'terminationDate', 'dateOfBirth', 'salaryEffectiveDate', 'purchaseDate', 'inServiceDate', 'warrantyStartDate', 'warrantyEndDate', 'asOfDate', 'dueDate']) {
     if (!isBlank(clean[key]) && !parseDateValue(clean[key])) {
       errors.push(buildValidationError(rowNumber, key, `${key} must be a valid date - found '${clean[key]}'.`, clean[key]));
     }
   }
   if (!isBlank(clean.accountType) && !['asset', 'liability', 'equity', 'revenue', 'expense', 'cogs'].includes(String(clean.accountType).toLowerCase())) {
     errors.push(buildValidationError(rowNumber, 'accountType', `Account type must be Asset, Liability, Equity, Revenue, or Expense - found '${clean.accountType}'.`, clean.accountType));
+  }
+
+  if (entityType === 'employees') {
+    if (!isBlank(clean.basicSalary) && (parseNumber(clean.basicSalary) == null || parseNumber(clean.basicSalary) <= 0)) errors.push(buildValidationError(rowNumber, 'basicSalary', 'Basic salary must be greater than zero.', clean.basicSalary));
+    for (const key of ['transportAllowance', 'housingAllowance', 'otherAllowances']) {
+      if (!isBlank(clean[key]) && parseNumber(clean[key]) < 0) errors.push(buildValidationError(rowNumber, key, `${key} cannot be negative.`, clean[key]));
+    }
+    if (!isBlank(clean.defaultDirectPercentage) && (parseNumber(clean.defaultDirectPercentage) < 0 || parseNumber(clean.defaultDirectPercentage) > 100)) errors.push(buildValidationError(rowNumber, 'defaultDirectPercentage', 'Direct percentage must be from 0 to 100.', clean.defaultDirectPercentage));
+    if (!isBlank(clean.isPrimaryEmployer) && !['true', 'false', 'yes', 'no', '1', '0'].includes(String(clean.isPrimaryEmployer).toLowerCase())) errors.push(buildValidationError(rowNumber, 'isPrimaryEmployer', 'Primary Employer must be TRUE or FALSE.', clean.isPrimaryEmployer));
+    if (!isBlank(clean.status) && !['active', 'inactive', 'terminated'].includes(String(clean.status).toLowerCase())) errors.push(buildValidationError(rowNumber, 'status', 'Employment status must be active, inactive, or terminated.', clean.status));
+    if (!isBlank(clean.gender) && !['male', 'female', 'other'].includes(String(clean.gender).toLowerCase())) errors.push(buildValidationError(rowNumber, 'gender', 'Gender must be male, female, or other.', clean.gender));
+    if (!isBlank(clean.employmentType) && !['full-time', 'part-time', 'contract', 'intern', 'casual'].includes(String(clean.employmentType).toLowerCase())) errors.push(buildValidationError(rowNumber, 'employmentType', 'Employment type must be full-time, part-time, contract, intern, or casual.', clean.employmentType));
+    if (!isBlank(clean.taxStatus) && !['resident', 'non-resident'].includes(String(clean.taxStatus).toLowerCase())) errors.push(buildValidationError(rowNumber, 'taxStatus', 'Tax status must be resident or non-resident.', clean.taxStatus));
+    if (!isBlank(clean.laborType) && !['direct', 'indirect', 'mixed'].includes(String(clean.laborType).toLowerCase())) errors.push(buildValidationError(rowNumber, 'laborType', 'Labor type must be direct, indirect, or mixed.', clean.laborType));
+    if (!isBlank(clean.tinNumber) && !/^\d{9}$/.test(String(clean.tinNumber))) errors.push(buildValidationError(rowNumber, 'tinNumber', 'TIN Number must be 9 digits.', clean.tinNumber));
+    if (!isBlank(clean.managerEmployeeId) && String(clean.managerEmployeeId).trim().toUpperCase() === String(clean.employeeId || '').trim().toUpperCase()) errors.push(buildValidationError(rowNumber, 'managerEmployeeId', 'An employee cannot be their own manager.', clean.managerEmployeeId));
+  }
+  if (entityType === 'budget') {
+    if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(String(clean.period || ''))) errors.push(buildValidationError(rowNumber, 'period', 'Period must use YYYY-MM format, for example 2026-05.', clean.period));
+    if (!isBlank(clean.budgetedAmount) && (parseNumber(clean.budgetedAmount) == null || parseNumber(clean.budgetedAmount) < 0)) errors.push(buildValidationError(rowNumber, 'budgetedAmount', 'Budgeted amount cannot be negative.', clean.budgetedAmount));
+    if (!isBlank(clean.budgetType) && !['expense', 'revenue', 'operational', 'capital', 'cash_flow', 'project'].includes(String(clean.budgetType).toLowerCase())) errors.push(buildValidationError(rowNumber, 'budgetType', 'Budget type must be expense, revenue, operational, capital, cash_flow, or project.', clean.budgetType));
+    if (!isBlank(clean.budgetCycle) && !['fixed_year', 'rolling'].includes(String(clean.budgetCycle).toLowerCase().replace(/[ -]+/g, '_'))) errors.push(buildValidationError(rowNumber, 'budgetCycle', 'Budget cycle must be fixed_year or rolling.', clean.budgetCycle));
+  }
+  if (entityType === 'fixed_assets') {
+    const cost = parseNumber(clean.cost);
+    const accumulated = parseNumber(clean.accumulatedDepreciation) || 0;
+    const salvage = parseNumber(clean.salvageValue) || 0;
+    if (!isBlank(clean.cost) && (cost == null || cost <= 0)) errors.push(buildValidationError(rowNumber, 'cost', 'Asset cost must be greater than zero.', clean.cost));
+    if (!isBlank(clean.accumulatedDepreciation) && (accumulated < 0 || (cost != null && accumulated > cost))) errors.push(buildValidationError(rowNumber, 'accumulatedDepreciation', 'Accumulated depreciation must be from zero through the asset cost.', clean.accumulatedDepreciation));
+    if (!isBlank(clean.salvageValue) && (salvage < 0 || (cost != null && salvage > cost))) errors.push(buildValidationError(rowNumber, 'salvageValue', 'Salvage value must be from zero through the asset cost.', clean.salvageValue));
+    if (!isBlank(clean.usefulLifeYears) && (parseNumber(clean.usefulLifeYears) == null || parseNumber(clean.usefulLifeYears) <= 0)) errors.push(buildValidationError(rowNumber, 'usefulLifeYears', 'Useful life must be greater than zero.', clean.usefulLifeYears));
+    if (!isBlank(clean.depreciationMethod) && !['straight line', 'straight_line', 'reducing balance', 'reducing_balance', 'declining balance', 'declining_balance'].includes(String(clean.depreciationMethod).toLowerCase())) errors.push(buildValidationError(rowNumber, 'depreciationMethod', 'Depreciation method must be straight line or reducing balance.', clean.depreciationMethod));
+    if (!isBlank(clean.decliningRate) && (parseNumber(clean.decliningRate) <= 0 || parseNumber(clean.decliningRate) > 100)) errors.push(buildValidationError(rowNumber, 'decliningRate', 'Declining rate must be greater than 0 and no more than 100 percent.', clean.decliningRate));
+    if (!isBlank(clean.warrantyStartDate) && !isBlank(clean.warrantyEndDate) && parseDateValue(clean.warrantyStartDate) > parseDateValue(clean.warrantyEndDate)) errors.push(buildValidationError(rowNumber, 'warrantyEndDate', 'Warranty end date must be on or after the start date.', clean.warrantyEndDate));
   }
 
   if (entityType === 'products' && !isBlank(clean.openingStockQuantity) && (parseNumber(clean.openingStockQuantity) || 0) > 0 && isBlank(clean.warehouse)) {
@@ -493,6 +531,41 @@ function validateCleanRow(entityType, clean, rowNumber) {
   return { errors, warnings };
 }
 
+async function validateRelatedRecords(entityType, clean, companyId, cache) {
+  const errors = [];
+  const lookup = async (modelPath, field, value, query) => {
+    if (isBlank(value)) return null;
+    const key = `${modelPath}:${String(value).trim().toLowerCase()}`;
+    if (!cache.has(key)) {
+      const Model = require(modelPath);
+      cache.set(key, await Model.findOne(query).lean());
+    }
+    return cache.get(key);
+  };
+  const byName = (name) => new RegExp(`^${escapeRegExp(String(name).trim())}$`, 'i');
+  if (entityType === 'employees') {
+    if (clean.department && !await lookup('../models/Department', 'name', clean.department, { company: companyId, name: byName(clean.department) })) errors.push({ field: 'department', message: `Department not found: ${clean.department}` });
+    if (clean.managerEmployeeId && !await lookup('../models/Employee', 'employeeId', clean.managerEmployeeId, { company: companyId, employeeId: String(clean.managerEmployeeId).trim().toUpperCase() })) errors.push({ field: 'managerEmployeeId', message: `Manager employee not found: ${clean.managerEmployeeId}` });
+  }
+  if (entityType === 'fixed_assets') {
+    const category = await lookup('../models/AssetCategory', 'name', clean.category, { company: companyId, name: byName(clean.category), isDeleted: false });
+    if (clean.category && !category) errors.push({ field: 'category', message: `Asset category not found: ${clean.category}` });
+    if (clean.department && !await lookup('../models/Department', 'name', clean.department, { company: companyId, name: byName(clean.department) })) errors.push({ field: 'department', message: `Department not found: ${clean.department}` });
+    if (clean.supplier && !await lookup('../models/Supplier', 'name', clean.supplier, { company: companyId, name: byName(clean.supplier) })) errors.push({ field: 'supplier', message: `Supplier not found: ${clean.supplier}` });
+    if (category) {
+      const codes = [clean.assetAccountCode || category.defaultAssetAccountCode || '1700', clean.accumDepreciationAccountCode || category.defaultAccumDepreciationAccountCode || '1810', clean.depreciationExpenseAccountCode || category.defaultDepreciationExpenseAccountCode || '5800'];
+      for (const code of codes) if (!await lookup('../models/ChartOfAccount', 'code', code, { company: companyId, code })) errors.push({ field: 'category', message: `Required fixed-asset account not found: ${code}` });
+      const method = String(clean.depreciationMethod || category.defaultDepreciationMethod || '').toLowerCase().replace(/[ -]+/g, '_');
+      if (['declining_balance', 'reducing_balance'].includes(method) && !(parseNumber(clean.decliningRate) > 0 || Number(category.defaultDecliningRate) > 0)) errors.push({ field: 'decliningRate', message: 'A declining rate is required for reducing-balance depreciation.' });
+    }
+  }
+  if (entityType === 'budget') {
+    if (clean.accountCode && !await lookup('../models/ChartOfAccount', 'code', clean.accountCode, { company: companyId, code: clean.accountCode })) errors.push({ field: 'accountCode', message: `Account not found: ${clean.accountCode}` });
+    if (clean.department && !await lookup('../models/Department', 'name', clean.department, { company: companyId, name: byName(clean.department) })) errors.push({ field: 'department', message: `Department not found: ${clean.department}` });
+  }
+  return errors;
+}
+
 async function validateImport({ entityType, mapping, rows, file, companyId }) {
   const definition = getEntityDefinition(entityType);
   if (!definition) {
@@ -512,11 +585,14 @@ async function validateImport({ entityType, mapping, rows, file, companyId }) {
   const openingExistingCache = new Map(); // key -> true if opening already exists in DB
   const productContext = entityType === 'products' ? await buildProductEnrichmentContext(companyId) : null;
   const fileDuplicateKeys = new Map();
+  const relatedRecordCache = new Map();
 
   for (let index = 0; index < fullRows.length; index++) {
     const rowNumber = index + 2;
     const clean = cleanMappedRow(entityType, fullRows[index], mapping);
     const { errors, warnings } = validateCleanRow(entityType, clean, rowNumber);
+    const relatedErrors = await validateRelatedRecords(entityType, clean, companyId, relatedRecordCache);
+    for (const relatedError of relatedErrors) errors.push(buildValidationError(rowNumber, relatedError.field, relatedError.message, clean[relatedError.field]));
     if (productContext) {
       const enrichmentWarnings = await enrichProductRow(companyId, clean, productContext, rowNumber);
       for (const warning of enrichmentWarnings) {
@@ -755,23 +831,36 @@ async function writeFixedAsset(companyId, userId, data) {
   const FixedAsset = require('../models/FixedAsset');
   const AssetCategory = require('../models/AssetCategory');
   const ChartOfAccount = require('../models/ChartOfAccount');
-  const category = await AssetCategory.findOne({ company: companyId, name: data.category }).lean();
+  const category = await AssetCategory.findOne({ company: companyId, name: new RegExp(`^${escapeRegExp(String(data.category).trim())}$`, 'i'), isDeleted: false }).lean();
   if (!category) throw new Error(`Asset category not found: ${data.category}`);
 
   const accountCodes = {
-    asset: category.defaultAssetAccountCode || '1700',
-    accumulated: category.defaultAccumDepreciationAccountCode || '1810',
-    expense: category.defaultDepreciationExpenseAccountCode || '5800',
+    asset: data.assetAccountCode || category.defaultAssetAccountCode || '1700',
+    accumulated: data.accumDepreciationAccountCode || category.defaultAccumDepreciationAccountCode || '1810',
+    expense: data.depreciationExpenseAccountCode || category.defaultDepreciationExpenseAccountCode || '5800',
   };
   const accounts = await Promise.all(Object.values(accountCodes).map((code) => ChartOfAccount.findOne({ company: companyId, code }).lean()));
   if (accounts.some((account) => !account)) throw new Error('Required fixed-asset accounts do not exist.');
 
   const purchaseCost = parseNumber(data.cost);
-  const accumulatedDepreciation = parseNumber(data.accumulatedDepreciation);
-  const usefulLifeMonths = Math.round(parseNumber(data.usefulLifeYears) * 12);
-  if (!purchaseCost || purchaseCost < 0 || !usefulLifeMonths || usefulLifeMonths < 1) {
+  const accumulatedDepreciation = parseNumber(data.accumulatedDepreciation) || 0;
+  const usefulLifeMonths = Math.round((parseNumber(data.usefulLifeYears) || (Number(category.defaultUsefulLifeMonths) / 12)) * 12);
+  const salvageValue = parseNumber(data.salvageValue) || 0;
+  if (!purchaseCost || purchaseCost <= 0 || !usefulLifeMonths || usefulLifeMonths < 1 || accumulatedDepreciation < 0 || accumulatedDepreciation > purchaseCost || salvageValue < 0 || salvageValue > purchaseCost || accumulatedDepreciation + salvageValue > purchaseCost) {
     throw new Error('Fixed asset cost and useful life must be valid positive values.');
   }
+
+  const Department = require('../models/Department');
+  const Supplier = require('../models/Supplier');
+  const department = data.department ? await Department.findOne({ company: companyId, name: new RegExp(`^${escapeRegExp(String(data.department).trim())}$`, 'i') }).lean() : null;
+  if (data.department && !department) throw new Error(`Department not found: ${data.department}`);
+  const supplier = data.supplier ? await Supplier.findOne({ company: companyId, name: new RegExp(`^${escapeRegExp(String(data.supplier).trim())}$`, 'i') }).lean() : null;
+  if (data.supplier && !supplier) throw new Error(`Supplier not found: ${data.supplier}`);
+  const rawDecliningRate = parseNumber(data.decliningRate) || Number(category.defaultDecliningRate) || null;
+  const decliningRate = rawDecliningRate > 1 ? rawDecliningRate / 100 : rawDecliningRate;
+  const normalizedMethod = String(data.depreciationMethod || category.defaultDepreciationMethod || 'straight_line').toLowerCase().replace(/[ -]+/g, '_');
+  const method = ['reducing_balance', 'declining_balance'].includes(normalizedMethod) ? 'declining_balance' : normalizedMethod;
+  if (method === 'declining_balance' && !(decliningRate > 0 && decliningRate <= 1)) throw new Error('A declining rate greater than 0 and no more than 100 percent is required either on this row or the asset category.');
 
   const asset = new FixedAsset({
     company: companyId,
@@ -785,16 +874,48 @@ async function writeFixedAsset(companyId, userId, data) {
     depreciationExpenseAccountCode: accountCodes.expense,
     purchaseDate: parseDateValue(data.purchaseDate),
     purchaseCost,
+    description: data.description || null,
     accumulatedDepreciation: accumulatedDepreciation || 0,
+    salvageValue,
     netBookValue: purchaseCost - (accumulatedDepreciation || 0),
     usefulLifeMonths,
-    depreciationMethod: String(data.depreciationMethod || 'straight_line').toLowerCase().replace(/\s+/g, '_'),
+    depreciationMethod: method,
+    decliningRate: decliningRate || null,
     location: data.location || null,
+    serialNumber: data.serialNumber || null,
+    supplierId: supplier?._id || null,
+    departmentId: department?._id || null,
+    inServiceDate: parseDateValue(data.inServiceDate),
+    isReadyForService: Boolean(data.inServiceDate),
+    warrantyStartDate: parseDateValue(data.warrantyStartDate),
+    warrantyEndDate: parseDateValue(data.warrantyEndDate),
+    insuredValue: parseNumber(data.insuredValue) || null,
     createdBy: userId,
-    status: 'in_transit',
+    status: data.inServiceDate ? 'in_service' : 'in_transit',
   });
   asset.referenceNo = await FixedAsset.generateReferenceNo(companyId);
-  await asset.save();
+  const savedAsset = await asset.save();
+  if (data.inServiceDate) {
+    const AssetStatusHistory = require('../models/AssetStatusHistory');
+    try {
+      await AssetStatusHistory.create({
+        company: companyId,
+        asset: savedAsset._id,
+        fromStatus: 'in_transit',
+        toStatus: 'in_service',
+        changedAt: parseDateValue(data.inServiceDate),
+        changedBy: userId,
+        reason: 'Imported asset register',
+        notes: 'Historical in-service date imported with the asset.',
+        locationAtChange: savedAsset.location,
+        departmentIdAtChange: savedAsset.departmentId,
+        custodianIdAtChange: savedAsset.custodianId,
+      });
+    } catch (error) {
+      await FixedAsset.deleteOne({ _id: savedAsset._id, company: companyId });
+      throw error;
+    }
+  }
   return { status: 'success', message: 'Created fixed asset.' };
 }
 
@@ -804,18 +925,33 @@ async function writeBudgetLine(companyId, userId, data) {
   const ChartOfAccount = require('../models/ChartOfAccount');
   const account = await ChartOfAccount.findOne({ company: companyId, code: data.accountCode }).lean();
   if (!account) throw new Error(`Account not found: ${data.accountCode}`);
-  const [year, month] = String(data.period || '').split('-').map(Number);
-  if (!year || month < 1 || month > 12) throw new Error(`Invalid budget period: ${data.period}`);
+  const periodMatch = String(data.period || '').match(/^(\d{4})-(0[1-9]|1[0-2])$/);
+  if (!periodMatch) throw new Error(`Invalid budget period: ${data.period}. Use YYYY-MM.`);
+  const [, yearText, monthText] = periodMatch;
+  const year = Number(yearText);
+  const month = Number(monthText);
 
-  const budgetName = `Imported Budget ${year}`;
+  const budgetName = String(data.budgetName || `Imported Budget ${year}`).trim();
+  const Department = require('../models/Department');
+  const department = data.department ? await Department.findOne({ company: companyId, name: new RegExp(`^${escapeRegExp(String(data.department).trim())}$`, 'i') }).lean() : null;
+  if (data.department && !department) throw new Error(`Department not found: ${data.department}`);
   let budget = await Budget.findOne({ company_id: companyId, fiscal_year: year, name: budgetName }).lean();
   if (!budget) {
-    budget = await Budget.create({ company: companyId, name: budgetName, fiscal_year: year, type: 'expense', budget_cycle: 'fixed_year', periodType: 'monthly', status: 'draft', amount: 0, created_by: userId });
+    budget = await Budget.create({ company: companyId, name: budgetName, description: data.budgetDescription || '', fiscal_year: year, type: String(data.budgetType || 'expense').toLowerCase(), category: data.budgetCategory || null, department: department?._id || null, budget_cycle: String(data.budgetCycle || 'fixed_year').toLowerCase().replace(/[ -]+/g, '_'), periodType: 'monthly', status: 'draft', amount: 0, created_by: userId });
+  } else if (data.department && String(budget.department || '') !== String(department._id)) {
+    throw new Error(`Budget '${budgetName}' already exists with a different department.`);
+  } else if (data.budgetType && String(budget.type || '').toLowerCase() !== String(data.budgetType).toLowerCase()) {
+    throw new Error(`Budget '${budgetName}' already exists with a different type.`);
   }
   const existing = await BudgetLine.findOne({ company_id: companyId, budget_id: budget._id, account_id: account._id, period_month: month, period_year: year }).lean();
-  const line = { company_id: companyId, budget_id: budget._id, account_id: account._id, period_month: month, period_year: year, budgeted_amount: parseNumber(data.budgetedAmount), category: '', notes: 'Universal Smart Import' };
+  const amount = parseNumber(data.budgetedAmount);
+  if (amount == null || amount < 0) throw new Error('Budgeted amount must be zero or greater.');
+  const line = { company_id: companyId, budget_id: budget._id, account_id: account._id, period_month: month, period_year: year, budgeted_amount: amount, category: data.lineCategory || '', notes: data.lineNotes || 'Universal Smart Import' };
   if (existing) await BudgetLine.updateOne({ _id: existing._id, company: companyId }, { $set: line });
   else await BudgetLine.create(line);
+  const lines = await BudgetLine.find({ company_id: companyId, budget_id: budget._id }).lean();
+  const totalAmount = lines.reduce((sum, row) => sum + (Number(row.budgetedAmount ?? row.budgeted_amount) || 0), 0);
+  await Budget.updateOne({ _id: budget._id, company_id: companyId }, { $set: { amount: totalAmount } });
   return { status: 'success', message: 'Created budget line.' };
 }
 
@@ -992,36 +1128,79 @@ async function upsertRow(entityType, companyId, userId, data, duplicateAction, c
 
   if (entityType === 'employees') {
     const Employee = require('../models/Employee');
+    const Department = require('../models/Department');
+    const SalaryHistory = require('../models/SalaryHistory');
+    const department = data.department ? await Department.findOne({ company: companyId, name: new RegExp(`^${escapeRegExp(String(data.department).trim())}$`, 'i') }).lean() : null;
+    if (data.department && !department) throw new Error(`Department not found: ${data.department}`);
+    const manager = data.managerEmployeeId ? await Employee.findOne({ company: companyId, employeeId: String(data.managerEmployeeId).trim().toUpperCase() }).select('_id employeeId').lean() : null;
+    if (data.managerEmployeeId && !manager) throw new Error(`Manager employee not found: ${data.managerEmployeeId}`);
+    const salaryEffectiveDate = parseDateValue(data.salaryEffectiveDate) || parseDateValue(data.hireDate);
+    const salary = {
+      basicSalary: parseNumber(data.basicSalary),
+      transportAllowance: parseNumber(data.transportAllowance) || 0,
+      housingAllowance: parseNumber(data.housingAllowance) || 0,
+      otherAllowances: parseNumber(data.otherAllowances) || 0,
+      effectiveDate: salaryEffectiveDate,
+      currency: String(data.salaryCurrency || 'RWF').trim().toUpperCase(),
+    };
     const payload = {
       company: companyId,
       employeeId: String(data.employeeId).toUpperCase(),
+      status: String(data.status || 'active').toLowerCase(),
       firstName: data.firstName,
       lastName: data.lastName,
       nationalId: data.nationalId,
       email: data.email,
       phone: data.phone,
-      department: data.department,
+      dateOfBirth: parseDateValue(data.dateOfBirth),
+      gender: data.gender,
+      employmentType: String(data.employmentType || 'full-time').toLowerCase(),
+      department: department?.name || data.department || null,
+      departmentRef: department?._id || null,
       position: data.position,
+      managerId: manager?._id || null,
+      location: data.location,
+      laborType: data.laborType,
+      defaultDirectPercentage: isBlank(data.defaultDirectPercentage) ? null : parseNumber(data.defaultDirectPercentage),
+      costCenter: data.costCenter,
+      bankName: data.bankName,
       hireDate: parseDateValue(data.hireDate),
+      terminationDate: parseDateValue(data.terminationDate),
       bankAccount: data.bankAccount,
+      bankBranch: data.bankBranch,
+      mobileMoneyNumber: data.mobileMoneyNumber,
+      taxStatus: String(data.taxStatus || 'resident').toLowerCase(),
+      isPrimaryEmployer: isBlank(data.isPrimaryEmployer) ? true : ['true', 'yes', '1'].includes(String(data.isPrimaryEmployer).toLowerCase()),
       rssbRegistrationNumber: data.rssbNumber,
-      currentSalary: {
-        basicSalary: parseNumber(data.basicSalary) || 0,
-        effectiveDate: parseDateValue(data.hireDate) || new Date()
-      },
+      tinNumber: data.tinNumber,
+      currentSalary: salary,
       createdBy: userId,
       updatedBy: userId
     };
     const existing = await Employee.findOne({ company: companyId, employeeId: payload.employeeId });
     if (existing && duplicateAction === 'skip') return { status: 'skipped', message: 'Skipped duplicate employee.' };
     if (existing && duplicateAction === 'update') {
+      const latestSalary = await SalaryHistory.findOne({ company: companyId, employee: existing._id }).sort({ effectiveDate: -1 }).lean();
+      const salaryIsCurrent = !latestSalary || !salaryEffectiveDate || new Date(latestSalary.effectiveDate) <= salaryEffectiveDate;
+      if (!salaryIsCurrent) delete payload.currentSalary;
       await Employee.updateOne({ _id: existing._id, company: companyId }, { $set: payload });
+      if (latestSalary && salaryEffectiveDate && new Date(latestSalary.effectiveDate).getTime() === salaryEffectiveDate.getTime()) {
+        await SalaryHistory.updateOne({ _id: latestSalary._id, company: companyId }, { $set: salary });
+      } else if ((!latestSalary || (salaryEffectiveDate && new Date(latestSalary.effectiveDate) < salaryEffectiveDate)) && salaryEffectiveDate) {
+        await SalaryHistory.create({ company: companyId, employee: existing._id, ...salary, changedBy: userId, reason: 'Updated by employee import' });
+      }
       return { status: 'success', message: 'Updated duplicate employee.' };
     }
     if (existing && duplicateAction === 'create') {
       payload.employeeId = `${payload.employeeId}-COPY-${Date.now().toString().slice(-5)}`;
     }
-    await Employee.create(payload);
+    const created = await Employee.create(payload);
+    try {
+      await SalaryHistory.create({ company: companyId, employee: created._id, ...salary, changedBy: userId, reason: 'Initial salary imported' });
+    } catch (error) {
+      await Employee.deleteOne({ _id: created._id, company: companyId });
+      throw error;
+    }
     return { status: 'success', message: 'Created employee.' };
   }
 
@@ -1174,24 +1353,23 @@ async function generateTemplate(entityType, companyId) {
   workbook.creator = 'Kubika Smart Import';
   const sheet = workbook.addWorksheet(definition.label);
   const instructions = workbook.addWorksheet('Instructions');
+  const fieldGuide = workbook.addWorksheet('Field Guide');
   const optionSheet = entityType === 'products' ? workbook.addWorksheet('Options') : null;
   const headers = definition.fields.map((field) => `${field.label}${field.required ? ' *' : ''}`);
-  const examples = definition.fields.map((field) => field.example || '');
-  const notes = definition.fields.map((field) => field.instructions || '');
   sheet.addRow(headers);
-  if (entityType !== 'products') {
-    sheet.addRow(examples);
-    sheet.addRow(notes);
-  }
   sheet.views = [{ state: 'frozen', ySplit: 1 }];
   sheet.getRow(1).font = { bold: true, color: { argb: 'FF111827' } };
-  sheet.getRow(3).font = { italic: true, color: { argb: 'FF6B7280' } };
   sheet.columns = definition.fields.map((field) => ({ width: Math.max(18, field.label.length + 6) }));
   definition.fields.forEach((field, index) => {
     if (field.required) {
       sheet.getRow(1).getCell(index + 1).font = { bold: true, color: { argb: 'FFB91C1C' } };
     }
   });
+  fieldGuide.addRow(['Field', 'Example', 'Required', 'Instructions']);
+  definition.fields.forEach((field) => fieldGuide.addRow([field.label, field.example || '', field.required ? 'Yes' : 'No', field.instructions || '']));
+  fieldGuide.views = [{ state: 'frozen', ySplit: 1 }];
+  fieldGuide.getRow(1).font = { bold: true, color: { argb: 'FF111827' } };
+  fieldGuide.columns = [{ width: 38 }, { width: 32 }, { width: 14 }, { width: 100 }];
   if (entityType === 'products' && companyId) {
     const context = await buildProductEnrichmentContext(companyId);
     const options = {
@@ -1254,15 +1432,10 @@ async function generateTemplate(entityType, companyId) {
   instructions.addRows([
     ['Smart Import Template', definition.label],
     ['Step 1', 'Keep row 1 headers unchanged where possible.'],
-    ['Step 2', entityType === 'products' ? 'Enter product records beginning in row 2 of the Products sheet. The sheet contains only headers so example data cannot be imported accidentally.' : 'Replace row 2 with your data or paste data below it.'],
-    ['Step 3', entityType === 'products' ? 'Use the Field Guide below for examples and formatting rules.' : 'Use row 3 instructions to format fields correctly.'],
+    ['Step 2', `Enter ${definition.label.toLowerCase()} records beginning in row 2 of the ${definition.label} sheet. The sheet contains headers only; examples are kept separately so they cannot be imported accidentally.`],
+    ['Step 3', 'Use the Field Guide sheet for examples and formatting rules.'],
     ['Limits', 'Maximum 10MB and 10,000 rows per import.']
   ]);
-  if (entityType === 'products') {
-    instructions.addRow([]);
-    instructions.addRow(['Product field', 'Example', 'Required', 'How to fill it']);
-    definition.fields.forEach((field) => instructions.addRow([field.label, field.example || '', field.required ? 'Yes' : 'No', field.instructions || '']));
-  }
   if (entityType === 'opening_stock') {
     instructions.addRows([
       ['Opening Stock Rules', 'Opening stock can only be imported once per product per warehouse. If you made a mistake — wrong quantity or wrong cost — you cannot re-import. You must ask your accountant to reverse the opening stock journal entry manually through Finance Control → Journal Entries, then import again. Contact your system administrator for assistance.'],
