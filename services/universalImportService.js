@@ -147,20 +147,35 @@ function escapeRegExp(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-async function resolveEmployeeDepartment(companyId, departmentName, departmentCode) {
+function normalizeDepartmentLookup(value) {
+  return String(value ?? '')
+    .normalize('NFKC')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .toLocaleLowerCase();
+}
+
+async function resolveEmployeeDepartment(companyId, departmentName, departmentCode, cache) {
   const Department = require('../models/Department');
-  const byCode = !isBlank(departmentCode)
-    ? await Department.findOne({ company: companyId, code: String(departmentCode).trim().toUpperCase() }).lean()
+  const cacheKey = `employee-departments:${String(companyId)}`;
+  let departmentRowsPromise = cache?.get(cacheKey);
+  if (!departmentRowsPromise) {
+    departmentRowsPromise = Department.find({ company: companyId })
+      .select('_id code name')
+      .limit(500)
+      .lean();
+    cache?.set(cacheKey, departmentRowsPromise);
+  }
+  const departments = await departmentRowsPromise;
+  const codeKey = normalizeDepartmentLookup(departmentCode);
+  const valueKey = normalizeDepartmentLookup(departmentName);
+  const byCode = codeKey
+    ? departments.find((department) => normalizeDepartmentLookup(department.code) === codeKey)
     : null;
-  const departmentValue = String(departmentName || '').trim();
-  const byNameOrCode = !isBlank(departmentValue)
-    ? await Department.findOne({
-      company: companyId,
-      $or: [
-        { name: new RegExp(`^${escapeRegExp(departmentValue)}$`, 'i') },
-        { code: departmentValue.toUpperCase() },
-      ],
-    }).lean()
+  const byNameOrCode = valueKey
+    ? departments.find((department) => normalizeDepartmentLookup(department.name) === valueKey
+      || normalizeDepartmentLookup(department.code) === valueKey)
     : null;
   if (!isBlank(departmentCode) && !byCode) throw new Error(`Department code not found: ${departmentCode}`);
   if (!isBlank(departmentName) && !byNameOrCode) throw new Error(`Department not found by name or code: ${departmentName}`);
@@ -589,7 +604,7 @@ async function validateRelatedRecords(entityType, clean, companyId, cache) {
   if (entityType === 'employees') {
     if (clean.department || clean.departmentCode) {
       try {
-        await resolveEmployeeDepartment(companyId, clean.department, clean.departmentCode);
+        await resolveEmployeeDepartment(companyId, clean.department, clean.departmentCode, cache);
       } catch (error) {
         errors.push({ field: clean.departmentCode ? 'departmentCode' : 'department', message: error.message });
       }
@@ -1212,7 +1227,7 @@ async function upsertRow(entityType, companyId, userId, data, duplicateAction, c
     const SalaryHistory = require('../models/SalaryHistory');
     const laborType = String(data.laborType || '').trim().toLowerCase();
     if (!['direct', 'indirect'].includes(laborType)) throw new Error('Every imported employee must have Labor Type set to direct or indirect.');
-    const department = await resolveEmployeeDepartment(companyId, data.department, data.departmentCode);
+    const department = await resolveEmployeeDepartment(companyId, data.department, data.departmentCode, context.departmentCache);
     const manager = data.managerEmployeeId ? await Employee.findOne({ company: companyId, employeeId: String(data.managerEmployeeId).trim().toUpperCase() }).select('_id employeeId').lean() : null;
     if (data.managerEmployeeId && !manager) throw new Error(`Manager employee not found: ${data.managerEmployeeId}`);
     const salaryEffectiveDate = parseDateValue(data.salaryEffectiveDate) || parseDateValue(data.hireDate);
@@ -1345,7 +1360,7 @@ async function processValidatedRows({ logId, entityType, companyId, userId, rows
   let successRows = 0;
   let errorRows = 0;
   let skippedRows = 0;
-  const context = { arBalances: new Map(), apBalances: new Map() };
+  const context = { arBalances: new Map(), apBalances: new Map(), departmentCache: new Map() };
   await ImportLog.updateOne({ _id: logId, companyId }, { $set: { status: 'processing', startedAt: new Date() } });
 
   if (entityType === 'opening_gl_balances') {
