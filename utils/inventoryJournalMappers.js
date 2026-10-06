@@ -81,6 +81,9 @@ const STOCK_LEVEL_INPUT = {
 
 async function stockLevelTranslateCreate(data) {
   const base = tenantCreateBase(data, 'company_id');
+  // StockLevel has no created_by column. tenantCreateBase is shared with
+  // other inventory models, so remove its default creator field here.
+  delete base.createdById;
   const mapped = pickMapped(data, STOCK_LEVEL_INPUT, {
     idFields: ['companyId', 'productId', 'warehouseId', 'lastCountedById'],
   });
