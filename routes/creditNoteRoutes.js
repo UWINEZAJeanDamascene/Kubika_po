@@ -46,7 +46,7 @@ router.post('/:id/confirm', authorizeCreditNoteConfirmation, controller.confirmC
 router.post('/:id/submit-ebm', requirePermission('credit_notes', 'approve'), controller.submitCreditNoteEbm);
 
 // Legacy endpoints (backwards compatibility)
-router.put('/:id/approve', requirePermission('credit_notes', 'approve'), controller.approveCreditNote);
+router.put('/:id/approve', requirePermission('credit_notes', 'approve'), controller.confirmCreditNote);
 router.post('/:id/apply', requirePermission('credit_notes', 'approve'), controller.applyCreditNote); // Apply to another invoice
 router.post('/:id/refund', authorizeCreditNoteConfirmation, controller.recordRefund);
 

@@ -11,6 +11,81 @@ const TaxAutomationService = require("../services/taxAutomationService");
 const emailService = require("../services/emailService");
 const { BankAccount } = require("../models/BankAccount");
 const { DEFAULT_ACCOUNTS } = require("../constants/chartOfAccounts");
+
+const idOf = (value) => String(value?._id || value?.id || value || '');
+
+function normalizeCreditNoteLines(invoice, requestedLines, type) {
+  if (!Array.isArray(requestedLines) || requestedLines.length === 0) {
+    const error = new Error('Add at least one invoice line and enter the quantity to credit.');
+    error.statusCode = 422;
+    throw error;
+  }
+  const seen = new Set();
+  return requestedLines.map((requested) => {
+    const invoiceLineId = idOf(requested.invoiceLineId);
+    const invoiceLine = (invoice.lines || []).find((line) => idOf(line._id || line.id || line.lineId) === invoiceLineId);
+    if (!invoiceLine) {
+      const error = new Error('Every credit note line must reference a line on the selected original invoice.');
+      error.statusCode = 422;
+      throw error;
+    }
+    if (seen.has(invoiceLineId)) {
+      const error = new Error('The same invoice line cannot appear more than once on a credit note.');
+      error.statusCode = 422;
+      throw error;
+    }
+    seen.add(invoiceLineId);
+
+    const quantity = Number(requested.quantity ?? requested.qty);
+    const originalQty = Number(invoiceLine.qty ?? invoiceLine.quantity ?? 0);
+    const alreadyCredited = Number(invoiceLine.qtyCredited || 0);
+    const remainingQty = Math.max(0, originalQty - alreadyCredited);
+    if (!Number.isFinite(quantity) || quantity <= 0 || quantity > remainingQty) {
+      const error = new Error(`Credit quantity must be greater than zero and no more than the ${remainingQty} remaining on the invoice line.`);
+      error.statusCode = 422;
+      throw error;
+    }
+
+    const productId = idOf(invoiceLine.product);
+    if (requested.product && idOf(requested.product) !== productId) {
+      const error = new Error('The selected product does not match the original invoice line.');
+      error.statusCode = 422;
+      throw error;
+    }
+    const unitPrice = Number(invoiceLine.unitPrice || 0);
+    const discountPct = Number(invoiceLine.discountPct || 0);
+    const taxRate = Number(invoiceLine.taxRate || 0);
+    const lineSubtotal = Math.round(quantity * unitPrice * (1 - discountPct / 100) * 100) / 100;
+    const lineTax = Math.round(lineSubtotal * taxRate) / 100;
+    const lineTotal = Math.round((lineSubtotal + lineTax) * 100) / 100;
+    const unitCost = Number(invoiceLine.unitCost || 0);
+    const product = invoiceLine.product && typeof invoiceLine.product === 'object' ? invoiceLine.product : null;
+    const returnToWarehouse = requested.returnToWarehouse || requested.returnToWarehouseId || null;
+    if (type === 'goods_return' && product?.isStockable !== false && !returnToWarehouse) {
+      const error = new Error(`Select a return warehouse for ${invoiceLine.productName || product?.name || 'each stock item'}.`);
+      error.statusCode = 422;
+      throw error;
+    }
+
+    return {
+      ...requested,
+      invoiceLineId,
+      product: productId,
+      productName: invoiceLine.productName || invoiceLine.description || product?.name || null,
+      quantity,
+      originalQty,
+      unitPrice,
+      discountPct,
+      unitCost,
+      taxRate,
+      lineSubtotal,
+      lineTax,
+      lineTotal,
+      cogsAmount: Math.round(quantity * unitCost * 100) / 100,
+      returnToWarehouse,
+    };
+  });
+}
 const EBMSalesService = require("../services/ebmSalesService");
 const { emitDataChanged } = require("../lib/realtimeEvents");
 const PDFDocument = require("pdfkit");
@@ -340,15 +415,6 @@ exports.createCreditNote = async (req, res, next) => {
     const companyId = req.user.company._id;
     const { invoice: invoiceId } = req.body;
 
-    console.log(
-      "DEBUG createCreditNote: req.body.lines =",
-      JSON.stringify(req.body.lines, null, 2),
-    );
-    console.log(
-      "DEBUG createCreditNote: req.body.items =",
-      JSON.stringify(req.body.items, null, 2),
-    );
-
     const invoice = await Invoice.findOne({
       _id: invoiceId,
       company: companyId,
@@ -365,123 +431,19 @@ exports.createCreditNote = async (req, res, next) => {
       currencyCode: req.body.currencyCode || invoice.currencyCode || 'FRW',
       createdBy: req.user.id,
     };
-    // Normalize and calculate line totals before creating so tax amounts persist
-    let lineArray =
+    const requestedLines =
       payload.lines && Array.isArray(payload.lines) && payload.lines.length > 0
         ? payload.lines
         : payload.items && Array.isArray(payload.items)
           ? payload.items
           : [];
-
-    // If no lines provided, auto-populate from invoice lines
-    if (lineArray.length === 0 && invoice.lines && invoice.lines.length > 0) {
-      lineArray = invoice.lines.map(invLine => ({
-        product: invLine.product,
-        productName: invLine.productName || invLine.description,
-        productCode: invLine.productCode || invLine.itemCode,
-        description: invLine.description,
-        quantity: 1, // Default qty to credit - user should specify
-        originalQty: invLine.quantity, // Store original invoice qty for reference
-        unitPrice: invLine.unitPrice,
-        unit: invLine.unit,
-        taxRate: invLine.taxRate,
-        invoiceLineId: invLine._id?.toString()
-      }));
-      console.log("DEBUG createCreditNote: auto-populated lines from invoice:", lineArray.length);
-    }
-
-    console.log("DEBUG createCreditNote: lineArray length =", lineArray.length);
-
-    if (lineArray.length > 0) {
-      let subtotal = 0;
-      let totalTax = 0;
-
-      for (let i = 0; i < lineArray.length; i++) {
-        const line = lineArray[i] || {};
-        const quantity = Number(line.quantity) || 0;
-        const unitPrice = Number(line.unitPrice) || 0;
-        // Use provided taxRate or fall back to the original invoice line's taxRate
-        let taxRate = Number(line.taxRate);
-        console.log(
-          "DEBUG: line",
-          i,
-          "input taxRate:",
-          line.taxRate,
-          "parsed:",
-          taxRate,
-        );
-        if ((!taxRate || isNaN(taxRate)) && line.invoiceLineId) {
-          try {
-            const invLine = invoice.lines.id(line.invoiceLineId);
-            console.log(
-              "DEBUG: found invoice line:",
-              invLine ? "yes" : "no",
-              "invLine.taxRate:",
-              invLine?.taxRate,
-            );
-            if (invLine && (invLine.taxRate || invLine.tax_rate)) {
-              taxRate = Number(invLine.taxRate || invLine.tax_rate) || 0;
-            }
-          } catch (e) {
-            taxRate = 0;
-          }
-        }
-
-        const lineSubtotal = quantity * unitPrice;
-        const lineTax = lineSubtotal * ((Number(taxRate) || 0) / 100);
-        const lineTotal = lineSubtotal + lineTax;
-        console.log(
-          "DEBUG: line",
-          i,
-          "qty:",
-          quantity,
-          "price:",
-          unitPrice,
-          "taxRate:",
-          taxRate,
-          "subtotal:",
-          lineSubtotal,
-          "tax:",
-          lineTax,
-        );
-        const unitCost = Number(line.unitCost) || 0;
-        const cogsAmount = quantity * unitCost;
-
-        // assign back into payload lines so model pre-save will also see values
-        lineArray[i] = {
-          ...line,
-          quantity,
-          unitPrice,
-          unitCost,
-          taxRate: Number(taxRate) || 0,
-          lineSubtotal,
-          lineTax,
-          lineTotal,
-          cogsAmount,
-        };
-
-        subtotal += lineSubtotal;
-        totalTax += lineTax;
-      }
-
-      // attach computed lines back to payload (prefer new `lines` name)
-      payload.lines = lineArray;
-      payload.subtotal = subtotal;
-      payload.taxAmount = totalTax;
-      payload.totalAmount = subtotal + totalTax;
-
-      console.log(
-        "DEBUG createCreditNote: processed payload.lines =",
-        JSON.stringify(payload.lines, null, 2),
-      );
-    }
+    const lineArray = normalizeCreditNoteLines(invoice, requestedLines, payload.type || 'goods_return');
+    payload.lines = lineArray;
+    payload.subtotal = lineArray.reduce((sum, line) => sum + line.lineSubtotal, 0);
+    payload.taxAmount = lineArray.reduce((sum, line) => sum + line.lineTax, 0);
+    payload.totalAmount = lineArray.reduce((sum, line) => sum + line.lineTotal, 0);
 
     const note = await CreditNote.create(payload);
-
-    console.log(
-      "DEBUG createCreditNote: created note.lines =",
-      JSON.stringify(note.lines, null, 2),
-    );
 
     // If model pre-save didn't compute totals for some reason, ensure totals persist
     try {
@@ -848,96 +810,94 @@ exports.approveCreditNote = async (req, res, next) => {
 exports.applyCreditNote = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { invoiceId } = req.body; // Target invoice to apply credit to
-
-    const note = await CreditNote.findOne({
-      _id: req.params.id,
-      company: companyId,
-    });
-    if (!note)
-      return res
-        .status(404)
-        .json({ success: false, message: "Credit note not found" });
-    if (note.status !== "issued" && note.status !== "confirmed")
-      return res.status(400).json({
-        success: false,
-        message: "Only confirmed or issued credit notes can be applied",
-      });
-    if (!invoiceId)
-      return res
-        .status(400)
-        .json({ success: false, message: "Target invoice required" });
-
-    // Get target invoice
-    const targetInvoice = await Invoice.findOne({
-      _id: invoiceId,
-      company: companyId,
-    });
-    if (!targetInvoice)
-      return res
-        .status(404)
-        .json({ success: false, message: "Target invoice not found" });
-
-    // Apply credit to client balance (reduce outstanding)
-    const client = await Client.findOne({
-      _id: note.client,
-      company: companyId,
-    });
-    if (client) {
-      client.outstandingBalance -= note.grandTotal;
-      if (client.outstandingBalance < 0) client.outstandingBalance = 0;
-      await client.save();
+    const { invoiceId } = req.body;
+    if (!invoiceId) return res.status(400).json({ success: false, message: 'Target invoice is required.' });
+    const note = await CreditNote.findOne({ _id: req.params.id, company: companyId });
+    if (!note) return res.status(404).json({ success: false, message: 'Credit note not found.' });
+    if (!['confirmed', 'issued', 'applied', 'partially_refunded'].includes(note.status)) {
+      return res.status(409).json({ success: false, message: 'Only issued credit notes with available customer credit can be allocated.' });
     }
 
-    // Add credit note to target invoice
-    if (!targetInvoice.creditNotes) targetInvoice.creditNotes = [];
-    targetInvoice.creditNotes.push({
-      creditNoteId: note._id,
-      creditNoteNumber: note.creditNoteNumber,
-      amount: note.grandTotal,
-      appliedDate: new Date(),
-    });
+    const targetInvoice = await Invoice.findOne({ _id: invoiceId, company: companyId });
+    if (!targetInvoice) return res.status(404).json({ success: false, message: 'Target invoice not found.' });
+    if (idOf(targetInvoice.client) !== idOf(note.client)) {
+      return res.status(422).json({ success: false, message: 'A credit note can only be allocated to an invoice for the same customer.' });
+    }
+    if (String(targetInvoice.currencyCode || 'RWF').toUpperCase() !== String(note.currencyCode || 'RWF').toUpperCase()) {
+      return res.status(422).json({ success: false, message: 'Credit note and invoice currencies must match.' });
+    }
 
-    // Reduce the invoice balance by the credit note amount
-    const creditAmount = note.grandTotal;
-    targetInvoice.balance = Math.max(
-      0,
-      (targetInvoice.balance || 0) - creditAmount,
+    const targetOutstanding = Math.max(0, Number(targetInvoice.amountOutstanding ?? targetInvoice.balance ?? 0));
+    const creditAvailable = Math.max(0,
+      Number(note.amountAvailableAsCredit || 0)
+      - Number(note.amountAppliedToOtherInvoices || 0)
+      - Number(note.amountRefundedFromCredit || 0),
     );
-
-    // Update invoice status - keep 'paid' if it was paid
-    if (targetInvoice.balance <= 0) {
-      targetInvoice.status = "paid";
-      if (!targetInvoice.paidDate) {
-        targetInvoice.paidDate = new Date();
-      }
-    }
-    // Don't reduce amountPaid - credit note is a separate adjustment
-    if (targetInvoice.balance <= 0) {
-      targetInvoice.status = "paid";
-      if (!targetInvoice.paidDate) {
-        targetInvoice.paidDate = new Date();
-      }
-    } else if (
-      targetInvoice.amountPaid > 0 &&
-      targetInvoice.amountPaid < targetInvoice.grandTotal
-    ) {
-      targetInvoice.status = "partial";
+    const requestedAmount = req.body.amount == null ? Math.min(creditAvailable, targetOutstanding) : Number(req.body.amount);
+    if (!Number.isFinite(requestedAmount) || requestedAmount <= 0 || requestedAmount > creditAvailable || requestedAmount > targetOutstanding) {
+      return res.status(422).json({ success: false, message: `Allocation must be positive and no more than the available credit (${creditAvailable}) or invoice balance (${targetOutstanding}).` });
     }
 
-    await targetInvoice.save();
+    const { runInTransaction } = require('../services/transactionService');
+    const { dbClient } = require('../lib/prisma');
+    const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
+    const appliedAt = new Date();
+    await runInTransaction(async () => {
+      const freshInvoice = await Invoice.findOne({ _id: invoiceId, company: companyId });
+      const freshClient = await Client.findOne({ _id: note.client, company: companyId });
+      if (!freshInvoice || !freshClient) throw new Error('The target invoice or customer no longer exists.');
+      const updatedRows = await dbClient().$queryRaw`
+        UPDATE credit_notes
+        SET amount_applied_to_other_invoices = amount_applied_to_other_invoices + ${requestedAmount},
+            applications = COALESCE(applications, '[]'::jsonb) || ${JSON.stringify([{ invoiceId: String(invoiceId), amount: requestedAmount, appliedAt, appliedBy: String(req.user.id) }])}::jsonb,
+            status = 'applied',
+            updated_at = NOW()
+        WHERE id = ${String(note._id)}
+          AND company_id = ${String(companyId)}
+          AND status IN ('confirmed', 'issued', 'applied', 'partially_refunded')
+          AND amount_applied_to_other_invoices + amount_refunded_from_credit + ${requestedAmount} <= amount_available_as_credit
+        RETURNING id`;
+      if (!updatedRows.length) {
+        const conflict = new Error('This customer credit has already been allocated or refunded. Refresh and try again.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
 
-    // Update credit note status
-    note.status = "applied";
-    note.appliedTo = targetInvoice.invoiceNumber;
-    note.appliedDate = new Date();
-    await note.save();
+      freshInvoice.amountOutstanding = Math.max(0, targetOutstanding - requestedAmount);
+      freshInvoice.status = freshInvoice.amountOutstanding <= 0
+        ? 'fully_paid'
+        : Number(freshInvoice.amountPaid || 0) > 0 ? 'partially_paid' : 'confirmed';
+      if (freshInvoice.amountOutstanding <= 0) freshInvoice.paidDate = new Date();
+      await freshInvoice.save();
 
-    res.json({
-      success: true,
-      data: note,
-      message: `Credit note applied to invoice ${targetInvoice.invoiceNumber}`,
+      freshClient.outstandingBalance = Math.max(0, Number(freshClient.outstandingBalance || 0) - requestedAmount);
+      await freshClient.save();
+
+      const journalEntry = await JournalService.createEntry(companyId, req.user.id, {
+        date: appliedAt,
+        description: `Credit Note ${note.referenceNo || note.creditNoteNumber} allocated to Invoice ${freshInvoice.referenceNo || freshInvoice.invoiceNumber}`,
+        sourceType: 'credit_note_application',
+        sourceId: note._id,
+        sourceReference: note.referenceNo || note.creditNoteNumber,
+        lines: [
+          JournalService.createDebitLine(DEFAULT_ACCOUNTS.customerAdvances, requestedAmount, 'Apply customer credit'),
+          JournalService.createCreditLine(DEFAULT_ACCOUNTS.accountsReceivable, requestedAmount, 'Apply customer credit'),
+        ],
+        isAutoGenerated: true,
+      });
+      if (!journalEntry) throw new Error('The credit allocation journal entry could not be created.');
+
+      await require('../services/arTrackingService').recordCreditNoteApplied(
+        note,
+        freshInvoice,
+        requestedAmount,
+        req.user.id,
+        { required: true, invoiceBalanceAfter: freshInvoice.amountOutstanding, clientBalanceAfter: freshClient.outstandingBalance },
+      );
     });
+
+    const updatedNote = await CreditNote.findOne({ _id: req.params.id, company: companyId });
+    res.json({ success: true, data: updatedNote, message: `Credit note allocated to invoice ${targetInvoice.referenceNo || targetInvoice.invoiceNumber}.` });
   } catch (err) {
     next(err);
   }
@@ -969,140 +929,179 @@ exports.recordRefund = async (req, res, next) => {
     if (!Number.isFinite(refundAmount) || refundAmount <= 0) {
       return res.status(400).json({ success: false, message: 'Refund amount must be a positive number.' });
     }
-    if (!['cash', 'bank', 'bank_transfer', 'mobile_money', 'cheque'].includes(String(paymentMethod || ''))) {
+    const normalizedMethod = String(paymentMethod || '').trim().toLowerCase();
+    const bankMethods = ['bank', 'bank_transfer', 'mobile_money', 'cheque'];
+    if (!['cash', ...bankMethods].includes(normalizedMethod)) {
       return res.status(400).json({ success: false, message: 'Select a supported refund payment method.' });
     }
 
-    const remaining = note.grandTotal - (note.amountRefunded || 0);
-    if (refundAmount > remaining)
+    const payments = Array.isArray(note.payments) ? note.payments : [];
+    const previouslyRefunded = Number(note.amountRefunded)
+      || payments.reduce((sum, payment) => sum + (Number(payment.amount) || 0), 0);
+    const creditTotal = Number(note.totalAmount || note.grandTotal || 0);
+    const remaining = Math.max(0, creditTotal - previouslyRefunded);
+    const customerCreditTotal = Number(note.amountAvailableAsCredit || 0);
+    const arAppliedTotal = Number(note.amountAppliedToAR)
+      || Math.max(0, creditTotal - customerCreditTotal - previouslyRefunded);
+    const refundedFromCredit = Number(note.amountRefundedFromCredit || 0);
+    const refundedFromAR = Number(note.amountRefundedFromAR || 0);
+    const availableCustomerCredit = Math.max(0, customerCreditTotal - refundedFromCredit);
+    const availableARCredit = Math.max(0, arAppliedTotal - refundedFromAR);
+    const refundFromCustomerCredit = Math.min(refundAmount, availableCustomerCredit);
+    const refundFromAR = refundAmount - refundFromCustomerCredit;
+    if (refundAmount > remaining || refundFromAR > availableARCredit)
       return res.status(400).json({
         success: false,
         message: "Refund amount exceeds credit note balance",
       });
 
-    if (note.posOrigin) {
-      await consumePosManagerApproval({
-        approvalId: req.body.posManagerApprovalId,
-        companyId,
-        cashierId: req.user.id,
-        action: 'refund',
-        subjectId: String(note._id),
-        payload: {
-          creditNoteId: String(note._id),
-          amount: refundAmount,
-          paymentMethod: String(paymentMethod),
-          reference: String(reference || '').trim(),
-        },
-      });
-    }
-
-    // attach payment
-    note.payments.push({
-      amount: refundAmount,
-      paymentMethod,
-      reference,
-      refundedBy: req.user.id,
-    });
-    note.amountRefunded = (note.amountRefunded || 0) + refundAmount;
-
-    // Adjust invoice payments (reduce amountPaid)
-    const invoice = await Invoice.findOne({
-      _id: note.invoice,
-      company: companyId,
-    });
-    if (invoice) {
-      invoice.amountPaid = Math.max(0, (invoice.amountPaid || 0) - refundAmount);
-      await invoice.save();
-    }
-
-    // Adjust client stats
-    const client = await Client.findOne({
-      _id: note.client,
-      company: companyId,
-    });
-    if (client) {
-      client.totalPurchases = Math.max(
-        0,
-        (client.totalPurchases || 0) - refundAmount,
-      );
-      // If invoice existed and we decreased amountPaid, outstandingBalance may increase; keep consistent: recompute outstandingBalance as sum of invoices minus payments is complex; instead, adjust by -amount earlier when approving; now refund increases outstandingBalance by amount
-      client.outstandingBalance = Math.max(
-        0,
-        (client.outstandingBalance || 0) + refundAmount,
-      );
-      await client.save();
-    }
-
-    if (note.amountRefunded >= note.grandTotal) {
-      note.status = "refunded";
-    } else {
-      note.status = "partially_refunded";
-    }
-
-    await note.save();
-
-    // Create journal entry for refund (Accounts Receivable Debit, Cash/Bank Credit)
-    let journalEntry = null;
     let bankAccount = null;
+    if (bankMethods.includes(normalizedMethod) && !req.body.bankAccountId) {
+      return res.status(400).json({ success: false, message: 'Select the bank or mobile-money account used to pay this refund.' });
+    }
     if (req.body.bankAccountId) {
       bankAccount = await BankAccount.findOne({
         _id: req.body.bankAccountId,
         company: companyId,
         isActive: true,
       });
+      if (!bankAccount) return res.status(404).json({ success: false, message: 'The selected refund account was not found or is inactive.' });
     }
-    try {
-      const { DEFAULT_ACCOUNTS } = require("../constants/chartOfAccounts");
-      const cashAccount = bankAccount?.ledgerAccountId || (paymentMethod === "bank" ? DEFAULT_ACCOUNTS.cashAtBank : DEFAULT_ACCOUNTS.cashInHand);
 
-      journalEntry = await JournalService.createEntry(companyId, req.user.id, {
+    const { runInTransaction } = require('../services/transactionService');
+    const { dbClient } = require('../lib/prisma');
+    const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
+    await runInTransaction(async () => {
+      if (note.posOrigin) {
+        await consumePosManagerApproval({
+          approvalId: req.body.posManagerApprovalId,
+          companyId,
+          cashierId: req.user.id,
+          action: 'refund',
+          subjectId: String(note._id),
+          payload: {
+            creditNoteId: String(note._id),
+            amount: refundAmount,
+            paymentMethod: normalizedMethod,
+            reference: String(reference || '').trim(),
+          },
+        });
+      }
+
+      const refundDate = new Date();
+      const creditReference = note.creditNoteNumber || note.referenceNo;
+      const cashAccount = bankAccount
+        ? (bankAccount.ledgerAccountId || bankAccount.accountCode)
+        : DEFAULT_ACCOUNTS.cashInHand;
+      if (!cashAccount) throw new Error('The selected bank account has no linked general-ledger account.');
+
+      // Settle customer advances first. Refunding the part that was applied
+      // to open AR reopens that receivable; it never rewrites original cash.
+      const journalEntry = await JournalService.createEntry(companyId, req.user.id, {
         date: new Date(),
-        description: `Refund for Credit Note ${note.creditNoteNumber}`,
+        description: `Refund for Credit Note ${creditReference}`,
         sourceType: "credit_note_refund",
         sourceId: note._id,
-        sourceReference: note.creditNoteNumber,
+        sourceReference: creditReference,
         lines: [
-          JournalService.createDebitLine(
+          ...(refundFromAR > 0 ? [JournalService.createDebitLine(
             DEFAULT_ACCOUNTS.accountsReceivable,
-            refundAmount,
-            `Refund for Credit Note ${note.creditNoteNumber}`,
-          ),
+            refundFromAR,
+            `Refund for Credit Note ${creditReference}`,
+          )] : []),
+          ...(refundFromCustomerCredit > 0 ? [JournalService.createDebitLine(
+            DEFAULT_ACCOUNTS.customerAdvances,
+            refundFromCustomerCredit,
+            `Refund of customer credit for Credit Note ${creditReference}`,
+          )] : []),
           JournalService.createCreditLine(
             cashAccount,
             refundAmount,
-            `Refund for Credit Note ${note.creditNoteNumber}`,
+            `Refund for Credit Note ${creditReference}`,
           ),
         ],
         isAutoGenerated: true,
       });
-    } catch (journalError) {
-      console.error(
-        "Error creating journal entry for credit note refund:",
-        journalError,
-      );
-    }
 
-    // Create BankTransaction when refunding from a bank account
-    if (bankAccount && journalEntry) {
-      try {
+      const refundPayment = {
+        amount: refundAmount,
+        paymentMethod: normalizedMethod,
+        reference: String(reference || '').trim() || null,
+        refundedBy: req.user.id,
+        refundedAt: refundDate,
+        bankAccountId: bankAccount?._id || null,
+        journalEntryId: journalEntry?._id || null,
+        arAmount: refundFromAR,
+        customerCreditAmount: refundFromCustomerCredit,
+      };
+      const appendedPayment = JSON.stringify([refundPayment]);
+      const updatedRows = await dbClient().$queryRaw`
+        UPDATE credit_notes
+        SET amount_refunded = amount_refunded + ${refundAmount},
+            amount_refunded_from_ar = amount_refunded_from_ar + ${refundFromAR},
+            amount_refunded_from_credit = amount_refunded_from_credit + ${refundFromCustomerCredit},
+            payments = COALESCE(payments, '[]'::jsonb) || ${appendedPayment}::jsonb,
+            status = CASE
+              WHEN amount_refunded + ${refundAmount} >= total_amount THEN 'refunded'
+              ELSE 'partially_refunded'
+            END,
+            updated_at = NOW()
+        WHERE id = ${String(note._id)}
+          AND company_id = ${String(companyId)}
+          AND status IN ('confirmed', 'issued', 'applied', 'partially_refunded')
+          AND amount_refunded + ${refundAmount} <= total_amount
+          AND amount_refunded_from_ar + ${refundFromAR} <= amount_applied_to_ar
+          AND amount_refunded_from_credit + ${refundFromCustomerCredit} <= amount_available_as_credit
+        RETURNING id`;
+      if (!updatedRows.length) {
+        const conflict = new Error('This credit note has already been refunded up to its available balance. Refresh and try again.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+
+      if (refundFromAR > 0) {
+        const invoice = await Invoice.findOne({ _id: note.invoice, company: companyId });
+        if (!invoice) throw new Error('The original invoice for this credit note is missing.');
+        invoice.amountOutstanding = Number(invoice.amountOutstanding || 0) + refundFromAR;
+        invoice.status = Number(invoice.amountOutstanding) <= 0
+          ? 'fully_paid'
+          : Number(invoice.amountPaid || 0) > 0
+            ? 'partially_paid'
+            : 'confirmed';
+        invoice.paidDate = null;
+        await invoice.save();
+
+        const client = await Client.findOne({ _id: note.client, company: companyId });
+        if (!client) throw new Error('The customer account for this credit note is missing.');
+        client.outstandingBalance = Number(client.outstandingBalance || 0) + refundFromAR;
+        await client.save();
+        await require('../services/arTrackingService').recordCreditNoteRefund(
+          note,
+          invoice,
+          refundFromAR,
+          req.user.id,
+          { required: true, invoiceBalanceAfter: invoice.amountOutstanding, clientBalanceAfter: client.outstandingBalance },
+        );
+      }
+
+      if (bankAccount) {
         await bankAccount.addTransaction({
           type: 'withdrawal',
           amount: refundAmount,
-          description: `Credit note refund: ${note.creditNoteNumber}`,
-          date: new Date(),
-          referenceNumber: note.creditNoteNumber,
+          description: `Credit note refund: ${creditReference}`,
+          date: refundDate,
+          referenceNumber: creditReference,
           referenceType: 'CreditNote',
           reference: note._id,
           createdBy: req.user.id,
           notes: 'Credit note refund to customer',
           journalEntryId: journalEntry._id,
         });
-      } catch (btErr) {
-        console.error('BankTransaction creation failed for credit note refund:', btErr.message);
       }
-    }
+    });
 
-    res.json({ success: true, data: note });
+    const updatedNote = await CreditNote.findOne({ _id: req.params.id, company: companyId });
+    res.json({ success: true, data: updatedNote });
   } catch (err) {
     next(err);
   }
@@ -1171,35 +1170,19 @@ exports.updateCreditNote = async (req, res, next) => {
 
     const { reason, type, creditDate, notes, lines } = req.body;
 
-    if (reason) note.reason = reason;
+    if (reason !== undefined) note.reason = reason;
     if (type) note.type = type;
     if (creditDate) note.creditDate = creditDate;
     if (notes !== undefined) note.notes = notes;
 
     // Update lines if provided - calculate line totals before saving
     if (lines && Array.isArray(lines)) {
-      // Calculate line totals
-      const processedLines = lines.map((line) => {
-        const quantity = Number(line.quantity) || 0;
-        const unitPrice = Number(line.unitPrice) || 0;
-        const taxRate = Number(line.taxRate) || 0;
-        const unitCost = Number(line.unitCost) || 0;
-
-        const lineSubtotal = quantity * unitPrice;
-        const lineTax = lineSubtotal * (taxRate / 100);
-        const lineTotal = lineSubtotal + lineTax;
-        const cogsAmount = quantity * unitCost;
-
-        return {
-          ...line,
-          lineSubtotal,
-          lineTax,
-          lineTotal,
-          cogsAmount,
-        };
-      });
-
-      note.lines = processedLines;
+      const sourceInvoice = await Invoice.findOne({ _id: note.invoice, company: companyId });
+      if (!sourceInvoice) return res.status(404).json({ success: false, message: 'Original invoice not found.' });
+      note.lines = normalizeCreditNoteLines(sourceInvoice, lines, note.type);
+      note.subtotal = note.lines.reduce((sum, line) => sum + Number(line.lineSubtotal || 0), 0);
+      note.taxAmount = note.lines.reduce((sum, line) => sum + Number(line.lineTax || 0), 0);
+      note.totalAmount = note.lines.reduce((sum, line) => sum + Number(line.lineTotal || 0), 0);
     }
 
     await note.save();
@@ -1303,7 +1286,7 @@ exports.confirmCreditNote = async (req, res, next) => {
       const alreadyCredited = invoiceLine.qtyCredited || 0;
       const invoiceQty = invoiceLine.quantity || invoiceLine.qty || 0;
       const remainingQty = invoiceQty - alreadyCredited;
-      if (line.quantity > remainingQty) {
+      if (!Number.isFinite(Number(line.quantity)) || Number(line.quantity) <= 0 || line.quantity > remainingQty) {
         return res.status(422).json({
           success: false,
           code: ERR_EXCEEDS_INVOICE_QTY,
@@ -1325,22 +1308,31 @@ exports.confirmCreditNote = async (req, res, next) => {
         });
       }
 
-      // Validate serial numbers if provided
-      if (line.serialNumbers && line.serialNumbers.length > 0) {
-        const StockSerialNumber = require("../models/StockSerialNumber");
-        for (const serialId of line.serialNumbers) {
-          const serial = await StockSerialNumber.findOne({
-            _id: serialId,
-            company: companyId,
-          });
-          if (!serial || serial.status !== "dispatched") {
+      const product = line.product;
+      const trackingType = product?.trackingType || 'none';
+      if (creditNote.type === 'goods_return' && product?.isStockable !== false && !line.returnToWarehouse) {
+        return res.status(422).json({ success: false, code: 'ERR_RETURN_WAREHOUSE_REQUIRED', message: `Select a return warehouse for ${product?.name || line.productName}.` });
+      }
+      if (trackingType === 'serial') {
+        const serialNumbers = Array.isArray(line.serialNumbers) ? line.serialNumbers : [];
+        if (serialNumbers.length !== Number(line.quantity)) {
+          return res.status(422).json({ success: false, code: 'ERR_SERIAL_COUNT_MISMATCH', message: `Select exactly ${line.quantity} serial number(s) for ${product.name}.` });
+        }
+        const serialRows = await require('../models/StockSerialNumber').find({
+          _id: { $in: serialNumbers },
+          company: companyId,
+          product: idOf(product),
+        });
+        if (serialRows.length !== serialNumbers.length || serialRows.some((serial) => serial.status !== 'dispatched')) {
             return res.status(400).json({
               success: false,
               code: ERR_SERIAL_NOT_DISPATCHED,
               message: "Serial number must be dispatched",
             });
-          }
         }
+      }
+      if (trackingType === 'batch' && !line.batchId) {
+        return res.status(422).json({ success: false, code: 'ERR_BATCH_REQUIRED', message: `Select the returned batch for ${product.name}.` });
       }
     }
 
@@ -1352,11 +1344,25 @@ exports.confirmCreditNote = async (req, res, next) => {
     const StockMovement = require("../models/StockMovement");
     const StockBatch = require("../models/StockBatch");
     const StockSerialNumber = require("../models/StockSerialNumber");
+    const StockLevel = require("../models/StockLevel");
+    const Warehouse = require("../models/Warehouse");
     const ChartOfAccount = require("../models/ChartOfAccount");
     const { DEFAULT_ACCOUNTS } = require("../constants/chartOfAccounts");
 
-    console.log("DEBUG: About to run transaction");
     await runInTransaction(async (session) => {
+      const { dbClient } = require('../lib/prisma');
+      const claimed = await dbClient().$queryRaw`
+        UPDATE credit_notes
+        SET status = 'processing'
+        WHERE id = ${String(creditNoteId)}
+          AND company_id = ${String(companyId)}
+          AND status = 'draft'
+        RETURNING id`;
+      if (!claimed.length) {
+        const conflict = new Error('This credit note is already being processed or is no longer a draft. Refresh the page.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
       if (creditNote.posOrigin) {
         const refundAmount = Number(creditNote.totalAmount || creditNote.grandTotal || creditNote.total || 0);
         await consumePosManagerApproval({
@@ -1375,20 +1381,10 @@ exports.confirmCreditNote = async (req, res, next) => {
 
       const isGoodsReturn = creditNote.type === "goods_return";
 
-      console.log(
-        "DEBUG: Inside transaction, processing",
-        lineArray.length,
-        "lines",
-      );
-
-      // Process each line
-      console.log(
-        "DEBUG: Processing lineArray =",
-        JSON.stringify(lineArray, null, 2),
-      );
+      // Process each line from the immutable source invoice values.
       for (const line of lineArray) {
         const product = line.product;
-        if (!product) continue;
+        if (!product) throw new Error(`Product on credit note line ${line.productName || ''} is missing.`);
 
         // Get taxRate from credit note line or fall back to invoice line
         let taxRate = line.taxRate;
@@ -1408,8 +1404,8 @@ exports.confirmCreditNote = async (req, res, next) => {
           "line.unitPrice =",
           line.unitPrice,
         );
-        const lineSubtotal = (line.quantity || 0) * (line.unitPrice || 0);
-        const lineTax = lineSubtotal * ((taxRate || 0) / 100);
+        const lineSubtotal = Number(line.lineSubtotal ?? ((line.quantity || 0) * (line.unitPrice || 0)));
+        const lineTax = Number(line.lineTax ?? (lineSubtotal * ((taxRate || 0) / 100)));
         const lineCogs = (line.unitCost || 0) * (line.quantity || 0);
 
         console.log(
@@ -1424,7 +1420,11 @@ exports.confirmCreditNote = async (req, res, next) => {
 
         // ========== STEP 4: Return stock to warehouse (goods return only) ==========
         if (isGoodsReturn && product.isStockable) {
-          const warehouse = line.returnToWarehouse;
+          const warehouseId = idOf(line.returnToWarehouse);
+          const warehouse = warehouseId
+            ? await Warehouse.findOne({ _id: warehouseId, company: companyId, isActive: true }).session(session)
+            : null;
+          if (!warehouse) throw new Error(`Select an active return warehouse for ${product.name}.`);
 
           // Add stock using inventory service createLayer
           await inventoryService.createLayer(
@@ -1432,35 +1432,39 @@ exports.confirmCreditNote = async (req, res, next) => {
             product._id,
             line.quantity,
             line.unitCost || 0,
+            { type: 'credit_note', reference: creditNote.referenceNo },
             {
-              warehouse: warehouse ? warehouse._id : null,
+              warehouse: warehouse._id,
               session,
               userId: req.user.id,
             },
           );
+          await StockLevel.recalculateWAC(companyId, product._id, warehouse._id, Number(line.quantity), Number(line.unitCost || 0));
 
           // Update batch if batch-tracked
           if (line.batchId) {
-            const batch = await StockBatch.findById(line.batchId).session(
-              session,
+            const batchUpdate = await StockBatch.updateMany(
+              { _id: line.batchId, company: companyId, product: product._id },
+              { $inc: { qtyOnHand: Number(line.quantity) } },
             );
-            if (batch) {
-              batch.qtyOnHand = (batch.qtyOnHand || 0) + line.quantity;
-              await batch.save({ session });
-            }
+            if (batchUpdate.matchedCount !== 1) throw new Error(`The batch selected for ${product.name} could not be found.`);
           }
 
           // Update serial numbers if serial-tracked
           if (line.serialNumbers && line.serialNumbers.length > 0) {
-            await StockSerialNumber.updateMany(
-              { _id: { $in: line.serialNumbers } },
+            const serialUpdate = await StockSerialNumber.updateMany(
+              { _id: { $in: line.serialNumbers }, company: companyId, product: product._id, status: 'dispatched' },
               {
                 status: "in_stock",
                 returnedVia: creditNote._id,
                 returnedAt: new Date(),
+                warehouse: warehouse._id,
+                dispatchedVia: null,
+                dispatchedAt: null,
               },
               { session },
             );
+            if (serialUpdate.matchedCount !== line.serialNumbers.length) throw new Error(`One or more serial numbers for ${product.name} are not currently dispatched.`);
           }
 
           // Create stock movement
@@ -1473,7 +1477,7 @@ exports.confirmCreditNote = async (req, res, next) => {
               {
                 company: companyId,
                 product: product._id,
-                warehouse: warehouse ? warehouse._id : null,
+              warehouse: warehouse._id,
                 type: "in",
                 reason: "return",
                 quantity: line.quantity,
@@ -1497,11 +1501,7 @@ exports.confirmCreditNote = async (req, res, next) => {
           );
 
           // Update product stock
-          await Product.findByIdAndUpdate(
-            product._id,
-            { currentStock: newStock },
-            { session },
-          );
+          await Product.findByIdAndUpdate(product._id, { $inc: { currentStock: Number(line.quantity) } }, { session });
         }
 
         // ========== Track qty credited on invoice line ==========
@@ -1509,14 +1509,29 @@ exports.confirmCreditNote = async (req, res, next) => {
         if (invoiceLine) {
           invoiceLine.qtyCredited =
             (invoiceLine.qtyCredited || 0) + line.quantity;
+          const invoiceLineUpdate = await dbClient().invoiceLine.updateMany({
+            where: {
+              id: String(invoiceLine._id || invoiceLine.id),
+              companyId: String(companyId),
+              qtyCredited: { lte: Number(invoiceLine.qty) - Number(line.quantity) },
+            },
+            data: { qtyCredited: { increment: Number(line.quantity) } },
+          });
+          if (invoiceLineUpdate.count !== 1) {
+            const conflict = new Error(`The remaining quantity on invoice line ${line.productName || ''} changed while this credit note was being confirmed.`);
+            conflict.statusCode = 409;
+            throw conflict;
+          }
         }
       }
 
-      // Save invoice with updated qtyCredited
-      await invoice.save({ session });
-
       // ========== STEP 2: Post Revenue Reversal Journal Entry (Entry A) ==========
       const totalAmount = totalSubtotal + totalTax;
+      const outstandingBeforeCredit = Math.max(0, Number(invoice.amountOutstanding ?? invoice.balance ?? 0));
+      const amountAppliedToAR = Math.min(totalAmount, outstandingBeforeCredit);
+      const amountAvailableAsCredit = Math.max(0, totalAmount - amountAppliedToAR);
+      creditNote.amountAppliedToAR = amountAppliedToAR;
+      creditNote.amountAvailableAsCredit = amountAvailableAsCredit;
       const narration =
         "Credit Note - " +
         (creditNote.client?.name || "Client") +
@@ -1559,7 +1574,8 @@ exports.confirmCreditNote = async (req, res, next) => {
       }
 
       // Build revenue reversal lines with proper debit/credit amounts
-      // For credit note: DR Sales Returns (contra-revenue), DR VAT Output, CR Accounts Receivable
+      // Credit the open invoice first. Any value beyond its receivable becomes
+      // a customer advance liability that can later be refunded or allocated.
       const revenueLines = [
         {
           accountCode: salesReturnsAccount,
@@ -1575,13 +1591,20 @@ exports.confirmCreditNote = async (req, res, next) => {
           debit: totalTax,
           credit: 0,
         }] : []),
-        {
+        ...(amountAppliedToAR > 0 ? [{
           accountCode: DEFAULT_ACCOUNTS.accountsReceivable,
           accountName: 'Accounts Receivable',
           description: narration,
           debit: 0,
-          credit: totalAmount,
-        },
+          credit: amountAppliedToAR,
+        }] : []),
+        ...(amountAvailableAsCredit > 0 ? [{
+          accountCode: DEFAULT_ACCOUNTS.customerAdvances,
+          accountName: 'Customer Deposits and Advances',
+          description: narration,
+          debit: 0,
+          credit: amountAvailableAsCredit,
+        }] : []),
       ];
 
       // Build COGS lines if goods return
@@ -1678,8 +1701,7 @@ exports.confirmCreditNote = async (req, res, next) => {
       }
 
       // ========== STEP 5: Update AR balance ==========
-      invoice.amountOutstanding =
-        (invoice.amountOutstanding || invoice.balance || 0) - totalAmount;
+      invoice.amountOutstanding = outstandingBeforeCredit - amountAppliedToAR;
       if (invoice.amountOutstanding <= 0) {
         invoice.amountOutstanding = 0;
         invoice.status = "fully_paid";
@@ -1688,6 +1710,25 @@ exports.confirmCreditNote = async (req, res, next) => {
         }
       }
       await invoice.save({ session });
+
+      const client = await Client.findOne({ _id: creditNote.client, company: companyId }).session(session);
+      const clientBalanceAfter = client
+        ? Math.max(0, Number(client.outstandingBalance || 0) - amountAppliedToAR)
+        : null;
+      if (client) {
+        client.outstandingBalance = clientBalanceAfter;
+        await client.save({ session });
+      }
+      if (amountAppliedToAR > 0) {
+        const ARTrackingService = require('../services/arTrackingService');
+        await ARTrackingService.recordCreditNoteApplied(
+          creditNote,
+          invoice,
+          amountAppliedToAR,
+          req.user.id,
+          { session, required: true, invoiceBalanceAfter: invoice.amountOutstanding, clientBalanceAfter },
+        );
+      }
 
       // Update credit note status
       console.log(
@@ -1711,24 +1752,6 @@ exports.confirmCreditNote = async (req, res, next) => {
       "DEBUG: Transaction completed, creditNote.status =",
       creditNote.status,
     );
-
-    // Record AR tracking transaction for credit note application
-    try {
-      const ARTrackingService = require("../services/arTrackingService");
-      const totalAmount =
-        creditNote.totalAmount ||
-        creditNote.grandTotal ||
-        creditNote.total ||
-        0;
-      await ARTrackingService.recordCreditNoteApplied(
-        creditNote,
-        invoice,
-        totalAmount,
-        req.user.id,
-      );
-    } catch (trackingError) {
-      console.error("AR tracking error for credit note:", trackingError);
-    }
 
     await creditNote.populate(
       "lines.product lines.returnToWarehouse createdBy confirmedBy invoice client revenueReversalEntry cogsReversalEntry",

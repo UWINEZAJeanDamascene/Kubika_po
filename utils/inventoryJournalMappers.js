@@ -669,7 +669,9 @@ function stockSerialNumberToApi(row) {
     unitCost: decimalToNumber(row.unitCost, 0),
     status: row.status,
     dispatchedVia: row.dispatchedVia ?? null,
+    dispatchedAt: row.dispatchedAt ?? null,
     returnedVia: row.returnedVia ?? null,
+    returnedAt: row.returnedAt ?? null,
     notes: row.notes ?? null,
     ...mapTimestamps(row),
   };
@@ -685,7 +687,9 @@ const STOCK_SERIAL_INPUT = {
   unitCost: 'unitCost',
   status: 'status',
   dispatchedVia: 'dispatchedVia',
+  dispatchedAt: 'dispatchedAt',
   returnedVia: 'returnedVia',
+  returnedAt: 'returnedAt',
   notes: 'notes',
 };
 

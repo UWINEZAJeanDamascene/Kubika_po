@@ -1793,7 +1793,9 @@ model StockSerialNumber {
   unitCost      Decimal           @map("unit_cost") @db.Decimal(19, 6)
   status        StockSerialStatus @default(in_stock)
   dispatchedVia String?           @map("dispatched_via") @db.Char(24)
+  dispatchedAt  DateTime?          @map("dispatched_at") @db.Timestamptz(3)
   returnedVia   String?           @map("returned_via") @db.Char(24)
+  returnedAt    DateTime?          @map("returned_at") @db.Timestamptz(3)
   notes         String?
   createdAt     DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt     DateTime          @updatedAt @map("updated_at") @db.Timestamptz(3)
@@ -2184,6 +2186,7 @@ model InvoiceLine {
   productCode  String?    @map("product_code")
   description  String?
   qty          Decimal    @db.Decimal(19, 4)
+  qtyDelivered Decimal    @default(0) @map("qty_delivered") @db.Decimal(19, 4)
   unit         String?
   unitPrice    Decimal    @map("unit_price") @db.Decimal(19, 6)
   discountPct  Decimal    @default(0) @map("discount_pct") @db.Decimal(19, 4)
@@ -2227,6 +2230,17 @@ model CreditNote {
   ebm                    Json             @default("{}")
   createdById            String?          @map("created_by") @db.Char(24)
   confirmedById          String?          @map("confirmed_by") @db.Char(24)
+  confirmedAt            DateTime?        @map("confirmed_at") @db.Timestamptz(3)
+  amountRefunded         Decimal          @default(0) @map("amount_refunded") @db.Decimal(19, 2)
+  amountAppliedToAR      Decimal          @default(0) @map("amount_applied_to_ar") @db.Decimal(19, 2)
+  amountAvailableAsCredit Decimal         @default(0) @map("amount_available_as_credit") @db.Decimal(19, 2)
+  amountRefundedFromAR    Decimal         @default(0) @map("amount_refunded_from_ar") @db.Decimal(19, 2)
+  amountRefundedFromCredit Decimal        @default(0) @map("amount_refunded_from_credit") @db.Decimal(19, 2)
+  amountAppliedToOtherInvoices Decimal    @default(0) @map("amount_applied_to_other_invoices") @db.Decimal(19, 2)
+  applications           Json             @default("[]")
+  appliedToInvoiceId     String?          @map("applied_to_invoice_id") @db.Char(24)
+  appliedAt              DateTime?        @map("applied_at") @db.Timestamptz(3)
+  notes                  String?
   createdAt              DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt              DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
   lines                  CreditNoteLine[]
@@ -2254,6 +2268,9 @@ model CreditNoteLine {
   unitPrice           Decimal    @map("unit_price") @db.Decimal(19, 6)
   unitCost            Decimal    @default(0) @map("unit_cost") @db.Decimal(19, 6)
   taxRate             Decimal    @default(0) @map("tax_rate") @db.Decimal(19, 4)
+  discountPct         Decimal    @default(0) @map("discount_pct") @db.Decimal(19, 4)
+  lineSubtotal        Decimal    @default(0) @map("line_subtotal") @db.Decimal(19, 2)
+  lineTax             Decimal    @default(0) @map("line_tax") @db.Decimal(19, 2)
   lineTotal           Decimal    @default(0) @map("line_total") @db.Decimal(19, 2)
   returnToWarehouseId String?    @map("return_to_warehouse_id") @db.Char(24)
   batchId             String?    @map("batch_id") @db.Char(24)
@@ -2358,6 +2375,21 @@ model DeliveryNote {
   stockDeducted Boolean            @default(false) @map("stock_deducted")
   notes         String?
   createdById   String?            @map("created_by") @db.Char(24)
+  confirmedById String?            @map("confirmed_by") @db.Char(24)
+  confirmedAt   DateTime?          @map("confirmed_at") @db.Timestamptz(3)
+  dispatchedById String?           @map("dispatched_by") @db.Char(24)
+  dispatchedAt  DateTime?          @map("dispatched_at") @db.Timestamptz(3)
+  deliveredBy   String?            @map("delivered_by")
+  deliveredAt   DateTime?          @map("delivered_at") @db.Timestamptz(3)
+  receivedBy    String?            @map("received_by")
+  actualDeliveryDate DateTime?     @map("actual_delivery_date") @db.Timestamptz(3)
+  carrier       String?
+  vehicle       String?
+  trackingNumber String?           @map("tracking_number")
+  deliveryAddress String?          @map("delivery_address")
+  cancelledById String?            @map("cancelled_by") @db.Char(24)
+  cancelledAt   DateTime?          @map("cancelled_at") @db.Timestamptz(3)
+  cancellationReason String?       @map("cancellation_reason")
   createdAt     DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt     DateTime           @updatedAt @map("updated_at") @db.Timestamptz(3)
   lines         DeliveryNoteLine[]

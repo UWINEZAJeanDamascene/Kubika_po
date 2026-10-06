@@ -19,6 +19,21 @@ const FIELD_MAP = {
   pickPack: { target: 'pickPackId', isId: true },
   status: { target: 'status' },
   deliveryDate: { target: 'deliveryDate' },
+  confirmedBy: { target: 'confirmedById', isId: true },
+  confirmedAt: { target: 'confirmedAt' },
+  dispatchedBy: { target: 'dispatchedById', isId: true },
+  dispatchedAt: { target: 'dispatchedAt' },
+  deliveredBy: { target: 'deliveredBy' },
+  deliveredAt: { target: 'deliveredAt' },
+  receivedBy: { target: 'receivedBy' },
+  actualDeliveryDate: { target: 'actualDeliveryDate' },
+  carrier: { target: 'carrier' },
+  vehicle: { target: 'vehicle' },
+  trackingNumber: { target: 'trackingNumber' },
+  deliveryAddress: { target: 'deliveryAddress' },
+  cancelledBy: { target: 'cancelledById', isId: true },
+  cancelledAt: { target: 'cancelledAt' },
+  cancellationReason: { target: 'cancellationReason' },
 };
 
 module.exports = buildDocumentModel({

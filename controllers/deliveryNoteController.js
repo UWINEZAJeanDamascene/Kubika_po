@@ -793,6 +793,10 @@ exports.confirmDelivery = async (req, res, next) => {
 
     // ========== STEP 1: VALIDATION ==========
     for (const line of deliveryNote.lines) {
+      const qtyToDeliver = Number(line.qtyToDeliver);
+      if (!Number.isFinite(qtyToDeliver) || qtyToDeliver < 0) {
+        return res.status(422).json({ success: false, code: 'ERR_INVALID_DELIVERY_QTY', message: 'Each delivery quantity must be a valid non-negative number.' });
+      }
       const invoiceLine = invoice.lines.id(line.invoiceLineId);
       if (!invoiceLine) {
         return res.status(400).json({
@@ -816,9 +820,15 @@ exports.confirmDelivery = async (req, res, next) => {
       }
 
       const product = line.product;
+      if (!product && qtyToDeliver > 0) {
+        return res.status(422).json({ success: false, code: 'ERR_DELIVERY_PRODUCT_MISSING', message: 'A product on this invoice line could not be loaded; no stock was changed.' });
+      }
       if (!product) continue;
 
       const trackingType = product.trackingType || "none";
+      if (trackingType === 'serial' && Number.isInteger(qtyToDeliver) && (line.serialNumbers || []).length !== qtyToDeliver) {
+        return res.status(422).json({ success: false, code: 'ERR_SERIAL_COUNT_MISMATCH', message: `Select exactly ${qtyToDeliver} serial number(s) for ${product.name}.` });
+      }
 
       // If product is stockable, ensure we can resolve a COGS unit cost (> 0)
       const isStockable = product.isStockable !== false;
@@ -866,6 +876,7 @@ exports.confirmDelivery = async (req, res, next) => {
           _id: line.batchId,
           company: companyId,
           product: product._id,
+          warehouse: deliveryNote.warehouse._id,
         });
 
         if (!batch) {
@@ -957,6 +968,19 @@ exports.confirmDelivery = async (req, res, next) => {
     const cogsAdjustments = [];
 
     await runInTransaction(async (session) => {
+      const { dbClient } = require('../lib/prisma');
+      const claimed = await dbClient().$queryRaw`
+        UPDATE delivery_notes
+        SET status = 'processing'
+        WHERE id = ${String(deliveryNoteId)}
+          AND company_id = ${String(companyId)}
+          AND status = 'draft'
+        RETURNING id`;
+      if (!claimed.length) {
+        const conflict = new Error('This delivery note is already being processed or is no longer a draft. Refresh the page.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
       // Process each line
       // Products for every line in one query; lines that are skipped below
       // (nothing to deliver / reverse) simply never look theirs up.
@@ -965,7 +989,7 @@ exports.confirmDelivery = async (req, res, next) => {
         if (line.qtyToDeliver <= 0) continue;
 
         const product = getLineProduct(dnLineProducts, line);
-        if (!product) continue;
+        if (!product) throw new Error(`Product for delivery line ${line.productName || ''} could not be loaded. The delivery has been rolled back.`);
 
         const trackingType = product.trackingType || "none";
         let actualUnitCost = 0;
@@ -1000,9 +1024,8 @@ exports.confirmDelivery = async (req, res, next) => {
           totalCost = actualUnitCost * Number(line.qtyToDeliver || 0);
         } else if (trackingType === "batch" && line.batchId) {
           // Batch-specific consumption
-          const batch = await StockBatch.findById(line.batchId).session(
-            session,
-          );
+          const batch = await StockBatch.findOne({ _id: line.batchId, company: companyId, product: product._id, warehouse: deliveryNote.warehouse._id }).session(session);
+          if (!batch || batch.isQuarantined) throw new Error(`The selected batch for ${line.productName} is missing or quarantined.`);
           actualUnitCost = batch?.unitCost
             ? batch.unitCost.toString
               ? Number(batch.unitCost.toString())
@@ -1010,9 +1033,11 @@ exports.confirmDelivery = async (req, res, next) => {
             : 0;
           totalCost = actualUnitCost * Number(line.qtyToDeliver || 0);
 
-          // Deduct from batch
-          batch.qtyOnHand = (batch.qtyOnHand || 0) - line.qtyToDeliver;
-          await batch.save({ session });
+          const batchUpdate = await StockBatch.updateMany(
+            { _id: line.batchId, company: companyId, product: product._id, warehouse: deliveryNote.warehouse._id, isQuarantined: { $ne: true }, qtyOnHand: { $gte: Number(line.qtyToDeliver) } },
+            { $inc: { qtyOnHand: -Number(line.qtyToDeliver) } },
+          );
+          if (batchUpdate.matchedCount !== 1) throw new Error(`The selected batch for ${line.productName} no longer has enough stock.`);
         }
 
         // ========== STEP 3: UPDATE STOCK LEVELS ==========
@@ -1021,7 +1046,7 @@ exports.confirmDelivery = async (req, res, next) => {
 
         // Update product quantity using direct update to avoid caching issues
         const previousStock = product.currentStock || 0;
-        const newStock = Math.max(0, previousStock - line.qtyToDeliver);
+        const newStock = Math.max(0, Number(previousStock) - Number(line.qtyToDeliver));
         // Also release the reservation for the delivered qty so that
         // qty_available (currentStock - reservedQuantity) stays accurate.
         // Clamp at 0 so a stale/partial reservation never produces a negative value.
@@ -1033,36 +1058,31 @@ exports.confirmDelivery = async (req, res, next) => {
         await Product.findByIdAndUpdate(
           product._id,
           {
-            $set: { currentStock: newStock },
-            $inc: { reservedQuantity: -reservationToRelease },
+            $inc: { currentStock: -Number(line.qtyToDeliver), reservedQuantity: -reservationToRelease },
           },
           { session },
         );
 
         // ── Decrement StockLevel for this product/warehouse (dispatch) ────────
-        try {
-          await StockLevel.updateOne(
-            {
-              company_id: companyId,
-              product_id: product._id,
-              warehouse_id: deliveryNote.warehouse._id,
-              qty_on_hand: { $gte: Number(line.qtyToDeliver) },
+        const stockLevelUpdate = await StockLevel.updateMany(
+          {
+            company_id: companyId,
+            product_id: product._id,
+            warehouse_id: deliveryNote.warehouse._id,
+            qty_on_hand: { $gte: Number(line.qtyToDeliver) },
+          },
+          {
+            $inc: { qty_on_hand: -Number(line.qtyToDeliver) },
+            $set: {
+              last_movement_at: new Date(),
+              last_movement_type: "dispatch",
             },
-            {
-              $inc: { qty_on_hand: -Number(line.qtyToDeliver) },
-              $set: {
-                last_movement_at: new Date(),
-                last_movement_type: "dispatch",
-              },
-            },
-            { session },
-          );
-        } catch (slErr) {
-          // StockLevel sync is best-effort — do not abort the delivery confirmation
-          console.error(
-            "StockLevel sync failed for delivery line:",
-            slErr.message,
-          );
+          },
+        );
+        if (stockLevelUpdate.matchedCount !== 1) {
+          const stockError = new Error(`Warehouse stock changed before delivery for ${line.productName}. Refresh availability and retry.`);
+          stockError.statusCode = 409;
+          throw stockError;
         }
 
         // ========== STEP 4: CREATE STOCK MOVEMENT (dispatch) ==========
@@ -1096,8 +1116,8 @@ exports.confirmDelivery = async (req, res, next) => {
           line.serialNumbers &&
           line.serialNumbers.length > 0
         ) {
-          await StockSerialNumber.updateMany(
-            { _id: { $in: line.serialNumbers } },
+          const serialUpdate = await StockSerialNumber.updateMany(
+            { _id: { $in: line.serialNumbers }, company: companyId, product: product._id, status: "in_stock", warehouse: deliveryNote.warehouse._id },
             {
               status: "dispatched",
               dispatchedVia: line._id,
@@ -1106,6 +1126,11 @@ exports.confirmDelivery = async (req, res, next) => {
             },
             { session },
           );
+          if (serialUpdate.matchedCount !== line.serialNumbers.length) {
+            const serialError = new Error(`One or more serial numbers for ${line.productName} are no longer in stock at this warehouse.`);
+            serialError.statusCode = 409;
+            throw serialError;
+          }
         }
 
         // Store actual cost on line for COGS adjustment
@@ -1158,11 +1183,21 @@ exports.confirmDelivery = async (req, res, next) => {
         if (invoiceLine) {
           invoiceLine.qtyDelivered =
             (invoiceLine.qtyDelivered || 0) + line.qtyToDeliver;
+          const invoiceLineUpdate = await dbClient().invoiceLine.updateMany({
+            where: {
+              id: String(invoiceLine._id || invoiceLine.id),
+              companyId: String(companyId),
+              qtyDelivered: { lte: Number(invoiceLine.qty) - Number(line.qtyToDeliver) },
+            },
+            data: { qtyDelivered: { increment: Number(line.qtyToDeliver) } },
+          });
+          if (invoiceLineUpdate.count !== 1) {
+            const conflict = new Error(`The remaining invoice quantity for ${line.productName} changed during dispatch. Refresh and retry.`);
+            conflict.statusCode = 409;
+            throw conflict;
+          }
         }
       }
-
-      // Save invoice with updated qtyDelivered
-      await invoice.save({ session });
 
       // Save delivery note lines
       deliveryNote.lines.forEach((line) => line.markModified("unitCost"));
@@ -1230,25 +1265,12 @@ exports.confirmDelivery = async (req, res, next) => {
         }
 
         if (entries.length > 0) {
-          try {
-            if (typeof JournalService.createEntriesAtomic === "function") {
-              await JournalService.createEntriesAtomic(
-                companyId,
-                req.user.id,
-                entries,
-                { session },
-              );
-            } else {
-              // Fallback: create entries one by one but keep session
-              for (const e of entries) {
-                await JournalService.createEntry(companyId, req.user.id, {
-                  ...e,
-                  session,
-                });
-              }
+          if (typeof JournalService.createEntriesAtomic === "function") {
+            await JournalService.createEntriesAtomic(companyId, req.user.id, entries, { session });
+          } else {
+            for (const entry of entries) {
+              await JournalService.createEntry(companyId, req.user.id, { ...entry, session });
             }
-          } catch (err) {
-            console.error("COGS adjustment failed (atomic post):", err);
           }
         }
       }
@@ -1256,7 +1278,7 @@ exports.confirmDelivery = async (req, res, next) => {
       // Update delivery note status
       deliveryNote.status = "confirmed";
       deliveryNote.confirmedBy = req.user.id;
-      deliveryNote.confirmedDate = new Date();
+      deliveryNote.confirmedAt = new Date();
       deliveryNote.stockDeducted = true;
       await deliveryNote.save({ session });
     });
@@ -1370,8 +1392,9 @@ exports.dispatchDeliveryNote = async (req, res, next) => {
       });
     }
 
-    // Can only dispatch if status is draft or confirmed
-    const dispatchableStatuses = ['draft', 'confirmed'];
+    // Stock is committed at confirmation; dispatching an unconfirmed draft
+    // would bypass invoice quantity and inventory checks.
+    const dispatchableStatuses = ['confirmed'];
     if (!dispatchableStatuses.includes(deliveryNote.status)) {
       return res.status(400).json({
         success: false,
@@ -1392,6 +1415,8 @@ exports.dispatchDeliveryNote = async (req, res, next) => {
 
     // Change status to dispatched when dispatch button is clicked
     deliveryNote.status = 'dispatched';
+    deliveryNote.dispatchedBy = req.user.id;
+    deliveryNote.dispatchedAt = new Date();
 
     await deliveryNote.save();
 
@@ -1437,8 +1462,10 @@ exports.markDelivered = async (req, res, next) => {
     }
 
     // Update delivery information
-    if (receivedBy) deliveryNote.deliveredBy = receivedBy;
-    if (receivedDate) deliveryNote.actualDeliveryDate = new Date(receivedDate);
+    if (receivedBy) deliveryNote.receivedBy = receivedBy;
+    deliveryNote.deliveredBy = req.user.id;
+    deliveryNote.deliveredAt = new Date();
+    deliveryNote.actualDeliveryDate = receivedDate ? new Date(receivedDate) : new Date();
     if (notes) deliveryNote.notes = notes;
 
     // Change status to delivered
@@ -1463,7 +1490,10 @@ exports.markDelivered = async (req, res, next) => {
 exports.cancelDeliveryNote = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const { cancellationReason } = req.body;
+    const cancellationReason = String(req.body.cancellationReason || '').trim();
+    if (cancellationReason.length < 5) {
+      return res.status(400).json({ success: false, code: 'ERR_CANCELLATION_REASON_REQUIRED', message: 'Provide a cancellation reason of at least 5 characters.' });
+    }
 
     let deliveryNote = await DeliveryNote.findOne({
       _id: req.params.id,
@@ -1500,6 +1530,19 @@ exports.cancelDeliveryNote = async (req, res, next) => {
 
     // Execute reversal in transaction
     await runInTransaction(async (session) => {
+      const { dbClient } = require('../lib/prisma');
+      const claimed = await dbClient().$queryRaw`
+        UPDATE delivery_notes
+        SET status = 'cancelling'
+        WHERE id = ${String(req.params.id)}
+          AND company_id = ${String(companyId)}
+          AND status = 'confirmed'
+        RETURNING id`;
+      if (!claimed.length) {
+        const conflict = new Error('This delivery note is no longer eligible for cancellation. Refresh and review its status.');
+        conflict.statusCode = 409;
+        throw conflict;
+      }
       // Reverse each line
       // Products for every line in one query; lines that are skipped below
       // (nothing to deliver / reverse) simply never look theirs up.
@@ -1508,7 +1551,7 @@ exports.cancelDeliveryNote = async (req, res, next) => {
         if (line.deliveredQty <= 0) continue;
 
         const product = getLineProduct(dnLineProducts, line);
-        if (!product) continue;
+        if (!product) throw new Error(`Product for delivery line ${line.productName || line.product} no longer exists in this company.`);
 
         const trackingType = product.trackingType || "none";
 
@@ -1541,9 +1584,15 @@ exports.cancelDeliveryNote = async (req, res, next) => {
         const newStock = previousStock + Number(line.deliveredQty);
         await Product.findByIdAndUpdate(
           product._id,
-          { currentStock: newStock },
+          { $inc: { currentStock: Number(line.deliveredQty) } },
           { session },
         );
+
+        const stockLevelRestore = await StockLevel.updateMany(
+          { company_id: companyId, product_id: product._id, warehouse_id: deliveryNote.warehouse._id },
+          { $inc: { qty_on_hand: Number(line.deliveredQty) }, $set: { last_movement_at: new Date(), last_movement_type: 'return_in' } },
+        );
+        if (stockLevelRestore.matchedCount !== 1) throw new Error(`Warehouse stock record is missing for ${line.productName}; cancellation was rolled back.`);
 
         // ========== Reverse stock movement ==========
         await StockMovement.create(
@@ -1576,8 +1625,8 @@ exports.cancelDeliveryNote = async (req, res, next) => {
           line.serialNumbers &&
           line.serialNumbers.length > 0
         ) {
-          await StockSerialNumber.updateMany(
-            { _id: { $in: line.serialNumbers } },
+          const serialRestore = await StockSerialNumber.updateMany(
+            { _id: { $in: line.serialNumbers }, company: companyId, product: product._id, status: 'dispatched' },
             {
               status: "in_stock",
               dispatchedVia: null,
@@ -1585,6 +1634,7 @@ exports.cancelDeliveryNote = async (req, res, next) => {
             },
             { session },
           );
+          if (serialRestore.matchedCount !== line.serialNumbers.length) throw new Error(`Serial return could not be reconciled for ${line.productName}.`);
         }
 
         // ========== Reverse invoice qty_delivered ==========
@@ -1594,11 +1644,13 @@ exports.cancelDeliveryNote = async (req, res, next) => {
             0,
             (invoiceLine.qtyDelivered || 0) - line.deliveredQty,
           );
+          const qtyRestore = await dbClient().invoiceLine.updateMany({
+            where: { id: String(invoiceLine._id || invoiceLine.id), companyId: String(companyId), qtyDelivered: { gte: Number(line.deliveredQty) } },
+            data: { qtyDelivered: { decrement: Number(line.deliveredQty) } },
+          });
+          if (qtyRestore.count !== 1) throw new Error(`Invoice delivered quantity could not be reversed for ${line.productName}.`);
         }
       }
-
-      // Save invoice
-      await invoice.save({ session });
 
       // ========== Reverse COGS adjustment if exists ==========
       // Find COGS adjustment journal entries for this delivery note
@@ -1650,7 +1702,7 @@ exports.cancelDeliveryNote = async (req, res, next) => {
       deliveryNote.status = "cancelled";
       deliveryNote.cancellationReason = cancellationReason;
       deliveryNote.cancelledBy = req.user.id;
-      deliveryNote.cancelledDate = new Date();
+      deliveryNote.cancelledAt = new Date();
       deliveryNote.stockDeducted = false;
       await deliveryNote.save({ session });
     });

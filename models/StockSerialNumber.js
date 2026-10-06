@@ -34,7 +34,9 @@ const FIELD_MAP = {
   batch: { target: 'batchId', isId: true },
   status: { target: 'status' },
   dispatchedVia: { target: 'dispatchedVia', isId: true },
+  dispatchedAt: { target: 'dispatchedAt' },
   returnedVia: { target: 'returnedVia', isId: true },
+  returnedAt: { target: 'returnedAt' },
   createdAt: { target: 'createdAt' },
   updatedAt: { target: 'updatedAt' },
 };

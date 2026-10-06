@@ -16,6 +16,18 @@ const FIELD_MAP = {
   status: { target: 'status' },
   posOrigin: { target: 'posOrigin' },
   creditDate: { target: 'creditDate' },
+  confirmedBy: { target: 'confirmedById', isId: true },
+  confirmedAt: { target: 'confirmedAt' },
+  amountRefunded: { target: 'amountRefunded' },
+  amountAppliedToAR: { target: 'amountAppliedToAR' },
+  amountAvailableAsCredit: { target: 'amountAvailableAsCredit' },
+  amountRefundedFromAR: { target: 'amountRefundedFromAR' },
+  amountRefundedFromCredit: { target: 'amountRefundedFromCredit' },
+  amountAppliedToOtherInvoices: { target: 'amountAppliedToOtherInvoices' },
+  applications: { target: 'applications' },
+  appliedTo: { target: 'appliedToInvoiceId', isId: true },
+  appliedDate: { target: 'appliedAt' },
+  notes: { target: 'notes' },
 };
 
 module.exports = buildDocumentModel({

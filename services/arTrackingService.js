@@ -314,10 +314,14 @@ class ARTrackingService {
 
       const creditAmount = parseFloat(amount) || 0;
       const currentClientBalance = parseFloat(client.outstandingBalance) || 0;
-      const newClientBalance = Math.max(0, currentClientBalance - creditAmount);
+      const newClientBalance = options.clientBalanceAfter == null
+        ? Math.max(0, currentClientBalance - creditAmount)
+        : Number(options.clientBalanceAfter);
 
       const currentInvoiceBalance = parseFloat(invoice.amountOutstanding) || parseFloat(invoice.balance) || 0;
-      const newInvoiceBalance = Math.max(0, currentInvoiceBalance - creditAmount);
+      const newInvoiceBalance = options.invoiceBalanceAfter == null
+        ? Math.max(0, currentInvoiceBalance - creditAmount)
+        : Number(options.invoiceBalanceAfter);
 
       const transaction = new ARTransactionLedger({
         company: creditNote.company,
@@ -349,6 +353,39 @@ class ARTrackingService {
       return transaction;
     } catch (error) {
       console.error('ARTrackingService.recordCreditNoteApplied error:', error);
+      if (options.required) throw error;
+      return null;
+    }
+  }
+
+  static async recordCreditNoteRefund(creditNote, invoice, amount, userId, options = {}) {
+    try {
+      const { session } = options;
+      const refundAmount = Number(amount) || 0;
+      if (refundAmount <= 0) return null;
+      const transaction = new ARTransactionLedger({
+        company: creditNote.company,
+        client: creditNote.client,
+        invoice: invoice._id,
+        transactionType: 'credit_note_refund',
+        transactionDate: new Date(),
+        referenceNo: creditNote.referenceNo || creditNote.creditNoteNumber,
+        description: `Credit note refund reinstated receivable on Invoice ${invoice.referenceNo || invoice.invoiceNumber}`,
+        amount: refundAmount,
+        direction: 'increase',
+        invoiceBalanceAfter: Number(options.invoiceBalanceAfter ?? invoice.amountOutstanding ?? 0),
+        clientBalanceAfter: Number(options.clientBalanceAfter ?? 0),
+        sourceType: 'credit_note_refund',
+        sourceId: creditNote._id,
+        sourceReference: creditNote.referenceNo || creditNote.creditNoteNumber,
+        createdBy: userId,
+        metadata: { creditNoteId: String(creditNote._id), refundAmount },
+      });
+      await transaction.save(session ? { session } : {});
+      return transaction;
+    } catch (error) {
+      console.error('ARTrackingService.recordCreditNoteRefund error:', error);
+      if (options.required) throw error;
       return null;
     }
   }
