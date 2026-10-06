@@ -14,6 +14,7 @@ const PROCESSABLE_ENTITY_TYPES = new Set([
   'customers',
   'clients',
   'suppliers',
+  'departments',
   'employees',
   'chart_of_accounts',
   'opening_stock',
@@ -194,6 +195,7 @@ function duplicateKeyFor(entityType, clean) {
   if (entityType === 'products' && clean.sku) return String(clean.sku).trim().toUpperCase();
   if ((entityType === 'customers' || entityType === 'clients' || entityType === 'suppliers') && clean.tin) return String(clean.tin).trim();
   if (entityType === 'employees' && clean.employeeId) return String(clean.employeeId).trim().toUpperCase();
+  if (entityType === 'departments' && clean.code) return String(clean.code).trim().toUpperCase();
   if (entityType === 'chart_of_accounts' && clean.accountCode) return String(clean.accountCode).trim();
   return null;
 }
@@ -393,6 +395,11 @@ async function detectDuplicate(entityType, companyId, clean) {
     const existing = await Employee.findOne({ company: companyId, employeeId: String(clean.employeeId).toUpperCase() }).select('_id employeeId').lean();
     return existing ? { duplicate: true, key: clean.employeeId, existingId: existing._id } : { duplicate: false };
   }
+  if (entityType === 'departments' && clean.code) {
+    const Department = require('../models/Department');
+    const existing = await Department.findOne({ company: companyId, code: String(clean.code).trim().toUpperCase() }).select('_id code').lean();
+    return existing ? { duplicate: true, key: clean.code, existingId: existing._id } : { duplicate: false };
+  }
   if (entityType === 'chart_of_accounts' && clean.accountCode) {
     const ChartOfAccount = require('../models/ChartOfAccount');
     const existing = await ChartOfAccount.findOne({ company: companyId, code: clean.accountCode }).select('_id code').lean();
@@ -427,7 +434,7 @@ function validateCleanRow(entityType, clean, rowNumber) {
     }
   }
 
-  for (const key of ['sellingPrice', 'costPrice', 'openingStockQuantity', 'reorderLevel', 'reorderQuantity', 'weight', 'creditLimit', 'openingBalance', 'basicSalary', 'transportAllowance', 'housingAllowance', 'otherAllowances', 'defaultDirectPercentage', 'debitBalance', 'creditBalance', 'cost', 'accumulatedDepreciation', 'salvageValue', 'decliningRate', 'insuredValue', 'usefulLifeYears', 'budgetedAmount', 'quantity', 'costPerUnit', 'amountOutstanding']) {
+  for (const key of ['sellingPrice', 'costPrice', 'openingStockQuantity', 'reorderLevel', 'reorderQuantity', 'weight', 'creditLimit', 'budgetLimit', 'openingBalance', 'basicSalary', 'transportAllowance', 'housingAllowance', 'otherAllowances', 'defaultDirectPercentage', 'debitBalance', 'creditBalance', 'cost', 'accumulatedDepreciation', 'salvageValue', 'decliningRate', 'insuredValue', 'usefulLifeYears', 'budgetedAmount', 'quantity', 'costPerUnit', 'amountOutstanding']) {
     if (!isBlank(clean[key]) && Number.isNaN(parseNumber(clean[key]))) {
       errors.push(buildValidationError(rowNumber, key, `${key} must be a number - found '${clean[key]}'.`, clean[key]));
     }
@@ -474,6 +481,11 @@ function validateCleanRow(entityType, clean, rowNumber) {
     if (!isBlank(clean.budgetedAmount) && (parseNumber(clean.budgetedAmount) == null || parseNumber(clean.budgetedAmount) < 0)) errors.push(buildValidationError(rowNumber, 'budgetedAmount', 'Budgeted amount cannot be negative.', clean.budgetedAmount));
     if (!isBlank(clean.budgetType) && !['expense', 'revenue', 'operational', 'capital', 'cash_flow', 'project'].includes(String(clean.budgetType).toLowerCase())) errors.push(buildValidationError(rowNumber, 'budgetType', 'Budget type must be expense, revenue, operational, capital, cash_flow, or project.', clean.budgetType));
     if (!isBlank(clean.budgetCycle) && !['fixed_year', 'rolling'].includes(String(clean.budgetCycle).toLowerCase().replace(/[ -]+/g, '_'))) errors.push(buildValidationError(rowNumber, 'budgetCycle', 'Budget cycle must be fixed_year or rolling.', clean.budgetCycle));
+  }
+  if (entityType === 'departments') {
+    if (!isBlank(clean.code) && !/^[A-Za-z0-9][A-Za-z0-9._-]{0,29}$/.test(String(clean.code).trim())) errors.push(buildValidationError(rowNumber, 'code', 'Department code must be 1–30 letters, numbers, dots, underscores, or hyphens.', clean.code));
+    if (!isBlank(clean.budgetLimit) && parseNumber(clean.budgetLimit) < 0) errors.push(buildValidationError(rowNumber, 'budgetLimit', 'Budget limit cannot be negative.', clean.budgetLimit));
+    if (!isBlank(clean.isActive) && !['true', 'false', 'yes', 'no', '1', '0'].includes(String(clean.isActive).toLowerCase())) errors.push(buildValidationError(rowNumber, 'isActive', 'Active must be TRUE or FALSE.', clean.isActive));
   }
   if (entityType === 'fixed_assets') {
     const cost = parseNumber(clean.cost);
@@ -546,6 +558,10 @@ async function validateRelatedRecords(entityType, clean, companyId, cache) {
   if (entityType === 'employees') {
     if (clean.department && !await lookup('../models/Department', 'name', clean.department, { company: companyId, name: byName(clean.department) })) errors.push({ field: 'department', message: `Department not found: ${clean.department}` });
     if (clean.managerEmployeeId && !await lookup('../models/Employee', 'employeeId', clean.managerEmployeeId, { company: companyId, employeeId: String(clean.managerEmployeeId).trim().toUpperCase() })) errors.push({ field: 'managerEmployeeId', message: `Manager employee not found: ${clean.managerEmployeeId}` });
+  }
+  if (entityType === 'departments') {
+    if (clean.managerEmployeeId && !await lookup('../models/Employee', 'employeeId', clean.managerEmployeeId, { company: companyId, employeeId: String(clean.managerEmployeeId).trim().toUpperCase() })) errors.push({ field: 'managerEmployeeId', message: `Manager employee not found: ${clean.managerEmployeeId}` });
+    if (clean.defaultLaborAccount && !await lookup('../models/ChartOfAccount', 'code', clean.defaultLaborAccount, { company: companyId, code: clean.defaultLaborAccount })) errors.push({ field: 'defaultLaborAccount', message: `Chart of accounts entry not found: ${clean.defaultLaborAccount}` });
   }
   if (entityType === 'fixed_assets') {
     const category = await lookup('../models/AssetCategory', 'name', clean.category, { company: companyId, name: byName(clean.category), isDeleted: false });
@@ -1124,6 +1140,34 @@ async function upsertRow(entityType, companyId, userId, data, duplicateAction, c
     payload.code = generateImportedMasterCode('SUP');
     const created = await Supplier.create(payload);
     return { status: 'success', message: `Created supplier (${created.code}).` };
+  }
+
+  if (entityType === 'departments') {
+    const Department = require('../models/Department');
+    const manager = data.managerEmployeeId
+      ? await require('../models/Employee').findOne({ company: companyId, employeeId: String(data.managerEmployeeId).trim().toUpperCase() }).select('_id').lean()
+      : null;
+    if (data.managerEmployeeId && !manager) throw new Error(`Manager employee not found: ${data.managerEmployeeId}`);
+    const code = String(data.code).trim().toUpperCase();
+    const payload = {
+      company: companyId,
+      code,
+      name: String(data.name).trim(),
+      description: data.description || '',
+      manager: manager?._id || null,
+      defaultLaborAccount: String(data.defaultLaborAccount || '5400').trim(),
+      budgetLimit: parseNumber(data.budgetLimit) || 0,
+      isActive: isBlank(data.isActive) ? true : ['true', 'yes', '1'].includes(String(data.isActive).toLowerCase()),
+    };
+    const existing = await Department.findOne({ company: companyId, code });
+    if (existing && duplicateAction === 'skip') return { status: 'skipped', message: `Skipped duplicate department code ${code}.` };
+    if (existing && duplicateAction === 'update') {
+      await Department.updateOne({ _id: existing._id, company: companyId }, { $set: payload });
+      return { status: 'success', message: `Updated department ${code}.` };
+    }
+    if (existing && duplicateAction === 'create') payload.code = `${code.slice(0, 17)}-COPY-${Date.now().toString().slice(-5)}`;
+    const created = await Department.create(payload);
+    return { status: 'success', message: `Created department ${created.code}.` };
   }
 
   if (entityType === 'employees') {

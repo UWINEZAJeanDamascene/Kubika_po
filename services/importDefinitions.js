@@ -59,6 +59,19 @@ const ENTITY_DEFINITIONS = {
     uniqueField: 'tin',
     fields: sharedContactFields.map((field) => ({ ...field, label: field.key === 'name' ? 'Supplier Name' : field.label }))
   },
+  departments: {
+    label: 'Departments',
+    uniqueField: 'code',
+    fields: [
+      { key: 'code', label: 'Department Code', required: true, section: 'Department', example: 'FIN', instructions: 'Required unique department code. Codes are saved in uppercase.' },
+      { key: 'name', label: 'Department Name', required: true, section: 'Department', example: 'Finance', instructions: 'Required department name.' },
+      { key: 'description', label: 'Description', required: false, section: 'Department', example: 'Finance and accounting operations', instructions: 'Optional description.' },
+      { key: 'managerEmployeeId', label: 'Manager Employee ID', required: false, section: 'Department', example: 'EMP-001', instructions: 'Optional employee ID of an existing manager in this workspace.' },
+      { key: 'defaultLaborAccount', label: 'Default Labor Account Code', required: false, section: 'Finance', example: '5400', instructions: 'Optional chart of accounts code used for labor costs; defaults to 5400.' },
+      { key: 'budgetLimit', label: 'Budget Limit', required: false, section: 'Finance', example: '0', instructions: 'Optional non-negative amount; defaults to zero.' },
+      { key: 'isActive', label: 'Active', required: false, section: 'Department', example: 'TRUE', instructions: 'TRUE or FALSE; defaults to TRUE.' }
+    ]
+  },
   employees: {
     label: 'Employees',
     uniqueField: 'employeeId',
