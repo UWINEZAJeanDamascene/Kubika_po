@@ -13,6 +13,17 @@ const cacheService = require('./cacheService');
  * Handles AP transaction recording, integrity verification, and reconciliation
  */
 class APTrackingService {
+  static async lockSupplierBalance(companyId, supplierId) {
+    const client = dbClient();
+    if (typeof client.$queryRaw !== 'function') {
+      throw new Error('Supplier AP updates require a PostgreSQL transaction');
+    }
+    await client.$queryRaw`
+      SELECT id FROM suppliers
+      WHERE id = ${String(supplierId)} AND company_id = ${String(companyId)}
+      FOR UPDATE`;
+  }
+
   /**
    * Record a new GRN received (increases AP)
    */
@@ -24,7 +35,8 @@ class APTrackingService {
     // An event can be retried (for example, a GRN confirmation response timing out).
     const existing = await APTransactionLedger.findOne({ company: companyId, sourceType: 'grn', sourceId: grn._id });
     if (existing) return existing;
-    const currentBalance = await this.getSupplierBalance(companyId, supplierId);
+    await this.lockSupplierBalance(companyId, supplierId);
+    const currentBalance = await this.getSupplierBalance(companyId, supplierId, { bypassCache: true });
     const newBalance = currentBalance + amount;
 
     // Create ledger entry
@@ -56,6 +68,85 @@ class APTrackingService {
     // Invalidate cache
     await this.invalidateSupplierBalanceCache(companyId, supplierId);
 
+    return transaction;
+  }
+
+  /**
+   * Record a supplier credit note when returned goods are accepted.
+   */
+  static async recordPurchaseReturn(returnDoc, userId) {
+    const companyId = returnDoc.company;
+    const supplierId = returnDoc.supplier;
+    const existing = await APTransactionLedger.findOne({
+      company: companyId,
+      sourceType: 'purchase_return',
+      sourceId: returnDoc._id,
+    });
+    if (existing) return existing;
+
+    await this.lockSupplierBalance(companyId, supplierId);
+    const amount = Number(returnDoc.totalAmount) || 0;
+    const currentBalance = await this.getSupplierBalance(companyId, supplierId, { bypassCache: true });
+    const transaction = new APTransactionLedger({
+      company: companyId,
+      supplier: supplierId,
+      transactionType: 'purchase_return',
+      transactionDate: returnDoc.returnDate || new Date(),
+      referenceNo: returnDoc.referenceNo,
+      description: `Purchase return ${returnDoc.referenceNo} accepted - supplier credit ${amount.toFixed(2)}`,
+      amount,
+      direction: 'decrease',
+      supplierBalanceAfter: currentBalance - amount,
+      grn: returnDoc.grn,
+      sourceType: 'purchase_return',
+      sourceId: returnDoc._id,
+      sourceReference: returnDoc.referenceNo,
+      createdBy: userId,
+      reconciliationStatus: 'verified',
+      metadata: { supplierCreditNoteNo: returnDoc.supplierCreditNoteNo || null },
+    });
+    await transaction.save();
+    await this.invalidateSupplierBalanceCache(companyId, supplierId);
+    return transaction;
+  }
+
+  /**
+   * Record cash received from the supplier to settle an accepted credit note.
+   */
+  static async recordPurchaseReturnRefund(returnDoc, userId) {
+    const companyId = returnDoc.company;
+    const supplierId = returnDoc.supplier;
+    const sourceType = 'purchase_return_refund';
+    const existing = await APTransactionLedger.findOne({
+      company: companyId,
+      sourceType,
+      sourceId: returnDoc._id,
+    });
+    if (existing) return existing;
+
+    await this.lockSupplierBalance(companyId, supplierId);
+    const amount = Number(returnDoc.totalAmount) || 0;
+    const currentBalance = await this.getSupplierBalance(companyId, supplierId, { bypassCache: true });
+    const transaction = new APTransactionLedger({
+      company: companyId,
+      supplier: supplierId,
+      transactionType: 'supplier_refund_received',
+      transactionDate: returnDoc.refundedAt || new Date(),
+      referenceNo: returnDoc.bankRefundReference || returnDoc.referenceNo,
+      description: `Supplier refund received for purchase return ${returnDoc.referenceNo}`,
+      amount,
+      direction: 'increase',
+      supplierBalanceAfter: currentBalance + amount,
+      grn: returnDoc.grn,
+      sourceType,
+      sourceId: returnDoc._id,
+      sourceReference: returnDoc.referenceNo,
+      createdBy: userId,
+      reconciliationStatus: 'verified',
+      metadata: { refundMethod: returnDoc.refundMethod },
+    });
+    await transaction.save();
+    await this.invalidateSupplierBalanceCache(companyId, supplierId);
     return transaction;
   }
 
@@ -154,11 +245,13 @@ class APTrackingService {
   /**
    * Get current supplier balance
    */
-  static async getSupplierBalance(companyId, supplierId) {
+  static async getSupplierBalance(companyId, supplierId, { bypassCache = false } = {}) {
     const cacheKey = `ap_supplier_balance_${companyId}_${supplierId}`;
-    const cached = await cacheService.get(cacheKey);
-    if (cached !== null) {
-      return parseFloat(cached);
+    if (!bypassCache) {
+      const cached = await cacheService.get(cacheKey);
+      if (cached !== null) {
+        return parseFloat(cached);
+      }
     }
 
     // Balance is the sum of posted source events, not the most recently dated
@@ -174,7 +267,7 @@ class APTrackingService {
     const balance = Number(rows?.[0]?.balance || 0);
 
     // Cache for 5 minutes
-    await cacheService.set(cacheKey, balance.toString(), 300);
+    if (!bypassCache) await cacheService.set(cacheKey, balance.toString(), 300);
 
     return balance;
   }

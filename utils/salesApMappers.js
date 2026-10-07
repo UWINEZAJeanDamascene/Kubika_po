@@ -455,6 +455,7 @@ function purchaseOrderLineToApi(row) {
     qtyOrdered: qtyNum(row.qtyOrdered),
     qtyReceived: qtyNum(row.qtyReceived),
     unitCost: qtyNum(row.unitCost),
+    landedUnitCost: row.landedUnitCost == null ? null : qtyNum(row.landedUnitCost),
     taxRate: qtyNum(row.taxRate),
     taxAmount: qtyNum(row.taxAmount),
     lineTotal: qtyNum(row.lineTotal),
@@ -1091,6 +1092,7 @@ function purchaseReturnLineToApi(row) {
     grnLine: row.grnLineId ?? null,
     qtyReturned: qtyNum(row.qtyReturned),
     unitCost: qtyNum(row.unitCost),
+    serialNumbers: Array.isArray(row.serialNumbers) ? row.serialNumbers : [],
     product: row.product && typeof row.product === 'object'
       ? { _id: row.product.id, name: row.product.name, sku: row.product.sku, unit: row.product.unit }
       : row.productId,
@@ -1111,14 +1113,20 @@ function purchaseReturnToApi(row) {
     warehouse: relationRef(row.warehouse, row.warehouseId),
     returnDate: row.returnDate,
     reason: row.reason ?? null,
+    supplierCreditNoteNo: row.supplierCreditNoteNo ?? null,
     status: row.status,
     subtotal: moneyStr(subtotal),
     taxAmount: moneyStr(Math.max(0, totalAmount - subtotal)),
     totalAmount: moneyStr(totalAmount),
     journalEntry: row.journalEntryId ?? null,
+    confirmedBy: row.confirmedById ?? null,
+    confirmedAt: row.confirmedAt ?? null,
     refundMethod: row.refundMethod ?? null,
     bankAccountId: row.bankAccountId ?? null,
     refundJournalEntry: row.refundJournalEntryId ?? null,
+    refundBankTransaction: row.refundBankTransactionId ?? null,
+    bankRefundReference: row.bankRefundReference ?? null,
+    refundedAt: row.refundedAt ?? null,
     createdBy: row.createdById ?? null,
     lines,
     ...mapTimestamps(row),
@@ -1674,6 +1682,10 @@ const GRN_HEADER = {
   amountPaid: 'amountPaid',
   paymentStatus: 'paymentStatus',
   paymentDueDate: 'paymentDueDate',
+  journalEntry: 'journalEntryId',
+  confirmedBy: 'confirmedById',
+  confirmedAt: 'confirmedAt',
+  freight: 'freight',
 };
 
 function grnTranslateCreate(data) {
@@ -1682,6 +1694,7 @@ function grnTranslateCreate(data) {
       purchaseOrderLineId: line.purchaseOrderLine ? toIdString(line.purchaseOrderLine) : null,
       qtyReceived: line.qtyReceived ?? line.qty ?? 0,
       unitCost: line.unitCost ?? 0,
+      landedUnitCost: line.landedUnitCost ?? null,
       taxRate: line.taxRate ?? 0,
       batchNo: line.batchNo ?? null,
     }));
@@ -1689,7 +1702,7 @@ function grnTranslateCreate(data) {
 
 const grnTranslateUpdate = genericTranslateUpdate(
   GRN_HEADER,
-  ['purchaseOrderId', 'warehouseId', 'supplierId'],
+  ['purchaseOrderId', 'warehouseId', 'supplierId', 'journalEntryId', 'confirmedById'],
 );
 
 const PURCHASE_RETURN_HEADER = {
@@ -1700,9 +1713,17 @@ const PURCHASE_RETURN_HEADER = {
   status: 'status',
   returnDate: 'returnDate',
   reason: 'reason',
+  supplierCreditNoteNo: 'supplierCreditNoteNo',
   totalAmount: 'totalAmount',
   refundMethod: 'refundMethod',
   bankAccountId: 'bankAccountId',
+  bankRefundReference: 'bankRefundReference',
+  refundedAt: 'refundedAt',
+  confirmedAt: 'confirmedAt',
+  confirmedBy: 'confirmedById',
+  refundBankTransaction: 'refundBankTransactionId',
+  journalEntry: 'journalEntryId',
+  refundJournalEntry: 'refundJournalEntryId',
 };
 
 function purchaseReturnTranslateCreate(data) {
@@ -1711,12 +1732,13 @@ function purchaseReturnTranslateCreate(data) {
       grnLineId: line.grnLine ? toIdString(line.grnLine) : null,
       qtyReturned: line.qtyReturned ?? line.qty ?? 0,
       unitCost: line.unitCost ?? 0,
+      serialNumbers: Array.isArray(line.serialNumbers) ? line.serialNumbers : [],
     }));
 }
 
 const purchaseReturnTranslateUpdate = genericTranslateUpdate(
   PURCHASE_RETURN_HEADER,
-  ['grnId', 'supplierId', 'warehouseId', 'bankAccountId'],
+  ['grnId', 'supplierId', 'warehouseId', 'bankAccountId', 'journalEntryId', 'refundJournalEntryId', 'refundBankTransactionId', 'confirmedById'],
 );
 
 // ── Translate: APPayment / Allocation / FreightBill ────────────────────────

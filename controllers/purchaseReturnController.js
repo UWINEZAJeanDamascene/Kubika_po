@@ -1,9 +1,11 @@
-const mongoose = require('mongoose');
 const PurchaseReturn = require('../models/PurchaseReturn');
 const GoodsReceivedNote = require('../models/GoodsReceivedNote');
 const InventoryBatch = require('../models/InventoryBatch');
+const StockBatch = require('../models/StockBatch');
+const StockSerialNumber = require('../models/StockSerialNumber');
 const StockMovement = require('../models/StockMovement');
 const Product = require('../models/Product');
+const StockLevel = require('../models/StockLevel');
 const Supplier = require('../models/Supplier');
 const Company = require('../models/Company');
 const JournalService = require('../services/journalService');
@@ -13,6 +15,70 @@ const emailService = require('../services/emailService');
 const cacheService = require('../services/cacheService');
 const DEFAULT_ACCOUNTS = require('../constants/chartOfAccounts').DEFAULT_ACCOUNTS;
 const { parsePagination, paginationMeta } = require('../utils/pagination');
+const {
+  buildReturnLines,
+  calculateReturnTotals,
+  idOf,
+  validateReturnSerialNumbers,
+} = require('../utils/purchaseReturnRules');
+
+async function lockPurchaseReturn(tx, returnId, companyId) {
+  if (!tx) return;
+  if (typeof tx.$queryRaw !== 'function') {
+    throw new Error('Purchase return confirmation requires a PostgreSQL transaction');
+  }
+  await tx.$queryRaw`
+    SELECT id FROM purchase_returns
+    WHERE id = ${String(returnId)} AND company_id = ${String(companyId)}
+    FOR UPDATE`;
+}
+
+async function lockGRN(tx, grnId, companyId) {
+  if (!tx) return;
+  await tx.$queryRaw`
+    SELECT id FROM goods_received_notes
+    WHERE id = ${String(grnId)} AND company_id = ${String(companyId)}
+    FOR UPDATE`;
+}
+
+async function lockProductAndStockLevel(tx, productId, warehouseId, companyId) {
+  if (!tx) return;
+  await tx.$queryRaw`
+    SELECT id FROM products
+    WHERE id = ${String(productId)} AND company_id = ${String(companyId)}
+    FOR UPDATE`;
+  await tx.$queryRaw`
+    SELECT id FROM stock_levels
+    WHERE product_id = ${String(productId)}
+      AND warehouse_id = ${String(warehouseId)}
+      AND company_id = ${String(companyId)}
+    FOR UPDATE`;
+}
+
+async function lockStockBatch(tx, batchId, companyId) {
+  if (!tx) return;
+  await tx.$queryRaw`
+    SELECT id FROM stock_batches
+    WHERE id = ${String(batchId)} AND company_id = ${String(companyId)}
+    FOR UPDATE`;
+}
+
+async function lockBankAccount(tx, bankAccountId, companyId) {
+  if (!tx) return;
+  await tx.$queryRaw`
+    SELECT id FROM bank_accounts
+    WHERE id = ${String(bankAccountId)} AND company_id = ${String(companyId)}
+    FOR UPDATE`;
+}
+
+function parseReturnDate(value) {
+  if (value == null || value === '') return new Date();
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw Object.assign(new Error('Return date is invalid'), { status: 400 });
+  }
+  return date;
+}
 
 const sendPurchaseReturnEmail = async (pr, company, supplier, action) => {
   try {
@@ -97,28 +163,39 @@ const sendPurchaseReturnEmail = async (pr, company, supplier, action) => {
 exports.createPurchaseReturn = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const payload = req.body;
-    payload.company = companyId;
-    payload.createdBy = req.user.id;
-    payload.status = payload.status || 'draft';
+    const payload = req.body || {};
 
     // Validate GRN exists and is confirmed
     const grn = await GoodsReceivedNote.findOne({ _id: payload.grn, company: companyId });
     if (!grn) return res.status(404).json({ success: false, message: 'GRN not found' });
     if (grn.status !== 'confirmed') return res.status(409).json({ success: false, message: 'Can only return against confirmed GRN' });
 
-    const pr = await PurchaseReturn.create(payload);
-
-    // Calculate totals from lines
-    if (pr.lines && pr.lines.length > 0) {
-      let subtotal = 0;
-      for (const line of pr.lines) {
-        subtotal += (Number(line.qtyReturned) || 0) * (Number(line.unitCost) || 0);
-      }
-      pr.subtotal = subtotal;
-      pr.totalAmount = subtotal;
-      await pr.save();
+    const confirmedReturns = await PurchaseReturn.find({
+      company: companyId,
+      grn: grn._id,
+      status: 'confirmed',
+    }).lean();
+    const lines = buildReturnLines(grn, payload.lines, confirmedReturns);
+    const totals = calculateReturnTotals(grn, lines);
+    const reason = String(payload.reason || '').trim();
+    if (!reason) {
+      return res.status(400).json({ success: false, message: 'Return reason is required' });
     }
+
+    const pr = await PurchaseReturn.create({
+      company: companyId,
+      createdBy: req.user.id,
+      status: 'draft',
+      grn: grn._id,
+      supplier: grn.supplier,
+      warehouse: grn.warehouse,
+      referenceNo: payload.referenceNo,
+      returnDate: parseReturnDate(payload.returnDate),
+      supplierCreditNoteNo: String(payload.supplierCreditNoteNo || '').trim() || null,
+      reason,
+      lines,
+      totalAmount: totals.totalAmount,
+    });
 
     // Send email notification
     if (req.body.sendEmail && pr.status !== 'draft') {
@@ -139,7 +216,36 @@ exports.updatePurchaseReturn = async (req, res, next) => {
     if (!pr) return res.status(404).json({ success: false, message: 'Purchase return not found' });
     if (pr.status !== 'draft') return res.status(409).json({ success: false, message: 'Only draft returns can be edited' });
 
-    Object.assign(pr, req.body);
+    const payload = req.body || {};
+    if (payload.grn || payload.supplier || payload.warehouse) {
+      return res.status(400).json({ success: false, message: 'A draft return cannot be moved to another GRN, supplier, or warehouse' });
+    }
+
+    const grnId = idOf(pr.grn);
+    const grn = await GoodsReceivedNote.findOne({ _id: grnId, company: companyId });
+    if (!grn || grn.status !== 'confirmed') {
+      return res.status(409).json({ success: false, message: 'The source GRN is no longer available for return' });
+    }
+    const confirmedReturns = await PurchaseReturn.find({
+      company: companyId,
+      grn: grn._id,
+      status: 'confirmed',
+    }).lean();
+    if (payload.lines !== undefined) {
+      pr.lines = buildReturnLines(grn, payload.lines, confirmedReturns, pr._id);
+    }
+    if (payload.referenceNo !== undefined) pr.referenceNo = String(payload.referenceNo).trim();
+    if (payload.returnDate !== undefined) pr.returnDate = parseReturnDate(payload.returnDate);
+    if (payload.supplierCreditNoteNo !== undefined) {
+      pr.supplierCreditNoteNo = String(payload.supplierCreditNoteNo || '').trim() || null;
+    }
+    if (payload.reason !== undefined) {
+      const reason = String(payload.reason || '').trim();
+      if (!reason) return res.status(400).json({ success: false, message: 'Return reason is required' });
+      pr.reason = reason;
+    }
+    const totals = calculateReturnTotals(grn, pr.lines || []);
+    pr.totalAmount = totals.totalAmount;
     await pr.save();
     res.json({ success: true, data: pr });
   } catch (err) { next(err); }
@@ -153,61 +259,141 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
     const useSession = !!sess;
     const opts = useSession ? { session: sess } : {};
 
+    await lockPurchaseReturn(sess, req.params.id, companyId);
     const pr = await PurchaseReturn.findOne({ _id: req.params.id, company: companyId }, null, opts);
     if (!pr) {
       throw Object.assign(new Error('Purchase return not found'), { status: 404 });
     }
-    if (pr.status === 'confirmed') throw Object.assign(new Error('Purchase return already confirmed'), { status: 400 });
+    if (pr.status !== 'draft') {
+      throw Object.assign(new Error('Only draft purchase returns can be confirmed'), { status: 409 });
+    }
 
+    await lockGRN(sess, idOf(pr.grn), companyId);
     // Load GRN
-    const grn = await GoodsReceivedNote.findOne({ _id: pr.grn, company: companyId }).session(sess);
+    const grnQuery = GoodsReceivedNote.findOne({ _id: idOf(pr.grn), company: companyId });
+    const grn = useSession ? await grnQuery.session(sess) : await grnQuery;
     if (!grn) throw Object.assign(new Error('GRN not found'), { status: 404 });
     if (grn.status !== 'confirmed') throw Object.assign(new Error('Cannot return against unconfirmed GRN'), { status: 409 });
+
+    const confirmedReturnsQuery = PurchaseReturn.find({
+      company: companyId,
+      status: 'confirmed',
+      grn: idOf(pr.grn),
+    });
+    const confirmedReturns = useSession
+      ? await confirmedReturnsQuery.session(sess).lean()
+      : await confirmedReturnsQuery.lean();
+    const returnLines = buildReturnLines(grn, pr.lines || [], confirmedReturns, pr._id);
+    const returnTotals = calculateReturnTotals(grn, returnLines);
+
+    const productIds = [...new Set(returnLines.map((line) => idOf(line.product)))].sort();
+    for (const productId of productIds) {
+      await lockProductAndStockLevel(sess, productId, idOf(grn.warehouse), companyId);
+    }
 
     // Track created resources for manual rollback
     const createdMovements = [];
     const modifiedBatches = [];
+    const modifiedStockBatches = [];
+    const modifiedSerials = [];
     const modifiedProducts = new Map();
+    const inventoryValueByProduct = new Map();
+    const inventoryAccountByProduct = new Map();
 
-    let totalReturnNet = 0;
-    let totalReturnTax = 0;
-
-    for (const line of pr.lines) {
-      const grnLine = grn.lines.id(line.grnLine);
+    for (const line of returnLines) {
+      const grnLine = (grn.lines || []).find((item) => idOf(item._id || item.id) === idOf(line.grnLine));
       if (!grnLine) throw Object.assign(new Error('GRN line not found'), { status: 404 });
 
-      // Unit cost must match original GRN unit cost
-      if (Number(line.unitCost) !== Number(grnLine.unitCost)) throw Object.assign(new Error('RETURN_PRICING_MISMATCH'), { status: 422 });
-
-      // Already returned qty across confirmed returns (Prisma shim has no aggregate().session())
-      const grnId = pr.grn?._id || pr.grn;
-      const confirmedReturns = await PurchaseReturn.find({
-        company: companyId,
-        status: 'confirmed',
-        grn: grnId,
-      }).lean();
-      const grnLineId = String(line.grnLine?._id || line.grnLine);
-      const alreadyReturned = (confirmedReturns || []).reduce((sum, ret) => {
-        const lines = Array.isArray(ret.lines) ? ret.lines : [];
-        return (
-          sum +
-          lines.reduce((lineSum, rl) => {
-            if (String(rl.grnLine?._id || rl.grnLine) !== grnLineId) return lineSum;
-            return lineSum + (Number(rl.qtyReturned) || 0);
-          }, 0)
-        );
-      }, 0);
-
-      if (Number(line.qtyReturned) + alreadyReturned > Number(grnLine.qtyReceived) + 1e-9) {
-        throw Object.assign(new Error('RETURN_EXCEEDS_RECEIVED'), { status: 422 });
-      }
-
       // Check warehouse stock
-      const product = await Product.findById(line.product).session(sess);
+      const productQuery = Product.findOne({ _id: line.product, company: companyId });
+      const product = useSession ? await productQuery.session(sess) : await productQuery;
       if (!product) throw Object.assign(new Error('Product not found'), { status: 404 });
-      if ((product.currentStock || 0) < line.qtyReturned - 1e-9) {
+      const stockLevelQuery = StockLevel.findOne({
+        company_id: companyId,
+        product_id: line.product,
+        warehouse_id: grn.warehouse,
+      });
+      const stockLevel = useSession ? await stockLevelQuery.session(sess) : await stockLevelQuery;
+      if (!stockLevel) throw Object.assign(new Error('No stock record exists for this product at the GRN warehouse'), { status: 409 });
+      const onHand = Number(stockLevel.qty_on_hand) || 0;
+      const reserved = Number(stockLevel.qty_reserved) || 0;
+      const stockFallbackCost = Number(stockLevel.avg_cost) || Number(product.averageCost) || Number(line.unitCost);
+      if (Number(line.qtyReturned) > Math.min(onHand - reserved, Number(product.currentStock) || 0) + 1e-9) {
         throw Object.assign(new Error('INSUFFICIENT_STOCK'), { status: 409 });
       }
+      const trackingType = product.trackingType || 'none';
+      const serialNumbers = Array.isArray(line.serialNumbers) ? line.serialNumbers : [];
+      if (trackingType === 'serial') {
+        const validatedSerialNumbers = validateReturnSerialNumbers(grnLine, line.qtyReturned, serialNumbers);
+        const serialQuery = StockSerialNumber.find({
+          company: companyId,
+          product: line.product,
+          warehouse: grn.warehouse,
+          grn: grn._id,
+          status: 'in_stock',
+          serialNo: { $in: validatedSerialNumbers },
+        });
+        const availableSerialRows = useSession ? await serialQuery.session(sess) : await serialQuery;
+        if (availableSerialRows.length !== validatedSerialNumbers.length) {
+          throw Object.assign(new Error('One or more selected serial numbers are no longer available at the GRN warehouse'), { status: 409 });
+        }
+        const returnedAt = new Date();
+        const serialUpdate = await StockSerialNumber.updateMany(
+          {
+            _id: { $in: availableSerialRows.map((serial) => serial._id) },
+            company: companyId,
+            product: line.product,
+            warehouse: grn.warehouse,
+            grn: grn._id,
+            status: 'in_stock',
+          },
+          { $set: { status: 'returned', returnedVia: pr._id, returnedAt } },
+        );
+        if (serialUpdate.modifiedCount !== validatedSerialNumbers.length) {
+          throw Object.assign(new Error('One or more selected serial numbers are no longer available'), { status: 409 });
+        }
+        for (const serial of availableSerialRows) {
+          modifiedSerials.push({
+            id: serial._id,
+            status: serial.status,
+            returnedVia: serial.returnedVia,
+            returnedAt: serial.returnedAt,
+          });
+        }
+      } else if (serialNumbers.length) {
+        throw Object.assign(new Error('Serial numbers can only be returned for serial-tracked products'), { status: 409 });
+      }
+
+      if (trackingType === 'batch') {
+        const batchNo = String(grnLine.batchNo || '').trim().toUpperCase();
+        if (!batchNo) {
+          throw Object.assign(new Error('The source GRN line is missing its batch number'), { status: 409 });
+        }
+        const stockBatchQuery = StockBatch.findOne({
+          company: companyId,
+          product: line.product,
+          warehouse: grn.warehouse,
+          batchNo,
+        });
+        let stockBatch = useSession ? await stockBatchQuery.session(sess) : await stockBatchQuery;
+        if (stockBatch && useSession) {
+          await lockStockBatch(sess, stockBatch._id, companyId);
+          const lockedStockBatchQuery = StockBatch.findOne({
+            _id: stockBatch._id,
+            company: companyId,
+          });
+          stockBatch = await lockedStockBatchQuery.session(sess);
+        }
+        const batchOnHand = Number(stockBatch?.qtyOnHand) || 0;
+        const batchReserved = Number(stockBatch?.reservedQuantity) || 0;
+        if (!stockBatch || Number(line.qtyReturned) > batchOnHand - batchReserved + 1e-9) {
+          throw Object.assign(new Error('Insufficient unreserved quantity in the source batch'), { status: 409 });
+        }
+        modifiedStockBatches.push({ id: stockBatch._id, qtyOnHand: batchOnHand });
+        stockBatch.qtyOnHand = batchOnHand - Number(line.qtyReturned);
+        await stockBatch.save(opts);
+      }
+      let inventoryCostRemoved = stockFallbackCost * Number(line.qtyReturned);
 
       // A return can be against an older receipt after the original FIFO layer
       // has been partially consumed, merged, or adjusted. Validate and consume
@@ -222,15 +408,18 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
         }).sort({ receivedDate: 1 }).session(sess);
         const requestedQuantity = Number(line.qtyReturned) || 0;
         let remainingQuantity = requestedQuantity;
+        let fifoCost = 0;
         for (const batch of batches) {
           if (remainingQuantity <= 1e-9) break;
           const previousAvailable = Number(batch.availableQuantity) || 0;
           const quantityFromBatch = Math.min(previousAvailable, remainingQuantity);
           modifiedBatches.push({ id: batch._id, prevAvailable: previousAvailable });
+          fifoCost += quantityFromBatch * (Number(batch.unitCost) || stockFallbackCost);
           batch.availableQuantity = previousAvailable - quantityFromBatch;
           await batch.save(opts);
           remainingQuantity -= quantityFromBatch;
         }
+        inventoryCostRemoved = fifoCost + remainingQuantity * stockFallbackCost;
         // Product.currentStock is the authoritative quantity check above.
         // Some older/adjusted stock has no matching InventoryBatch layer, so
         // do not reject a valid return solely because this legacy cost-layer
@@ -238,10 +427,23 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
         // them negative, and let the product stock movement record the return.
       }
 
-      // Reduce stock_levels qty_on_hand after validating and consuming the lots.
+      inventoryCostRemoved = Math.round((inventoryCostRemoved + Number.EPSILON) * 100) / 100;
+
+      // Reduce product and warehouse stock in the same transaction as the return.
+      const previousStock = Number(product.currentStock) || 0;
       if (!modifiedProducts.has(String(product._id))) modifiedProducts.set(String(product._id), { prevStock: product.currentStock, prevAvg: product.averageCost });
       product.currentStock = (product.currentStock || 0) - line.qtyReturned;
       await product.save(opts);
+      const stockUnitCost = Number(line.qtyReturned) > 0 ? inventoryCostRemoved / Number(line.qtyReturned) : stockFallbackCost;
+      stockLevel.applyMovement('return_out', Number(line.qtyReturned), stockUnitCost);
+      await stockLevel.save(opts);
+      inventoryValueByProduct.set(
+        String(line.product),
+        Math.round(
+          ((inventoryValueByProduct.get(String(line.product)) || 0) + inventoryCostRemoved + Number.EPSILON) * 100,
+        ) / 100,
+      );
+      inventoryAccountByProduct.set(String(line.product), product.inventoryAccount || null);
 
       // Create return_out stock movement
       const movement = new StockMovement({
@@ -250,46 +452,72 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
         type: 'out',
         reason: 'return',
         quantity: line.qtyReturned,
-        previousStock: modifiedProducts.get(String(product._id)).prevStock,
+        previousStock,
         newStock: product.currentStock,
-        unitCost: line.unitCost,
-        totalCost: line.unitCost * line.qtyReturned,
-        warehouse: pr.warehouse,
+        unitCost: stockUnitCost,
+        totalCost: stockUnitCost * line.qtyReturned,
+        warehouse: grn.warehouse,
         referenceType: 'return',
-        referenceNumber: pr.referenceNo || pr.referenceNo || pr.referenceNo,
+        referenceNumber: pr.referenceNo,
         referenceDocument: pr._id,
-        referenceModel: 'CreditNote',
+        referenceModel: 'PurchaseReturn',
         performedBy: req.user.id,
         movementDate: new Date()
       });
       await movement.save(opts);
       createdMovements.push(movement._id);
 
-      totalReturnNet += Number(line.unitCost) * line.qtyReturned;
-      // Tax: find tax from original GRN/PO line if available
-      const poLine = grn.purchaseOrder
-        ? await PurchaseOrder.findOne({ _id: grn.purchaseOrder, company: companyId }).then(po => po ? po.lines.id(grnLine.purchaseOrderLine) : null)
-        : null;
-      const taxRate = poLine ? (poLine.taxRate || 0) : 0;
-      const lineTax = Number(line.unitCost) * line.qtyReturned * (taxRate/100);
-      totalReturnTax += lineTax;
     }
 
-    // Build journal lines: DR AP, CR VAT, CR Inventory per product
+    // Build journal lines: reverse AP and VAT, and remove inventory at carrying value.
     const journalLines = [];
     // DR Accounts Payable - total incl tax
     const apAcct = await JournalService.getMappedAccountCode(companyId, 'purchases', 'accountsPayable', DEFAULT_ACCOUNTS.accountsPayable);
-    journalLines.push(JournalService.createDebitLine(apAcct, totalReturnNet + totalReturnTax, `Purchase Return ${pr.referenceNo || pr.referenceNo} - GRN#${grn.referenceNo}`));
+    journalLines.push(JournalService.createDebitLine(apAcct, returnTotals.totalAmount, `Purchase Return ${pr.referenceNo} - GRN#${grn.referenceNo}`));
 
-    if (totalReturnTax > 0) {
+    if (returnTotals.taxAmount > 0) {
       // CR VAT Input (2210) — reverses the DR VAT Input from the original GRN
       const vatAcct = await JournalService.getMappedAccountCode(companyId, 'tax', 'vatInput', DEFAULT_ACCOUNTS.vatInput);
-      journalLines.push(JournalService.createCreditLine(vatAcct, totalReturnTax, `VAT reversal ${pr.referenceNo || pr.referenceNo}`));
+      journalLines.push(JournalService.createCreditLine(vatAcct, returnTotals.taxAmount, `VAT reversal ${pr.referenceNo}`));
     }
 
-    // CR Purchase Returns (5200) — contra-COGS, flows to P&L
-    const purchaseReturnsAcct = await JournalService.getMappedAccountCode(companyId, 'purchases', 'purchaseReturns', DEFAULT_ACCOUNTS.purchaseReturns);
-    journalLines.push(JournalService.createCreditLine(purchaseReturnsAcct, totalReturnNet, `Purchase Return - ${pr.referenceNo || pr.referenceNo}`));
+    let inventoryCostTotal = 0;
+    for (const [productId, amount] of inventoryValueByProduct.entries()) {
+      inventoryCostTotal += amount;
+      let inventoryAccount = inventoryAccountByProduct.get(productId);
+      if (inventoryAccount && /^[0-9a-fA-F]{24}$/.test(String(inventoryAccount))) {
+        const account = await require('../models/ChartOfAccount').findById(inventoryAccount).lean();
+        inventoryAccount = account?.code;
+      }
+      if (!inventoryAccount) {
+        inventoryAccount = await JournalService.getMappedAccountCode(
+          companyId,
+          'purchases',
+          'inventory',
+          DEFAULT_ACCOUNTS.inventory,
+          { productId, warehouseId: idOf(grn.warehouse) },
+        );
+      }
+      journalLines.push(JournalService.createCreditLine(
+        inventoryAccount || DEFAULT_ACCOUNTS.inventory,
+        amount,
+        `Inventory returned - ${pr.referenceNo}`,
+      ));
+    }
+
+    inventoryCostTotal = Math.round((inventoryCostTotal + Number.EPSILON) * 100) / 100;
+    const returnPriceVariance = Number((returnTotals.subtotal - inventoryCostTotal).toFixed(2));
+    if (returnPriceVariance !== 0) {
+      const purchaseReturnsAcct = await JournalService.getMappedAccountCode(
+        companyId,
+        'purchases',
+        'purchaseReturns',
+        DEFAULT_ACCOUNTS.purchaseReturns,
+      );
+      journalLines.push(returnPriceVariance > 0
+        ? JournalService.createCreditLine(purchaseReturnsAcct, returnPriceVariance, `Purchase return price variance - ${pr.referenceNo}`)
+        : JournalService.createDebitLine(purchaseReturnsAcct, Math.abs(returnPriceVariance), `Purchase return price variance - ${pr.referenceNo}`));
+    }
 
     // Post journal
     const supplier = await (require('../models/Supplier')).findById(pr.supplier).lean();
@@ -312,9 +540,7 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
       pr.status = 'confirmed';
       pr.confirmedBy = req.user.id;
       pr.confirmedAt = new Date();
-      pr.subtotal = totalReturnNet;
-      pr.taxAmount = totalReturnTax;
-      pr.totalAmount = totalReturnNet + totalReturnTax;
+      pr.totalAmount = returnTotals.totalAmount;
       // Reverse the project/budget actual recognized when these goods were
       // received. Supplier cash refunds and credit settlement do not create a
       // second project actual; this is tied to the accepted physical return.
@@ -337,6 +563,7 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
         });
       }
       await pr.save(opts);
+      await require('../services/apTrackingService').recordPurchaseReturn(pr, req.user.id);
 
       return pr;
     } catch (jeErr) {
@@ -350,6 +577,22 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
           for (const b of modifiedBatches) {
             try {
               await InventoryBatch.findByIdAndUpdate(b.id, { $set: { availableQuantity: b.prevAvailable } });
+            } catch (e) { /* best-effort */ }
+          }
+          for (const b of modifiedStockBatches) {
+            try {
+              await StockBatch.findByIdAndUpdate(b.id, { $set: { qtyOnHand: b.qtyOnHand } });
+            } catch (e) { /* best-effort */ }
+          }
+          for (const serial of modifiedSerials) {
+            try {
+              await StockSerialNumber.findByIdAndUpdate(serial.id, {
+                $set: {
+                  status: serial.status,
+                  returnedVia: serial.returnedVia,
+                  returnedAt: serial.returnedAt,
+                },
+              });
             } catch (e) { /* best-effort */ }
           }
           // restore modified products
@@ -376,10 +619,15 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
     // pre-return quantity for up to their TTL.
     try {
       await cacheService.bumpCompanyStockCaches(companyId);
+      await cacheService.bumpCompanyFinancialCaches(companyId);
       await cacheService.invalidateByCompany(companyId, 'report');
     } catch (cacheErr) {
       console.error('Cache invalidation after purchase return confirm failed:', cacheErr);
     }
+    require('../lib/realtimeEvents').emitDataChanged(companyId, 'purchase_return', {
+      affectsStock: true,
+      affectsFinance: true,
+    });
 
     // Send email notification
     if (req.body.sendEmail) {
@@ -478,7 +726,7 @@ exports.getPurchaseReturnSummary = async (req, res, next) => {
       { $group: {
         _id: '$status',
         count: { $sum: 1 },
-        totalAmount: { $sum: '$grandTotal' }
+        totalAmount: { $sum: '$totalAmount' }
       }}
     ]);
     
@@ -496,98 +744,132 @@ exports.processRefund = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const { id } = req.params;
-    const { refundMethod, bankAccountId, reference } = req.body;
-
-    const pr = await PurchaseReturn.findOne({ _id: id, company: companyId });
-    if (!pr) return res.status(404).json({ success: false, message: 'Purchase return not found' });
-    if (pr.status !== 'confirmed') return res.status(400).json({ success: false, message: 'Can only refund confirmed returns' });
-    if (pr.refundMethod && pr.refundMethod !== 'none') return res.status(400).json({ success: false, message: 'Refund already processed' });
-
-    const refundAmt = pr.totalAmount || 0;
-    if (refundAmt <= 0) return res.status(400).json({ success: false, message: 'No amount to refund' });
-
-    const validMethods = ['credit', 'bank_transfer', 'cash'];
-    if (!validMethods.includes(refundMethod)) return res.status(400).json({ success: false, message: 'Invalid refund method' });
-
-    // If bank transfer, validate bank account
-    if (refundMethod === 'bank_transfer' && !bankAccountId) {
-      return res.status(400).json({ success: false, message: 'Bank account required for bank transfer' });
-    }
-
-    pr.refundMethod = refundMethod;
-    pr.bankRefundReference = reference || null;
-
-    // If bank transfer or cash, create bank transaction and journal
-    if (refundMethod === 'bank_transfer' || refundMethod === 'cash') {
-      const { BankAccount } = require('../models/BankAccount');
-      const JournalService = require('../services/journalService');
-      const DEFAULT_ACCOUNTS = require('../constants/chartOfAccounts').DEFAULT_ACCOUNTS;
-
-      let debitAccount;
-      let bankTransaction = null;
-
-      if (refundMethod === 'bank_transfer' && bankAccountId) {
-        const bankAccount = await BankAccount.findOne({ _id: bankAccountId, company: companyId, isActive: true });
-        if (!bankAccount) return res.status(400).json({ success: false, message: 'Invalid or inactive bank account' });
-
-        // Create bank transaction (deposit adds to balance)
-        bankTransaction = await bankAccount.addTransaction({
-          type: 'deposit',
-          amount: refundAmt,
-          description: `Purchase Return Refund - PRN#${pr.referenceNo}`,
-          date: new Date(),
-          referenceNumber: reference || pr.referenceNo,
-          paymentMethod: 'bank_transfer',
-          status: 'completed',
-          reference: pr._id,
-          referenceType: 'PurchaseReturn',
-          createdBy: req.user.id,
-          notes: `Refund for purchase return ${pr.referenceNo}`,
-        });
-
-        pr.refundBankTransaction = bankTransaction._id;
-
-        // Use bank account's ledger account for journal
-        if (bankAccount.ledgerAccountId) {
-          debitAccount = bankAccount.ledgerAccountId;
-        } else {
-          debitAccount = await JournalService.getMappedAccountCode(companyId, 'cash', 'cashAtBank', DEFAULT_ACCOUNTS.cashAtBank || '1100');
-        }
-      } else {
-        // Cash refund - use cash account
-        debitAccount = await JournalService.getMappedAccountCode(companyId, 'cash', 'cashOnHand', DEFAULT_ACCOUNTS.cashOnHand || '1000');
+    const { refundMethod, bankAccountId, reference } = req.body || {};
+    const result = await transactionService.runInTransaction(async (trx) => {
+      await lockPurchaseReturn(trx, id, companyId);
+      const query = PurchaseReturn.findOne({ _id: id, company: companyId });
+      const pr = trx ? await query.session(trx) : await query;
+      if (!pr) throw Object.assign(new Error('Purchase return not found'), { status: 404 });
+      if (pr.status !== 'confirmed') {
+        throw Object.assign(new Error('Can only settle confirmed returns'), { status: 409 });
+      }
+      if (pr.refundMethod && pr.refundMethod !== 'none') {
+        throw Object.assign(new Error('Supplier settlement already recorded'), { status: 409 });
       }
 
-      // Create journal entry: Dr AP, Cr Cash/Bank
-      const journalLines = [];
-      const apAcct = await JournalService.getMappedAccountCode(companyId, 'purchases', 'accountsPayable', DEFAULT_ACCOUNTS.accountsPayable);
-      journalLines.push(JournalService.createDebitLine(apAcct, refundAmt, `Purchase Return Refund - PRN#${pr.referenceNo}`));
-      journalLines.push(JournalService.createCreditLine(debitAccount, refundAmt, `Refund payment - PRN#${pr.referenceNo}`));
+      const refundAmt = Number(pr.totalAmount) || 0;
+      if (refundAmt <= 0) throw Object.assign(new Error('No amount to settle'), { status: 400 });
+      if (!['credit', 'bank_transfer', 'cash'].includes(refundMethod)) {
+        throw Object.assign(new Error('Invalid refund method'), { status: 400 });
+      }
+      if (refundMethod === 'bank_transfer' && !bankAccountId) {
+        throw Object.assign(new Error('Bank account required for bank transfer'), { status: 400 });
+      }
 
-      const je = await JournalService.createEntry(companyId, req.user.id, {
-        date: new Date(),
-        description: `Purchase Return Refund - PRN#${pr.referenceNo}`,
-        sourceType: 'purchase_return',
-        sourceId: pr._id,
-        sourceReference: pr.referenceNo,
-        lines: journalLines,
-        isAutoGenerated: true,
-      });
+      const now = new Date();
+      let debitAccount;
+      let bankAccount;
+      if (refundMethod === 'bank_transfer') {
+        await lockBankAccount(trx, bankAccountId, companyId);
+        const bankQuery = require('../models/BankAccount').BankAccount.findOne({
+          _id: bankAccountId,
+          company: companyId,
+          isActive: true,
+        });
+        bankAccount = trx ? await bankQuery.session(trx) : await bankQuery;
+        if (!bankAccount) throw Object.assign(new Error('Invalid or inactive bank account'), { status: 400 });
+        debitAccount = bankAccount.ledgerAccountId
+          || await JournalService.getMappedAccountCode(
+            companyId,
+            'cash',
+            'cashAtBank',
+            DEFAULT_ACCOUNTS.cashAtBank || '1100',
+          );
+      } else if (refundMethod === 'cash') {
+        debitAccount = await JournalService.getMappedAccountCode(
+          companyId,
+          'cash',
+          'cashOnHand',
+          DEFAULT_ACCOUNTS.cashOnHand || '1000',
+        );
+      }
 
-      pr.refundJournalEntry = je._id;
-    }
+      if (refundMethod !== 'credit') {
+        const apAccount = await JournalService.getMappedAccountCode(
+          companyId,
+          'purchases',
+          'accountsPayable',
+          DEFAULT_ACCOUNTS.accountsPayable,
+        );
+        const je = await JournalService.createEntry(companyId, req.user.id, {
+          date: now,
+          description: `Supplier refund received for purchase return ${pr.referenceNo}`,
+          sourceType: 'purchase_return_refund',
+          sourceId: pr._id,
+          sourceReference: pr.referenceNo,
+          lines: [
+            JournalService.createDebitLine(debitAccount, refundAmt, `Refund received - PRN#${pr.referenceNo}`),
+            JournalService.createCreditLine(apAccount, refundAmt, `Settle supplier credit - PRN#${pr.referenceNo}`),
+          ],
+          isAutoGenerated: true,
+          session: trx || null,
+        });
+        pr.refundJournalEntry = je._id;
 
-    pr.refundedAt = new Date();
-    await pr.save();
+        if (refundMethod === 'bank_transfer') {
+          const bankTransaction = await bankAccount.addTransaction({
+            type: 'deposit',
+            amount: refundAmt,
+            description: `Purchase return refund - PRN#${pr.referenceNo}`,
+            date: now,
+            referenceNumber: reference || pr.referenceNo,
+            paymentMethod: 'bank_transfer',
+            status: 'completed',
+            reference: pr._id,
+            referenceType: 'PurchaseReturn',
+            sourceDocumentType: 'purchase_return_refund',
+            sourceDocumentId: pr._id,
+            sourceReference: pr.referenceNo,
+            journalEntryId: je._id,
+            createdBy: req.user.id,
+            notes: `Supplier refund for purchase return ${pr.referenceNo}`,
+          });
+          pr.refundBankTransaction = bankTransaction._id;
+        }
+      }
+
+      pr.refundMethod = refundMethod;
+      pr.bankAccountId = refundMethod === 'bank_transfer' ? bankAccountId : null;
+      pr.bankRefundReference = String(reference || '').trim() || null;
+      pr.refundedAt = refundMethod === 'credit' ? null : now;
+      await pr.save({ session: trx || null });
+      if (refundMethod !== 'credit') {
+        await require('../services/apTrackingService').recordPurchaseReturnRefund(pr, req.user.id);
+      }
+      return pr;
+    });
 
     // Send email notification for refund
-    if (req.body.sendEmail) {
+    if (req.body?.sendEmail) {
       const company = await Company.findById(companyId);
-      const grn = await GoodsReceivedNote.findById(pr.grn);
+      const grn = await GoodsReceivedNote.findById(result.grn);
       const supplier = grn ? await Supplier.findById(grn.supplier) : null;
-      await sendPurchaseReturnEmail(pr, company, supplier, 'refunded');
+      await sendPurchaseReturnEmail(result, company, supplier, 'refunded');
     }
 
-    res.json({ success: true, message: 'Refund processed successfully', data: pr });
-  } catch (err) { next(err); }
+    try {
+      await cacheService.bumpCompanyFinancialCaches(companyId);
+      await cacheService.invalidateByCompany(companyId, 'report');
+    } catch (cacheErr) {
+      console.error('Cache invalidation after purchase return settlement failed:', cacheErr);
+    }
+    require('../lib/realtimeEvents').emitDataChanged(companyId, 'purchase_return', {
+      affectsFinance: true,
+    });
+
+    res.json({ success: true, message: 'Supplier settlement recorded successfully', data: result });
+  } catch (err) {
+    if (err && err.status) return res.status(err.status).json({ success: false, message: err.message });
+    next(err);
+  }
 };

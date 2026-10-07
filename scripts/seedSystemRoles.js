@@ -33,7 +33,7 @@ const systemRoles = [
     permissions: [
       { resource: 'products', actions: ['read', 'create', 'update'] },
       { resource: 'sales_invoices', actions: ['read', 'create', 'update', 'delete'] },
-      { resource: 'purchase_orders', actions: ['read', 'create', 'update'] },
+      { resource: 'purchase_orders', actions: ['read', 'create', 'update', 'approve'] },
       { resource: 'users', actions: ['read', 'create', 'update'] },
       { resource: 'projects', actions: ['read', 'create', 'update', 'close', 'reopen'] },
       { resource: 'payroll', actions: ['read', 'create', 'update'] },
@@ -113,7 +113,7 @@ const systemRoles = [
     permissions: [
       { resource: 'products', actions: ['read'] },
       { resource: 'suppliers', actions: ['read', 'create', 'update'] },
-      { resource: 'purchase_orders', actions: ['read', 'create', 'update'] },
+      { resource: 'purchase_orders', actions: ['read', 'create', 'update', 'approve'] },
       { resource: 'grn', actions: ['read', 'create', 'update', 'confirm'] },
       { resource: 'purchase_returns', actions: ['read', 'create', 'update'] },
       { resource: 'ap_payments', actions: ['read'] }

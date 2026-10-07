@@ -19,6 +19,12 @@ const FIELD_MAP = {
   totalAmount: { target: 'totalAmount' },
   amountPaid: { target: 'amountPaid' },
   balance: { target: 'balance' },
+  paymentStatus: { target: 'paymentStatus' },
+  paymentDueDate: { target: 'paymentDueDate' },
+  journalEntry: { target: 'journalEntryId', isId: true },
+  confirmedBy: { target: 'confirmedById', isId: true },
+  confirmedAt: { target: 'confirmedAt' },
+  freight: { target: 'freight' },
 };
 
 module.exports = buildDocumentModel({
