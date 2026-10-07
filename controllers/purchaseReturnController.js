@@ -15,6 +15,7 @@ const emailService = require('../services/emailService');
 const cacheService = require('../services/cacheService');
 const DEFAULT_ACCOUNTS = require('../constants/chartOfAccounts').DEFAULT_ACCOUNTS;
 const { parsePagination, paginationMeta } = require('../utils/pagination');
+const { nextReferenceNo } = require('../utils/referenceNumbers');
 const {
   buildReturnLines,
   calculateReturnTotals,
@@ -182,6 +183,10 @@ exports.createPurchaseReturn = async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Return reason is required' });
     }
 
+    const supplierCreditNoteNo = await nextReferenceNo(companyId, 'SCN', {
+      field: 'supplierCreditNoteNo',
+      model: 'purchaseReturn',
+    });
     const pr = await PurchaseReturn.create({
       company: companyId,
       createdBy: req.user.id,
@@ -191,7 +196,7 @@ exports.createPurchaseReturn = async (req, res, next) => {
       warehouse: grn.warehouse,
       referenceNo: payload.referenceNo,
       returnDate: parseReturnDate(payload.returnDate),
-      supplierCreditNoteNo: String(payload.supplierCreditNoteNo || '').trim() || null,
+      supplierCreditNoteNo,
       reason,
       lines,
       totalAmount: totals.totalAmount,
@@ -236,9 +241,6 @@ exports.updatePurchaseReturn = async (req, res, next) => {
     }
     if (payload.referenceNo !== undefined) pr.referenceNo = String(payload.referenceNo).trim();
     if (payload.returnDate !== undefined) pr.returnDate = parseReturnDate(payload.returnDate);
-    if (payload.supplierCreditNoteNo !== undefined) {
-      pr.supplierCreditNoteNo = String(payload.supplierCreditNoteNo || '').trim() || null;
-    }
     if (payload.reason !== undefined) {
       const reason = String(payload.reason || '').trim();
       if (!reason) return res.status(400).json({ success: false, message: 'Return reason is required' });

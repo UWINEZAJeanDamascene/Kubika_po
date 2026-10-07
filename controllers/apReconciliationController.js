@@ -5,6 +5,7 @@ const GoodsReceivedNote = require('../models/GoodsReceivedNote');
 const Supplier = require('../models/Supplier');
 const { dbClient } = require('../lib/prisma');
 const { parsePagination } = require('../utils/pagination');
+const { inclusiveEndDate } = require('../utils/reportDateRange');
 
 function buildOutstandingPayablesSql(companyId, supplierId) {
   const params = [String(companyId)];
@@ -344,7 +345,8 @@ const apReconciliationController = {
 
       const dateFilter = {};
       if (startDate) dateFilter.$gte = new Date(startDate);
-      if (endDate) dateFilter.$lte = new Date(endDate);
+      const endDateInclusive = endDate ? inclusiveEndDate(endDate) : null;
+      if (endDateInclusive) dateFilter.$lte = endDateInclusive;
       const grnQuery = { supplier: supplierId, company: companyId };
       if (Object.keys(dateFilter).length) grnQuery.receivedDate = dateFilter;
       const grnParams = [String(companyId), String(supplierId)];
@@ -354,7 +356,7 @@ const apReconciliationController = {
         grnWhere.push(`received_date >= $${grnParams.length}`);
       }
       if (endDate) {
-        grnParams.push(new Date(endDate));
+        grnParams.push(endDateInclusive);
         grnWhere.push(`received_date <= $${grnParams.length}`);
       }
       const [grnStats, grns] = await Promise.all([
@@ -376,7 +378,7 @@ const apReconciliationController = {
 
       const transactions = await APTrackingService.getSupplierHistory(companyId, supplierId, {
         startDate: startDate ? new Date(startDate) : null,
-        endDate: endDate ? new Date(endDate) : null,
+        endDate: endDateInclusive,
         limit: limitNum,
         skip,
       });

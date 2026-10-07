@@ -1,6 +1,7 @@
 const ChartOfAccount = require('../models/ChartOfAccount');
 const { dbClient } = require('../lib/prisma');
 const ChartOfAccountsService = require('./chartOfAccountsService');
+const { inclusiveEndDate } = require('../utils/reportDateRange');
 
 /**
  * General Ledger Service
@@ -46,7 +47,7 @@ class GeneralLedgerService {
         accountCode: account.code,
         journalEntry: {
           status: 'posted',
-          date: { gte: new Date(dateFrom), lte: new Date(dateTo) },
+          date: { gte: new Date(dateFrom), lte: inclusiveEndDate(dateTo) },
         },
       },
       select: {
@@ -221,7 +222,7 @@ class GeneralLedgerService {
         } : {}),
         journalEntry: {
           status: 'posted',
-          ...(dateFrom && dateTo ? { date: { gte: new Date(dateFrom), lte: new Date(dateTo) } } : {}),
+          ...(dateFrom && dateTo ? { date: { gte: new Date(dateFrom), lte: inclusiveEndDate(dateTo) } } : {}),
         },
       },
       select: {

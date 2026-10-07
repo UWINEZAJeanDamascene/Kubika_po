@@ -1,5 +1,6 @@
 const ChartOfAccount = require('../models/ChartOfAccount');
 const { dbClient } = require('../lib/prisma');
+const { inclusiveEndDate } = require('../utils/reportDateRange');
 
 /**
  * Chart of Accounts Service
@@ -31,7 +32,7 @@ class ChartOfAccountsService {
           status: 'posted',
           date: {
             gte: new Date(dateFrom),
-            lte: new Date(dateTo),
+            lte: inclusiveEndDate(dateTo),
           },
         },
       },

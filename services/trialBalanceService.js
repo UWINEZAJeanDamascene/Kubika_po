@@ -1,5 +1,6 @@
 const ChartOfAccount = require('../models/ChartOfAccount');
 const { dbClient } = require('../lib/prisma');
+const { inclusiveEndDate } = require('../utils/reportDateRange');
 
 /**
  * Trial Balance Service
@@ -31,7 +32,7 @@ class TrialBalanceService {
         companyId: String(companyId),
         journalEntry: {
           status: 'posted',
-          date: { gte: new Date(dateFrom), lte: new Date(dateTo) },
+          date: { gte: new Date(dateFrom), lte: inclusiveEndDate(dateTo) },
         },
       },
       _sum: { debit: true, credit: true },
