@@ -13,6 +13,7 @@ const { emitDataChanged } = require("../lib/realtimeEvents");
 const Supplier = require("../models/Supplier");
 const Company = require("../models/Company");
 const { generateUniqueNumber } = require('../models/utils/autoIncrement');
+const { nextReferenceNo } = require('../utils/referenceNumbers');
 const JournalService = require("../services/journalService");
 const TaxAutomationService = require("../services/taxAutomationService");
 const transactionService = require("../services/transactionService");
@@ -223,7 +224,6 @@ exports.createGRN = async (req, res, next) => {
       warehouse,
       lines,
       referenceNo,
-      supplierInvoiceNo,
       receivedDate,
       freight,
     } = req.body;
@@ -259,12 +259,7 @@ exports.createGRN = async (req, res, next) => {
       return res.status(400).json({ success: false, message: "Receiving warehouse must match the purchase order warehouse" });
     }
 
-    // Auto-generate supplier invoice number when not provided
-    let supplierInv = supplierInvoiceNo;
-    if (!supplierInv) {
-      // Use sequential supplier invoice number format e.g. SI-2026-00001
-      supplierInv = await generateUniqueNumber('SI', GoodsReceivedNote, companyId, 'supplierInvoiceNo');
-    }
+    const supplierInv = await generateUniqueNumber('SI', GoodsReceivedNote, companyId, 'supplierInvoiceNo');
 
     // Build freight payload: pre-fill from PO estimate if not provided by frontend
     let freightPayload = {};
@@ -284,7 +279,9 @@ exports.createGRN = async (req, res, next) => {
         account: freight.account || (po.freight && po.freight.account) || '5110',
         includeInInventoryCost: freight.includeInInventoryCost != null ? freight.includeInInventoryCost : (po.freight && po.freight.includeInInventoryCost) || false,
         allocationMethod,
-        invoiceReference: freight.invoiceReference || '',
+        invoiceReference: actualFreightAmount > 0
+          ? await nextReferenceNo(companyId, 'FRT', { model: 'goodsReceivedNote' })
+          : '',
         invoiceDate: freight.invoiceDate ? new Date(freight.invoiceDate) : undefined,
         paidBy: freight.paidBy || 'company',
       };
