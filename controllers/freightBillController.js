@@ -14,7 +14,15 @@ function resolveCreditAccount(paymentMethod) {
 }
 
 function resolveCompanyId(req) {
-  return req.user?.company?._id || req.user?.company || req.user?.companyId || null;
+  const userCompany = req.user?.company;
+  const companyId = req.company?._id
+    || req.company?.id
+    || (userCompany && typeof userCompany === 'object'
+      ? userCompany._id || userCompany.id
+      : userCompany)
+    || req.user?.companyId
+    || req.companyId;
+  return companyId == null ? null : String(companyId);
 }
 
 /** Goods value from GRN lines, with totalAmount fallback when lines are missing/zero. */
@@ -33,7 +41,8 @@ function computeGrnGoodsValue(grn) {
 // Create freight bill
 exports.createFreightBill = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
+    const companyId = resolveCompanyId(req);
+    if (!companyId) return res.status(400).json({ success: false, message: 'Company context required' });
     const payload = req.body;
     payload.company = companyId;
     payload.createdBy = req.user.id;
@@ -47,7 +56,8 @@ exports.createFreightBill = async (req, res, next) => {
 // Update freight bill (draft only)
 exports.updateFreightBill = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
+    const companyId = resolveCompanyId(req);
+    if (!companyId) return res.status(400).json({ success: false, message: 'Company context required' });
     const fb = await FreightBill.findOne({ _id: req.params.id, company: companyId });
     if (!fb) return res.status(404).json({ success: false, message: 'Freight bill not found' });
     if (fb.status !== 'draft') return res.status(409).json({ success: false, message: 'Only draft freight bills can be edited' });
@@ -63,7 +73,8 @@ exports.updateFreightBill = async (req, res, next) => {
 
 // Confirm freight bill -> post journal entry
 exports.confirmFreightBill = async (req, res, next) => {
-  const companyId = req.user.company._id;
+  const companyId = resolveCompanyId(req);
+  if (!companyId) return res.status(400).json({ success: false, message: 'Company context required' });
 
   const runConfirm = async (sess) => {
     const useSession = !!sess;
@@ -131,7 +142,8 @@ exports.confirmFreightBill = async (req, res, next) => {
 // List freight bills
 exports.listFreightBills = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
+    const companyId = resolveCompanyId(req);
+    if (!companyId) return res.status(400).json({ success: false, message: 'Company context required' });
     const { status, page = 1, limit = 20 } = req.query;
     const query = { company: companyId };
     if (status) query.status = status;
@@ -153,7 +165,8 @@ exports.listFreightBills = async (req, res, next) => {
 // Get single freight bill
 exports.getFreightBill = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
+    const companyId = resolveCompanyId(req);
+    if (!companyId) return res.status(400).json({ success: false, message: 'Company context required' });
     const fb = await FreightBill.findOne({ _id: req.params.id, company: companyId })
       .populate('supplier', 'name code')
       .populate('grnMatches.grn', 'referenceNo receivedDate')
@@ -245,7 +258,8 @@ exports.getFreightAnalysis = async (req, res, next) => {
 // Delete freight bill (draft only)
 exports.deleteFreightBill = async (req, res, next) => {
   try {
-    const companyId = req.user.company._id;
+    const companyId = resolveCompanyId(req);
+    if (!companyId) return res.status(400).json({ success: false, message: 'Company context required' });
     const fb = await FreightBill.findOne({ _id: req.params.id, company: companyId });
     if (!fb) return res.status(404).json({ success: false, message: 'Freight bill not found' });
     if (fb.status !== 'draft') return res.status(409).json({ success: false, message: 'Only draft freight bills can be deleted' });
