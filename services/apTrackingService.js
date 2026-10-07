@@ -277,7 +277,7 @@ class APTrackingService {
    */
   static async invalidateSupplierBalanceCache(companyId, supplierId) {
     const cacheKey = `ap_supplier_balance_${companyId}_${supplierId}`;
-    await cacheService.del(cacheKey);
+    await cacheService.delete(cacheKey);
   }
 
   /**
