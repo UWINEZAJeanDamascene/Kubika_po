@@ -35,7 +35,9 @@ exports.createPurchaseOrder = async (req, res, next) => {
     const payload = req.body;
     payload.company = companyId;
     payload.createdBy = req.user.id;
-    payload.status = payload.status || 'draft';
+    // Orders must enter the approval workflow as drafts; accepting an incoming
+    // status here would allow callers to bypass approval and commitment checks.
+    payload.status = 'draft';
 
     // Normalize freight defaults if provided
     if (payload.freight) {
@@ -80,100 +82,91 @@ exports.approvePurchaseOrder = async (req, res, next) => {
     const po = await PurchaseOrder.findOne({ _id: req.params.id, company: companyId });
     if (!po) return res.status(404).json({ success: false, message: 'PO not found' });
     if (po.status !== 'draft') return res.status(409).json({ success: false, message: 'Only draft POs can be approved' });
-
-    // Update PO status
-    po.status = 'approved';
-    po.approvedBy = userId;
-    po.approvedAt = new Date();
-    await po.save();
-    emitDataChanged(companyId, 'purchaseOrders');
-
-    // Send email notification for approved PO
-    const sendEmailOnApprove = req.body.sendEmail || false;
-    if (sendEmailOnApprove) {
-      sendPOEmail(po, 'approved', companyId);
+    if (po.createdBy && String(po.createdBy) === String(userId)) {
+      return res.status(403).json({ success: false, message: 'The purchase order creator cannot approve the same order. Ask another user with purchase order approval permission.' });
     }
 
-    // Auto-create encumbrances for budget tracking
-    const encumbranceIds = [];
-    try {
-      if (po.lines && po.lines.length > 0) {
-        const BudgetLine = require('../models/BudgetLine');
-        
-        const encumbrancePromises = po.lines
-          .filter(line => line.budgetId && (line.budget_line_id || line.accountId))
-          .map(async (line, index) => {
-            try {
-              // Prefer the explicit budget line so project/WBS allocations are not ambiguous.
-              const budgetLine = line.budget_line_id
-                ? await BudgetLine.findOne({
-                    _id: line.budget_line_id,
-                    budget_id: line.budgetId,
-                    company_id: companyId
-                  })
-                : await BudgetLine.findOne({
-                    budget_id: line.budgetId,
-                    account_id: line.accountId,
-                    company_id: companyId
-                  });
-
-              if (!budgetLine) {
-                console.log('[PO] No budget line found for budget:', line.budgetId, 'account:', line.accountId);
-                return { success: false, error: 'No budget line found' };
-              }
-
-              const budget_line_id = budgetLine._id;
-
-              // Calculate line total including tax
-              const lineSubtotal = (Number(line.qtyOrdered) || 0) * (Number(line.unitCost) || 0);
-              const lineTax = lineSubtotal * ((Number(line.taxRate) || 0) / 100);
-              const lineTotal = lineSubtotal + lineTax;
-
-              if (lineTotal <= 0) return null;
-
-              const encumbrance = await BudgetService.createEncumbrance(
-                companyId,
-                {
-                  budget_id: line.budgetId,
-                  budget_line_id: budget_line_id,
-                  account_id: line.accountId || budgetLine.account_id,
-                  source_type: "purchase_order",
-                  source_id: po._id.toString(),
-                  source_number: po.referenceNo || po._id.toString(),
-                  description: `PO: ${po.referenceNo || ''} - ${line.product?.name || 'Item'}`,
-                  amount: lineTotal,
-                  expected_liquidation_date: po.expectedDeliveryDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-                  notes: `Auto-created from Purchase Order approval`,
-                },
-                userId
-              );
-
-              // Store encumbrance_id back to the PO line for tracking
-              if (encumbrance && encumbrance._id) {
-                po.lines[index].encumbrance_id = encumbrance._id;
-                po.lines[index].budget_line_id = budget_line_id;
-                encumbranceIds.push({ lineIndex: index, encumbranceId: encumbrance._id });
-              }
-
-              return { success: true, encumbranceId: encumbrance._id };
-            } catch (encErr) {
-              console.error('Error creating encumbrance for PO line:', encErr);
-              return { success: false, error: encErr.message };
-            }
-          });
-
-        await Promise.all(encumbrancePromises);
-
-        // Save PO with updated encumbrance_ids
-        if (encumbranceIds.length > 0) {
-          await po.save();
-          console.log('[PO] Saved encumbrance_ids to PO lines:', encumbranceIds);
+    const BudgetLine = require('../models/BudgetLine');
+    const resolvedLines = [];
+    // Validate every budget coding before creating commitments. Budgeted PO
+    // lines must point to one exact line; account-only lookups are ambiguous
+    // when projects or cost centres share an account.
+    for (let index = 0; index < (po.lines || []).length; index += 1) {
+      const line = po.lines[index];
+      if (!line.budgetId && !line.budget_line_id) continue;
+      if (!line.budgetId || !line.budget_line_id) {
+        return res.status(400).json({ success: false, message: `Line ${index + 1}: select both a budget and a budget line` });
+      }
+      const budgetLine = await BudgetLine.findOne({
+        _id: line.budget_line_id,
+        budget_id: line.budgetId,
+        company_id: companyId,
+      });
+      if (!budgetLine) {
+        return res.status(400).json({ success: false, message: `Line ${index + 1}: budget line does not belong to the selected budget` });
+      }
+      const lineAccountId = line.accountId && String(line.accountId);
+      if (lineAccountId && lineAccountId !== String(budgetLine.account_id)) {
+        return res.status(400).json({ success: false, message: `Line ${index + 1}: account does not match the selected budget line` });
+      }
+      const refs = line.budgetRefs && typeof line.budgetRefs === 'object' ? line.budgetRefs : {};
+      const projectId = budgetLine.project_id?._id || budgetLine.project_id || refs.projectId || null;
+      let projectSnapshot = null;
+      if (projectId) {
+        const Project = require('../models/Project');
+        projectSnapshot = await Project.findOne({ _id: projectId, company_id: companyId });
+        if (!projectSnapshot) {
+          return res.status(400).json({ success: false, message: `Line ${index + 1}: linked project is unavailable in this company` });
         }
       }
-    } catch (encErr) {
-      // Log error but don't fail the approval
-      console.error('Failed to create encumbrances for PO:', encErr.message);
+      line.budgetId = String(line.budgetId);
+      line.budget_line_id = String(budgetLine._id);
+      line.accountId = String(budgetLine.account_id);
+      line.project_id = projectId ? String(projectId) : null;
+      line.projectName = projectSnapshot?.name || null;
+      line.projectCode = projectSnapshot?.project_code || projectSnapshot?.wbs_code || null;
+      resolvedLines.push({ line, index, budgetLine });
     }
+
+    const createdEncumbrances = [];
+    try {
+      for (const { line, index, budgetLine } of resolvedLines) {
+        const subtotal = (Number(line.qtyOrdered) || 0) * (Number(line.unitCost) || 0);
+        const calculatedTotal = subtotal + subtotal * ((Number(line.taxRate) || 0) / 100);
+        const amount = Number(line.lineTotal) > 0
+          ? Number(Number(line.lineTotal).toFixed(2))
+          : Number(calculatedTotal.toFixed(2));
+        if (amount <= 0) throw new Error(`Line ${index + 1}: amount must be greater than zero to encumber a budget`);
+        const encumbrance = await BudgetService.createEncumbrance(companyId, {
+          budget_id: line.budgetId,
+          budget_line_id: budgetLine._id,
+          account_id: budgetLine.account_id,
+          source_type: 'purchase_order',
+          source_id: po._id.toString(),
+          source_number: po.referenceNo || po._id.toString(),
+          description: `PO ${po.referenceNo || ''} - ${line.product?.name || 'Item'}`,
+          amount,
+          expected_liquidation_date: po.expectedDeliveryDate || new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+          notes: 'Commitment created on purchase order approval',
+        }, userId);
+        line.encumbrance_id = String(encumbrance._id);
+        createdEncumbrances.push(encumbrance);
+      }
+
+      po.status = 'approved';
+      po.approvedBy = userId;
+      po.approvedAt = new Date();
+      await po.save();
+    } catch (approvalError) {
+      // Do not leave budget commitments behind if approval cannot be completed.
+      await Promise.allSettled(createdEncumbrances.map((encumbrance) =>
+        BudgetService.releaseEncumbrance(companyId, 'purchase_order', po._id.toString(),
+          'Approval rolled back after a later budget line failed validation', userId, encumbrance._id)));
+      throw approvalError;
+    }
+
+    emitDataChanged(companyId, 'purchaseOrders');
+    if (req.body.sendEmail) sendPOEmail(po, 'approved', companyId);
 
     res.json({ success: true, data: po });
   } catch (err) { next(err); }
@@ -188,6 +181,25 @@ exports.cancelPurchaseOrder = async (req, res, next) => {
     // Block cancellation if any GRN exists
     const grn = await GoodsReceivedNote.findOne({ purchaseOrder: po._id, company: companyId });
     if (grn) return res.status(409).json({ success: false, message: 'Cannot cancel PO with existing GRN' });
+
+    if (!['draft', 'approved'].includes(po.status)) {
+      return res.status(409).json({ success: false, message: 'Only draft or approved purchase orders can be cancelled' });
+    }
+    if (Number(po.amountPaid || 0) > 0) {
+      return res.status(409).json({ success: false, message: 'This order has recorded payments. Resolve the supplier advance or refund before cancelling it.' });
+    }
+
+    if (po.status === 'approved') {
+      const Encumbrance = require('../models/Encumbrance');
+      const commitments = await Encumbrance.find({
+        source_type: 'purchase_order', source_id: po._id.toString(), company_id: companyId,
+        status: { $in: ['active', 'partially_liquidated'] },
+      });
+      for (const commitment of commitments) {
+        await BudgetService.releaseEncumbrance(companyId, 'purchase_order', po._id.toString(),
+          `Purchase order ${po.referenceNo} cancelled`, req.user.id, commitment._id);
+      }
+    }
 
     po.status = 'cancelled';
     await po.save();
@@ -471,75 +483,9 @@ exports.recordPOPayment = async (req, res, next) => {
       console.error('Failed to update GRN payment status:', grnErr);
     }
 
-    // Liquidate encumbrances when PO is paid (fully or partially)
-    try {
-      const Encumbrance = require('../models/Encumbrance');
-      const encumbrances = await Encumbrance.find({
-        source_type: 'purchase_order',
-        source_id: po._id.toString(),
-        status: { $in: ['active', 'partially_liquidated'] }
-      });
-
-      for (const encumbrance of encumbrances) {
-        const encumberedAmount = Number(encumbrance.encumbered_amount?.toString() || 0);
-        const currentLiquidated = Number(encumbrance.liquidated_amount?.toString() || 0);
-        const remainingToLiquidate = encumberedAmount - currentLiquidated;
-
-        if (remainingToLiquidate <= 0) continue;
-
-        // Calculate how much of this encumbrance to liquidate based on payment ratio
-        const paymentRatio = po.totalAmount > 0 ? payAmount / po.totalAmount : 0;
-        const liquidationAmount = Math.min(remainingToLiquidate, encumberedAmount * paymentRatio);
-
-        if (liquidationAmount <= 0) continue;
-
-        const newLiquidated = currentLiquidated + liquidationAmount;
-
-        // Update encumbrance
-        encumbrance.liquidated_amount = newLiquidated;
-        encumbrance.remaining_amount = encumberedAmount - newLiquidated;
-        encumbrance.liquidations.push({
-          document_type: 'payment',
-          document_id: po._id.toString(),
-          document_number: po.referenceNo || `PO-${po._id.toString().slice(-5)}`,
-          amount: liquidationAmount,
-          date: new Date(),
-          notes: `PO payment - reference: ${reference || 'N/A'}, method: ${paymentMethod || 'N/A'}`
-        });
-
-        if (newLiquidated >= encumberedAmount) {
-          encumbrance.status = 'fully_liquidated';
-          encumbrance.liquidated_at = new Date();
-        } else {
-          encumbrance.status = 'partially_liquidated';
-        }
-
-        await encumbrance.save();
-
-        if (!encumbrance.budget_line_id) {
-          throw new Error('Encumbrance missing budget_line_id');
-        }
-
-        await BudgetService.applyActualConsumptionToLine({
-          companyId,
-          budgetLineId: encumbrance.budget_line_id,
-          amount: liquidationAmount,
-          reduceEncumbered: true,
-          origin_type: 'encumbrance_liquidation',
-          document_type: 'purchase_order_payment',
-          document_id: po._id.toString(),
-          document_number: po.referenceNo || `PO-${po._id.toString().slice(-5)}`,
-          document_date: new Date(),
-          source_type: encumbrance.source_type,
-          source_id: encumbrance.source_id,
-          source_number: encumbrance.source_number,
-          notes: `PO payment - reference: ${reference || 'N/A'}, method: ${paymentMethod || 'N/A'}`,
-          created_by: req.user.id,
-        });
-      }
-    } catch (encErr) {
-      console.error('Error liquidating encumbrances for PO payment:', encErr);
-    }
+    // Budget actuals are recognized when goods/services are received, not when
+    // cash is paid. Payment settles AP and must not consume the same budget a
+    // second time.
 
     res.json({ success: true, data: po });
   } catch (err) { next(err); }

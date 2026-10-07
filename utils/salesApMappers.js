@@ -446,6 +446,7 @@ function salesOrderToApi(row) {
 
 function purchaseOrderLineToApi(row) {
   if (!row) return null;
+  const budgetRefs = row.budgetRefs && typeof row.budgetRefs === 'object' ? row.budgetRefs : {};
   return {
     _id: row.id,
     product: row.product && typeof row.product === 'object'
@@ -457,7 +458,16 @@ function purchaseOrderLineToApi(row) {
     taxRate: qtyNum(row.taxRate),
     taxAmount: qtyNum(row.taxAmount),
     lineTotal: qtyNum(row.lineTotal),
-    ...(row.budgetRefs || {}),
+    ...budgetRefs,
+    // Keep the legacy API's snake-case fields while preserving the canonical
+    // camel-case JSON keys used by Prisma.
+    budgetId: budgetRefs.budgetId ?? budgetRefs.budget_id ?? null,
+    budget_line_id: budgetRefs.budgetLineId ?? budgetRefs.budget_line_id ?? null,
+    accountId: budgetRefs.accountId ?? budgetRefs.account_id ?? null,
+    project_id: budgetRefs.projectId ?? budgetRefs.project_id ?? null,
+    projectName: budgetRefs.projectName ?? null,
+    projectCode: budgetRefs.projectCode ?? null,
+    encumbrance_id: budgetRefs.encumbranceId ?? budgetRefs.encumbrance_id ?? null,
   };
 }
 
@@ -609,6 +619,13 @@ function apPaymentToApi(row) {
     _id: row.id,
     company: row.companyId,
     referenceNo: row.referenceNo,
+    reference: row.externalReference ?? null,
+    notes: row.notes ?? null,
+    postedBy: row.postedById ?? null,
+    postedAt: row.postedAt ?? null,
+    reversedBy: row.reversedById ?? null,
+    reversedAt: row.reversedAt ?? null,
+    reversalReason: row.reversalReason ?? null,
     supplier: relationRef(row.supplier, row.supplierId),
     paymentDate: row.paymentDate,
     paymentMethod: row.paymentMethod,
@@ -1500,6 +1517,8 @@ const PURCHASE_ORDER_HEADER = {
   paymentStatus: 'paymentStatus',
   payments: 'payments',
   notes: 'notes',
+  approvedBy: 'approvedById',
+  approvedAt: 'approvedAt',
 };
 
 function purchaseOrderTranslateCreate(data) {
@@ -1544,12 +1563,15 @@ function purchaseOrderTranslateCreate(data) {
       ? Number(line.lineTotal)
       : lineSubtotal + taxAmountLine;
     const budgetRefs = {};
-    if (line.budgetId || line.budget_line_id) {
-      budgetRefs.budgetId = toIdString(line.budgetId || line.budget_line_id);
-    }
-    if (line.accountId || line.account_id) {
-      budgetRefs.accountId = toIdString(line.accountId || line.account_id);
-    }
+    const budgetId = line.budgetId || line.budget_id;
+    const budgetLineId = line.budget_line_id || line.budgetLineId;
+    if (budgetId) budgetRefs.budgetId = toIdString(budgetId);
+    if (budgetLineId) budgetRefs.budgetLineId = toIdString(budgetLineId);
+    if (line.accountId || line.account_id) budgetRefs.accountId = toIdString(line.accountId || line.account_id);
+    if (line.project_id || line.projectId) budgetRefs.projectId = toIdString(line.project_id || line.projectId);
+    if (line.projectName) budgetRefs.projectName = String(line.projectName);
+    if (line.projectCode) budgetRefs.projectCode = String(line.projectCode);
+    if (line.encumbrance_id || line.encumbranceId) budgetRefs.encumbranceId = toIdString(line.encumbrance_id || line.encumbranceId);
     return defaultLineCreate(line, idx, companyId, {
       qtyOrdered: qty,
       qtyReceived: line.qtyReceived ?? 0,
@@ -1621,6 +1643,18 @@ function purchaseTranslateCreate(data) {
         unitCost: line.unitCost ?? 0,
         taxRate: line.taxRate ?? 0,
         lineTotal: line.lineTotal ?? line.totalWithTax ?? 0,
+        extra: {
+          ...(line.extra && typeof line.extra === 'object' ? line.extra : {}),
+          ...(line.budgetId || line.budget_id ? { budgetId: toIdString(line.budgetId || line.budget_id) } : {}),
+          ...(line.budget_line_id || line.budgetLineId ? { budget_line_id: toIdString(line.budget_line_id || line.budgetLineId) } : {}),
+          ...(line.accountId || line.account_id ? { accountId: toIdString(line.accountId || line.account_id) } : {}),
+          ...(line.project_id || line.projectId ? { project_id: toIdString(line.project_id || line.projectId) } : {}),
+          ...(line.projectName ? { projectName: String(line.projectName) } : {}),
+          ...(line.projectCode ? { projectCode: String(line.projectCode) } : {}),
+          ...(line.encumbrance_id || line.encumbranceId ? { encumbrance_id: toIdString(line.encumbrance_id || line.encumbranceId) } : {}),
+          ...(line.taxCode ? { taxCode: line.taxCode } : {}),
+          ...(line.discount != null ? { discount: Number(line.discount) || 0 } : {}),
+        },
       }),
   );
 }
@@ -1689,6 +1723,8 @@ const purchaseReturnTranslateUpdate = genericTranslateUpdate(
 
 const AP_PAYMENT_HEADER = {
   referenceNo: 'referenceNo',
+  reference: 'externalReference',
+  notes: 'notes',
   supplier: 'supplierId',
   status: 'status',
   paymentDate: 'paymentDate',

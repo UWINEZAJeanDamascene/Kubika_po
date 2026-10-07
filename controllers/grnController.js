@@ -755,35 +755,30 @@ exports.confirmGRN = async (req, res, next) => {
     markPoLinesDirty(po);
     await po.save(useSession ? { session: sess } : {});
 
-    // Liquidate encumbrances if PO is fully received
-    if (wasFullyReceived) {
-      try {
-        const BudgetService = require('../services/budgetService');
-        for (const line of po.lines) {
-          if (line.encumbrance_id) {
-            try {
-              await BudgetService.liquidateEncumbrance(
-                companyId,
-                'purchase_order',
-                po._id.toString(),
-                {
-                  document_type: 'goods_received_note',
-                  document_id: grn._id.toString(),
-                  document_number: grn.referenceNo,
-                  amount: parseFloat(line.lineTotal?.toString() || 0),
-                  notes: `GRN confirmed - PO fully received`
-                },
-                req.user.id
-              );
-              console.log(`[GRN] Liquidated encumbrance ${line.encumbrance_id} for PO line`);
-            } catch (liqErr) {
-              console.error('Error liquidating encumbrance:', liqErr);
-            }
-          }
-        }
-      } catch (encErr) {
-        console.error('Error processing encumbrance liquidation:', encErr);
-      }
+    // Recognize project/budget actuals as each receipt is confirmed, including
+    // partial deliveries. This leaves only the unreceived commitment open.
+    const BudgetService = require('../services/budgetService');
+    for (const receivedLine of grn.lines || []) {
+      const poLine = po.lines.id(receivedLine.purchaseOrderLine);
+      if (!poLine?.encumbrance_id) continue; // Supports legacy POs created before budget integration.
+      const netReceived = Number(receivedLine.qtyReceived || 0) * Number(receivedLine.unitCost || 0);
+      const receivedTotal = Number((netReceived * (1 + (Number(poLine.taxRate) || 0) / 100)).toFixed(2));
+      if (receivedTotal <= 0) continue;
+      await BudgetService.liquidateEncumbrance(
+        companyId,
+        'purchase_order',
+        po._id.toString(),
+        {
+          document_type: 'goods_received_note',
+          document_id: grn._id.toString(),
+          document_number: grn.referenceNo,
+          amount: receivedTotal,
+          encumbrance_id: poLine.encumbrance_id,
+          budget_line_id: poLine.budget_line_id || undefined,
+          notes: `GRN ${grn.referenceNo} confirmed${wasFullyReceived ? ' - order fully received' : ' - partial receipt'}`,
+        },
+        req.user.id,
+      );
     }
 
     // Use TaxAutomationService for centralized tax computation
@@ -979,6 +974,10 @@ exports.confirmGRN = async (req, res, next) => {
     grn.paymentStatus = "pending";
 
     await grn.save(useSession ? { session: sess } : {});
+    // GRN confirmation is the AP recognition event. Record it in the same
+    // PostgreSQL transaction as the stock and journal posting so retries cannot
+    // leave the subledger behind the confirmed document.
+    await require('../services/apTrackingService').recordGRNReceived(grn, req.user.id);
 
     return grn;
   };

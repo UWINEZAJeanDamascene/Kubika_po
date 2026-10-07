@@ -164,6 +164,43 @@ exports.createPurchase = async (req, res, next) => {
       });
     }
 
+    // Resolve and validate project/budget coding before creating the purchase.
+    const BudgetLine = require('../models/BudgetLine');
+    const resolvedBudgetLines = new Map();
+    for (let index = 0; index < (items || []).length; index += 1) {
+      const item = items[index];
+      item.budgetId = item.budgetId || budgetId;
+      item.budget_line_id = item.budget_line_id || budget_line_id;
+      item.accountId = item.accountId || accountId;
+      if (!item.budgetId && !item.budget_line_id) continue;
+      if (!item.budgetId || !item.budget_line_id) {
+        return res.status(400).json({ success: false, message: `Item ${index + 1}: select both a budget and a budget line` });
+      }
+      const budgetLine = await BudgetLine.findOne({
+        _id: item.budget_line_id,
+        budget_id: item.budgetId,
+        company_id: companyId,
+      });
+      if (!budgetLine) {
+        return res.status(400).json({ success: false, message: `Item ${index + 1}: budget line does not belong to the selected budget` });
+      }
+      if (item.accountId && String(item.accountId) !== String(budgetLine.account_id)) {
+        return res.status(400).json({ success: false, message: `Item ${index + 1}: account does not match the selected budget line` });
+      }
+      item.accountId = String(budgetLine.account_id);
+      item.project_id = budgetLine.project_id?._id || budgetLine.project_id || null;
+      if (item.project_id) {
+        const Project = require('../models/Project');
+        const project = await Project.findOne({ _id: item.project_id, company_id: companyId });
+        if (!project) {
+          return res.status(400).json({ success: false, message: `Item ${index + 1}: linked project is unavailable in this company` });
+        }
+        item.projectName = project.name;
+        item.projectCode = project.project_code || project.wbs_code || null;
+      }
+      resolvedBudgetLines.set(index, budgetLine);
+    }
+
     // Process items with tax codes - prefer product defaults when present
     const processedItems = [];
     let headerSubtotal = 0;
@@ -236,60 +273,41 @@ exports.createPurchase = async (req, res, next) => {
 
     await purchase.populate("supplier items.product createdBy");
 
-    // Create encumbrance if budget is specified
-    const encumbranceIds = [];
-    console.log('[DEBUG] Purchase created with budgetId:', purchase.budgetId, 'budget_line_id:', purchase.budget_line_id, 'accountId:', purchase.accountId);
-    if (purchase.budgetId && purchase.budget_line_id) {
-      try {
-        const BudgetService = require('../services/budgetService');
-        console.log('[DEBUG] Creating encumbrances for', purchase.items.length, 'items');
-        for (let i = 0; i < purchase.items.length; i++) {
-          const item = purchase.items[i];
-          // Check if item has budget info or use purchase-level budget
-          const itemBudgetId = item.budgetId || purchase.budgetId;
-          const itemBudgetLineId = item.budget_line_id || purchase.budget_line_id;
-          const itemAccountId = item.accountId || purchase.accountId;
-
-          if (itemBudgetId && itemBudgetLineId) {
-            try {
-              const itemTotal = parseFloat(item.totalWithTax?.toString?.() || item.totalWithTax || 0);
-              if (itemTotal <= 0) continue;
-
-              const encumbrance = await BudgetService.createEncumbrance(
-                companyId,
-                {
-                  budget_id: itemBudgetId,
-                  budget_line_id: itemBudgetLineId,
-                  account_id: itemAccountId,
-                  source_type: "purchase",
-                  source_id: purchase._id.toString(),
-                  source_number: purchase.purchaseNumber || purchase._id.toString(),
-                  description: `Purchase: ${purchase.purchaseNumber || ''} - ${item.product?.name || 'Item'}`,
-                  amount: itemTotal,
-                  expected_liquidation_date: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
-                  notes: `Auto-created from Purchase creation`,
-                },
-                req.user.id
-              );
-
-              if (encumbrance && encumbrance._id) {
-                purchase.items[i].encumbrance_id = encumbrance._id;
-                encumbranceIds.push({ itemIndex: i, encumbranceId: encumbrance._id });
-              }
-            } catch (encErr) {
-              console.error('Error creating encumbrance for purchase item:', encErr);
-            }
-          }
-        }
-
-        // Save purchase with updated encumbrance_ids
-        if (encumbranceIds.length > 0) {
-          await purchase.save();
-          console.log('[Purchase] Saved encumbrance_ids:', encumbranceIds);
-        }
-      } catch (encErr) {
-        console.error('Failed to create encumbrances for purchase:', encErr);
+    // One commitment per coded line. Never silently approve/create a purchase
+    // while dropping project budget tracking.
+    const BudgetService = require('../services/budgetService');
+    const createdEncumbrances = [];
+    try {
+      for (let i = 0; i < purchase.items.length; i += 1) {
+        const item = purchase.items[i];
+        const itemBudgetId = item.budgetId || budgetId;
+        const itemBudgetLineId = item.budget_line_id || budget_line_id;
+        if (!itemBudgetId || !itemBudgetLineId) continue;
+        const itemTotal = Number(item.totalWithTax ?? item.lineTotal ?? 0) || 0;
+        if (itemTotal <= 0) throw new Error(`Item ${i + 1}: budgeted purchase amount must be greater than zero`);
+        const budgetLine = resolvedBudgetLines.get(i);
+        const encumbrance = await BudgetService.createEncumbrance(companyId, {
+          budget_id: itemBudgetId,
+          budget_line_id: itemBudgetLineId,
+          account_id: item.accountId || budgetLine?.account_id,
+          source_type: 'purchase',
+          source_id: purchase._id.toString(),
+          source_number: purchase.purchaseNumber || purchase._id.toString(),
+          description: `Direct purchase ${purchase.purchaseNumber || ''} - ${item.product?.name || 'Item'}`,
+          amount: itemTotal,
+          expected_liquidation_date: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+          notes: 'Commitment created from direct purchase',
+        }, req.user.id);
+        item.encumbrance_id = String(encumbrance._id);
+        createdEncumbrances.push(encumbrance);
       }
+      if (createdEncumbrances.length) await purchase.save();
+    } catch (encErr) {
+      await Promise.allSettled(createdEncumbrances.map((encumbrance) =>
+        BudgetService.releaseEncumbrance(companyId, 'purchase', purchase._id.toString(),
+          'Direct purchase creation rolled back after a budget line failed', req.user.id, encumbrance._id)));
+      await purchase.deleteOne();
+      return res.status(400).json({ success: false, message: encErr.message || 'Unable to reserve the selected budget lines' });
     }
 
     // Create journal entry for the purchase (Inventory + VAT Debit, Accounts Payable Credit)
@@ -599,10 +617,12 @@ exports.receivePurchase = async (req, res, next) => {
                   purchase._id.toString(),
                   {
                     document_type: 'purchase_received',
-                    document_id: purchase._id.toString(),
-                    document_number: purchase.purchaseNumber,
-                    amount: parseFloat(item.totalWithTax?.toString?.() || item.totalWithTax || 0),
-                    notes: `Purchase received and confirmed`
+                  document_id: purchase._id.toString(),
+                  document_number: purchase.purchaseNumber,
+                  amount: parseFloat(item.totalWithTax?.toString?.() || item.totalWithTax || 0),
+                  encumbrance_id: item.encumbrance_id || undefined,
+                  budget_line_id: item.budget_line_id || undefined,
+                  notes: `Purchase received and confirmed`
                   },
                   req.user.id
                 );
@@ -923,36 +943,8 @@ exports.recordPayment = async (req, res, next) => {
       // Don't fail the payment if journal entry fails
     }
 
-    // Liquidate encumbrances and update budget actuals for paid items
-    if (purchase.items && purchase.items.length > 0) {
-      try {
-        const BudgetService = require('../services/budgetService');
-        for (const item of purchase.items) {
-          if (item.encumbrance_id) {
-            try {
-              await BudgetService.liquidateEncumbrance(
-                companyId,
-                'purchase',
-                purchase._id.toString(),
-                {
-                  document_type: 'purchase_payment',
-                  document_id: purchase._id.toString(),
-                  document_number: purchase.purchaseNumber,
-                  amount: parseFloat(item.totalWithTax?.toString?.() || item.totalWithTax || 0),
-                  notes: `Payment recorded for purchase ${purchase.purchaseNumber}`
-                },
-                req.user.id
-              );
-              console.log(`[Purchase Payment] Liquidated encumbrance ${item.encumbrance_id} for item`);
-            } catch (liqErr) {
-              console.error('Error liquidating encumbrance on payment:', liqErr);
-            }
-          }
-        }
-      } catch (encErr) {
-        console.error('Error processing encumbrance liquidation on payment:', encErr);
-      }
-    }
+    // Payment settles the supplier liability; budget actuals are recognized on
+    // receipt and must not be counted again when cash is paid.
 
     // Auto-create APPayment for system-generated ledger record
     let autoPayment = null;
@@ -1044,45 +1036,31 @@ exports.cancelPurchase = async (req, res, next) => {
       });
     }
 
-    // Reverse stock if it was added
     if (purchase.stockAdded) {
-      for (const item of purchase.items) {
-        const productId = item.product?._id || item.product;
-        const qty = Number(item.quantity ?? item.qty ?? 0) || 0;
-        if (!productId || qty <= 0) continue;
+      return res.status(409).json({
+        success: false,
+        message: "Received purchases cannot be cancelled. Create a purchase return or supplier credit note so stock, accounts payable, and project actuals are reversed together.",
+      });
+    }
+    if (Number(purchase.amountPaid || 0) > 0) {
+      return res.status(409).json({
+        success: false,
+        message: "A purchase with payments cannot be cancelled. Record the supplier refund or credit note first.",
+      });
+    }
+    if (!['draft', 'ordered'].includes(purchase.status)) {
+      return res.status(409).json({ success: false, message: "Only unreceived draft or ordered purchases can be cancelled" });
+    }
 
-        const product = await Product.findOne({
-          _id: productId,
-          company: companyId,
-        });
-
-        if (product) {
-          const previousStock = product.currentStock;
-          const newStock = Math.max(0, previousStock - qty);
-
-          // Create reversal stock movement
-          await StockMovement.create({
-            company: companyId,
-            product: product._id,
-            type: "out",
-            reason: "return",
-            quantity: qty,
-            previousStock,
-            newStock,
-            unitCost: item.unitCost,
-            totalCost: item.totalWithTax ?? item.lineTotal,
-            referenceType: "purchase",
-            referenceNumber: purchase.purchaseNumber,
-            referenceDocument: purchase._id,
-            referenceModel: "Purchase",
-            notes: `Purchase ${purchase.purchaseNumber} cancelled - Stock reversal`,
-            performedBy: req.user.id,
-          });
-
-          product.currentStock = newStock;
-          await product.save();
-        }
-      }
+    const Encumbrance = require('../models/Encumbrance');
+    const commitments = await Encumbrance.find({
+      source_type: 'purchase', source_id: purchase._id.toString(), company_id: companyId,
+      status: { $in: ['active', 'partially_liquidated'] },
+    });
+    const BudgetService = require('../services/budgetService');
+    for (const commitment of commitments) {
+      await BudgetService.releaseEncumbrance(companyId, 'purchase', purchase._id.toString(),
+        `Direct purchase ${purchase.purchaseNumber} cancelled`, req.user.id, commitment._id);
     }
 
     // Update supplier outstanding balance

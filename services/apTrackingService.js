@@ -21,7 +21,9 @@ class APTrackingService {
     const supplierId = grn.supplier;
     const amount = parseFloat(grn.totalAmount) || 0;
 
-    // Get current supplier balance
+    // An event can be retried (for example, a GRN confirmation response timing out).
+    const existing = await APTransactionLedger.findOne({ company: companyId, sourceType: 'grn', sourceId: grn._id });
+    if (existing) return existing;
     const currentBalance = await this.getSupplierBalance(companyId, supplierId);
     const newBalance = currentBalance + amount;
 
@@ -65,9 +67,12 @@ class APTrackingService {
     const supplierId = payment.supplier;
     const amount = parseFloat(payment.amountPaid) || 0;
 
+    const existing = await APTransactionLedger.findOne({ company: companyId, sourceType: 'ap_payment', sourceId: payment._id });
+    if (existing) return existing;
+
     // Get current supplier balance
     const currentBalance = await this.getSupplierBalance(companyId, supplierId);
-    const newBalance = Math.max(0, currentBalance - amount);
+    const newBalance = currentBalance - amount;
 
     // Create ledger entry for payment
     const transaction = new APTransactionLedger({
@@ -93,39 +98,8 @@ class APTrackingService {
 
     await transaction.save();
 
-    // Create ledger entries for each allocation
-    const allocations = await APPaymentAllocation.find({ payment: payment._id })
-      .populate('grn', 'referenceNo grnNumber balance');
-
-    for (const alloc of allocations) {
-      const allocAmount = parseFloat(alloc.amountAllocated) || 0;
-      const grn = alloc.grn;
-
-      if (grn) {
-        const grnBalance = parseFloat(grn.balance) || 0;
-        const newGRNBalance = Math.max(0, grnBalance - allocAmount);
-
-        await APTransactionLedger.create({
-          company: companyId,
-          supplier: supplierId,
-          transactionType: 'payment_allocation',
-          transactionDate: payment.paymentDate || new Date(),
-          referenceNo: payment.referenceNo || payment.reference,
-          description: `Allocation to GRN ${grn.referenceNo || grn.grnNumber}: ${allocAmount.toFixed(2)}`,
-          amount: allocAmount,
-          direction: 'decrease',
-          grnBalanceAfter: newGRNBalance,
-          supplierBalanceAfter: newBalance,
-          grn: grn._id,
-          payment: payment._id,
-          sourceType: 'ap_allocation',
-          sourceId: alloc._id,
-          sourceReference: payment.referenceNo || payment.reference,
-          createdBy: userId,
-          reconciliationStatus: 'verified'
-        });
-      }
-    }
+    // Allocations explain which liabilities were settled; they are not separate
+    // cash/AP events. Recording them as decreases here double-counted payments.
 
     // Invalidate cache
     await this.invalidateSupplierBalanceCache(companyId, supplierId);
@@ -142,6 +116,8 @@ class APTrackingService {
     const amount = parseFloat(payment.amountPaid) || 0;
 
     // Get current supplier balance
+    const existing = await APTransactionLedger.findOne({ company: companyId, sourceType: 'ap_payment_reversal', sourceId: payment._id });
+    if (existing) return existing;
     const currentBalance = await this.getSupplierBalance(companyId, supplierId);
     const newBalance = currentBalance + amount;
 
@@ -156,7 +132,7 @@ class APTrackingService {
       amount: amount,
       direction: 'increase',
       supplierBalanceAfter: newBalance,
-      sourceType: 'ap_payment',
+      sourceType: 'ap_payment_reversal',
       sourceId: payment._id,
       sourceReference: payment.referenceNo || payment.reference,
       createdBy: userId,
@@ -185,12 +161,17 @@ class APTrackingService {
       return parseFloat(cached);
     }
 
-    const latestEntry = await APTransactionLedger.findOne({
-      company: companyId,
-      supplier: supplierId
-    }).sort({ transactionDate: -1, createdAt: -1 });
-
-    const balance = latestEntry ? parseFloat(latestEntry.supplierBalanceAfter) : 0;
+    // Balance is the sum of posted source events, not the most recently dated
+    // snapshot: backdated invoices/payments must not rewrite the current AP.
+    // Historical allocation detail rows duplicated the payment decrease, so
+    // exclude that legacy detail event from the authoritative balance.
+    const rows = await dbClient().$queryRawUnsafe(`
+      SELECT COALESCE(SUM(CASE WHEN direction = 'increase' THEN amount ELSE -amount END), 0)::double precision AS balance
+        FROM ap_transaction_ledger
+       WHERE company_id = $1 AND supplier_id = $2
+         AND transaction_type <> 'payment_allocation'
+    `, String(companyId), String(supplierId));
+    const balance = Number(rows?.[0]?.balance || 0);
 
     // Cache for 5 minutes
     await cacheService.set(cacheKey, balance.toString(), 300);

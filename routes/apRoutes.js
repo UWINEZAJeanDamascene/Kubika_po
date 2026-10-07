@@ -2,12 +2,15 @@ const express = require('express');
 const router = express.Router();
 const apController = require('../controllers/apController');
 const { protect } = require('../middleware/authMiddleware');
+const paymentController = require('../controllers/apPaymentController');
+const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
+const logAction = require('../middleware/logAction');
 
 // All routes require authentication
 router.use(protect);
 
 /**
- * AP Routes - Read-Only Reporting Module
+ * AP reporting and supplier payment lifecycle.
  *
  * Core Principle: AP is an auto-generated ledger, NOT a transaction entry module.
  * All AP movements originate from source documents:
@@ -19,10 +22,16 @@ router.use(protect);
  * These endpoints return reports only. No manual transaction entry here.
  */
 
-// GET /api/ap/aging - AP aging report
-router.get('/aging', apController.getAgingReport);
+router.get('/aging', requirePermissionOrRoles('ap_payments', 'read', ['admin', 'accountant']), apController.getAgingReport);
 
 // GET /api/ap/statement/:supplier_id - Supplier statement
-router.get('/statement/:supplier_id', apController.getSupplierStatement);
+router.get('/statement/:supplier_id', requirePermissionOrRoles('ap_payments', 'read', ['admin', 'accountant']), apController.getSupplierStatement);
+
+router.get('/payments', requirePermissionOrRoles('ap_payments', 'read', ['admin', 'accountant']), paymentController.list);
+router.get('/payments/:id', requirePermissionOrRoles('ap_payments', 'read', ['admin', 'accountant']), paymentController.get);
+router.post('/payments', requirePermissionOrRoles('ap_payments', 'create', ['admin', 'accountant']), logAction('ap_payment'), paymentController.create);
+router.put('/payments/:id', requirePermissionOrRoles('ap_payments', 'update', ['admin', 'accountant']), logAction('ap_payment'), paymentController.update);
+router.post('/payments/:id/post', requirePermissionOrRoles('ap_payments', 'create', ['admin', 'accountant']), logAction('ap_payment'), paymentController.post);
+router.post('/payments/:id/reverse', requirePermissionOrRoles('ap_payments', 'update', ['admin', 'accountant']), logAction('ap_payment'), paymentController.reverse);
 
 module.exports = router;

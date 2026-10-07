@@ -241,6 +241,33 @@ class BudgetService {
     return budgetLine;
   }
 
+  // Supplier returns reverse the receipt's project/budget actual. The AP
+  // settlement itself must not affect project spend; only the accepted return
+  // quantity reverses the original receipt actual.
+  static async reverseActualConsumptionToLine({ companyId, budgetLineId, amount, document_id, document_number, source_id, source_number, created_by, notes }) {
+    const numericAmount = parseFloat(amount);
+    if (!Number.isFinite(numericAmount) || numericAmount <= 0) return null;
+    const budgetLine = await BudgetLine.findById(budgetLineId);
+    if (!budgetLine) throw new Error(`BUDGET_LINE_NOT_FOUND:${budgetLineId}`);
+    const currentActual = parseFloat(budgetLine.actual_amount?.toString() || '0');
+    if (numericAmount > currentActual + 0.01) throw new Error(`RETURN_EXCEEDS_PROJECT_ACTUAL:${budgetLineId}`);
+    budgetLine.actual_amount = Math.max(0, currentActual - numericAmount).toString();
+    await budgetLine.save();
+    const reversal = new BudgetActualConsumption({
+      company_id: companyId, budget_id: budgetLine.budget_id,
+      budget_line_id: budgetLine._id, account_id: budgetLine.account_id,
+      project_id: budgetLine.project_id || null, wbs_code: budgetLine.wbs_code || null,
+      origin_type: 'purchase_return', document_type: 'purchase_return',
+      document_id: String(document_id), document_number: document_number || '',
+      document_date: new Date(), amount: -numericAmount,
+      source_type: 'purchase_return', source_id: String(source_id),
+      source_number: source_number || '', notes: notes || '', created_by: created_by || null,
+    });
+    await reversal.save();
+    if (budgetLine.project_id) await projectService.updateBudgetSpentForProjects(companyId, [budgetLine.project_id]);
+    return budgetLine;
+  }
+
   static async getActualConsumptions(companyId, budgetId, filters = {}) {
     const query = { company_id: companyId, budget_id: budgetId };
 
@@ -3362,6 +3389,7 @@ class BudgetService {
     const existingEncumbrance = await Encumbrance.findOne({
       source_type: source_type,
       source_id: source_id.toString(),
+      budget_line_id: new mongoose.Types.ObjectId(budget_line_id),
       company_id: companyId
     });
 
@@ -3401,18 +3429,21 @@ class BudgetService {
   }
 
   static async liquidateEncumbrance(companyId, sourceType, sourceId, data, userId) {
-    const { document_type, document_id, document_number, amount, date, notes } = data;
+    const { document_type, document_id, document_number, amount, date, notes, budget_line_id, encumbrance_id } = data;
 
     if (!document_type || !document_id || !amount) {
       throw new Error('MISSING_LIQUIDATION_FIELDS');
     }
 
     // Find encumbrance by source
-    const encumbrance = await Encumbrance.findOne({
+    const lookup = {
       source_type: sourceType,
       source_id: sourceId.toString(),
       company_id: companyId
-    });
+    };
+    if (encumbrance_id) lookup._id = encumbrance_id;
+    else if (budget_line_id) lookup.budget_line_id = budget_line_id;
+    const encumbrance = await Encumbrance.findOne(lookup);
 
     if (!encumbrance) {
       throw new Error('ENCUMBRANCE_NOT_FOUND');
@@ -3525,12 +3556,14 @@ class BudgetService {
     return summary;
   }
 
-  static async releaseEncumbrance(companyId, sourceType, sourceId, reason, userId) {
-    const encumbrance = await Encumbrance.findOne({
+  static async releaseEncumbrance(companyId, sourceType, sourceId, reason, userId, encumbranceId = null) {
+    const lookup = {
       source_type: sourceType,
       source_id: sourceId.toString(),
       company_id: companyId
-    });
+    };
+    if (encumbranceId) lookup._id = encumbranceId;
+    const encumbrance = await Encumbrance.findOne(lookup);
 
     if (!encumbrance) {
       throw new Error('ENCUMBRANCE_NOT_FOUND');

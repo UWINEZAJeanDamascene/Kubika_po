@@ -2788,6 +2788,13 @@ model APPayment {
   status                String                @default("draft")
   journalEntryId        String?               @map("journal_entry_id") @db.Char(24)
   reverseJournalEntryId String?               @map("reverse_journal_entry_id") @db.Char(24)
+  externalReference     String?               @map("external_reference")
+  notes                 String?
+  postedById            String?               @map("posted_by") @db.Char(24)
+  postedAt              DateTime?             @map("posted_at") @db.Timestamptz(3)
+  reversedById          String?               @map("reversed_by") @db.Char(24)
+  reversedAt            DateTime?             @map("reversed_at") @db.Timestamptz(3)
+  reversalReason        String?               @map("reversal_reason")
   unallocatedAmount     Decimal               @default(0) @map("unallocated_amount") @db.Decimal(19, 2)
   createdById           String?               @map("created_by") @db.Char(24)
   createdAt             DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)

@@ -267,7 +267,9 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
 
       totalReturnNet += Number(line.unitCost) * line.qtyReturned;
       // Tax: find tax from original GRN/PO line if available
-      const poLine = await PurchaseOrder.findOne({ 'lines._id': grnLine.purchaseOrderLine }).then(po => po ? po.lines.id(grnLine.purchaseOrderLine) : null);
+      const poLine = grn.purchaseOrder
+        ? await PurchaseOrder.findOne({ _id: grn.purchaseOrder, company: companyId }).then(po => po ? po.lines.id(grnLine.purchaseOrderLine) : null)
+        : null;
       const taxRate = poLine ? (poLine.taxRate || 0) : 0;
       const lineTax = Number(line.unitCost) * line.qtyReturned * (taxRate/100);
       totalReturnTax += lineTax;
@@ -313,6 +315,27 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
       pr.subtotal = totalReturnNet;
       pr.taxAmount = totalReturnTax;
       pr.totalAmount = totalReturnNet + totalReturnTax;
+      // Reverse the project/budget actual recognized when these goods were
+      // received. Supplier cash refunds and credit settlement do not create a
+      // second project actual; this is tied to the accepted physical return.
+      const BudgetService = require('../services/budgetService');
+      for (const line of pr.lines || []) {
+        const returnedGrnLine = grn.lines.id(line.grnLine);
+        if (!returnedGrnLine?.purchaseOrderLine) continue;
+        const poLine = grn.purchaseOrder
+          ? await PurchaseOrder.findOne({ _id: grn.purchaseOrder, company: companyId }).then(po => po ? po.lines.id(returnedGrnLine.purchaseOrderLine) : null)
+          : null;
+        if (!poLine?.budget_line_id) continue;
+        const rate = Number(poLine.taxRate) || 0;
+        const amount = Number((Number(line.qtyReturned || 0) * Number(line.unitCost || 0) * (1 + rate / 100)).toFixed(2));
+        await BudgetService.reverseActualConsumptionToLine({
+          companyId, budgetLineId: poLine.budget_line_id, amount,
+          document_id: pr._id, document_number: pr.referenceNo,
+          source_id: pr._id, source_number: pr.referenceNo,
+          created_by: req.user.id,
+          notes: `Accepted supplier return ${pr.referenceNo} against GRN ${grn.referenceNo}`,
+        });
+      }
       await pr.save(opts);
 
       return pr;

@@ -38,12 +38,10 @@ class APService {
       WITH grn_balances AS (
         SELECT g.supplier_id,
                s.name AS supplier_name,
-               GREATEST(g.balance - COALESCE(SUM(a.amount_allocated), 0), 0)::double precision AS balance,
+               GREATEST(g.balance, 0)::double precision AS balance,
                COALESCE(g.payment_due_date, g.received_date)::date AS due_date
           FROM goods_received_notes g
           JOIN suppliers s ON s.id = g.supplier_id
-          LEFT JOIN ap_payment_allocations a
-            ON a.grn_id = g.id AND a.company_id = g.company_id
          WHERE g.company_id = $1
            AND g.payment_status IN ('pending', 'partially_paid')
            AND g.balance > 0
@@ -147,6 +145,7 @@ class APService {
     const payments = await APPayment.find({
       supplier: supplierId,
       company: companyId,
+      status: 'posted',
     }).sort({ paymentDate: -1 });
 
     const paymentIds = payments.map((p) => p._id);
