@@ -1697,6 +1697,7 @@ function grnTranslateCreate(data) {
       landedUnitCost: line.landedUnitCost ?? null,
       taxRate: line.taxRate ?? 0,
       batchNo: line.batchNo ?? null,
+      serialNumbers: Array.isArray(line.serialNumbers) ? line.serialNumbers : [],
     }));
 }
 

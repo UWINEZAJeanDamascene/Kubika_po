@@ -8,6 +8,7 @@ const {
   purchaseOrderToApi,
   purchaseToApi,
   purchaseTranslateUpdate,
+  grnTranslateCreate,
   grnToApi,
   arReceiptAllocationToApi,
 } = require('../utils/salesApMappers');
@@ -165,6 +166,25 @@ describe('Phase 5+6 sales/AP mappers', () => {
       updatedAt: new Date(),
     });
     expect(api.totalAmount).toBe('590.00');
+  });
+
+  test('grnTranslateCreate persists serial numbers on receipt lines', async () => {
+    const payload = await grnTranslateCreate({
+      company: 'company-1',
+      referenceNo: 'GRN-2026-00001',
+      purchaseOrder: 'po-1',
+      warehouse: 'warehouse-1',
+      supplier: 'supplier-1',
+      lines: [{
+        product: 'product-1',
+        purchaseOrderLine: 'po-line-1',
+        qtyReceived: 2,
+        unitCost: 10,
+        serialNumbers: ['SN-001', 'SN-002'],
+      }],
+    });
+
+    expect(payload.lines.create[0].serialNumbers).toEqual(['SN-001', 'SN-002']);
   });
 
   test('arReceiptAllocationToApi', () => {
