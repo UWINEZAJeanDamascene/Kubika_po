@@ -1225,7 +1225,9 @@ exports.confirmDelivery = async (req, res, next) => {
       }
 
       // Save delivery note lines
-      deliveryNote.lines.forEach((line) => line.markModified("unitCost"));
+      deliveryNote.lines.forEach((line) => {
+        if (typeof line.markModified === "function") line.markModified("unitCost");
+      });
       await deliveryNote.save({ session });
 
       // ========== POST COGS ADJUSTMENTS ==========
