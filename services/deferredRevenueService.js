@@ -24,6 +24,7 @@ class DeferredRevenueService {
     const items = await DeferredRevenue.find(query)
       .sort({ createdAt: -1 })
       .populate('journalEntryId', 'entryNumber date status')
+      .populate('recognitions.journalEntryId', 'entryNumber date status')
       .populate('createdBy', 'name email');
 
     return items;
@@ -119,6 +120,41 @@ class DeferredRevenueService {
 
     await item.save();
     return item;
+  }
+
+  /** Post every recognition whose scheduled date has arrived. */
+  static async postDueRecognitions(now = new Date()) {
+    const dueItems = await DeferredRevenue.find({ status: 'active' }).sort({ company: 1, _id: 1 });
+    const result = { posted: 0, failed: 0 };
+
+    for (const item of dueItems) {
+      const due = (item.recognitions || []).filter((recognition) =>
+        recognition.status === 'pending'
+        && recognition.date
+        && new Date(recognition.date).getTime() <= now.getTime(),
+      );
+      for (const recognition of due) {
+        try {
+          const userId = item.createdBy?._id || item.createdBy || item.createdById;
+          if (!userId) throw new Error('Deferred revenue has no creator for journal attribution');
+          await this.postRecognition(
+            item.company?._id || item.company,
+            userId,
+            item._id,
+            recognition._id,
+          );
+          result.posted += 1;
+        } catch (error) {
+          result.failed += 1;
+          console.error(
+            `[deferred-revenue] Failed to post ${item.referenceNo} recognition ${recognition._id}:`,
+            error.message || error,
+          );
+        }
+      }
+    }
+
+    return result;
   }
 
   static async delete(companyId, id) {

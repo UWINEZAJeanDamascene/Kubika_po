@@ -30,9 +30,10 @@ async function startWorker() {
   // Schedulers below were previously blocked on Mongoose-only models. Notification
   // and NotificationSettings are now Prisma-backed (migration
   // 20260831222643_add_notification_models), and every other model these touch —
-  // ReportSnapshot, EbmSubmissionQueue, RecurringInvoice, Company, Invoice,
-  // Product, User — was already on PostgreSQL. Each start is guarded so one
-  // failing scheduler cannot take the worker down with it.
+  // ReportSnapshot, EbmSubmissionQueue, RecurringInvoice, DeferredRevenue,
+  // JournalEntry, BankAccount, Company, Invoice, Product, User — was already
+  // on PostgreSQL. Each start is guarded so one failing scheduler cannot take
+  // the worker down with it.
   const started = [];
   const startSafely = (label, fn) => {
     try {
@@ -45,6 +46,7 @@ async function startWorker() {
 
   startSafely('notifications', () => require('./services/notificationScheduler').startScheduler());
   startSafely('prepaid-expense-amortizations', () => require('./services/prepaidExpenseScheduler').startScheduler());
+  startSafely('deferred-revenue-recognitions', () => require('./services/deferredRevenueScheduler').startScheduler());
   startSafely('ebm-retry', () => require('./services/ebmRetryJob').startRetryJob());
   startSafely('report-snapshots', () => require('./services/reportSchedulerService').initializeScheduler());
   startSafely('ai-monitoring', () => require('./services/aiMonitoringScheduler').startMonitoringScheduler());
@@ -120,6 +122,7 @@ async function shutdown(signal) {
     stopSafely('report-snapshots', () => require('./services/reportSchedulerService').stopScheduler());
     stopSafely('notifications', () => require('./services/notificationScheduler').stopScheduler());
     stopSafely('prepaid-expense-amortizations', () => require('./services/prepaidExpenseScheduler').stopScheduler());
+    stopSafely('deferred-revenue-recognitions', () => require('./services/deferredRevenueScheduler').stopScheduler());
     stopSafely('ai-monitoring', () => require('./services/aiMonitoringScheduler').stopMonitoringScheduler());
     // closeWorkers() is async; awaiting it lets in-flight jobs finish rather
     // than being killed mid-write.
