@@ -717,6 +717,7 @@ exports.confirmGRN = async (req, res, next) => {
         unitCost: line.landedUnitCost,
         totalCost: line.landedUnitCost * line.qtyReceived,
         warehouse: grn.warehouse,
+        supplier: grn.supplier,
         referenceType: "purchase_order",
         referenceNumber: po.referenceNo,
         referenceDocument: po._id,

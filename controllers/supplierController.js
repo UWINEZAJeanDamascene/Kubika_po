@@ -1,5 +1,6 @@
 const Supplier = require('../models/Supplier');
 const StockMovement = require('../models/StockMovement');
+const PurchaseOrder = require('../models/PurchaseOrder');
 
 // @desc    Get all suppliers
 // @route   GET /api/suppliers
@@ -231,11 +232,26 @@ exports.getSupplierPurchaseHistory = async (req, res, next) => {
       });
     }
     
-    const query = { 
-      supplier: req.params.id,
+    const supplierId = req.params.id;
+    const purchaseOrders = await PurchaseOrder.find({
+      supplier: supplierId,
+      company: companyId,
+    }).select('_id');
+    const purchaseOrderIds = purchaseOrders.map((purchaseOrder) => purchaseOrder._id);
+
+    const query = {
       company: companyId,
       type: 'in',
-      reason: 'purchase'
+      reason: 'purchase',
+      $or: [
+        { supplier: supplierId },
+        ...(purchaseOrderIds.length
+          ? [{
+            referenceModel: 'PurchaseOrder',
+            referenceDocument: { $in: purchaseOrderIds },
+          }]
+          : []),
+      ],
     };
 
     if (startDate || endDate) {
