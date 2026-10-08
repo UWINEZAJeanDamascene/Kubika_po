@@ -2427,6 +2427,11 @@ model DeliveryNoteLine {
   serialNumbers  Json         @default("[]") @map("serial_numbers")
   unitCost       Decimal      @default(0) @map("unit_cost") @db.Decimal(19, 6)
   unitPrice      Decimal      @default(0) @map("unit_price") @db.Decimal(19, 6)
+  discountPct    Decimal      @default(0) @map("discount_pct") @db.Decimal(19, 4)
+  taxRate        Decimal      @default(0) @map("tax_rate") @db.Decimal(19, 4)
+  taxCode        String       @default("A") @map("tax_code")
+  lineSubtotal   Decimal      @default(0) @map("line_subtotal") @db.Decimal(19, 2)
+  lineTax        Decimal      @default(0) @map("line_tax") @db.Decimal(19, 2)
   lineTotal      Decimal      @default(0) @map("line_total") @db.Decimal(19, 2)
   notes          String?
   deliveryNote   DeliveryNote @relation(fields: [deliveryNoteId], references: [id], onDelete: Cascade)

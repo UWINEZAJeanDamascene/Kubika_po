@@ -789,7 +789,11 @@ exports.completePacking = async (req, res, next) => {
 
         const qtyToDeliver = Number(line.qtyPacked) || 0;
       const unitPrice = soLine?.unitPrice != null ? Number(soLine.unitPrice) : Number(line.product?.sellingPrice) || 0;
-      deliveryLines.push({
+        const discountPct = Number(soLine?.discountPct || 0);
+        const taxRate = Number(soLine?.taxRate ?? line.product?.taxRate ?? 0);
+        const lineSubtotal = Math.round(qtyToDeliver * unitPrice * (1 - discountPct / 100) * 100) / 100;
+        const lineTax = Math.round(lineSubtotal * taxRate / 100 * 100) / 100;
+        deliveryLines.push({
           salesOrderLineId: String(soLine?._id || soLine?.id || line.salesOrderLineId || ''),
           product: productId,
           productName,
@@ -798,8 +802,13 @@ exports.completePacking = async (req, res, next) => {
           qtyToDeliver,
           deliveredQty: 0,
           unitPrice,
+          discountPct,
+          taxRate,
+          taxCode: line.product?.taxCode || 'A',
+          lineSubtotal,
+          lineTax,
           unitCost: 0,
-          lineTotal: qtyToDeliver * unitPrice,
+          lineTotal: lineSubtotal + lineTax,
           batchId: line.batchId || null,
           serialNumbers: line.serialNumbers || [],
         });

@@ -12,11 +12,72 @@ const {
   grnTranslateCreate,
   grnToApi,
   arReceiptAllocationToApi,
+  deliveryNoteToApi,
+  deliveryNoteTranslateCreate,
 } = require('../utils/salesApMappers');
 const { buildLineInclude } = require('../utils/salesApCommon');
 const { makeCompatModel } = require('../utils/prismaCompat');
 
 describe('Phase 5+6 sales/AP mappers', () => {
+  test('preserves delivery note line tax snapshots through database mapping', async () => {
+    const source = {
+      id: 'dn1',
+      companyId: 'c1',
+      referenceNo: 'DN-1',
+      clientId: 'cl1',
+      warehouseId: 'w1',
+      status: 'draft',
+      lines: [{
+        id: 'dnl1',
+        productId: 'p1',
+        qtyToDeliver: 2,
+        unitPrice: 100,
+        discountPct: 10,
+        taxRate: 18,
+        taxCode: 'A',
+        lineSubtotal: 180,
+        lineTax: 32.4,
+        lineTotal: 212.4,
+      }],
+    };
+
+    const api = deliveryNoteToApi(source);
+    const created = await deliveryNoteTranslateCreate({
+      referenceNo: 'DN-TEST',
+      company: 'c1',
+      client: 'cl1',
+      warehouse: 'w1',
+      lines: [{
+        product: 'p1',
+        qtyToDeliver: 2,
+        unitPrice: 100,
+        discountPct: 10,
+        taxRate: 18,
+        taxCode: 'A',
+        lineSubtotal: 180,
+        lineTax: 32.4,
+        lineTotal: 212.4,
+      }],
+    });
+
+    expect(api.lines[0]).toEqual(expect.objectContaining({
+      discountPct: 10,
+      taxRate: 18,
+      taxCode: 'A',
+      lineSubtotal: 180,
+      lineTax: 32.4,
+      lineTotal: 212.4,
+    }));
+    expect(created.lines.create[0]).toEqual(expect.objectContaining({
+      discountPct: 10,
+      taxRate: 18,
+      taxCode: 'A',
+      lineSubtotal: 180,
+      lineTax: 32.4,
+      lineTotal: 212.4,
+    }));
+  });
+
   test('keeps sales order line count in a header-only list projection', async () => {
     let capturedQuery;
     const delegate = {

@@ -41,6 +41,21 @@ const toNumber = (value) => {
   if (typeof value === 'string') return parseFloat(value) || 0;
   return 0;
 };
+const taxSnapshotForQuantity = (invoiceLine, quantity) => {
+  const unitPrice = toNumber(invoiceLine.unitPrice);
+  const discountPct = toNumber(invoiceLine.discountPct);
+  const taxRate = toNumber(invoiceLine.taxRate);
+  const lineSubtotal = Math.round(quantity * unitPrice * (1 - discountPct / 100) * 100) / 100;
+  const lineTax = Math.round(lineSubtotal * taxRate / 100 * 100) / 100;
+  return {
+    discountPct,
+    taxRate,
+    taxCode: invoiceLine.taxCode || 'A',
+    lineSubtotal,
+    lineTax,
+    lineTotal: lineSubtotal + lineTax,
+  };
+};
 const ERR_COGS_ADJUSTMENT_FAILED = "ERR_COGS_ADJUSTMENT_FAILED";
 
 const normalizeId = (value) => {
@@ -65,11 +80,11 @@ async function hydrateDeliveryNoteRelations(docOrDocs) {
   const [clients, quotations, salesOrders, invoices, warehouses, users, products] = await Promise.all([
     clientIds.length ? Client.find({ _id: { $in: clientIds } }, 'name code contact taxId address type email').lean() : [],
     quotationIds.length ? Quotation.find({ _id: { $in: quotationIds } }, 'referenceNo status items').lean() : [],
-    salesOrderIds.length ? require('../models/SalesOrder').find({ _id: { $in: salesOrderIds } }, 'referenceNo quotation status').lean() : [],
+    salesOrderIds.length ? require('../models/SalesOrder').find({ _id: { $in: salesOrderIds } }, 'referenceNo quotation status lines').lean() : [],
     invoiceIds.length ? Invoice.find({ _id: { $in: invoiceIds } }, 'referenceNo status grandTotal currencyCode').lean() : [],
     warehouseIds.length ? require('../models/Warehouse').find({ _id: { $in: warehouseIds } }, 'name code').lean() : [],
     userIds.length ? require('../models/User').find({ _id: { $in: userIds } }, 'name email').lean() : [],
-    productIds.length ? Product.find({ _id: { $in: productIds } }, 'name sku unit trackingType isStockable').lean() : [],
+    productIds.length ? Product.find({ _id: { $in: productIds } }, 'name sku unit trackingType isStockable taxRate taxCode').lean() : [],
   ]);
 
   const clientMap = new Map(clients.map((c) => [normalizeId(c._id), c]));
@@ -109,6 +124,23 @@ async function hydrateDeliveryNoteRelations(docOrDocs) {
     for (const line of note.lines || []) {
       const pid = normalizeId(line.product);
       if (pid && productMap.has(pid)) line.product = productMap.get(pid);
+      const salesOrderLineId = normalizeId(line.salesOrderLineId);
+      const salesOrderLine = salesOrderLineId && (note.salesOrder?.lines || []).find((candidate) =>
+        String(candidate._id || candidate.id) === salesOrderLineId,
+      );
+      const product = line.product && typeof line.product === 'object' ? line.product : null;
+      const taxRate = Number(salesOrderLine?.taxRate ?? line.taxRate ?? product?.taxRate ?? 0);
+      const discountPct = Number(salesOrderLine?.discountPct ?? line.discountPct ?? 0);
+      const qty = Number(line.qtyToDeliver || 0);
+      const unitPrice = Number(line.unitPrice || 0);
+      const subtotal = Math.round(qty * unitPrice * (1 - discountPct / 100) * 100) / 100;
+      const tax = Math.round(subtotal * taxRate / 100 * 100) / 100;
+      line.discountPct = discountPct;
+      line.taxRate = taxRate;
+      line.taxCode = salesOrderLine?.product?.taxCode || product?.taxCode || line.taxCode || 'A';
+      line.lineSubtotal = subtotal;
+      line.lineTax = tax;
+      line.lineTotal = subtotal + tax;
     }
     for (const line of note.items || []) {
       const pid = normalizeId(line.product);
@@ -507,6 +539,7 @@ exports.createDeliveryNote = async (req, res, next) => {
         const invoiceQty = toNumber(invoiceLine.quantity);
         const remainingQty = invoiceQty - alreadyDelivered;
         const qtyToDeliver = line.qtyToDeliver || remainingQty;
+        const taxSnapshot = taxSnapshotForQuantity(invoiceLine, qtyToDeliver);
 
         if (qtyToDeliver > remainingQty) {
           return res.status(422).json({
@@ -527,7 +560,7 @@ exports.createDeliveryNote = async (req, res, next) => {
           deliveredQty: 0,
           pendingQty: qtyToDeliver,
           unitPrice: toNumber(invoiceLine.unitPrice),
-          lineTotal: qtyToDeliver * toNumber(invoiceLine.unitPrice),
+          ...taxSnapshot,
           unitCost:
             invoiceQty > 0
               ? (invoiceLine.cogsAmount && invoiceLine.cogsAmount.toString
@@ -547,6 +580,7 @@ exports.createDeliveryNote = async (req, res, next) => {
         const invoiceQty = toNumber(invoiceLine.quantity);
         const remainingQty = invoiceQty - alreadyDelivered;
         if (remainingQty > 0) {
+          const taxSnapshot = taxSnapshotForQuantity(invoiceLine, remainingQty);
           deliveryLines.push({
             invoiceLineId: invoiceLine._id,
             product: invoiceLine.product,
@@ -558,7 +592,7 @@ exports.createDeliveryNote = async (req, res, next) => {
             deliveredQty: 0,
             pendingQty: remainingQty,
             unitPrice: toNumber(invoiceLine.unitPrice),
-            lineTotal: remainingQty * toNumber(invoiceLine.unitPrice),
+            ...taxSnapshot,
             unitCost:
               invoiceQty > 0
                 ? (invoiceLine.cogsAmount && invoiceLine.cogsAmount.toString
@@ -1888,13 +1922,16 @@ exports.createInvoiceFromDeliveryNote = async (req, res, next) => {
 
         // Use the unitPrice from the delivery note line (set from SO/Quotation), fallback to product.sellingPrice
         const unitPrice = line.unitPrice || product.sellingPrice || 0;
-        const subtotal = quantity * unitPrice;
-        const discountPct = 0;
-        const netAmount = subtotal;
-        const taxRate = product.taxRate || 0;
-        const taxCode = product.taxCode || "A";
-        const taxAmount = netAmount * (taxRate / 100);
-        const totalWithTax = netAmount + taxAmount;
+        const discountPct = Number(line.discountPct || 0);
+        const subtotal = Number(line.lineSubtotal) > 0
+          ? Number(line.lineSubtotal)
+          : quantity * unitPrice * (1 - discountPct / 100);
+        const taxRate = Number(line.taxRate ?? product.taxRate ?? 0);
+        const taxCode = line.taxCode || product.taxCode || "A";
+        const taxAmount = Number(line.lineTax) > 0
+          ? Number(line.lineTax)
+          : subtotal * (taxRate / 100);
+        const totalWithTax = subtotal + taxAmount;
 
         return {
           product: product._id,
