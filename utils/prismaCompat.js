@@ -481,6 +481,7 @@ const DOC_POPULATE_REFS = {
   approvedBy: 'User',
   rejectedBy: 'User',
   cancelledBy: 'User',
+  countedBy: 'User',
   performedBy: 'User',
   receivedBy: 'User',
   requestedBy: 'User',

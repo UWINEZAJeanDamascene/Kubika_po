@@ -814,7 +814,7 @@ function pettyCashTransactionToApi(row) {
     company: row.companyId,
     float: row.floatId,
     referenceNo: row.referenceNo ?? null,
-    voucherNumber: row.voucherNumber ?? null,
+    voucherNumber: row.voucherNumber ?? row.referenceNo ?? null,
     type: row.type,
     transactionDate: row.transactionDate,
     status: row.status,
@@ -860,6 +860,8 @@ async function pettyCashTransactionTranslateCreate(data) {
   const companyId = toIdString(data.company || data.companyId);
   const referenceNo = data.referenceNo
     || await nextPettyCashRef(companyId, 'PCT', 'petty_cash_transaction');
+  const voucherNumber = data.voucherNumber
+    || await nextPettyCashRef(companyId, 'PCV', 'petty_cash_voucher');
   return headerTranslateCreate(data, PETTY_CASH_TX_HEADER, [
     'floatId',
     'approvedById',
@@ -870,7 +872,7 @@ async function pettyCashTransactionTranslateCreate(data) {
     amount: moneyStr(data.amount ?? 0),
     balanceAfter: moneyStr(data.balanceAfter ?? 0),
     referenceNo,
-    voucherNumber: data.voucherNumber || null,
+    voucherNumber,
     receiptRef: data.receiptRef || data.receiptNumber || null,
     expenseAccountId: data.expenseAccountId || null,
     createdById: toIdString(data.createdBy || data.createdById),
@@ -933,7 +935,10 @@ const PETTY_CASH_RECON_HEADER = {
   journalEntryId: 'journalEntryId',
 };
 
-function pettyCashReconciliationTranslateCreate(data) {
+async function pettyCashReconciliationTranslateCreate(data) {
+  const companyId = toIdString(data.company || data.companyId);
+  const reconciliationNumber = data.reconciliationNumber
+    || await nextPettyCashRef(companyId, 'PCR', 'petty_cash_reconciliation');
   return headerTranslateCreateNoCreator(data, PETTY_CASH_RECON_HEADER, [
     'floatId',
     'countedById',
@@ -941,6 +946,7 @@ function pettyCashReconciliationTranslateCreate(data) {
     'journalEntryId',
   ], {
     floatId: resolveFloatId(data),
+    reconciliationNumber,
     systemBalance: moneyStr(data.systemBalance ?? 0),
     physicalCashTotal: moneyStr(data.physicalCashTotal ?? 0),
     difference: moneyStr(data.difference ?? 0),
