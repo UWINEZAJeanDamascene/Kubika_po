@@ -270,8 +270,8 @@ exports.getSupplierPurchaseHistory = async (req, res, next) => {
 
     // Calculate totals
     const allPurchases = await StockMovement.find(query);
-    const totalAmount = allPurchases.reduce((sum, purchase) => sum + (purchase.totalCost || 0), 0);
-    const totalQuantity = allPurchases.reduce((sum, purchase) => sum + purchase.quantity, 0);
+    const totalAmount = allPurchases.reduce((sum, purchase) => sum + (Number(purchase.totalCost) || 0), 0);
+    const totalQuantity = allPurchases.reduce((sum, purchase) => sum + (Number(purchase.quantity) || 0), 0);
 
     res.json({
       success: true,

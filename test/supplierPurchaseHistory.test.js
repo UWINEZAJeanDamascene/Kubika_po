@@ -29,8 +29,8 @@ describe('supplier purchase history', () => {
     const rows = [{
       _id: 'movement-id',
       movementDate: new Date('2026-10-08T00:00:00.000Z'),
-      quantity: 3,
-      totalCost: 300,
+      quantity: '3.0000',
+      totalCost: '300.00',
       product: { name: 'Product', sku: 'SKU-1', unit: 'each' },
     }];
     StockMovement.find.mockImplementation(() => {

@@ -794,12 +794,18 @@ exports.recordPayment = async (req, res, next) => {
       }
     }
 
+    const paymentReferenceNo = await nextReferenceNo(companyId, 'PAY', {
+      field: 'referenceNo',
+      model: 'aPPayment',
+    });
+    const paymentReference = String(reference || '').trim() || paymentReferenceNo;
+
     // Add payment
     const paymentDate = new Date();
     purchase.payments.push({
       amount,
       paymentMethod,
-      reference,
+      reference: paymentReference,
       notes,
       paidDate: paymentDate,
       date: paymentDate,
@@ -955,7 +961,6 @@ exports.recordPayment = async (req, res, next) => {
     // Auto-create APPayment for system-generated ledger record
     let autoPayment = null;
     try {
-      const refNo = `PAY-SYS-${Date.now()}-${Math.floor(Math.random() * 10000).toString().padStart(4, '0')}`;
       autoPayment = new APPayment({
         company: companyId,
         supplier: purchase.supplier,
@@ -969,8 +974,8 @@ exports.recordPayment = async (req, res, next) => {
         amountPaid: mongoose.Types.Decimal128.fromString(amount.toFixed(2)),
         currencyCode: purchase.currencyCode || "USD",
         exchangeRate: mongoose.Types.Decimal128.fromString("1"),
-        referenceNo: refNo,
-        reference: reference || `Payment for Purchase ${purchase.purchaseNumber}`,
+        referenceNo: paymentReferenceNo,
+        reference: paymentReference,
         status: "posted",
         postedBy: req.user.id,
         postedAt: new Date(),
