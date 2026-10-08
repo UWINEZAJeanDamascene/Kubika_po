@@ -1,6 +1,8 @@
 const {
   buildReturnLines,
+  buildPurchaseReturnLines,
   calculateReturnTotals,
+  calculatePurchaseReturnTotals,
   validateReturnSerialNumbers,
 } = require('../utils/purchaseReturnRules');
 const {
@@ -76,6 +78,53 @@ describe('purchase return rules', () => {
     expect(validateReturnSerialNumbers(sourceLine, 2, ['sn-001', 'Sn-002'])).toEqual(['SN-001', 'SN-002']);
     expect(() => validateReturnSerialNumbers(sourceLine, 2, ['SN-001'])).toThrow(/one available serial/);
     expect(() => validateReturnSerialNumbers(sourceLine, 1, ['SN-003'])).toThrow(/source GRN line/);
+  });
+});
+
+describe('direct purchase return rules', () => {
+  const purchase = {
+    items: [{
+      _id: 'purchase-line-1',
+      product: 'product-1',
+      qty: 8,
+      unitCost: 12.5,
+      taxRate: 10,
+    }],
+  };
+
+  test('binds return values to the source purchase and deducts confirmed quantities', () => {
+    const confirmedReturns = [{
+      _id: 'return-1',
+      lines: [{ purchaseLine: 'purchase-line-1', qtyReturned: 2 }],
+    }];
+    const lines = buildPurchaseReturnLines(purchase, [{
+      purchaseLine: 'purchase-line-1',
+      product: 'product-1',
+      qtyReturned: 3,
+      unitCost: 0.01,
+    }], confirmedReturns);
+
+    expect(lines).toEqual([{
+      purchaseLine: 'purchase-line-1',
+      product: 'product-1',
+      qtyReturned: 3,
+      unitCost: 12.5,
+      serialNumbers: [],
+    }]);
+    expect(calculatePurchaseReturnTotals(purchase, lines)).toEqual({
+      subtotal: 37.5,
+      taxAmount: 3.75,
+      totalAmount: 41.25,
+    });
+  });
+
+  test('rejects duplicate lines, product mismatches, and returns above remaining quantity', () => {
+    const line = { purchaseLine: 'purchase-line-1', product: 'product-1', qtyReturned: 1 };
+    expect(() => buildPurchaseReturnLines(purchase, [line, line])).toThrow(/once/);
+    expect(() => buildPurchaseReturnLines(purchase, [{ ...line, product: 'other-product' }])).toThrow(/does not match/);
+    expect(() => buildPurchaseReturnLines(purchase, [{ ...line, qtyReturned: 7 }], [{
+      lines: [{ purchaseLine: 'purchase-line-1', qtyReturned: 2 }],
+    }])).toThrow(/unreturned purchase quantity/);
   });
 });
 

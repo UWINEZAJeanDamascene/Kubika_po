@@ -12,6 +12,7 @@ const {
 const FIELD_MAP = {
   referenceNo: { target: 'referenceNo' },
   grn: { target: 'grnId', isId: true },
+  purchase: { target: 'purchaseId', isId: true },
   supplier: { target: 'supplierId', isId: true },
   warehouse: { target: 'warehouseId', isId: true },
   status: { target: 'status' },

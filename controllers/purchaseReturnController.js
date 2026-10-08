@@ -11,6 +11,7 @@ const Company = require('../models/Company');
 const JournalService = require('../services/journalService');
 const transactionService = require('../services/transactionService');
 const PurchaseOrder = require('../models/PurchaseOrder');
+const Purchase = require('../models/Purchase');
 const emailService = require('../services/emailService');
 const cacheService = require('../services/cacheService');
 const DEFAULT_ACCOUNTS = require('../constants/chartOfAccounts').DEFAULT_ACCOUNTS;
@@ -18,7 +19,9 @@ const { parsePagination, paginationMeta } = require('../utils/pagination');
 const { nextReferenceNo } = require('../utils/referenceNumbers');
 const {
   buildReturnLines,
+  buildPurchaseReturnLines,
   calculateReturnTotals,
+  calculatePurchaseReturnTotals,
   idOf,
   validateReturnSerialNumbers,
 } = require('../utils/purchaseReturnRules');
@@ -39,6 +42,14 @@ async function lockGRN(tx, grnId, companyId) {
   await tx.$queryRaw`
     SELECT id FROM goods_received_notes
     WHERE id = ${String(grnId)} AND company_id = ${String(companyId)}
+    FOR UPDATE`;
+}
+
+async function lockPurchase(tx, purchaseId, companyId) {
+  if (!tx) return;
+  await tx.$queryRaw`
+    SELECT id FROM purchases
+    WHERE id = ${String(purchaseId)} AND company_id = ${String(companyId)}
     FOR UPDATE`;
 }
 
@@ -165,19 +176,54 @@ exports.createPurchaseReturn = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const payload = req.body || {};
+    const hasGrn = Boolean(payload.grn);
+    const hasPurchase = Boolean(payload.purchase);
+    if (hasGrn === hasPurchase) {
+      return res.status(400).json({ success: false, message: 'Select exactly one source: a confirmed GRN or a received direct purchase.' });
+    }
 
-    // Validate GRN exists and is confirmed
-    const grn = await GoodsReceivedNote.findOne({ _id: payload.grn, company: companyId });
-    if (!grn) return res.status(404).json({ success: false, message: 'GRN not found' });
-    if (grn.status !== 'confirmed') return res.status(409).json({ success: false, message: 'Can only return against confirmed GRN' });
-
-    const confirmedReturns = await PurchaseReturn.find({
-      company: companyId,
-      grn: grn._id,
-      status: 'confirmed',
-    }).lean();
-    const lines = buildReturnLines(grn, payload.lines, confirmedReturns);
-    const totals = calculateReturnTotals(grn, lines);
+    let grn = null;
+    let purchase = null;
+    let lines;
+    let totals;
+    if (hasGrn) {
+      grn = await GoodsReceivedNote.findOne({ _id: payload.grn, company: companyId });
+      if (!grn) return res.status(404).json({ success: false, message: 'GRN not found' });
+      if (grn.status !== 'confirmed') return res.status(409).json({ success: false, message: 'Can only return against confirmed GRN' });
+      const confirmedReturns = await PurchaseReturn.find({
+        company: companyId,
+        grn: grn._id,
+        status: 'confirmed',
+      }).lean();
+      lines = buildReturnLines(grn, payload.lines, confirmedReturns);
+      totals = calculateReturnTotals(grn, lines);
+    } else {
+      purchase = await Purchase.findOne({ _id: payload.purchase, company: companyId });
+      if (!purchase) return res.status(404).json({ success: false, message: 'Purchase not found' });
+      if (purchase.status !== 'received' || !purchase.stockAdded) {
+        return res.status(409).json({ success: false, message: 'Can only return stock from a received direct purchase.' });
+      }
+      if (!purchase.warehouse) {
+        return res.status(409).json({ success: false, message: 'The direct purchase has no warehouse assigned for stock return.' });
+      }
+      const confirmedReturns = await PurchaseReturn.find({
+        company: companyId,
+        purchase: purchase._id,
+        status: 'confirmed',
+      }).lean();
+      lines = buildPurchaseReturnLines(purchase, payload.lines, confirmedReturns);
+      const sourceProducts = await Product.find({
+        _id: { $in: [...new Set(lines.map((line) => idOf(line.product)))] },
+        company: companyId,
+      });
+      if (sourceProducts.some((product) => (product.trackingType || 'none') !== 'none')) {
+        return res.status(409).json({
+          success: false,
+          message: 'Tracked products must be returned against their confirmed GRN so batch or serial traceability can be verified.',
+        });
+      }
+      totals = calculatePurchaseReturnTotals(purchase, lines);
+    }
     const reason = String(payload.reason || '').trim();
     if (!reason) {
       return res.status(400).json({ success: false, message: 'Return reason is required' });
@@ -191,9 +237,10 @@ exports.createPurchaseReturn = async (req, res, next) => {
       company: companyId,
       createdBy: req.user.id,
       status: 'draft',
-      grn: grn._id,
-      supplier: grn.supplier,
-      warehouse: grn.warehouse,
+      grn: grn?._id || null,
+      purchase: purchase?._id || null,
+      supplier: grn?.supplier || purchase?.supplier,
+      warehouse: grn?.warehouse || purchase?.warehouse,
       referenceNo: payload.referenceNo,
       returnDate: parseReturnDate(payload.returnDate),
       supplierCreditNoteNo,
@@ -205,8 +252,9 @@ exports.createPurchaseReturn = async (req, res, next) => {
     // Send email notification
     if (req.body.sendEmail && pr.status !== 'draft') {
       const company = await Company.findById(companyId);
-      const grn = await GoodsReceivedNote.findById(pr.grn);
-      const supplier = grn ? await Supplier.findById(grn.supplier) : null;
+      const sourceGrn = pr.grn ? await GoodsReceivedNote.findById(pr.grn) : null;
+      const sourcePurchase = pr.purchase ? await Purchase.findById(pr.purchase) : null;
+      const supplier = await Supplier.findById(sourceGrn?.supplier || sourcePurchase?.supplier);
       await sendPurchaseReturnEmail(pr, company, supplier, 'created');
     }
 
@@ -222,22 +270,32 @@ exports.updatePurchaseReturn = async (req, res, next) => {
     if (pr.status !== 'draft') return res.status(409).json({ success: false, message: 'Only draft returns can be edited' });
 
     const payload = req.body || {};
-    if (payload.grn || payload.supplier || payload.warehouse) {
-      return res.status(400).json({ success: false, message: 'A draft return cannot be moved to another GRN, supplier, or warehouse' });
+    if (payload.grn || payload.purchase || payload.supplier || payload.warehouse) {
+      return res.status(400).json({ success: false, message: 'A draft return cannot be moved to another source, supplier, or warehouse' });
     }
 
-    const grnId = idOf(pr.grn);
-    const grn = await GoodsReceivedNote.findOne({ _id: grnId, company: companyId });
-    if (!grn || grn.status !== 'confirmed') {
+    const isDirectPurchase = Boolean(idOf(pr.purchase));
+    const grn = isDirectPurchase
+      ? null
+      : await GoodsReceivedNote.findOne({ _id: idOf(pr.grn), company: companyId });
+    const purchase = isDirectPurchase
+      ? await Purchase.findOne({ _id: idOf(pr.purchase), company: companyId })
+      : null;
+    if (!isDirectPurchase && (!grn || grn.status !== 'confirmed')) {
       return res.status(409).json({ success: false, message: 'The source GRN is no longer available for return' });
+    }
+    if (isDirectPurchase && (!purchase || purchase.status !== 'received' || !purchase.stockAdded)) {
+      return res.status(409).json({ success: false, message: 'The source direct purchase is no longer available for return' });
     }
     const confirmedReturns = await PurchaseReturn.find({
       company: companyId,
-      grn: grn._id,
+      ...(isDirectPurchase ? { purchase: idOf(pr.purchase) } : { grn: grn?._id }),
       status: 'confirmed',
     }).lean();
     if (payload.lines !== undefined) {
-      pr.lines = buildReturnLines(grn, payload.lines, confirmedReturns, pr._id);
+      pr.lines = isDirectPurchase
+        ? buildPurchaseReturnLines(purchase, payload.lines, confirmedReturns, pr._id)
+        : buildReturnLines(grn, payload.lines, confirmedReturns, pr._id);
     }
     if (payload.referenceNo !== undefined) pr.referenceNo = String(payload.referenceNo).trim();
     if (payload.returnDate !== undefined) pr.returnDate = parseReturnDate(payload.returnDate);
@@ -246,7 +304,9 @@ exports.updatePurchaseReturn = async (req, res, next) => {
       if (!reason) return res.status(400).json({ success: false, message: 'Return reason is required' });
       pr.reason = reason;
     }
-    const totals = calculateReturnTotals(grn, pr.lines || []);
+    const totals = isDirectPurchase
+      ? calculatePurchaseReturnTotals(purchase, pr.lines || [])
+      : calculateReturnTotals(grn, pr.lines || []);
     pr.totalAmount = totals.totalAmount;
     await pr.save();
     res.json({ success: true, data: pr });
@@ -270,27 +330,52 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
       throw Object.assign(new Error('Only draft purchase returns can be confirmed'), { status: 409 });
     }
 
-    await lockGRN(sess, idOf(pr.grn), companyId);
-    // Load GRN
-    const grnQuery = GoodsReceivedNote.findOne({ _id: idOf(pr.grn), company: companyId });
-    const grn = useSession ? await grnQuery.session(sess) : await grnQuery;
-    if (!grn) throw Object.assign(new Error('GRN not found'), { status: 404 });
-    if (grn.status !== 'confirmed') throw Object.assign(new Error('Cannot return against unconfirmed GRN'), { status: 409 });
+    const isDirectPurchase = Boolean(idOf(pr.purchase));
+    let grn = null;
+    let purchase = null;
+    let sourceWarehouse;
+    let sourceReference;
+    if (isDirectPurchase) {
+      await lockPurchase(sess, idOf(pr.purchase), companyId);
+      const purchaseQuery = Purchase.findOne({ _id: idOf(pr.purchase), company: companyId });
+      purchase = useSession ? await purchaseQuery.session(sess) : await purchaseQuery;
+      if (!purchase) throw Object.assign(new Error('Source purchase not found'), { status: 404 });
+      if (purchase.status !== 'received' || !purchase.stockAdded) {
+        throw Object.assign(new Error('Cannot return stock from a purchase that has not been received'), { status: 409 });
+      }
+      if (!purchase.warehouse) {
+        throw Object.assign(new Error('The source purchase has no warehouse assigned for stock return'), { status: 409 });
+      }
+      sourceWarehouse = idOf(purchase.warehouse);
+      sourceReference = purchase.purchaseNumber;
+    } else {
+      await lockGRN(sess, idOf(pr.grn), companyId);
+      const grnQuery = GoodsReceivedNote.findOne({ _id: idOf(pr.grn), company: companyId });
+      grn = useSession ? await grnQuery.session(sess) : await grnQuery;
+      if (!grn) throw Object.assign(new Error('GRN not found'), { status: 404 });
+      if (grn.status !== 'confirmed') throw Object.assign(new Error('Cannot return against unconfirmed GRN'), { status: 409 });
+      sourceWarehouse = idOf(grn.warehouse);
+      sourceReference = grn.referenceNo;
+    }
 
     const confirmedReturnsQuery = PurchaseReturn.find({
       company: companyId,
       status: 'confirmed',
-      grn: idOf(pr.grn),
+      ...(isDirectPurchase ? { purchase: idOf(pr.purchase) } : { grn: idOf(pr.grn) }),
     });
     const confirmedReturns = useSession
       ? await confirmedReturnsQuery.session(sess).lean()
       : await confirmedReturnsQuery.lean();
-    const returnLines = buildReturnLines(grn, pr.lines || [], confirmedReturns, pr._id);
-    const returnTotals = calculateReturnTotals(grn, returnLines);
+    const returnLines = isDirectPurchase
+      ? buildPurchaseReturnLines(purchase, pr.lines || [], confirmedReturns, pr._id)
+      : buildReturnLines(grn, pr.lines || [], confirmedReturns, pr._id);
+    const returnTotals = isDirectPurchase
+      ? calculatePurchaseReturnTotals(purchase, returnLines)
+      : calculateReturnTotals(grn, returnLines);
 
     const productIds = [...new Set(returnLines.map((line) => idOf(line.product)))].sort();
     for (const productId of productIds) {
-      await lockProductAndStockLevel(sess, productId, idOf(grn.warehouse), companyId);
+      await lockProductAndStockLevel(sess, productId, sourceWarehouse, companyId);
     }
 
     // Track created resources for manual rollback
@@ -303,8 +388,10 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
     const inventoryAccountByProduct = new Map();
 
     for (const line of returnLines) {
-      const grnLine = (grn.lines || []).find((item) => idOf(item._id || item.id) === idOf(line.grnLine));
-      if (!grnLine) throw Object.assign(new Error('GRN line not found'), { status: 404 });
+      const sourceLineId = idOf(isDirectPurchase ? line.purchaseLine : line.grnLine);
+      const sourceLine = (isDirectPurchase ? purchase.items || [] : grn.lines || [])
+        .find((item) => idOf(item._id || item.id) === sourceLineId);
+      if (!sourceLine) throw Object.assign(new Error('Source purchase line not found'), { status: 404 });
 
       // Check warehouse stock
       const productQuery = Product.findOne({ _id: line.product, company: companyId });
@@ -313,7 +400,7 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
       const stockLevelQuery = StockLevel.findOne({
         company_id: companyId,
         product_id: line.product,
-        warehouse_id: grn.warehouse,
+        warehouse_id: sourceWarehouse,
       });
       const stockLevel = useSession ? await stockLevelQuery.session(sess) : await stockLevelQuery;
       if (!stockLevel) throw Object.assign(new Error('No stock record exists for this product at the GRN warehouse'), { status: 409 });
@@ -325,12 +412,15 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
       }
       const trackingType = product.trackingType || 'none';
       const serialNumbers = Array.isArray(line.serialNumbers) ? line.serialNumbers : [];
+      if (isDirectPurchase && trackingType !== 'none') {
+        throw Object.assign(new Error('Tracked products must be returned against their confirmed GRN so batch or serial traceability can be verified.'), { status: 409 });
+      }
       if (trackingType === 'serial') {
-        const validatedSerialNumbers = validateReturnSerialNumbers(grnLine, line.qtyReturned, serialNumbers);
+        const validatedSerialNumbers = validateReturnSerialNumbers(sourceLine, line.qtyReturned, serialNumbers);
         const serialQuery = StockSerialNumber.find({
           company: companyId,
           product: line.product,
-          warehouse: grn.warehouse,
+          warehouse: sourceWarehouse,
           grn: grn._id,
           status: 'in_stock',
           serialNo: { $in: validatedSerialNumbers },
@@ -345,7 +435,7 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
             _id: { $in: availableSerialRows.map((serial) => serial._id) },
             company: companyId,
             product: line.product,
-            warehouse: grn.warehouse,
+            warehouse: sourceWarehouse,
             grn: grn._id,
             status: 'in_stock',
           },
@@ -367,14 +457,14 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
       }
 
       if (trackingType === 'batch') {
-        const batchNo = String(grnLine.batchNo || '').trim().toUpperCase();
+        const batchNo = String(sourceLine.batchNo || '').trim().toUpperCase();
         if (!batchNo) {
           throw Object.assign(new Error('The source GRN line is missing its batch number'), { status: 409 });
         }
         const stockBatchQuery = StockBatch.findOne({
           company: companyId,
           product: line.product,
-          warehouse: grn.warehouse,
+          warehouse: sourceWarehouse,
           batchNo,
         });
         let stockBatch = useSession ? await stockBatchQuery.session(sess) : await stockBatchQuery;
@@ -458,7 +548,7 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
         newStock: product.currentStock,
         unitCost: stockUnitCost,
         totalCost: stockUnitCost * line.qtyReturned,
-        warehouse: grn.warehouse,
+        warehouse: sourceWarehouse,
         referenceType: 'return',
         referenceNumber: pr.referenceNo,
         referenceDocument: pr._id,
@@ -475,7 +565,7 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
     const journalLines = [];
     // DR Accounts Payable - total incl tax
     const apAcct = await JournalService.getMappedAccountCode(companyId, 'purchases', 'accountsPayable', DEFAULT_ACCOUNTS.accountsPayable);
-    journalLines.push(JournalService.createDebitLine(apAcct, returnTotals.totalAmount, `Purchase Return ${pr.referenceNo} - GRN#${grn.referenceNo}`));
+    journalLines.push(JournalService.createDebitLine(apAcct, returnTotals.totalAmount, `Purchase Return ${pr.referenceNo} - ${isDirectPurchase ? 'Purchase' : 'GRN'}#${sourceReference}`));
 
     if (returnTotals.taxAmount > 0) {
       // CR VAT Input (2210) — reverses the DR VAT Input from the original GRN
@@ -497,7 +587,7 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
           'purchases',
           'inventory',
           DEFAULT_ACCOUNTS.inventory,
-          { productId, warehouseId: idOf(grn.warehouse) },
+          { productId, warehouseId: sourceWarehouse },
         );
       }
       journalLines.push(JournalService.createCreditLine(
@@ -523,7 +613,7 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
 
     // Post journal
     const supplier = await (require('../models/Supplier')).findById(pr.supplier).lean();
-    const narration = `Purchase Return - ${supplier ? supplier.name : ''} - GRN#${grn.referenceNo} - PRN#${pr.referenceNo}`;
+    const narration = `Purchase Return - ${supplier ? supplier.name : ''} - ${isDirectPurchase ? 'Purchase' : 'GRN'}#${sourceReference} - PRN#${pr.referenceNo}`;
 
     let je;
     try {
@@ -548,20 +638,22 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
       // second project actual; this is tied to the accepted physical return.
       const BudgetService = require('../services/budgetService');
       for (const line of pr.lines || []) {
-        const returnedGrnLine = grn.lines.id(line.grnLine);
-        if (!returnedGrnLine?.purchaseOrderLine) continue;
-        const poLine = grn.purchaseOrder
-          ? await PurchaseOrder.findOne({ _id: grn.purchaseOrder, company: companyId }).then(po => po ? po.lines.id(returnedGrnLine.purchaseOrderLine) : null)
+        const returnedSourceLine = isDirectPurchase
+          ? (purchase.items || []).find((item) => idOf(item._id || item.id) === idOf(line.purchaseLine))
+          : grn.lines.id(line.grnLine);
+        const poLine = !isDirectPurchase && returnedSourceLine?.purchaseOrderLine && grn.purchaseOrder
+          ? await PurchaseOrder.findOne({ _id: grn.purchaseOrder, company: companyId }).then(po => po ? po.lines.id(returnedSourceLine.purchaseOrderLine) : null)
           : null;
-        if (!poLine?.budget_line_id) continue;
-        const rate = Number(poLine.taxRate) || 0;
+        const budgetLineId = isDirectPurchase ? returnedSourceLine?.budget_line_id : poLine?.budget_line_id;
+        if (!budgetLineId) continue;
+        const rate = Number(isDirectPurchase ? returnedSourceLine.taxRate : poLine.taxRate) || 0;
         const amount = Number((Number(line.qtyReturned || 0) * Number(line.unitCost || 0) * (1 + rate / 100)).toFixed(2));
         await BudgetService.reverseActualConsumptionToLine({
-          companyId, budgetLineId: poLine.budget_line_id, amount,
+          companyId, budgetLineId, amount,
           document_id: pr._id, document_number: pr.referenceNo,
           source_id: pr._id, source_number: pr.referenceNo,
           created_by: req.user.id,
-          notes: `Accepted supplier return ${pr.referenceNo} against GRN ${grn.referenceNo}`,
+          notes: `Accepted supplier return ${pr.referenceNo} against ${isDirectPurchase ? 'purchase' : 'GRN'} ${sourceReference}`,
         });
       }
       await pr.save(opts);
@@ -633,10 +725,15 @@ exports.confirmPurchaseReturn = async (req, res, next) => {
 
     // Send email notification
     if (req.body.sendEmail) {
-      const confirmedPR = await PurchaseReturn.findById(result._id).populate('grn');
+      const confirmedPR = await PurchaseReturn.findById(result._id).populate('grn').populate('purchase');
       const company = await Company.findById(companyId);
-      const grn = await GoodsReceivedNote.findById(confirmedPR.grn);
-      const supplier = grn ? await Supplier.findById(grn.supplier) : null;
+      const grn = confirmedPR.grn
+        ? await GoodsReceivedNote.findById(confirmedPR.grn)
+        : null;
+      const purchase = confirmedPR.purchase
+        ? await Purchase.findById(confirmedPR.purchase)
+        : null;
+      const supplier = await Supplier.findById(grn?.supplier || purchase?.supplier);
       await sendPurchaseReturnEmail(confirmedPR, company, supplier, 'confirmed');
     }
     
@@ -651,9 +748,17 @@ exports.listPurchaseReturns = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
     const q = { company: companyId };
-    const { supplier_id, grn_id, status, date_from, date_to } = req.query;
+    const { supplier_id, grn_id, purchase_id, purchase_order_id, status, date_from, date_to } = req.query;
     if (supplier_id) q.supplier = supplier_id;
     if (grn_id) q.grn = grn_id;
+    if (purchase_id) q.purchase = purchase_id;
+    if (purchase_order_id) {
+      const sourceGrns = await GoodsReceivedNote.find({
+        company: companyId,
+        purchaseOrder: purchase_order_id,
+      });
+      q.grn = { $in: sourceGrns.map((grn) => grn._id) };
+    }
     if (status) q.status = status;
     if (date_from || date_to) q.returnDate = {};
     if (date_from) q.returnDate.$gte = new Date(date_from);
@@ -663,6 +768,7 @@ exports.listPurchaseReturns = async (req, res, next) => {
     const total = await PurchaseReturn.countDocuments(q);
     const list = await PurchaseReturn.find(q)
       .populate('grn', 'referenceNo')
+      .populate('purchase', 'purchaseNumber')
       .populate('supplier', 'name code')
       .populate('warehouse', 'name code')
       .sort({ createdAt: -1 })
@@ -682,6 +788,7 @@ exports.getPurchaseReturn = async (req, res, next) => {
     const companyId = req.user.company._id;
     const pr = await PurchaseReturn.findOne({ _id: req.params.id, company: companyId })
       .populate('grn', 'referenceNo')
+      .populate('purchase', 'purchaseNumber')
       .populate('supplier', 'name code')
       .populate('warehouse', 'name code')
       .populate('lines.product', 'name sku')
@@ -854,8 +961,9 @@ exports.processRefund = async (req, res, next) => {
     // Send email notification for refund
     if (req.body?.sendEmail) {
       const company = await Company.findById(companyId);
-      const grn = await GoodsReceivedNote.findById(result.grn);
-      const supplier = grn ? await Supplier.findById(grn.supplier) : null;
+      const grn = result.grn ? await GoodsReceivedNote.findById(result.grn) : null;
+      const purchase = result.purchase ? await Purchase.findById(result.purchase) : null;
+      const supplier = await Supplier.findById(grn?.supplier || purchase?.supplier);
       await sendPurchaseReturnEmail(result, company, supplier, 'refunded');
     }
 

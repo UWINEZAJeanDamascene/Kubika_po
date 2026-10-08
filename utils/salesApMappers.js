@@ -1102,6 +1102,7 @@ function purchaseReturnLineToApi(row) {
   return {
     _id: row.id,
     grnLine: row.grnLineId ?? null,
+    purchaseLine: row.purchaseLineId ?? null,
     qtyReturned: qtyNum(row.qtyReturned),
     unitCost: qtyNum(row.unitCost),
     serialNumbers: Array.isArray(row.serialNumbers) ? row.serialNumbers : [],
@@ -1121,6 +1122,7 @@ function purchaseReturnToApi(row) {
     company: row.companyId,
     referenceNo: row.referenceNo,
     grn: relationRef(row.grn, row.grnId),
+    purchase: relationRef(row.purchase, row.purchaseId),
     supplier: relationRef(row.supplier, row.supplierId),
     warehouse: relationRef(row.warehouse, row.warehouseId),
     returnDate: row.returnDate,
@@ -1727,6 +1729,7 @@ const grnTranslateUpdate = genericTranslateUpdate(
 const PURCHASE_RETURN_HEADER = {
   referenceNo: 'referenceNo',
   grn: 'grnId',
+  purchase: 'purchaseId',
   supplier: 'supplierId',
   warehouse: 'warehouseId',
   status: 'status',
@@ -1749,6 +1752,7 @@ function purchaseReturnTranslateCreate(data) {
   return genericTranslateCreate(data, PURCHASE_RETURN_HEADER, (line, idx, companyId) =>
     defaultLineCreate(line, idx, companyId, {
       grnLineId: line.grnLine ? toIdString(line.grnLine) : null,
+      purchaseLineId: line.purchaseLine ? toIdString(line.purchaseLine) : null,
       qtyReturned: line.qtyReturned ?? line.qty ?? 0,
       unitCost: line.unitCost ?? 0,
       serialNumbers: Array.isArray(line.serialNumbers) ? line.serialNumbers : [],
@@ -1757,7 +1761,7 @@ function purchaseReturnTranslateCreate(data) {
 
 const purchaseReturnTranslateUpdate = genericTranslateUpdate(
   PURCHASE_RETURN_HEADER,
-  ['grnId', 'supplierId', 'warehouseId', 'bankAccountId', 'journalEntryId', 'refundJournalEntryId', 'refundBankTransactionId', 'confirmedById'],
+  ['grnId', 'purchaseId', 'supplierId', 'warehouseId', 'bankAccountId', 'journalEntryId', 'refundJournalEntryId', 'refundBankTransactionId', 'confirmedById'],
 );
 
 // ── Translate: APPayment / Allocation / FreightBill ────────────────────────

@@ -1,7 +1,6 @@
 const { dbClient } = require('../lib/prisma');
 const { runInPrismaTransaction } = require('../services/transactionService');
-const { generateUniqueNumber } = require('../models/utils/autoIncrement');
-const ARReceipt = require('../models/ARReceipt');
+const { nextReferenceNo } = require('../utils/referenceNumbers');
 const JournalService = require('../services/journalService');
 const periodService = require('../services/periodService');
 const cacheService = require('../services/cacheService');
@@ -105,7 +104,10 @@ exports.createReceipt = async (req, res, next) => {
     if (['bank_transfer', 'cheque', 'mobile_money', 'card'].includes(method) && !bank) {
       throw error(400, 'BANK_ACCOUNT_REQUIRED', 'Select an active bank or mobile-money account for this payment method.');
     }
-    const referenceNo = req.body.referenceNo || await generateUniqueNumber('RCP', ARReceipt, companyId, 'referenceNo');
+    const referenceNo = req.body.referenceNo
+      ? String(req.body.referenceNo).trim()
+      : await nextReferenceNo(companyId, 'RCP', { field: 'referenceNo', model: 'aRReceipt' });
+    if (!referenceNo) throw error(400, 'INVALID_RECEIPT_REFERENCE', 'Receipt reference cannot be empty.');
     const currencyCode = String(req.body.currencyCode || 'RWF').toUpperCase();
     const exchangeRate = req.body.exchangeRate === undefined && currencyCode === 'RWF' ? 1 : Number(req.body.exchangeRate);
     if (!Number.isFinite(exchangeRate) || exchangeRate <= 0) throw error(400, 'INVALID_EXCHANGE_RATE', 'Exchange rate must be greater than zero.');
@@ -144,7 +146,17 @@ exports.createReceipt = async (req, res, next) => {
       return tx.aRReceipt.findFirst({ where: { id: created.id }, include: receiptInclude });
     });
     res.status(201).json({ success: true, data: receiptView(row) });
-  } catch (err) { next(err); }
+  } catch (err) {
+    const target = Array.isArray(err?.meta?.target) ? err.meta.target : [err?.meta?.target];
+    if (err?.code === 'P2002' && target.some((field) => ['company_id', 'reference_no', 'companyId', 'referenceNo'].includes(field))) {
+      return res.status(409).json({
+        success: false,
+        code: 'AR_RECEIPT_REFERENCE_EXISTS',
+        message: 'A receipt with this reference already exists for this company. Use a different reference.',
+      });
+    }
+    next(err);
+  }
 };
 
 exports.updateReceipt = async (req, res, next) => {

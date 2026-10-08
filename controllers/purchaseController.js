@@ -111,7 +111,7 @@ exports.getPurchase = async (req, res, next) => {
       company: companyId,
     })
       .populate("supplier", "name code contact type taxId")
-      .populate("items.product", "name sku unit")
+      .populate("items.product", "name sku unit trackingType")
       .populate("createdBy", "name email")
       .populate("payments.recordedBy", "name email");
 

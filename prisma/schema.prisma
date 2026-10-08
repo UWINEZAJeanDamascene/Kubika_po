@@ -2469,9 +2469,11 @@ model ARReceipt {
   updatedAt             DateTime              @updatedAt @map("updated_at") @db.Timestamptz(3)
   allocations           ARReceiptAllocation[]
   client                Client                @relation(fields: [clientId], references: [id])
+  bankAccount           BankAccount?           @relation(fields: [bankAccountId], references: [id], onDelete: SetNull)
   company               Company               @relation(fields: [companyId], references: [id], onDelete: Cascade)
 
   @@unique([companyId, referenceNo])
+  @@index([bankAccountId])
   @@index([companyId, clientId])
   @@index([companyId, receiptDate])
   @@index([companyId, status])
@@ -2648,6 +2650,7 @@ model Purchase {
   createdAt             DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt             DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
   lines                 PurchaseLine[]
+  purchaseReturns       PurchaseReturn[]
   company               Company        @relation(fields: [companyId], references: [id], onDelete: Cascade)
   supplier              Supplier       @relation(fields: [supplierId], references: [id])
 
@@ -2740,7 +2743,8 @@ model PurchaseReturn {
   id                   String               @id @db.Char(24)
   companyId            String               @map("company_id") @db.Char(24)
   referenceNo          String               @map("reference_no")
-  grnId                String               @map("grn_id") @db.Char(24)
+  grnId                String?              @map("grn_id") @db.Char(24)
+  purchaseId           String?              @map("purchase_id") @db.Char(24)
   supplierId           String               @map("supplier_id") @db.Char(24)
   warehouseId          String               @map("warehouse_id") @db.Char(24)
   returnDate           DateTime             @default(now()) @map("return_date") @db.Timestamptz(3)
@@ -2762,11 +2766,13 @@ model PurchaseReturn {
   updatedAt            DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
   lines                PurchaseReturnLine[]
   company              Company              @relation(fields: [companyId], references: [id], onDelete: Cascade)
-  grn                  GoodsReceivedNote    @relation(fields: [grnId], references: [id])
+  grn                  GoodsReceivedNote?   @relation(fields: [grnId], references: [id], onDelete: Restrict)
+  purchase             Purchase?            @relation(fields: [purchaseId], references: [id])
   supplier             Supplier             @relation(fields: [supplierId], references: [id])
   warehouse            Warehouse            @relation(fields: [warehouseId], references: [id])
 
   @@unique([companyId, referenceNo])
+  @@index([purchaseId])
   @@map("purchase_returns")
 }
 
@@ -2776,6 +2782,7 @@ model PurchaseReturnLine {
   purchaseReturnId String         @map("purchase_return_id") @db.Char(24)
   lineOrder        Int            @default(0) @map("line_order")
   grnLineId        String?        @map("grn_line_id") @db.Char(24)
+  purchaseLineId   String?        @map("purchase_line_id") @db.Char(24)
   productId        String         @map("product_id") @db.Char(24)
   qtyReturned      Decimal        @map("qty_returned") @db.Decimal(19, 4)
   unitCost         Decimal        @default(0) @map("unit_cost") @db.Decimal(19, 6)
@@ -2908,6 +2915,7 @@ model BankAccount {
   statementLines            BankStatementLine[]
   statementTransactions     BankStatementTransaction[]
   transactions              BankTransaction[]
+  arReceipts                ARReceipt[]
   pettyCashReplenishments   PettyCashReplenishment[]
 
   @@index([companyId, isActive])
