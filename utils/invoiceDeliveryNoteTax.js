@@ -26,6 +26,7 @@ function buildInvoiceTaxCorrection(invoice, deliveryNote) {
   }
 
   const unmatchedDeliveryLines = [...deliveryLines];
+  const salesOrderLines = deliveryNote?.salesOrder?.lines || [];
   const correctedLines = [];
   for (const invoiceLine of invoiceLines) {
     const invoiceLineId = idOf(invoiceLine._id || invoiceLine.id);
@@ -48,6 +49,9 @@ function buildInvoiceTaxCorrection(invoice, deliveryNote) {
 
     const [deliveryLine] = matches;
     unmatchedDeliveryLines.splice(unmatchedDeliveryLines.indexOf(deliveryLine), 1);
+    const salesOrderLine = salesOrderLines.find((line) =>
+      idOf(line._id || line.id) === idOf(deliveryLine.salesOrderLineId),
+    );
     const qty = toAmount(deliveryLine.qtyToDeliver ?? deliveryLine.deliveredQty);
     const unitPrice = toAmount(deliveryLine.unitPrice ?? invoiceLine.unitPrice);
     const discountPct = toAmount(deliveryLine.discountPct);
@@ -63,14 +67,22 @@ function buildInvoiceTaxCorrection(invoice, deliveryNote) {
       fail('Invoice and delivery note quantities differ; tax correction was not applied.');
     }
 
-    const taxRate = toAmount(deliveryLine.taxRate);
+    const taxRate = toAmount(
+      salesOrderLine?.taxRate ?? deliveryLine.taxRate ?? deliveryLine.product?.taxRate ?? invoiceLine.taxRate,
+    );
     const lineTax = toAmount(deliveryLine.lineTax)
       || Math.round(subtotal * taxRate / 100 * 100) / 100;
+    const taxCode = salesOrderLine?.taxCode
+      || salesOrderLine?.product?.taxCode
+      || deliveryLine.product?.taxCode
+      || deliveryLine.taxCode
+      || invoiceLine.taxCode
+      || 'A';
     correctedLines.push({
       id: invoiceLine._id || invoiceLine.id,
       lineSubtotal: subtotal,
       taxRate,
-      taxCode: deliveryLine.taxCode || 'A',
+      taxCode,
       lineTax,
       lineTotal: subtotal + lineTax,
     });

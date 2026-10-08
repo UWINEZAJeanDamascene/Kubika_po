@@ -1,5 +1,6 @@
 const Invoice = require("../models/Invoice");
 const DeliveryNote = require("../models/DeliveryNote");
+const SalesOrder = require("../models/SalesOrder");
 const Product = require("../models/Product");
 const Client = require("../models/Client");
 const StockMovement = require("../models/StockMovement");
@@ -676,6 +677,12 @@ exports.correctInvoiceTaxFromDeliveryNote = async (req, res, next) => {
       return res.status(404).json({ success: false, code: 'ERR_INVOICE_TAX_DELIVERY_NOTE_NOT_FOUND', message: 'No delivery note is linked to this invoice.' });
     }
 
+    if (deliveryNote.salesOrder) {
+      deliveryNote.salesOrder = await SalesOrder.findOne({
+        _id: normalizeId(deliveryNote.salesOrder),
+        company: companyId,
+      }).lean();
+    }
     const plan = buildInvoiceTaxCorrection(invoice, deliveryNote);
     const creditNote = await dbClient().creditNote.findFirst({
       where: { invoiceId: invoiceKey, companyId, status: { notIn: ['draft', 'cancelled'] } },

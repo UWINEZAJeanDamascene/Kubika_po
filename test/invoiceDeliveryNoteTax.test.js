@@ -45,6 +45,75 @@ describe('invoice tax correction from delivery note', () => {
     });
   });
 
+  test('uses the linked delivery note tax for the reported confirmed invoice values', () => {
+    const plan = buildInvoiceTaxCorrection({
+      subtotal: 13000,
+      taxAmount: 0,
+      lines: [{
+        _id: 'invoice-line-13000',
+        product: 'product-1',
+        qty: 2,
+        unitPrice: 6500,
+        lineSubtotal: 13000,
+        lineTax: 0,
+      }],
+    }, {
+      lines: [{
+        invoiceLineId: 'invoice-line-13000',
+        product: 'product-1',
+        qtyToDeliver: 2,
+        unitPrice: 6500,
+        lineSubtotal: 13000,
+        taxRate: 18,
+        taxCode: 'B',
+        lineTax: 2340,
+      }],
+    });
+
+    expect(plan.taxAmount).toBe(2340);
+    expect(plan.totalAmount).toBe(15340);
+    expect(plan.taxDelta).toBe(2340);
+  });
+
+  test('uses the matching sales order line when delivery-note tax fields are still zero', () => {
+    const plan = buildInvoiceTaxCorrection({
+      subtotal: 13000,
+      taxAmount: 0,
+      lines: [{
+        _id: 'invoice-line-sales-order-tax',
+        product: 'product-1',
+        qty: 2,
+        unitPrice: 6500,
+        lineSubtotal: 13000,
+        lineTax: 0,
+        taxRate: 0,
+      }],
+    }, {
+      salesOrder: {
+        lines: [{
+          _id: 'sales-order-line-1',
+          taxRate: 18,
+          taxCode: 'B',
+        }],
+      },
+      lines: [{
+        invoiceLineId: 'invoice-line-sales-order-tax',
+        salesOrderLineId: 'sales-order-line-1',
+        product: 'product-1',
+        qtyToDeliver: 2,
+        unitPrice: 6500,
+        lineSubtotal: 13000,
+        taxRate: 0,
+        taxCode: 'A',
+        lineTax: 0,
+      }],
+    });
+
+    expect(plan.taxAmount).toBe(2340);
+    expect(plan.totalAmount).toBe(15340);
+    expect(plan.lines[0].taxCode).toBe('B');
+  });
+
   test('rejects mismatched invoice and delivery note subtotals', () => {
     expect(() => buildInvoiceTaxCorrection({
       subtotal: 900,
