@@ -45,17 +45,29 @@ async function confirmDraftInvoiceInTransaction(companyId, invoiceId, userId) {
   if (claim.count !== 1) confirmError('ERR_INVOICE_CONFIRMED', 'Invoice is already being confirmed or is no longer a draft.', 409);
 
   const DeliveryNote = require('../models/DeliveryNote');
-  const existingDeliveryNote = await DeliveryNote.findOne({
+  const deliveryNote = await DeliveryNote.findOne({
     invoice: invoice._id,
+    company: companyId,
     status: 'confirmed',
   });
-  if (existingDeliveryNote) {
+  if (deliveryNote) {
     confirmError(
       'ERR_DELIVERY_EXISTS',
       'Cannot confirm invoice. A confirmed delivery note already exists for this invoice.',
       409,
     );
   }
+  const pendingDeliveryNote = await DeliveryNote.findOne({
+    invoice: invoice._id,
+    company: companyId,
+    status: 'draft',
+  });
+  const deliveryNoteLinesByInvoiceLineId = new Map(
+    (pendingDeliveryNote?.lines || [])
+      .filter((line) => line.invoiceLineId)
+      .map((line) => [String(line.invoiceLineId), line]),
+  );
+  const deliveryNoteHandlesStock = Boolean(pendingDeliveryNote);
 
   let totalInvoiceCOGS = 0;
   let hasStockableLines = false;
@@ -76,11 +88,22 @@ async function confirmDraftInvoiceInTransaction(companyId, invoiceId, userId) {
     const isStockable = product.isStockable !== false;
     if (isStockable) {
       if (product.trackingType && product.trackingType !== 'none') {
-        confirmError(
-          'ERR_TRACEABILITY_REQUIRED',
-          `Auto-confirm requires batch or serial assignments for ${product.name}. Keep the generated invoice as a draft and confirm it after assigning traceability.`,
-          409,
-        );
+        const deliveryLine = deliveryNoteLinesByInvoiceLineId.get(String(line._id));
+        const deliveredQty = Number(deliveryLine?.qtyToDeliver || 0);
+        const matchesInvoiceQty = Math.abs(deliveredQty - Number(qty)) < 0.0001;
+        const hasTraceability = product.trackingType === 'batch'
+          ? Boolean(deliveryLine?.batchId)
+          : product.trackingType === 'serial'
+            && Array.isArray(deliveryLine?.serialNumbers)
+            && deliveryLine.serialNumbers.length === deliveredQty
+            && new Set(deliveryLine.serialNumbers.map(String)).size === deliveredQty;
+        if (!deliveryNoteHandlesStock || !matchesInvoiceQty || !hasTraceability) {
+          confirmError(
+            'ERR_TRACEABILITY_REQUIRED',
+            `Auto-confirm requires batch or serial assignments for ${product.name}. Select the traceability during picking before confirming the generated invoice.`,
+            409,
+          );
+        }
       }
       hasStockableLines = true;
       const unitCost = await resolveCogsUnitCost(product, companyId);
@@ -97,31 +120,33 @@ async function confirmDraftInvoiceInTransaction(companyId, invoiceId, userId) {
       line.unitCost = unitCost;
       line.cogsAmount = cogsAmount;
 
-      const warehouseId = line.warehouse || product.defaultWarehouse;
-      let availableQty = 0;
-      if (warehouseId) {
-        const stockLevel = await warehouseService.getStockLevel(companyId, product._id, warehouseId);
-        availableQty = stockLevel.qty_available || 0;
-      } else {
-        availableQty = product.currentStock || 0;
-      }
+      if (!deliveryNoteHandlesStock) {
+        const warehouseId = line.warehouse || product.defaultWarehouse;
+        let availableQty = 0;
+        if (warehouseId) {
+          const stockLevel = await warehouseService.getStockLevel(companyId, product._id, warehouseId);
+          availableQty = stockLevel.qty_available || 0;
+        } else {
+          availableQty = product.currentStock || 0;
+        }
 
-      if (availableQty < qty) {
-        confirmError(
-          'ERR_INSUFFICIENT_STOCK',
-          `Insufficient stock for ${product.name}. Available: ${availableQty}, Required: ${qty}`,
-          409,
-        );
-      }
+        if (availableQty < qty) {
+          confirmError(
+            'ERR_INSUFFICIENT_STOCK',
+            `Insufficient stock for ${product.name}. Available: ${availableQty}, Required: ${qty}`,
+            409,
+          );
+        }
 
-      try {
-        await stockValidationService.reserveForOrder(companyId, product._id, qty, warehouseId);
-      } catch (reserveErr) {
-        confirmError(
-          'ERR_INSUFFICIENT_STOCK',
-          reserveErr.message || `Failed to reserve stock for ${product.name}`,
-          409,
-        );
+        try {
+          await stockValidationService.reserveForOrder(companyId, product._id, qty, warehouseId);
+        } catch (reserveErr) {
+          confirmError(
+            'ERR_INSUFFICIENT_STOCK',
+            reserveErr.message || `Failed to reserve stock for ${product.name}`,
+            409,
+          );
+        }
       }
     } else {
       line.unitCost = 0;
@@ -202,49 +227,51 @@ async function confirmDraftInvoiceInTransaction(companyId, invoiceId, userId) {
 
   // One query for every line's product instead of one per line.
   const autoConfirmProducts1 = await loadLineProducts(Product, invoice.lines, companyId);
-  for (const line of invoice.lines) {
-    const product = getLineProduct(autoConfirmProducts1, line);
-    if (product && product.isStockable) {
-      const qty = line.qty || line.quantity || 0;
-      if (qty > 0) {
-        const warehouseId = line.warehouse || product.defaultWarehouse || null;
-        const stockCommit = await warehouseService.commitReservedStock(
-          companyId,
-          product._id,
-          warehouseId,
-          qty,
-        );
-        const newStock = Number(stockCommit.currentStock);
-        const previousStock = newStock + Number(qty);
-        await StockMovement.create({
-          company: companyId,
-          product: product._id,
-          type: 'out',
-          reason: 'sale',
-          quantity: qty,
-          previousStock,
-          newStock,
-          unitCost: line.unitCost || 0,
-          totalCost: line.cogsAmount || 0,
-          referenceType: 'invoice',
-          referenceNumber: invoice.referenceNo || invoice.invoiceNumber,
-          referenceDocument: invoice._id,
-          referenceModel: 'Invoice',
-          notes: `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Sale`,
-          performedBy: userId,
-          movementDate: new Date(),
-        });
-        await dbClient().product.updateMany({
-          where: { id: String(product._id), companyId: String(companyId) },
-          data: { lastSaleDate: new Date() },
-        });
+  if (!deliveryNoteHandlesStock) {
+    for (const line of invoice.lines) {
+      const product = getLineProduct(autoConfirmProducts1, line);
+      if (product && product.isStockable) {
+        const qty = line.qty || line.quantity || 0;
+        if (qty > 0) {
+          const warehouseId = line.warehouse || product.defaultWarehouse || null;
+          const stockCommit = await warehouseService.commitReservedStock(
+            companyId,
+            product._id,
+            warehouseId,
+            qty,
+          );
+          const newStock = Number(stockCommit.currentStock);
+          const previousStock = newStock + Number(qty);
+          await StockMovement.create({
+            company: companyId,
+            product: product._id,
+            type: 'out',
+            reason: 'sale',
+            quantity: qty,
+            previousStock,
+            newStock,
+            unitCost: line.unitCost || 0,
+            totalCost: line.cogsAmount || 0,
+            referenceType: 'invoice',
+            referenceNumber: invoice.referenceNo || invoice.invoiceNumber,
+            referenceDocument: invoice._id,
+            referenceModel: 'Invoice',
+            notes: `Invoice ${invoice.referenceNo || invoice.invoiceNumber} - Sale`,
+            performedBy: userId,
+            movementDate: new Date(),
+          });
+          await dbClient().product.updateMany({
+            where: { id: String(product._id), companyId: String(companyId) },
+            data: { lastSaleDate: new Date() },
+          });
+        }
       }
     }
   }
 
   await Invoice.findByIdAndUpdate(invoice._id, {
     status: 'confirmed',
-    stockDeducted: hasStockableLines,
+    stockDeducted: hasStockableLines && !deliveryNoteHandlesStock,
     confirmedAt: new Date(),
     confirmedBy: userId,
     revenueJournalEntry: invoice.revenueJournalEntry,
