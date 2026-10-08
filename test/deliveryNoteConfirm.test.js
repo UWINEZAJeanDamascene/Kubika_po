@@ -10,10 +10,43 @@ const DeliveryNoteController = require('../controllers/deliveryNoteController');
 const DeliveryNote = require('../models/DeliveryNote');
 const Invoice = require('../models/Invoice');
 const prismaModule = require('../lib/prisma');
+const { makeCompatModel } = require('../utils/prismaCompat');
 
 describe('Delivery note confirmation', () => {
   afterEach(() => {
     jest.restoreAllMocks();
+  });
+
+  test('persists confirmed status after earlier saves in the same workflow', async () => {
+    let persisted = { id: 'delivery_note_1', status: 'draft' };
+    const delegate = {
+      name: 'DeliveryNote',
+      findUnique: jest.fn(async () => ({ ...persisted })),
+      update: jest.fn(async ({ data }) => {
+        persisted = { ...persisted, ...data };
+        return { ...persisted };
+      }),
+    };
+    const CompatDeliveryNote = makeCompatModel({
+      delegate: () => delegate,
+      delegateName: 'deliveryNote',
+      mutable: true,
+      tenantField: null,
+      fieldMap: { _id: { target: 'id', isId: true }, status: { target: 'status' } },
+      toApi: (value) => value,
+      translateCreate: (value) => value,
+      translateUpdate: ({ $set }) => ({ status: $set.status }),
+    });
+
+    const deliveryNote = await CompatDeliveryNote.findById('delivery_note_1');
+    persisted.status = 'processing';
+
+    await deliveryNote.save();
+    deliveryNote.status = 'confirmed';
+    await deliveryNote.save();
+
+    expect(persisted.status).toBe('confirmed');
+    expect(delegate.update).toHaveBeenCalledTimes(2);
   });
 
   test('confirms a note when PostgreSQL-backed lines are plain objects', async () => {

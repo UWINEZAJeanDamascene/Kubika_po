@@ -76,4 +76,5 @@ describe('PickPack mutable document save', () => {
 
     expect(capturedUpdate.lines.create[0].qtyPicked).toBe(0.5);
   });
+
 });

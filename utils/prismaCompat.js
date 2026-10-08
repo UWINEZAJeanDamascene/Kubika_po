@@ -735,9 +735,19 @@ function wrapMutableDoc(apiDoc, config) {
       include: config.include ? config.include([]) : undefined,
     });
     const next = config.toApi(row);
+    const stableMethods = {
+      save: doc.save,
+      toObject: doc.toObject,
+      toJSON: doc.toJSON,
+      lean: doc.lean,
+      populate: doc.populate,
+    };
     Object.keys(doc).forEach((k) => delete doc[k]);
-    // wrapResult, not wrapMutableDoc: .save() must not strip .populate() off the doc.
-    Object.assign(doc, wrapResult(next, config));
+    Object.assign(doc, next);
+    Object.assign(doc, Object.fromEntries(
+      Object.entries(stableMethods).filter(([, method]) => typeof method === 'function'),
+    ));
+    doc.__mutable = true;
     doc.__loadedLines = doc.lines;
     doc.__loadedLinesSnapshot = snapshotLines(doc.lines);
     doc.__loadedStatus = doc.status;
