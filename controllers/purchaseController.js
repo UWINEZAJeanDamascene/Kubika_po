@@ -21,6 +21,7 @@ const { runInTransaction } = require("../services/transactionService");
 const EBMPurchaseService = require("../services/ebmPurchaseService");
 const EBMStockService = require("../services/ebmStockService");
 const { parseBoundedPage } = require("../utils/querySafety");
+const { nextReferenceNo } = require("../utils/referenceNumbers");
 
 const sendPurchaseEmail = async (purchase, action, companyId) => {
   try {
@@ -255,6 +256,11 @@ exports.createPurchase = async (req, res, next) => {
     const purchase = await Purchase.create({
       ...req.body,
       company: companyId,
+      supplierInvoiceNumber: String(supplierInvoiceNumber || '').trim()
+        || await nextReferenceNo(companyId, 'PINV', {
+          field: 'supplierInvoiceNumber',
+          model: 'purchase',
+        }),
       items: processedItems,
       subtotal: headerSubtotal,
       taxAmount: headerTax,
