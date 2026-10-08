@@ -1279,6 +1279,7 @@ const CREDIT_NOTE_HEADER = {
   client: 'clientId',
   status: 'status',
   posOrigin: 'posOrigin',
+  stockReversed: 'stockReversed',
   creditDate: 'creditDate',
   reason: 'reason',
   type: 'type',

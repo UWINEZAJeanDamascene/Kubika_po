@@ -1718,7 +1718,7 @@ exports.confirmCreditNote = async (req, res, next) => {
       creditNote.status = "confirmed";
       creditNote.confirmedBy = req.user.id;
       creditNote.confirmedAt = new Date();
-      creditNote.stockReversed = isGoodsReturn;
+      creditNote.stockReversed = isGoodsReturn && lineArray.some((line) => line.product?.isStockable === true);
 
       console.log(
         "DEBUG: Saving credit note with new status:",

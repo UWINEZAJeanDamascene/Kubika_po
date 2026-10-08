@@ -15,6 +15,7 @@ const FIELD_MAP = {
   client: { target: 'clientId', isId: true },
   status: { target: 'status' },
   posOrigin: { target: 'posOrigin' },
+  stockReversed: { target: 'stockReversed' },
   creditDate: { target: 'creditDate' },
   confirmedBy: { target: 'confirmedById', isId: true },
   confirmedAt: { target: 'confirmedAt' },
