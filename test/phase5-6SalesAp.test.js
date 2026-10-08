@@ -5,6 +5,7 @@ const {
   invoiceToApi,
   invoiceLineToApi,
   quotationToApi,
+  salesOrderToApi,
   purchaseOrderToApi,
   purchaseToApi,
   purchaseTranslateUpdate,
@@ -12,8 +13,39 @@ const {
   grnToApi,
   arReceiptAllocationToApi,
 } = require('../utils/salesApMappers');
+const { buildLineInclude } = require('../utils/salesApCommon');
+const { makeCompatModel } = require('../utils/prismaCompat');
 
 describe('Phase 5+6 sales/AP mappers', () => {
+  test('keeps sales order line count in a header-only list projection', async () => {
+    let capturedQuery;
+    const delegate = {
+      name: 'SalesOrder',
+      findMany: jest.fn(async (query) => {
+        capturedQuery = query;
+        return [{ id: 'so1', companyId: 'c1', _count: { lines: 2 } }];
+      }),
+    };
+    const SalesOrder = makeCompatModel({
+      delegate: () => delegate,
+      delegateName: 'salesOrder',
+      fieldMap: { _id: { target: 'id', isId: true } },
+      toApi: salesOrderToApi,
+      translateCreate: async (data) => data,
+      translateUpdate: (update) => update,
+      include: buildLineInclude(),
+      tenantField: null,
+    });
+
+    const [order] = await SalesOrder.find({})
+      .select({ referenceNo: 1, lineCount: 1 })
+      .populate('-lines')
+      .lean();
+
+    expect(capturedQuery.select._count).toEqual({ select: { lines: true } });
+    expect(order.lineCount).toBe(2);
+  });
+
   test('invoiceToApi embeds lines and items alias', () => {
     const api = invoiceToApi({
       id: 'inv1',

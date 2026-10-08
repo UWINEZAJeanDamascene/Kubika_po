@@ -187,7 +187,7 @@ exports.getSalesOrders = async (req, res, next) => {
     // omitted to keep the list response lightweight.
     const [salesOrders, totalCount] = await Promise.all([
       SalesOrder.find(filter)
-        .select({ client: 1, createdBy: 1, referenceNo: 1, status: 1, orderDate: 1, expectedDate: 1, fulfillmentStatus: 1, subtotal: 1, taxAmount: 1, totalAmount: 1, currencyCode: 1, exchangeRate: 1, createdAt: 1 })
+        .select({ client: 1, createdBy: 1, referenceNo: 1, status: 1, orderDate: 1, expectedDate: 1, fulfillmentStatus: 1, subtotal: 1, taxAmount: 1, totalAmount: 1, currencyCode: 1, exchangeRate: 1, createdAt: 1, lineCount: 1 })
         .populate('-lines')
         .sort({ createdAt: -1, _id: -1 })
         .skip(skip)
