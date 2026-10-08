@@ -6,6 +6,7 @@ const StockMovement = require("../models/StockMovement");
 const Client = require("../models/Client");
 const Company = require("../models/Company");
 const SerialNumber = require("../models/SerialNumber");
+const StockSerialNumber = require("../models/StockSerialNumber");
 const JournalService = require("../services/journalService");
 const TaxAutomationService = require("../services/taxAutomationService");
 const emailService = require("../services/emailService");
@@ -1198,6 +1199,8 @@ exports.confirmCreditNote = async (req, res, next) => {
       });
     }
 
+    const serialReturnPlans = new Map();
+    const serialsReturnedByProduct = new Set();
     for (const line of lineArray) {
       // Find original invoice line
       const invoiceLine = invoice.lines.id(line.invoiceLineId);
@@ -1241,22 +1244,55 @@ exports.confirmCreditNote = async (req, res, next) => {
         return res.status(422).json({ success: false, code: 'ERR_RETURN_WAREHOUSE_REQUIRED', message: `Select a return warehouse for ${product?.name || line.productName}.` });
       }
       if (trackingType === 'serial') {
-        const serialNumbers = Array.isArray(line.serialNumbers) ? line.serialNumbers : [];
+        const serialNumbers = Array.isArray(line.serialNumbers)
+          ? line.serialNumbers.map((serial) => String(serial || '').trim()).filter(Boolean)
+          : [];
         if (serialNumbers.length !== Number(line.quantity)) {
           return res.status(422).json({ success: false, code: 'ERR_SERIAL_COUNT_MISMATCH', message: `Select exactly ${line.quantity} serial number(s) for ${product.name}.` });
         }
-        const serialRows = await require('../models/StockSerialNumber').find({
-          _id: { $in: serialNumbers },
-          company: companyId,
-          product: idOf(product),
-        });
-        if (serialRows.length !== serialNumbers.length || serialRows.some((serial) => serial.status !== 'dispatched')) {
+        const normalizedSerials = serialNumbers.map((serial) => serial.toUpperCase());
+        if (new Set(normalizedSerials).size !== normalizedSerials.length) {
+          return res.status(422).json({ success: false, code: 'ERR_DUPLICATE_RETURN_SERIAL', message: `Enter a different serial number for each returned ${product.name}.` });
+        }
+
+        const existingSerialIds = [];
+        const missingSerialNumbers = [];
+        for (const serialValue of serialNumbers) {
+          const productSerialKey = `${idOf(product)}:${serialValue.toUpperCase()}`;
+          if (serialsReturnedByProduct.has(productSerialKey)) {
+            return res.status(422).json({ success: false, code: 'ERR_DUPLICATE_RETURN_SERIAL', message: `Serial ${serialValue} is listed more than once for ${product.name}.` });
+          }
+          serialsReturnedByProduct.add(productSerialKey);
+
+          let serial = null;
+          if (/^[a-f\d]{24}$/i.test(serialValue)) {
+            serial = await StockSerialNumber.findOne({
+              _id: serialValue,
+              company: companyId,
+              product: idOf(product),
+            });
+          }
+          if (!serial) {
+            serial = await StockSerialNumber.findOne({
+              serialNo: serialValue.toUpperCase(),
+              company: companyId,
+              product: idOf(product),
+            });
+          }
+
+          if (!serial) {
+            missingSerialNumbers.push(serialValue.toUpperCase());
+          } else if (serial.status !== 'dispatched') {
             return res.status(400).json({
               success: false,
               code: ERR_SERIAL_NOT_DISPATCHED,
-              message: "Serial number must be dispatched",
+              message: `Serial ${serial.serialNo} is ${serial.status}; only dispatched serials can be returned.`,
             });
+          } else {
+            existingSerialIds.push(serial._id);
+          }
         }
+        serialReturnPlans.set(line, { existingSerialIds, missingSerialNumbers });
       }
       if (trackingType === 'batch' && !line.batchId) {
         return res.status(422).json({ success: false, code: 'ERR_BATCH_REQUIRED', message: `Select the returned batch for ${product.name}.` });
@@ -1270,7 +1306,6 @@ exports.confirmCreditNote = async (req, res, next) => {
     const Product = require("../models/Product");
     const StockMovement = require("../models/StockMovement");
     const StockBatch = require("../models/StockBatch");
-    const StockSerialNumber = require("../models/StockSerialNumber");
     const StockLevel = require("../models/StockLevel");
     const Warehouse = require("../models/Warehouse");
     const ChartOfAccount = require("../models/ChartOfAccount");
@@ -1378,9 +1413,10 @@ exports.confirmCreditNote = async (req, res, next) => {
           }
 
           // Update serial numbers if serial-tracked
-          if (line.serialNumbers && line.serialNumbers.length > 0) {
+          const serialReturnPlan = serialReturnPlans.get(line);
+          if (serialReturnPlan?.existingSerialIds.length) {
             const serialUpdate = await StockSerialNumber.updateMany(
-              { _id: { $in: line.serialNumbers }, company: companyId, product: product._id, status: 'dispatched' },
+              { _id: { $in: serialReturnPlan.existingSerialIds }, company: companyId, product: product._id, status: 'dispatched' },
               {
                 status: "in_stock",
                 returnedVia: creditNote._id,
@@ -1391,7 +1427,22 @@ exports.confirmCreditNote = async (req, res, next) => {
               },
               { session },
             );
-            if (serialUpdate.matchedCount !== line.serialNumbers.length) throw new Error(`One or more serial numbers for ${product.name} are not currently dispatched.`);
+            if (serialUpdate.matchedCount !== serialReturnPlan.existingSerialIds.length) throw new Error(`One or more serial numbers for ${product.name} are not currently dispatched.`);
+          }
+          if (serialReturnPlan?.missingSerialNumbers.length) {
+            for (const serialNo of serialReturnPlan.missingSerialNumbers) {
+              await StockSerialNumber.create({
+                company: companyId,
+                product: product._id,
+                warehouse: warehouse._id,
+                serialNo,
+                unitCost: line.unitCost || 0,
+                status: 'in_stock',
+                returnedVia: creditNote._id,
+                returnedAt: new Date(),
+                notes: `Serial record restored through credit note ${creditNote.referenceNo}.`,
+              });
+            }
           }
 
           // Create stock movement
