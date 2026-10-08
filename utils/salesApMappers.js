@@ -148,7 +148,14 @@ function invoiceLineToApi(row) {
     }),
   };
   if (row.product && typeof row.product === 'object') {
-    api.product = { _id: row.product.id, name: row.product.name, sku: row.product.sku, unit: row.product.unit };
+    api.product = {
+      _id: row.product.id,
+      name: row.product.name,
+      sku: row.product.sku,
+      unit: row.product.unit,
+      ...(row.product.trackingType != null ? { trackingType: row.product.trackingType } : {}),
+      ...(row.product.isStockable != null ? { isStockable: row.product.isStockable } : {}),
+    };
   }
   return api;
 }

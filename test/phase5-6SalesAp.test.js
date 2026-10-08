@@ -160,7 +160,7 @@ describe('Phase 5+6 sales/AP mappers', () => {
     const line = invoiceLineToApi({
       id: 'l1',
       productId: 'p1',
-      product: { id: 'p1', name: 'A', sku: 'SKU1', unit: 'pcs' },
+      product: { id: 'p1', name: 'A', sku: 'SKU1', unit: 'pcs', trackingType: 'batch', isStockable: true },
       qty: 1,
       unitPrice: 10,
       discountPct: 0,
@@ -174,6 +174,8 @@ describe('Phase 5+6 sales/AP mappers', () => {
       qtyCredited: 0,
     });
     expect(line.product.name).toBe('A');
+    expect(line.product.trackingType).toBe('batch');
+    expect(line.product.isStockable).toBe(true);
   });
 
   test('purchaseOrderToApi maps lines', () => {

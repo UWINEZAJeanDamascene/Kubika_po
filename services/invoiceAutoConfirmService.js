@@ -100,7 +100,7 @@ async function confirmDraftInvoiceInTransaction(companyId, invoiceId, userId) {
         if (!deliveryNoteHandlesStock || !matchesInvoiceQty || !hasTraceability) {
           confirmError(
             'ERR_TRACEABILITY_REQUIRED',
-            `Auto-confirm requires batch or serial assignments for ${product.name}. Select the traceability during picking before confirming the generated invoice.`,
+            `Traceability is required for ${product.name}. Create a draft Delivery Note from this invoice, assign the batch or serial number during picking, then confirm the invoice.`,
             409,
           );
         }

@@ -149,7 +149,11 @@ describe('Invoice confirmation from a delivery note', () => {
 
     await expect(
       confirmDraftInvoice('company-1', 'invoice-1', 'user-1', { submitEbm: false }),
-    ).rejects.toMatchObject({ code: 'ERR_TRACEABILITY_REQUIRED', statusCode: 409 });
+    ).rejects.toMatchObject({
+      code: 'ERR_TRACEABILITY_REQUIRED',
+      statusCode: 409,
+      message: expect.stringContaining('Create a draft Delivery Note'),
+    });
 
     expect(Invoice.findByIdAndUpdate).not.toHaveBeenCalled();
     expect(stockValidationService.reserveForOrder).not.toHaveBeenCalled();
