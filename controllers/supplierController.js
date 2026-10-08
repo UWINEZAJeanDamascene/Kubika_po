@@ -272,6 +272,10 @@ exports.getSupplierPurchaseHistory = async (req, res, next) => {
     const allPurchases = await StockMovement.find(query);
     const totalAmount = allPurchases.reduce((sum, purchase) => sum + (Number(purchase.totalCost) || 0), 0);
     const totalQuantity = allPurchases.reduce((sum, purchase) => sum + (Number(purchase.quantity) || 0), 0);
+    const lastPurchaseDate = allPurchases.reduce((latest, purchase) => {
+      const date = purchase.movementDate ? new Date(purchase.movementDate) : null;
+      return date && !Number.isNaN(date.getTime()) && (!latest || date > latest) ? date : latest;
+    }, null);
 
     res.json({
       success: true,
@@ -282,7 +286,8 @@ exports.getSupplierPurchaseHistory = async (req, res, next) => {
       summary: {
         totalAmount,
         totalQuantity,
-        totalPurchases: total
+        totalPurchases: total,
+        lastPurchaseDate,
       },
       data: purchases
     });

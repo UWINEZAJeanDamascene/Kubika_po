@@ -67,7 +67,12 @@ describe('supplier purchase history', () => {
     ]);
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
       success: true,
-      summary: expect.objectContaining({ totalPurchases: 1, totalAmount: 300, totalQuantity: 3 }),
+      summary: expect.objectContaining({
+        totalPurchases: 1,
+        totalAmount: 300,
+        totalQuantity: 3,
+        lastPurchaseDate: new Date('2026-10-08T00:00:00.000Z'),
+      }),
       data: rows,
     }));
     expect(next).not.toHaveBeenCalled();
