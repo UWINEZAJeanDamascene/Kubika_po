@@ -13,6 +13,7 @@ const emailService = require("../services/emailService");
 const { BankAccount } = require("../models/BankAccount");
 const { DEFAULT_ACCOUNTS } = require("../constants/chartOfAccounts");
 const { normalizeCreditNoteLines } = require("../utils/creditNoteLineNormalization");
+const { toIdString } = require("../utils/objectId");
 
 const EBMSalesService = require("../services/ebmSalesService");
 const { emitDataChanged } = require("../lib/realtimeEvents");
@@ -748,7 +749,7 @@ exports.applyCreditNote = async (req, res, next) => {
 
     const targetInvoice = await Invoice.findOne({ _id: invoiceId, company: companyId });
     if (!targetInvoice) return res.status(404).json({ success: false, message: 'Target invoice not found.' });
-    if (idOf(targetInvoice.client) !== idOf(note.client)) {
+    if (toIdString(targetInvoice.client) !== toIdString(note.client)) {
       return res.status(422).json({ success: false, message: 'A credit note can only be allocated to an invoice for the same customer.' });
     }
     if (String(targetInvoice.currencyCode || 'RWF').toUpperCase() !== String(note.currencyCode || 'RWF').toUpperCase()) {
@@ -1258,7 +1259,8 @@ exports.confirmCreditNote = async (req, res, next) => {
         const existingSerialIds = [];
         const missingSerialNumbers = [];
         for (const serialValue of serialNumbers) {
-          const productSerialKey = `${idOf(product)}:${serialValue.toUpperCase()}`;
+          const productId = toIdString(product);
+          const productSerialKey = `${productId}:${serialValue.toUpperCase()}`;
           if (serialsReturnedByProduct.has(productSerialKey)) {
             return res.status(422).json({ success: false, code: 'ERR_DUPLICATE_RETURN_SERIAL', message: `Serial ${serialValue} is listed more than once for ${product.name}.` });
           }
@@ -1269,14 +1271,14 @@ exports.confirmCreditNote = async (req, res, next) => {
             serial = await StockSerialNumber.findOne({
               _id: serialValue,
               company: companyId,
-              product: idOf(product),
+              product: productId,
             });
           }
           if (!serial) {
             serial = await StockSerialNumber.findOne({
               serialNo: serialValue.toUpperCase(),
               company: companyId,
-              product: idOf(product),
+              product: productId,
             });
           }
 
@@ -1382,7 +1384,7 @@ exports.confirmCreditNote = async (req, res, next) => {
 
         // ========== STEP 4: Return stock to warehouse (goods return only) ==========
         if (isGoodsReturn && product.isStockable) {
-          const warehouseId = idOf(line.returnToWarehouse);
+          const warehouseId = toIdString(line.returnToWarehouse);
           const warehouse = warehouseId
             ? await Warehouse.findOne({ _id: warehouseId, company: companyId, isActive: true }).session(session)
             : null;
