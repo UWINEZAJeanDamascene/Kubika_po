@@ -8,7 +8,7 @@ jest.mock('../services/cacheService', () => ({}));
 const { dbClient } = require('../lib/prisma');
 const { runInPrismaTransaction } = require('../services/transactionService');
 const { nextReferenceNo } = require('../utils/referenceNumbers');
-const { createReceipt } = require('../controllers/arReceiptController');
+const { createReceipt, getReceipts } = require('../controllers/arReceiptController');
 
 describe('AR receipt creation', () => {
   beforeEach(() => {
@@ -85,6 +85,34 @@ describe('AR receipt creation', () => {
     expect(res.status).toHaveBeenCalledWith(409);
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
       code: 'AR_RECEIPT_REFERENCE_EXISTS',
+    }));
+  });
+
+  test('filters receipts to those allocated to a requested invoice', async () => {
+    const findMany = jest.fn().mockResolvedValue([]);
+    const count = jest.fn().mockResolvedValue(0);
+    dbClient.mockReturnValue({ aRReceipt: { findMany, count } });
+    const req = {
+      user: { company: { _id: 'company-1' } },
+      query: { invoiceId: 'invoice-1', status: 'posted' },
+    };
+    const res = { json: jest.fn() };
+
+    await getReceipts(req, res, (err) => { throw err; });
+
+    expect(findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: {
+        companyId: 'company-1',
+        allocations: { some: { invoiceId: 'invoice-1' } },
+        status: 'posted',
+      },
+    }));
+    expect(count).toHaveBeenCalledWith(expect.objectContaining({
+      where: {
+        companyId: 'company-1',
+        allocations: { some: { invoiceId: 'invoice-1' } },
+        status: 'posted',
+      },
     }));
   });
 });

@@ -195,7 +195,34 @@ exports.getInvoice = async (req, res, next) => {
     const invoice = await Invoice.findOne({
       _id: req.params.id,
       company: companyId,
-    }).select({ client: 1, lines: 1, createdBy: 1, quotation: 1, payments: 1, revenueJournalEntry: 1, cogsJournalEntry: 1, referenceNo: 1, status: 1, totalAmount: 1, company: 1 }).lean();
+    }).select({
+      client: 1,
+      lines: 1,
+      createdBy: 1,
+      quotation: 1,
+      payments: 1,
+      revenueJournalEntry: 1,
+      cogsJournalEntry: 1,
+      referenceNo: 1,
+      status: 1,
+      totalAmount: 1,
+      amountPaid: 1,
+      amountOutstanding: 1,
+      currencyCode: 1,
+      exchangeRate: 1,
+      invoiceDate: 1,
+      dueDate: 1,
+      paidDate: 1,
+      subtotal: 1,
+      taxAmount: 1,
+      totalAEx: 1,
+      totalB18: 1,
+      totalDiscount: 1,
+      ebm: 1,
+      terms: 1,
+      notes: 1,
+      company: 1,
+    }).lean();
 
     const hydratedInvoice = await hydrateInvoiceRelations(invoice, companyId);
 

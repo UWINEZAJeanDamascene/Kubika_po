@@ -50,6 +50,9 @@ exports.getReceipts = async (req, res, next) => {
     const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 20));
     const where = { companyId };
     if (req.query.clientId) where.clientId = String(req.query.clientId);
+    if (req.query.invoiceId) {
+      where.allocations = { some: { invoiceId: String(req.query.invoiceId) } };
+    }
     if (req.query.status) where.status = String(req.query.status);
     if (req.query.startDate || req.query.endDate) {
       where.receiptDate = {};
