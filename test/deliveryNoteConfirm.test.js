@@ -5,6 +5,9 @@ jest.mock('../services/cacheService', () => ({
   bumpCompanyFinancialCaches: jest.fn(),
   bumpCompanyStockCaches: jest.fn(),
 }));
+jest.mock('../services/salesOrderLifecycleService', () => ({
+  syncSalesOrderLifecycle: jest.fn(),
+}));
 
 const DeliveryNoteController = require('../controllers/deliveryNoteController');
 const DeliveryNote = require('../models/DeliveryNote');
@@ -92,5 +95,36 @@ describe('Delivery note confirmation', () => {
     expect(deliveryNote.status).toBe('confirmed');
     expect(deliveryNote.save).toHaveBeenCalled();
     expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+  });
+
+  test('treats a retry for an already delivered note as successful', async () => {
+    const deliveryNote = {
+      _id: 'delivery-note-1',
+      status: 'delivered',
+      save: jest.fn(),
+      lines: [],
+    };
+    jest.spyOn(DeliveryNote, 'findOne').mockResolvedValue(deliveryNote);
+    const req = {
+      user: { company: { _id: 'company-1' }, id: 'user-1' },
+      params: { id: 'delivery-note-1' },
+      body: {},
+    };
+    const res = {
+      status: jest.fn().mockReturnThis(),
+      json: jest.fn(),
+    };
+    const next = jest.fn();
+
+    await DeliveryNoteController.markDelivered(req, res, next);
+
+    expect(next).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(200);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+      success: true,
+      data: deliveryNote,
+      message: 'Delivery note was already marked as delivered',
+    }));
+    expect(deliveryNote.save).not.toHaveBeenCalled();
   });
 });

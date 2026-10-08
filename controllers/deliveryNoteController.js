@@ -1479,6 +1479,14 @@ exports.markDelivered = async (req, res, next) => {
       });
     }
 
+    if (deliveryNote.status === 'delivered') {
+      return res.status(200).json({
+        success: true,
+        data: deliveryNote,
+        message: "Delivery note was already marked as delivered",
+      });
+    }
+
     // Can only mark as delivered if status is dispatched
     if (deliveryNote.status !== 'dispatched') {
       return res.status(400).json({
@@ -1488,32 +1496,58 @@ exports.markDelivered = async (req, res, next) => {
       });
     }
 
-    // Update delivery information
-    if (receivedBy) deliveryNote.receivedBy = receivedBy;
-    deliveryNote.deliveredBy = req.user.id;
-    deliveryNote.deliveredAt = new Date();
-    deliveryNote.actualDeliveryDate = receivedDate ? new Date(receivedDate) : new Date();
-    if (notes) deliveryNote.notes = notes;
-
-    // Change status to delivered
-    deliveryNote.status = 'delivered';
-
-    await deliveryNote.save();
-    if (deliveryNote.salesOrder) {
-      const { dbClient } = require('../lib/prisma');
-      for (const line of deliveryNote.lines || []) {
-        if (!line.salesOrderLineId) continue;
-        const deliveredQty = Number(line.qtyToDeliver || line.deliveredQty || 0);
-        const updated = await dbClient().$executeRaw`
-          UPDATE sales_order_lines
-          SET qty_delivered = qty_delivered + ${deliveredQty}
-          WHERE id = ${String(line.salesOrderLineId)}
+    try {
+      await runInTransaction(async () => {
+        const { dbClient } = require('../lib/prisma');
+        const claimed = await dbClient().$queryRaw`
+          UPDATE delivery_notes
+          SET status = 'processing'
+          WHERE id = ${String(deliveryNoteId)}
             AND company_id = ${String(companyId)}
-            AND qty_delivered + ${deliveredQty} <= qty_shipped`;
-        if (updated !== 1) throw new Error(`Could not update delivered quantity for ${line.productName}; shipped quantity may not cover this delivery.`);
+            AND status = 'dispatched'
+          RETURNING id`;
+        if (!claimed.length) {
+          const conflict = new Error('Delivery note status changed before it could be marked delivered. Refresh and retry.');
+          conflict.statusCode = 409;
+          throw conflict;
+        }
+
+        if (receivedBy) deliveryNote.receivedBy = receivedBy;
+        deliveryNote.deliveredBy = req.user.id;
+        deliveryNote.deliveredAt = new Date();
+        deliveryNote.actualDeliveryDate = receivedDate ? new Date(receivedDate) : new Date();
+        if (notes) deliveryNote.notes = notes;
+        deliveryNote.status = 'delivered';
+        await deliveryNote.save();
+
+        if (deliveryNote.salesOrder) {
+          for (const line of deliveryNote.lines || []) {
+            if (!line.salesOrderLineId) continue;
+            const deliveredQty = Number(line.qtyToDeliver || line.deliveredQty || 0);
+            const updated = await dbClient().$executeRaw`
+              UPDATE sales_order_lines
+              SET qty_delivered = qty_delivered + ${deliveredQty}
+              WHERE id = ${String(line.salesOrderLineId)}
+                AND company_id = ${String(companyId)}
+                AND qty_delivered + ${deliveredQty} <= qty_shipped`;
+            if (updated !== 1) throw new Error(`Could not update delivered quantity for ${line.productName}; shipped quantity may not cover this delivery.`);
+          }
+        }
+        await syncSalesOrderLifecycle(deliveryNote.salesOrder, companyId);
+      });
+    } catch (error) {
+      if (error.statusCode === 409) {
+        const current = await DeliveryNote.findOne({ _id: deliveryNoteId, company: companyId }).lean();
+        if (current?.status === 'delivered') {
+          return res.status(200).json({
+            success: true,
+            data: current,
+            message: "Delivery note was already marked as delivered",
+          });
+        }
       }
+      throw error;
     }
-    await syncSalesOrderLifecycle(deliveryNote.salesOrder, companyId);
 
     res.status(200).json({
       success: true,
