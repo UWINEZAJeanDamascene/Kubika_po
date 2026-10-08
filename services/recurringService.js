@@ -151,6 +151,17 @@ function buildInvoiceData(template, runDate) {
   };
 }
 
+function canAutoConfirmTemplate(template) {
+  return !(template.lines || []).some((line) => {
+    const product = line.product;
+    return product
+      && typeof product === 'object'
+      && product.isStockable !== false
+      && product.trackingType
+      && product.trackingType !== 'none';
+  });
+}
+
 async function advanceSchedule(template, occurrence, now) {
   let next = computeNextRunDate(template.schedule, occurrence);
   const changes = {
@@ -226,7 +237,7 @@ async function generateForTemplate(templateId, { companyId, scheduled = false } 
     }
     if (!invoice) invoice = await Invoice.create(buildInvoiceData(template, occurrence));
 
-    if (template.autoConfirm && invoice.status === 'draft') {
+    if (template.autoConfirm && canAutoConfirmTemplate(template) && invoice.status === 'draft') {
       invoice = await confirmDraftInvoice(template.company, invoice._id, template.createdBy);
       if (invoice?.status !== 'confirmed') {
         throw new Error('The generated invoice could not be confirmed. It remains a draft for review.');
@@ -308,4 +319,5 @@ module.exports = {
   generateForTemplate,
   computeNextRunDate,
   checkIdempotency,
+  canAutoConfirmTemplate,
 };
