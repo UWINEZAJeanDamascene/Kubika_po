@@ -1552,6 +1552,9 @@ exports.markDelivered = async (req, res, next) => {
         deliveryNote.actualDeliveryDate = receivedDate ? new Date(receivedDate) : new Date();
         if (notes) deliveryNote.notes = notes;
         deliveryNote.status = 'delivered';
+        for (const line of deliveryNote.lines || []) {
+          line.deliveredQty = Number(line.qtyToDeliver || line.deliveredQty || 0);
+        }
         await deliveryNote.save();
 
         if (deliveryNote.salesOrder) {

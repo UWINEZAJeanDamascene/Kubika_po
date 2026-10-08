@@ -64,7 +64,7 @@ async function syncSalesOrderLifecycle(salesOrderId, companyId) {
     if (note.status !== 'delivered') continue;
     for (const line of note.lines || []) {
       const productId = String(line.product?._id || line.product?.id || line.product || '');
-      const delivered = Number(line.deliveredQty ?? line.qtyToDeliver ?? 0) || 0;
+      const delivered = Number(line.deliveredQty) || Number(line.qtyToDeliver) || 0;
       let orderLine = lineById.get(String(line.salesOrderLineId || ''));
       // Backward compatibility for delivery notes created before line links existed.
       if (!orderLine) orderLine = orderLines.find((candidate) => {

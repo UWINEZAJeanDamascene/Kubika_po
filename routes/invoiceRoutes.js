@@ -7,6 +7,7 @@ const {
   updateInvoice,
   deleteInvoice,
   confirmInvoice,
+  correctInvoiceTaxFromDeliveryNote,
   recordPayment,
   writeOffInvoiceBadDebt,
   cancelInvoice,
@@ -49,6 +50,7 @@ router.route('/:id')
 
 // Confirm invoice (deducts stock)
 router.put('/:id/confirm', requirePermission('sales_invoices', 'approve'), logAction('invoice'), confirmInvoice);
+router.put('/:id/correct-tax-from-delivery-note', requirePermission('sales_invoices', 'update'), logAction('invoice'), correctInvoiceTaxFromDeliveryNote);
 
 router.post('/:id/ebm/verify-tin', requirePermission('sales_invoices', 'update'), verifyInvoiceCustomerTin);
 router.post('/:id/ebm/submit', requirePermission('sales_invoices', 'update'), logAction('invoice'), submitInvoiceEbm);

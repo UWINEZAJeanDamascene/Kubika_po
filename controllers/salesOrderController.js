@@ -8,6 +8,7 @@ const Warehouse = require('../models/Warehouse');
 const Company = require('../models/Company');
 const emailService = require('../services/emailService');
 const EBMProductService = require('../services/ebmProductService');
+const { syncSalesOrderLifecycle } = require('../services/salesOrderLifecycleService');
 
 const normalizeId = (value) => {
   if (!value) return null;
@@ -195,6 +196,19 @@ exports.getSalesOrders = async (req, res, next) => {
         .lean(),
       SalesOrder.countDocuments(filter)
     ]);
+    if (!status) {
+      await Promise.all(salesOrders
+        .filter((salesOrder) => salesOrder.status === 'packed')
+        .map(async (salesOrder) => {
+          const reconciled = await syncSalesOrderLifecycle(salesOrder._id, companyId);
+          if (reconciled) {
+            salesOrder.status = reconciled.status;
+            salesOrder.fulfillmentStatus = reconciled.fulfillmentStatus;
+            salesOrder.fulfillmentPercent = reconciled.fulfillmentPercent;
+            salesOrder.isBackorder = reconciled.isBackorder;
+          }
+        }));
+    }
     const hydratedSalesOrders = await hydrateSalesOrderRelations(salesOrders);
     
     res.status(200).json({

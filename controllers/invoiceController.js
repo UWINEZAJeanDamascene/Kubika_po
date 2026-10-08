@@ -1,4 +1,5 @@
 const Invoice = require("../models/Invoice");
+const DeliveryNote = require("../models/DeliveryNote");
 const Product = require("../models/Product");
 const Client = require("../models/Client");
 const StockMovement = require("../models/StockMovement");
@@ -14,6 +15,7 @@ const { runInTransaction } = require("../services/transactionService");
 const { dbClient } = require("../lib/prisma");
 const { generateObjectId } = require("../utils/objectId");
 const { DEFAULT_ACCOUNTS } = require("../constants/chartOfAccounts");
+const { buildInvoiceTaxCorrection } = require("../utils/invoiceDeliveryNoteTax");
 const { parseBoundedPage } = require("../utils/querySafety");
 const { consumeApproval: consumePosManagerApproval } = require('./posManagerApprovalController');
 const {
@@ -637,6 +639,185 @@ exports.confirmInvoice = async (req, res, next) => {
     if (error.status || error.statusCode) {
       return res.status(error.status || error.statusCode).json({
         success: false, code: error.code || 'INVOICE_CONFIRMATION_FAILED', message: error.message,
+      });
+    }
+    next(error);
+  }
+};
+
+exports.correctInvoiceTaxFromDeliveryNote = async (req, res, next) => {
+  try {
+    const companyId = String(req.user.company._id || req.user.company.id);
+    const userId = String(req.user.id || req.user._id);
+    const invoiceId = req.params.id;
+    const invoice = await Invoice.findOne({ _id: invoiceId, company: companyId }).lean();
+    if (!invoice) {
+      return res.status(404).json({ success: false, code: 'ERR_INVOICE_NOT_FOUND', message: 'Invoice not found.' });
+    }
+    if (invoice.status !== 'confirmed') {
+      return res.status(409).json({ success: false, code: 'ERR_INVOICE_TAX_CORRECTION_STATUS', message: 'Only an unpaid confirmed invoice can be corrected from its delivery note.' });
+    }
+    const embeddedPayments = Array.isArray(invoice.payments)
+      ? invoice.payments.reduce((sum, payment) => sum + Number(payment.amount || 0), 0)
+      : 0;
+    if (Number(invoice.amountPaid || 0) > 0 || embeddedPayments > 0) {
+      return res.status(409).json({ success: false, code: 'ERR_INVOICE_TAX_CORRECTION_PAID', message: 'This invoice has payments. Use the credit-note workflow to correct it.' });
+    }
+    if (['submitted', 'pending'].includes(invoice.ebm?.ebmStatus) || invoice.ebm?.rcptNo) {
+      return res.status(409).json({ success: false, code: 'ERR_INVOICE_TAX_CORRECTION_EBM', message: 'This invoice has an EBM submission or pending submission. Correct it through the fiscal credit-note workflow.' });
+    }
+
+    const invoiceKey = normalizeId(invoice._id);
+    const deliveryNote = await DeliveryNote.findOne({
+      invoice: invoiceKey,
+      company: companyId,
+    }).lean();
+    if (!deliveryNote) {
+      return res.status(404).json({ success: false, code: 'ERR_INVOICE_TAX_DELIVERY_NOTE_NOT_FOUND', message: 'No delivery note is linked to this invoice.' });
+    }
+
+    const plan = buildInvoiceTaxCorrection(invoice, deliveryNote);
+    const creditNote = await dbClient().creditNote.findFirst({
+      where: { invoiceId: invoiceKey, companyId, status: { notIn: ['draft', 'cancelled'] } },
+      select: { id: true },
+    });
+    if (creditNote) {
+      return res.status(409).json({ success: false, code: 'ERR_INVOICE_TAX_CORRECTION_CREDIT_NOTE', message: 'This invoice has an issued credit note. Correct it through the credit-note workflow.' });
+    }
+
+    if (Math.abs(plan.taxDelta) < 0.01) {
+      return res.status(200).json({
+        success: true,
+        message: 'Invoice tax already matches the linked delivery note.',
+        data: invoice,
+      });
+    }
+
+    await runInTransaction(async () => {
+      const prisma = dbClient();
+      const currentInvoice = await prisma.invoice.findFirst({
+        where: { id: invoiceKey, companyId },
+        select: { status: true, amountPaid: true, taxAmount: true, ebm: true },
+      });
+      if (!currentInvoice || currentInvoice.status !== 'confirmed'
+        || Number(currentInvoice.amountPaid) > 0
+        || ['submitted', 'pending'].includes(currentInvoice.ebm?.ebmStatus)
+        || currentInvoice.ebm?.rcptNo) {
+        const conflict = new Error('Invoice state changed; refresh and review it before applying a tax correction.');
+        conflict.code = 'ERR_INVOICE_TAX_CORRECTION_CONFLICT';
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+
+      const existingCreditNote = await prisma.creditNote.findFirst({
+        where: { invoiceId: invoiceKey, companyId, status: { notIn: ['draft', 'cancelled'] } },
+        select: { id: true },
+      });
+      if (existingCreditNote) {
+        const conflict = new Error('An issued credit note now exists for this invoice; use the credit-note workflow.');
+        conflict.code = 'ERR_INVOICE_TAX_CORRECTION_CREDIT_NOTE';
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+
+      const invoiceUpdate = await prisma.invoice.updateMany({
+        where: {
+          id: invoiceKey,
+          companyId,
+          status: 'confirmed',
+          amountPaid: 0,
+          taxAmount: currentInvoice.taxAmount,
+        },
+        data: {
+          subtotal: plan.subtotal,
+          taxAmount: plan.taxAmount,
+          totalAmount: plan.totalAmount,
+          amountOutstanding: plan.totalAmount,
+          totalAEx: plan.totalAEx,
+          totalB18: plan.totalB18,
+        },
+      });
+      if (invoiceUpdate.count !== 1) {
+        const conflict = new Error('Invoice changed before the tax correction could be applied. Refresh and retry.');
+        conflict.code = 'ERR_INVOICE_TAX_CORRECTION_CONFLICT';
+        conflict.statusCode = 409;
+        throw conflict;
+      }
+
+      for (const line of plan.lines) {
+        const lineUpdate = await prisma.invoiceLine.updateMany({
+          where: { id: String(line.id), invoiceId: invoiceKey, companyId },
+          data: {
+            taxRate: line.taxRate,
+            taxCode: line.taxCode,
+            lineTax: line.lineTax,
+            lineTotal: line.lineTotal,
+          },
+        });
+        if (lineUpdate.count !== 1) {
+          throw new Error(`Invoice line ${line.id} could not be updated with its delivery-note tax.`);
+        }
+      }
+
+      const taxDelta = Math.abs(plan.taxDelta);
+      const debitAccount = plan.taxDelta > 0 ? DEFAULT_ACCOUNTS.accountsReceivable : DEFAULT_ACCOUNTS.vatOutput;
+      const creditAccount = plan.taxDelta > 0 ? DEFAULT_ACCOUNTS.vatOutput : DEFAULT_ACCOUNTS.accountsReceivable;
+      await JournalService.createEntry(companyId, userId, {
+        date: invoice.invoiceDate || new Date(),
+        description: `Tax correction for Invoice ${invoice.referenceNo}`,
+        sourceType: 'invoice_tax_correction',
+        sourceId: invoiceKey,
+        sourceReference: invoice.referenceNo,
+        isAutoGenerated: true,
+        notes: `Tax recalculated from linked delivery note ${deliveryNote.referenceNo}.`,
+        lines: [
+          {
+            accountCode: debitAccount,
+            accountName: debitAccount === DEFAULT_ACCOUNTS.accountsReceivable ? 'Accounts Receivable' : 'VAT Output',
+            description: `Tax correction for Invoice ${invoice.referenceNo}`,
+            debit: plan.taxDelta > 0 ? taxDelta : 0,
+            credit: plan.taxDelta < 0 ? taxDelta : 0,
+          },
+          {
+            accountCode: creditAccount,
+            accountName: creditAccount === DEFAULT_ACCOUNTS.vatOutput ? 'VAT Output' : 'Accounts Receivable',
+            description: `Tax correction for Invoice ${invoice.referenceNo}`,
+            debit: plan.taxDelta < 0 ? taxDelta : 0,
+            credit: plan.taxDelta > 0 ? taxDelta : 0,
+          },
+        ],
+        sourceData: {
+          taxCode: plan.lines.every((line) => line.taxCode === plan.lines[0].taxCode) ? plan.lines[0].taxCode : null,
+          taxRate: plan.subtotal > 0 ? Math.round((plan.taxAmount / plan.subtotal) * 10000) / 100 : 0,
+          vatAmount: taxDelta,
+          netAmount: 0,
+          grossAmount: taxDelta,
+          metadata: { correctionForInvoiceId: invoiceKey, deliveryNoteId: deliveryNote._id },
+        },
+      });
+
+      const clientUpdate = await prisma.client.updateMany({
+        where: { id: normalizeId(invoice.client), companyId },
+        data: { outstandingBalance: { increment: plan.taxDelta } },
+      });
+      if (clientUpdate.count !== 1) {
+        throw new Error('Customer receivable balance could not be updated for the invoice tax correction.');
+      }
+    });
+
+    const correctedInvoice = await Invoice.findOne({ _id: invoiceKey, company: companyId });
+    await cacheService.bumpCompanyFinancialCaches(companyId);
+    res.status(200).json({
+      success: true,
+      message: `Invoice tax corrected by ${Math.abs(plan.taxDelta).toFixed(2)} from its linked delivery note.`,
+      data: correctedInvoice,
+    });
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({
+        success: false,
+        code: error.code || 'ERR_INVOICE_TAX_CORRECTION_FAILED',
+        message: error.message,
       });
     }
     next(error);
