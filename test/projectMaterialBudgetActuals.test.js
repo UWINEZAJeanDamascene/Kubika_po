@@ -21,6 +21,15 @@ jest.mock("../lib/prisma", () => {
       findMany: jest.fn(),
       create: jest.fn(),
     },
+    stockSerialNumber: {
+      findMany: jest.fn(),
+      updateMany: jest.fn(),
+    },
+    stockBatch: {
+      findMany: jest.fn(),
+      updateMany: jest.fn(),
+      update: jest.fn(),
+    },
     stockLevel: {
       findUnique: jest.fn(),
       updateMany: jest.fn(),
@@ -139,6 +148,11 @@ describe("Project material budget actual reconciliation", () => {
     prisma.stockMovement.findFirst.mockResolvedValue(null);
     prisma.stockMovement.findMany.mockResolvedValue([]);
     prisma.stockMovement.create.mockResolvedValue({});
+    prisma.stockSerialNumber.findMany.mockResolvedValue([]);
+    prisma.stockSerialNumber.updateMany.mockResolvedValue({ count: 1 });
+    prisma.stockBatch.findMany.mockResolvedValue([]);
+    prisma.stockBatch.updateMany.mockResolvedValue({ count: 1 });
+    prisma.stockBatch.update.mockResolvedValue({});
     prisma.budgetLine.findMany.mockResolvedValue([budgetLine]);
     prisma.budgetLine.findFirst.mockResolvedValue(budgetLine);
     prisma.chartOfAccount.findFirst.mockImplementation(({ where }) => {
@@ -280,9 +294,123 @@ describe("Project material budget actual reconciliation", () => {
     );
   });
 
+  test("allows reissuing returned quantity on a fully issued requisition", async () => {
+    const returnedLine = {
+      ...line,
+      plannedQuantity: 4,
+      issuedQuantity: 4,
+      returnedQuantity: 4,
+      issuedCost: 48,
+      returnedCost: 48,
+      unitCost: 12,
+      reservedQuantity: 0,
+      budgetLineId: "budget_line_1",
+    };
+    prisma.projectMaterialRequisition.findFirst.mockResolvedValue({
+      ...requisition,
+      status: "issued",
+      lines: [returnedLine],
+    });
+    prisma.projectMaterialRequisitionLine.findMany.mockResolvedValue([{
+      plannedQuantity: 4,
+      issuedQuantity: 8,
+      returnedQuantity: 4,
+    }]);
+
+    await projectMaterialService.issue(
+      "company_1", "project_1", "requisition_1", "line_1", 4, "user_1",
+    );
+
+    expect(prisma.projectMaterialRequisitionLine.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: "line_1" },
+      data: expect.objectContaining({
+        issuedQuantity: { increment: 4 },
+      }),
+    }));
+    expect(prisma.projectMaterialRequisition.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: "requisition_1" },
+      data: { status: "issued" },
+    }));
+    expect(prisma.stockMovement.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        referenceType: "project_material_issue",
+        quantity: 4,
+      }),
+    }));
+  });
+
+  test("reserves returned serial stock when reissuing a returned quantity", async () => {
+    const returnedLine = {
+      ...line,
+      plannedQuantity: 1,
+      issuedQuantity: 1,
+      returnedQuantity: 1,
+      issuedCost: 12,
+      returnedCost: 12,
+      unitCost: 12,
+      reservedQuantity: 0,
+      budgetLineId: "budget_line_1",
+      trackingAllocations: [{
+        kind: "serial",
+        serialId: "serial_1",
+        issued: true,
+        returned: true,
+      }],
+    };
+    prisma.projectMaterialRequisition.findFirst.mockResolvedValue({
+      ...requisition,
+      status: "partially_issued",
+      lines: [returnedLine],
+    });
+    prisma.product.findFirst.mockResolvedValue({
+      id: "product_1",
+      name: "Serial material",
+      cogsAccount: "COGS-01",
+      currentStock: 1,
+      averageCost: 12,
+      trackingType: "serial",
+    });
+    prisma.stockSerialNumber.findMany.mockResolvedValue([{
+      id: "serial_1",
+      serialNo: "SER-001",
+      status: "returned",
+    }]);
+    prisma.stockLevel.findUnique.mockResolvedValue({
+      id: "stock_1",
+      qtyOnHand: 1,
+      qtyReserved: 0,
+    });
+    prisma.projectMaterialRequisitionLine.findMany.mockResolvedValue([{
+      plannedQuantity: 1,
+      issuedQuantity: 2,
+      returnedQuantity: 1,
+    }]);
+
+    await projectMaterialService.issue(
+      "company_1", "project_1", "requisition_1", "line_1", 1, "user_1",
+    );
+
+    expect(prisma.stockSerialNumber.updateMany).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        where: expect.objectContaining({ status: { in: ["in_stock", "returned"] } }),
+        data: { status: "reserved" },
+      }),
+    );
+    expect(prisma.stockSerialNumber.updateMany).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        where: expect.objectContaining({ status: "reserved" }),
+        data: expect.objectContaining({ status: "dispatched" }),
+      }),
+    );
+    expect(prisma.stockLevel.updateMany).toHaveBeenCalledTimes(2);
+  });
+
   test("reverses the proportional original budget actual on material return", async () => {
     const returnLine = {
       ...line,
+      plannedQuantity: 5,
       issuedQuantity: 4,
       returnedQuantity: 0,
       issuedCost: 48,
@@ -310,6 +438,10 @@ describe("Project material budget actual reconciliation", () => {
 
     await projectMaterialService.returnStock("company_1", "project_1", "requisition_1", "line_1", 1, "user_1");
 
+    expect(prisma.projectMaterialRequisition.update).toHaveBeenCalledWith({
+      where: { id: "requisition_1" },
+      data: { status: "partially_issued" },
+    });
     expect(prisma.budgetLine.update).toHaveBeenCalledWith({
       where: { id: "budget_line_1" },
       data: { actualAmount: { increment: -12 } },
@@ -332,6 +464,50 @@ describe("Project material budget actual reconciliation", () => {
         ],
       }),
     );
+  });
+
+  test("reopens a requisition after every issued unit has been returned", async () => {
+    const fullyIssuedLine = {
+      ...line,
+      plannedQuantity: 4,
+      issuedQuantity: 4,
+      returnedQuantity: 0,
+      issuedCost: 48,
+      returnedCost: 0,
+      unitCost: 12,
+      budgetLineId: "budget_line_1",
+      trackingAllocations: [],
+    };
+    prisma.projectMaterialRequisition.findFirst.mockResolvedValue({
+      ...requisition,
+      status: "issued",
+      lines: [fullyIssuedLine],
+    });
+    prisma.budgetLine.findFirst.mockResolvedValue({
+      ...budgetLine,
+      actualAmount: 48,
+    });
+    mockConsumptionRecords.push({
+      companyId: "company_1",
+      budgetLineId: "budget_line_1",
+      sourceId: "line_1",
+      sourceType: "project_material_issue",
+      amount: "48",
+    });
+    prisma.stockLevel.findUnique.mockResolvedValue({
+      id: "stock_1",
+      qtyOnHand: 0,
+      totalValue: 0,
+    });
+
+    await projectMaterialService.returnStock(
+      "company_1", "project_1", "requisition_1", "line_1", 4, "user_1",
+    );
+
+    expect(prisma.projectMaterialRequisition.update).toHaveBeenCalledWith({
+      where: { id: "requisition_1" },
+      data: { status: "partially_issued" },
+    });
   });
 
   test("records stock returns and warns when no budget line can be matched", async () => {

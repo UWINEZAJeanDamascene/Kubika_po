@@ -467,14 +467,93 @@ class ProjectMaterialService {
       const req = await tx.projectMaterialRequisition.findFirst({ where: { id: String(requisitionId), companyId: String(companyId), projectId: String(projectId) }, include: { lines: true } });
       const line = req?.lines.find((item) => item.id === String(lineId));
       if (!req || !line) throw fail("Requisition line not found", 404);
-      if (!["approved", "partially_issued"].includes(req.status)) throw fail("Approve the requisition before issuing stock");
-      const outstanding = number(line.plannedQuantity) - number(line.issuedQuantity);
+      if (!["approved", "partially_issued", "issued"].includes(req.status)) throw fail("Approve the requisition before issuing stock");
+      const outstanding = number(line.plannedQuantity) - number(line.issuedQuantity) + number(line.returnedQuantity);
       if (qty > outstanding) throw fail("Issue quantity exceeds the remaining planned quantity");
       const product = await tx.product.findFirst({ where: { id: line.productId, companyId: String(companyId) } });
       if (!product) throw fail("Material product not found", 404);
       const mode = trackedMode(product);
-      let allocations = Array.isArray(line.trackingAllocations) ? line.trackingAllocations.map((item) => ({ ...item })) : [];
       if (mode === "serial" && !Number.isInteger(qty)) throw fail(`${product.name} is serial tracked; issue quantity must be a whole number`);
+      let allocations = Array.isArray(line.trackingAllocations) ? line.trackingAllocations.map((item) => ({ ...item })) : [];
+      let newlyReserved = 0;
+      if (mode === "serial") {
+        const alreadyReserved = allocations.filter((item) => item.kind === "serial" && !item.issued).length;
+        const shortage = Math.max(0, qty - alreadyReserved);
+        if (shortage) {
+          const availableSerials = await tx.stockSerialNumber.findMany({
+            where: {
+              companyId: String(companyId),
+              productId: product.id,
+              warehouseId: line.warehouseId,
+              status: { in: ["in_stock", "returned"] },
+            },
+            orderBy: { createdAt: "asc" },
+          });
+          const toReserve = availableSerials.slice(0, shortage);
+          if (toReserve.length !== shortage) throw fail(`Not enough available serial numbers for ${product.name} in the selected warehouse`);
+          const reserved = await tx.stockSerialNumber.updateMany({
+            where: {
+              id: { in: toReserve.map((serial) => serial.id) },
+              companyId: String(companyId),
+              status: { in: ["in_stock", "returned"] },
+            },
+            data: { status: "reserved" },
+          });
+          if (reserved.count !== shortage) throw fail(`Serial stock changed while reserving ${product.name}; refresh and retry`);
+          allocations.push(...toReserve.map((serial) => ({
+            kind: "serial",
+            serialId: serial.id,
+            serialNo: serial.serialNo,
+            priorStatus: serial.status,
+            issued: false,
+            returned: false,
+          })));
+          newlyReserved = shortage;
+        }
+      } else if (mode === "batch") {
+        const alreadyReserved = allocations
+          .filter((item) => item.kind === "batch")
+          .reduce((total, item) => total + Math.max(0, number(item.quantity) - number(item.issuedQuantity)), 0);
+        let shortage = Math.max(0, qty - alreadyReserved);
+        if (shortage) {
+          const batches = await tx.stockBatch.findMany({
+            where: {
+              companyId: String(companyId),
+              productId: product.id,
+              warehouseId: line.warehouseId,
+              isQuarantined: false,
+              qtyOnHand: { gt: 0 },
+            },
+            orderBy: [{ expiryDate: "asc" }, { createdAt: "asc" }],
+          });
+          for (const batch of batches) {
+            const available = Math.max(0, number(batch.qtyOnHand) - number(batch.reservedQuantity));
+            const take = Math.min(shortage, available);
+            if (!take) continue;
+            const reserved = await tx.stockBatch.updateMany({
+              where: {
+                id: batch.id,
+                qtyOnHand: { gte: number(batch.reservedQuantity) + take },
+                reservedQuantity: batch.reservedQuantity,
+              },
+              data: { reservedQuantity: { increment: take } },
+            });
+            if (!reserved.count) throw fail(`Batch stock changed while reserving ${product.name}; refresh and retry`);
+            allocations.push({
+              kind: "batch",
+              batchId: batch.id,
+              batchNo: batch.batchNo,
+              quantity: take,
+              issuedQuantity: 0,
+              returnedQuantity: 0,
+            });
+            shortage -= take;
+            newlyReserved += take;
+            if (shortage <= 0) break;
+          }
+          if (shortage > 0) throw fail(`Not enough available batch stock for ${product.name} in the selected warehouse`);
+        }
+      }
       if (mode && !allocations.length) throw fail(`No tracked stock is reserved for ${product.name}; cancel and reapprove this requisition`);
       const previousStock = number(product.currentStock);
       if (qty > previousStock) throw fail("Issue quantity exceeds product on-hand stock");
@@ -508,7 +587,16 @@ class ProjectMaterialService {
       }
       const stockLevel = await tx.stockLevel.findUnique({ where: { companyId_productId_warehouseId: { companyId: String(companyId), productId: line.productId, warehouseId: line.warehouseId } } });
       if (!stockLevel || number(stockLevel.qtyOnHand) < qty) throw fail("Warehouse stock is insufficient to issue this quantity");
-      const reservedRelease = Math.min(qty, number(line.reservedQuantity), number(stockLevel.qtyReserved));
+      if (newlyReserved > 0) {
+        const reservation = await tx.stockLevel.updateMany({
+          where: { id: stockLevel.id, qtyOnHand: { gte: number(stockLevel.qtyReserved) + newlyReserved } },
+          data: { qtyReserved: { increment: newlyReserved } },
+        });
+        if (!reservation.count) throw fail(`Stock changed while reserving ${product.name}; refresh and retry`);
+        await tx.product.update({ where: { id: product.id }, data: { reservedQuantity: { increment: newlyReserved } } });
+      }
+      const reservedQuantity = number(line.reservedQuantity) + newlyReserved;
+      const reservedRelease = Math.min(qty, reservedQuantity, number(stockLevel.qtyReserved) + newlyReserved);
       const stockUpdate = await tx.stockLevel.updateMany({ where: { id: stockLevel.id, qtyOnHand: { gte: qty }, qtyReserved: { gte: reservedRelease } }, data: { qtyOnHand: { decrement: qty }, qtyReserved: { decrement: reservedRelease }, totalValue: { decrement: round(unitCost * qty) }, lastMovementAt: new Date(), lastMovementType: "out" } });
       if (!stockUpdate.count) throw fail("Warehouse stock is insufficient to issue this quantity");
       const layers = await tx.inventoryLayer.findMany({ where: { companyId: String(companyId), productId: product.id, warehouseId: line.warehouseId, qtyRemaining: { gt: 0 } }, orderBy: { receiptDate: "asc" } });
@@ -520,7 +608,7 @@ class ProjectMaterialService {
         remainingToCost -= consumed;
       }
       await tx.product.update({ where: { id: product.id }, data: { currentStock: { decrement: qty }, reservedQuantity: { decrement: Math.min(qty, number(line.reservedQuantity)) } } });
-      await tx.projectMaterialRequisitionLine.update({ where: { id: line.id }, data: { issuedQuantity: { increment: qty }, issuedCost: { increment: issueCost }, reservedQuantity: { decrement: Math.min(qty, number(line.reservedQuantity)) }, trackingAllocations: allocations, unitCost } });
+      await tx.projectMaterialRequisitionLine.update({ where: { id: line.id }, data: { issuedQuantity: { increment: qty }, issuedCost: { increment: issueCost }, reservedQuantity: { increment: newlyReserved - reservedRelease }, trackingAllocations: allocations, unitCost } });
       await postBudgetActual(tx, {
         companyId, budgetLine, amount: issueCost,
         documentType: "project_material_issue", documentId: req.id,
@@ -535,7 +623,8 @@ class ProjectMaterialService {
       const trackingNote = mode === "serial" ? `; serials ${allocations.filter((item) => item.kind === "serial" && item.issued).map((item) => item.serialId).join(",")}` : mode === "batch" ? `; batches ${allocations.filter((item) => item.kind === "batch" && item.issuedQuantity).map((item) => `${item.batchId}:${item.issuedQuantity}`).join(",")}` : "";
       await tx.stockMovement.create({ data: { id: movementId, companyId: String(companyId), productId: product.id, type: "out", reason: "dispatch", quantity: qty, previousStock, newStock: previousStock - qty, unitCost, totalCost: issueCost, warehouseId: line.warehouseId, referenceType: "project_material_issue", referenceNumber: req.requisitionNo, referenceDocumentId: req.id, referenceModel: "ProjectMaterialRequisition", notes: `Project ${req.projectId}${line.taskId ? ` task ${line.taskId}` : ""}${trackingNote}`, performedById: userId ? String(userId) : null, movementDate } });
       const updatedLines = await tx.projectMaterialRequisitionLine.findMany({ where: { requisitionId: req.id } });
-      const status = updatedLines.every((item) => number(item.issuedQuantity) >= number(item.plannedQuantity)) ? "issued" : "partially_issued";
+      const status = updatedLines.every((item) =>
+        number(item.issuedQuantity) - number(item.returnedQuantity) >= number(item.plannedQuantity)) ? "issued" : "partially_issued";
       return tx.projectMaterialRequisition.update({ where: { id: req.id }, data: { status }, include: { lines: true } });
     }, { timeout: 30000, isolationLevel: "Serializable" });
   }
@@ -594,6 +683,12 @@ class ProjectMaterialService {
       await tx.product.update({ where: { id: product.id }, data: { currentStock: { increment: qty } } });
       await tx.inventoryLayer.create({ data: { id: generateObjectId(), companyId: String(companyId), productId: line.productId, warehouseId: line.warehouseId, qtyReceived: qty, qtyRemaining: qty, unitCost, sourceType: "project_material_return", sourceId: req.id, createdById: userId ? String(userId) : null } });
       await tx.projectMaterialRequisitionLine.update({ where: { id: line.id }, data: { returnedQuantity: { increment: qty }, returnedCost: { increment: round(unitCost * qty) }, trackingAllocations: allocations } });
+      const isTargetLine = (candidate) => candidate.id === line.id;
+      const status = req.lines.every((candidate) => {
+        const returnedQuantity = number(candidate.returnedQuantity) + (isTargetLine(candidate) ? qty : 0);
+        return number(candidate.issuedQuantity) - returnedQuantity >= number(candidate.plannedQuantity);
+      }) ? "issued" : "partially_issued";
+      await tx.projectMaterialRequisition.update({ where: { id: req.id }, data: { status } });
       if (budgetLine && returnedBudgetCost > 0) {
         const amountToReverse = round(Math.min(returnedBudgetCost, Math.max(0, number(budgetLine.actualAmount))));
         if (amountToReverse > 0) {
