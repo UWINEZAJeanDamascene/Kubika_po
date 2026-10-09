@@ -489,6 +489,7 @@ const DOC_POPULATE_REFS = {
   requested_by: 'User',
   employee: 'Employee',
   account_id: 'ChartOfAccount',
+  budget_id: 'Budget',
   bankAccount: 'BankAccount',
   bankAccountId: 'BankAccount',
   account: 'ChartOfAccount',
