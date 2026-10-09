@@ -133,7 +133,15 @@ class ProjectService {
       summary.cost_by_currency[currency] = (summary.cost_by_currency[currency] || 0) + Number(row.laborCost || 0);
       laborByTask.set(row.taskId, summary);
     }
-    return tasks.map((task) => ({ ...task, timesheet_hours: laborByTask.get(String(task._id))?.hours || 0, timesheet_labor_cost_by_currency: laborByTask.get(String(task._id))?.cost_by_currency || {} }))
+    return tasks.map((task) => {
+      const approvedHours = laborByTask.get(String(task._id))?.hours || 0;
+      return {
+        ...task,
+        actual_hours: Number(task.actual_hours || 0) || approvedHours,
+        timesheet_hours: approvedHours,
+        timesheet_labor_cost_by_currency: laborByTask.get(String(task._id))?.cost_by_currency || {},
+      };
+    })
       .sort((a, b) => String(a.end_date || "").localeCompare(String(b.end_date || "")) || String(a.wbs_code).localeCompare(String(b.wbs_code)));
   }
 
@@ -499,7 +507,7 @@ class ProjectService {
 
     const allNodes = await prisma.project.findMany({
       where: { companyId: String(companyId), isTemplate: false },
-      select: { id: true, parentId: true },
+      select: { id: true, parentId: true, type: true },
     });
     const projectIds = [...new Set(projects.map((project) => String(project._id)))];
     const descendantsByProject = new Map(projectIds.map((id) => [id, new Set([id])]));
@@ -518,6 +526,25 @@ class ProjectService {
     }
 
     const allIncludedIds = [...new Set([...descendantsByProject.values()].flatMap((ids) => [...ids]))];
+    const nodeById = new Map(allNodes.map((node) => [String(node.id), node]));
+    const taskIds = [...new Set([...descendantsByProject.values()]
+      .flatMap((ids) => [...ids])
+      .filter((id) => nodeById.get(id)?.type === "task"))];
+    const laborRows = taskIds.length
+      ? await prisma.projectLaborEntry.findMany({
+          where: { companyId: String(companyId), taskId: { in: taskIds } },
+          select: { taskId: true, hours: true, laborCost: true, currencyCode: true },
+        })
+      : [];
+    const hoursByTask = new Map();
+    const laborCostByTask = new Map();
+    for (const row of laborRows) {
+      hoursByTask.set(row.taskId, (hoursByTask.get(row.taskId) || 0) + Number(row.hours || 0));
+      const costsByCurrency = laborCostByTask.get(row.taskId) || new Map();
+      const currency = row.currencyCode || "RWF";
+      costsByCurrency.set(currency, (costsByCurrency.get(currency) || 0) + Number(row.laborCost || 0));
+      laborCostByTask.set(row.taskId, costsByCurrency);
+    }
     const budgetLines = allIncludedIds.length
       ? await prisma.budgetLine.findMany({
           where: {
@@ -544,14 +571,23 @@ class ProjectService {
         actual: summary.actual + Number(line.actualAmount || 0),
         encumbered: summary.encumbered + Number(line.encumberedAmount || 0),
       }), { budgeted: 0, actual: 0, encumbered: 0 });
+      const projectCurrency = String(project.currency_code || "RWF").toUpperCase();
+      const laborSpent = [...includedIds].reduce((sum, taskId) =>
+        sum + Number(laborCostByTask.get(taskId)?.get(projectCurrency) || 0), 0);
       const budgetAllocated = approvedLines.length
         ? totals.budgeted
         : Number(project.budget_allocated || 0);
+      const actualSpent = totals.actual + laborSpent;
       return {
         ...project,
         ...(approvedLines.length ? { budget_allocated: totals.budgeted } : {}),
-        budget_spent: totals.actual,
-        budget_remaining: budgetAllocated - totals.actual - totals.encumbered,
+        budget_spent: actualSpent,
+        budget_remaining: budgetAllocated - actualSpent - totals.encumbered,
+        labor_spent: laborSpent,
+        ...(project.type === "task" ? {
+          timesheet_hours: hoursByTask.get(String(project._id)) || 0,
+          actual_hours: Number(project.actual_hours || 0) || hoursByTask.get(String(project._id)) || 0,
+        } : {}),
       };
     });
   }
@@ -613,9 +649,25 @@ class ProjectService {
     const endDate = effective.end_date ? new Date(effective.end_date) : null;
     if ((startDate && !Number.isFinite(startDate.getTime())) || (endDate && !Number.isFinite(endDate.getTime()))) throw validationError("Project dates are invalid");
     if (startDate && endDate && endDate < startDate) throw validationError("Target end date must be on or after the start date");
-    if (data.status === "completed" && effective.type === "task") {
+    if (data.status === "completed" && effective.type === "task" && project.status !== "completed") {
       const dependencies = await Project.find({ company_id: companyId, _id: { $in: effective.depends_on_ids || [] } });
       if (dependencies.some((task) => task.status !== "completed")) throw validationError("Complete all dependent tasks before completing this task");
+      const laborEntries = await prisma.projectLaborEntry.findMany({
+        where: { companyId: String(companyId), taskId: String(projectId) },
+        select: { hours: true },
+      });
+      const approvedTimesheetHours = laborEntries.reduce((total, entry) => total + Number(entry.hours || 0), 0);
+      if (approvedTimesheetHours > 0) {
+        data.actual_hours = approvedTimesheetHours;
+      } else {
+        const recordedHours = data.actual_hours === undefined
+          ? Number(project.actual_hours || 0)
+          : Number(data.actual_hours);
+        if (recordedHours <= 0) {
+          throw validationError("Enter the task's actual hours before completing it; no approved timesheet hours were found.");
+        }
+        data.actual_hours = recordedHours;
+      }
       data.progress_percent = 100;
       data.completed_at = new Date();
     } else if (data.status && data.status !== "completed" && project.status === "completed") {

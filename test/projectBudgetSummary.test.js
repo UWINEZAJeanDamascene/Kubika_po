@@ -45,6 +45,8 @@ const projectService = require("../services/projectService");
 describe("Project budget summary", () => {
   beforeEach(() => {
     mockBudgetLines.splice(0, mockBudgetLines.length);
+    mockProject.type = "project";
+    mockProject.actual_hours = 0;
   });
 
   test("lists linked lines while counting only approved budgets in project totals", async () => {
@@ -79,7 +81,10 @@ describe("Project budget summary", () => {
   });
 
   test("returns current approved budget actuals for project list rows", async () => {
-    prisma.project.findMany.mockResolvedValue([{ id: "project_1", parentId: null }]);
+    prisma.project.findMany.mockResolvedValue([
+      { id: "project_1", parentId: null, type: "project" },
+      { id: "task_1", parentId: "project_1", type: "task" },
+    ]);
     prisma.budgetLine.findMany.mockResolvedValue([
       {
         projectId: "project_1",
@@ -96,19 +101,39 @@ describe("Project budget summary", () => {
         budget: { status: "pending_approval" },
       },
     ]);
+    prisma.projectLaborEntry.findMany.mockResolvedValue([
+      { taskId: "task_1", hours: 24, laborCost: 180000, currencyCode: "RWF" },
+      { taskId: "task_1", hours: 1, laborCost: 500, currencyCode: "USD" },
+    ]);
 
     const projects = await projectService.getAllProjects("company_1", { type: "project" });
 
     expect(projects[0]).toMatchObject({
       budget_allocated: 3000000,
-      budget_spent: 1020000,
-      budget_remaining: 1980000,
+      budget_spent: 1200000,
+      budget_remaining: 1800000,
+      labor_spent: 180000,
     });
     expect(prisma.budgetLine.findMany).toHaveBeenCalledWith(expect.objectContaining({
       where: expect.objectContaining({
         companyId: "company_1",
-        projectId: { in: ["project_1"] },
+        projectId: { in: ["project_1", "task_1"] },
       }),
     }));
+  });
+
+  test("includes approved timesheet hours on task list rows", async () => {
+    mockProject.type = "task";
+    mockProject.actual_hours = 0;
+    prisma.project.findMany.mockResolvedValue([{ id: "project_1", parentId: null, type: "task" }]);
+    prisma.projectLaborEntry.findMany.mockResolvedValue([
+      { taskId: "project_1", hours: 5 },
+      { taskId: "project_1", hours: 2.5 },
+    ]);
+
+    const projects = await projectService.getAllProjects("company_1", { type: "task" });
+
+    expect(projects[0].timesheet_hours).toBe(7.5);
+    expect(projects[0].actual_hours).toBe(7.5);
   });
 });
