@@ -102,6 +102,16 @@ class ProjectController {
     catch (error) { next(error); }
   }
 
+  async deleteMaterialRequisition(req, res, next) {
+    try {
+      const { companyId } = collaborationContext(req);
+      res.json({
+        success: true,
+        data: await projectMaterialService.deleteRequisition(companyId, req.params.id, req.params.requisitionId),
+      });
+    } catch (error) { next(error); }
+  }
+
   async getTypeSettings(req, res, next) {
     try {
       const companyId = req.companyId || req.user?.company?._id || req.user?.company;

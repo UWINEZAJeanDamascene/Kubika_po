@@ -62,6 +62,7 @@ router.post("/:id/material-requisitions/reconcile-budget-actuals", authorize("pr
 router.post("/:id/material-requisitions", authorize("projects", "create"), projectController.createMaterialRequisition);
 router.post("/:id/material-requisitions/:requisitionId/approve", authorize("projects", "update"), projectController.approveMaterialRequisition);
 router.post("/:id/material-requisitions/:requisitionId/cancel", authorize("projects", "update"), projectController.cancelMaterialRequisition);
+router.delete("/:id/material-requisitions/:requisitionId", authorize("projects", "update"), projectController.deleteMaterialRequisition);
 router.post("/:id/material-requisitions/:requisitionId/lines/:lineId/issue", authorize("projects", "update"), projectController.issueProjectMaterial);
 router.post("/:id/material-requisitions/:requisitionId/lines/:lineId/return", authorize("projects", "update"), projectController.returnProjectMaterial);
 

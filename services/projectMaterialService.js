@@ -226,6 +226,56 @@ async function assignBudgetLine(tx, { companyId, projectId, line, product, req, 
   return budgetLine;
 }
 
+async function releaseMaterialReservation(tx, companyId, line) {
+  const release = number(line.reservedQuantity);
+  if (!release) return;
+  const product = await tx.product.findFirst({
+    where: { id: line.productId, companyId: String(companyId) },
+  });
+  if (!product) throw fail(`Material product ${line.productId} was not found`, 404);
+  const allocations = Array.isArray(line.trackingAllocations) ? line.trackingAllocations : [];
+  const mode = trackedMode(product);
+
+  if (mode === "serial") {
+    for (const item of allocations.filter((allocation) => allocation.kind === "serial" && !allocation.issued)) {
+      const restored = await tx.stockSerialNumber.updateMany({
+        where: { id: item.serialId, companyId: String(companyId), status: "reserved" },
+        data: { status: item.priorStatus === "returned" ? "returned" : "in_stock" },
+      });
+      if (!restored.count) throw fail("Could not safely release reserved serials; refresh stock and retry");
+    }
+  } else if (mode === "batch") {
+    for (const allocation of allocations.filter((item) => item.kind === "batch")) {
+      const pending = Math.max(0, number(allocation.quantity) - number(allocation.issuedQuantity));
+      if (!pending) continue;
+      const released = await tx.stockBatch.updateMany({
+        where: { id: allocation.batchId, companyId: String(companyId), reservedQuantity: { gte: pending } },
+        data: { reservedQuantity: { decrement: pending } },
+      });
+      if (!released.count) throw fail("Could not safely release reserved batch stock; refresh stock and retry");
+    }
+  }
+
+  const stockRelease = await tx.stockLevel.updateMany({
+    where: {
+      companyId: String(companyId),
+      productId: line.productId,
+      warehouseId: line.warehouseId,
+      qtyReserved: { gte: release },
+    },
+    data: { qtyReserved: { decrement: release } },
+  });
+  if (!stockRelease.count) throw fail("Could not safely release the stock reservation; refresh the stock record and retry");
+  await tx.product.update({
+    where: { id: line.productId },
+    data: { reservedQuantity: { decrement: release } },
+  });
+  await tx.projectMaterialRequisitionLine.update({
+    where: { id: line.id },
+    data: { reservedQuantity: 0 },
+  });
+}
+
 class ProjectMaterialService {
   async list(companyId, projectId) {
     const project = await prisma.project.findFirst({ where: { id: String(projectId), companyId: String(companyId), isActive: true } });
@@ -239,7 +289,11 @@ class ProjectMaterialService {
     }
 
     const rows = await prisma.projectMaterialRequisition.findMany({
-      where: { companyId: String(companyId), projectId: { in: [...projectIds] } },
+      where: {
+        companyId: String(companyId),
+        projectId: { in: [...projectIds] },
+        status: { not: "archived" },
+      },
       include: { lines: true }, orderBy: { createdAt: "desc" },
     });
     const productIds = [...new Set(rows.flatMap((row) => row.lines.map((line) => line.productId)))];
@@ -283,7 +337,7 @@ class ProjectMaterialService {
         where: {
           companyId: String(companyId),
           projectId: { in: [...projectIds] },
-          status: { in: ["issued", "partially_issued", "closed"] },
+          status: { in: ["issued", "partially_issued", "closed", "archived"] },
         },
         include: { lines: true },
       });
@@ -737,32 +791,43 @@ class ProjectMaterialService {
       if (!req) throw fail("Material requisition not found", 404);
       if (["issued", "closed", "cancelled"].includes(req.status)) throw fail("This requisition cannot be cancelled in its current state");
       for (const line of req.lines) {
-        const release = number(line.reservedQuantity);
-        if (!release) continue;
-        const product = await tx.product.findFirst({ where: { id: line.productId, companyId: String(companyId) } });
-        const mode = trackedMode(product);
-        const allocations = Array.isArray(line.trackingAllocations) ? line.trackingAllocations : [];
-        if (mode === "serial") {
-          const pending = allocations.filter((item) => item.kind === "serial" && !item.issued);
-          for (const item of pending) {
-            const restored = await tx.stockSerialNumber.updateMany({ where: { id: item.serialId, companyId: String(companyId), status: "reserved" }, data: { status: item.priorStatus === "returned" ? "returned" : "in_stock" } });
-            if (!restored.count) throw fail("Could not safely release reserved serials; refresh stock and retry");
-          }
-        } else if (mode === "batch") {
-          for (const allocation of allocations.filter((item) => item.kind === "batch")) {
-            const pending = Math.max(0, number(allocation.quantity) - number(allocation.issuedQuantity));
-            if (!pending) continue;
-            const released = await tx.stockBatch.updateMany({ where: { id: allocation.batchId, companyId: String(companyId), reservedQuantity: { gte: pending } }, data: { reservedQuantity: { decrement: pending } } });
-            if (!released.count) throw fail("Could not safely release reserved batch stock; refresh stock and retry");
-          }
-        }
-        const stockRelease = await tx.stockLevel.updateMany({ where: { companyId: String(companyId), productId: line.productId, warehouseId: line.warehouseId, qtyReserved: { gte: release } }, data: { qtyReserved: { decrement: release } } });
-        if (!stockRelease.count) throw fail("Could not safely release the stock reservation; refresh the stock record and retry");
-        await tx.product.update({ where: { id: line.productId }, data: { reservedQuantity: { decrement: release } } });
-        await tx.projectMaterialRequisitionLine.update({ where: { id: line.id }, data: { reservedQuantity: 0 } });
+        await releaseMaterialReservation(tx, companyId, line);
       }
       return tx.projectMaterialRequisition.update({ where: { id: req.id }, data: { status: "cancelled" }, include: { lines: true } });
     }, { isolationLevel: "Serializable" });
+  }
+
+  async deleteRequisition(companyId, projectId, requisitionId) {
+    return prisma.$transaction(async (tx) => {
+      const req = await tx.projectMaterialRequisition.findFirst({
+        where: {
+          id: String(requisitionId),
+          companyId: String(companyId),
+          projectId: String(projectId),
+        },
+        include: { lines: true },
+      });
+      if (!req) throw fail("Material requisition not found", 404);
+
+      const hasStockHistory = req.lines.some((line) =>
+        number(line.issuedQuantity) > 0 || number(line.returnedQuantity) > 0);
+      if (!hasStockHistory) {
+        for (const line of req.lines) {
+          await releaseMaterialReservation(tx, companyId, line);
+        }
+        await tx.projectMaterialRequisition.delete({ where: { id: req.id } });
+        return { id: req.id, deleted: true, archived: false };
+      }
+
+      for (const line of req.lines) {
+        await releaseMaterialReservation(tx, companyId, line);
+      }
+      await tx.projectMaterialRequisition.update({
+        where: { id: req.id },
+        data: { status: "archived" },
+      });
+      return { id: req.id, deleted: false, archived: true };
+    }, { timeout: 30000, isolationLevel: "Serializable" });
   }
 }
 

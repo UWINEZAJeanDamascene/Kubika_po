@@ -11,6 +11,7 @@ jest.mock("../lib/prisma", () => {
       findFirst: jest.fn(),
       findUnique: jest.fn(),
       update: jest.fn(),
+      delete: jest.fn(),
     },
     product: {
       findFirst: jest.fn(),
@@ -628,5 +629,74 @@ describe("Project material budget actual reconciliation", () => {
 
     expect(result.journalEntries).toBe(0);
     expect(JournalService.createEntry).not.toHaveBeenCalled();
+  });
+
+  test("deletes an unissued requisition after releasing its stock reservation", async () => {
+    const unissuedLine = {
+      ...line,
+      issuedQuantity: 0,
+      returnedQuantity: 0,
+      reservedQuantity: 3,
+      trackingAllocations: [],
+    };
+    prisma.projectMaterialRequisition.findFirst.mockResolvedValue({
+      ...requisition,
+      status: "approved",
+      lines: [unissuedLine],
+    });
+    prisma.projectMaterialRequisition.delete.mockResolvedValue({ id: "requisition_1" });
+
+    const result = await projectMaterialService.deleteRequisition(
+      "company_1", "project_1", "requisition_1",
+    );
+
+    expect(result).toEqual({
+      id: "requisition_1",
+      deleted: true,
+      archived: false,
+    });
+    expect(prisma.stockLevel.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      data: { qtyReserved: { decrement: 3 } },
+    }));
+    expect(prisma.product.update).toHaveBeenCalledWith({
+      where: { id: "product_1" },
+      data: { reservedQuantity: { decrement: 3 } },
+    });
+    expect(prisma.projectMaterialRequisition.delete).toHaveBeenCalledWith({
+      where: { id: "requisition_1" },
+    });
+  });
+
+  test("archives requisitions with stock history and preserves movement records", async () => {
+    const issuedLine = {
+      ...line,
+      issuedQuantity: 4,
+      returnedQuantity: 2,
+      reservedQuantity: 1,
+      trackingAllocations: [],
+    };
+    prisma.projectMaterialRequisition.findFirst.mockResolvedValue({
+      ...requisition,
+      status: "partially_issued",
+      lines: [issuedLine],
+    });
+
+    const result = await projectMaterialService.deleteRequisition(
+      "company_1", "project_1", "requisition_1",
+    );
+
+    expect(result).toEqual({
+      id: "requisition_1",
+      deleted: false,
+      archived: true,
+    });
+    expect(prisma.projectMaterialRequisition.update).toHaveBeenCalledWith({
+      where: { id: "requisition_1" },
+      data: { status: "archived" },
+    });
+    expect(prisma.projectMaterialRequisition.delete).not.toHaveBeenCalled();
+    expect(prisma.stockLevel.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      data: { qtyReserved: { decrement: 1 } },
+    }));
   });
 });
