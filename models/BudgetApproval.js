@@ -17,6 +17,7 @@ const FIELD_MAP = {
   workflow_id: { target: 'workflowId', isId: true },
   status: { target: 'status' },
   requested_by: { target: 'requestedById', isId: true },
+  requested_at: { target: 'requestedAt' },
 };
 
 module.exports = buildTenantModel({
