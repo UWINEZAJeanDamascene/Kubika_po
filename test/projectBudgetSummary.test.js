@@ -5,11 +5,15 @@ const mockProject = {
   parent_id: null,
   contract_value: 0,
   currency_code: "RWF",
+  budget_allocated: 3000000,
+  budget_spent: 0,
+  budget_remaining: 3000000,
 };
 
 const mockQuery = (rows) => {
   const query = {
     populate: () => query,
+    sort: () => query,
     then: (resolve, reject) => Promise.resolve(rows).then(resolve, reject),
   };
   return query;
@@ -29,11 +33,13 @@ jest.mock("../services/sequenceService", () => ({}));
 jest.mock("../lib/prisma", () => ({
   prisma: {
     project: { findMany: jest.fn(async () => []) },
+    budgetLine: { findMany: jest.fn(async () => []) },
     projectLaborEntry: { findMany: jest.fn(async () => []) },
     projectMaterialRequisition: { findMany: jest.fn(async () => []) },
   },
 }));
 
+const { prisma } = require("../lib/prisma");
 const projectService = require("../services/projectService");
 
 describe("Project budget summary", () => {
@@ -70,5 +76,39 @@ describe("Project budget summary", () => {
       total_encumbered: 50,
       total_remaining: 250,
     });
+  });
+
+  test("returns current approved budget actuals for project list rows", async () => {
+    prisma.project.findMany.mockResolvedValue([{ id: "project_1", parentId: null }]);
+    prisma.budgetLine.findMany.mockResolvedValue([
+      {
+        projectId: "project_1",
+        budgetedAmount: 3000000,
+        actualAmount: 1020000,
+        encumberedAmount: 0,
+        budget: { status: "approved" },
+      },
+      {
+        projectId: "project_1",
+        budgetedAmount: 500000,
+        actualAmount: 400000,
+        encumberedAmount: 0,
+        budget: { status: "pending_approval" },
+      },
+    ]);
+
+    const projects = await projectService.getAllProjects("company_1", { type: "project" });
+
+    expect(projects[0]).toMatchObject({
+      budget_allocated: 3000000,
+      budget_spent: 1020000,
+      budget_remaining: 1980000,
+    });
+    expect(prisma.budgetLine.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        companyId: "company_1",
+        projectId: { in: ["project_1"] },
+      }),
+    }));
   });
 });

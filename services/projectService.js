@@ -495,7 +495,65 @@ class ProjectService {
       .populate("client_id", "name")
       .populate("manager_id", "firstName lastName email");
 
-    return projects;
+    if (!projects.length) return projects;
+
+    const allNodes = await prisma.project.findMany({
+      where: { companyId: String(companyId), isTemplate: false },
+      select: { id: true, parentId: true },
+    });
+    const projectIds = [...new Set(projects.map((project) => String(project._id)))];
+    const descendantsByProject = new Map(projectIds.map((id) => [id, new Set([id])]));
+    for (const ids of descendantsByProject.values()) {
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const node of allNodes) {
+          const parentId = node.parentId?._id || node.parentId;
+          if (parentId && ids.has(String(parentId)) && !ids.has(String(node.id))) {
+            ids.add(String(node.id));
+            changed = true;
+          }
+        }
+      }
+    }
+
+    const allIncludedIds = [...new Set([...descendantsByProject.values()].flatMap((ids) => [...ids]))];
+    const budgetLines = allIncludedIds.length
+      ? await prisma.budgetLine.findMany({
+          where: {
+            companyId: String(companyId),
+            projectId: { in: allIncludedIds },
+          },
+          select: {
+            projectId: true,
+            budgetedAmount: true,
+            actualAmount: true,
+            encumberedAmount: true,
+            budget: { select: { status: true } },
+          },
+        })
+      : [];
+    const approvedStatuses = new Set(["approved", "locked", "closed", "view_only"]);
+
+    return projects.map((project) => {
+      const includedIds = descendantsByProject.get(String(project._id));
+      const approvedLines = budgetLines.filter((line) =>
+        includedIds.has(String(line.projectId)) && approvedStatuses.has(line.budget?.status));
+      const totals = approvedLines.reduce((summary, line) => ({
+        budgeted: summary.budgeted + Number(line.budgetedAmount || 0),
+        actual: summary.actual + Number(line.actualAmount || 0),
+        encumbered: summary.encumbered + Number(line.encumberedAmount || 0),
+      }), { budgeted: 0, actual: 0, encumbered: 0 });
+      const budgetAllocated = approvedLines.length
+        ? totals.budgeted
+        : Number(project.budget_allocated || 0);
+      return {
+        ...project,
+        ...(approvedLines.length ? { budget_allocated: totals.budgeted } : {}),
+        budget_spent: totals.actual,
+        budget_remaining: budgetAllocated - totals.actual - totals.encumbered,
+      };
+    });
   }
 
   /**

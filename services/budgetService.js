@@ -299,7 +299,9 @@ class BudgetService {
     return getBudgetActualMap(companyId, accountIds, periodStart, periodEnd);
   }
 
-  static async calculateLineActualTotal({ companyId, budgetId, lines, periodStart, periodEnd }) {
+  static async calculateLineActualTotal({
+    companyId, budgetId, lines, periodStart, periodEnd, useProjectLineActualAmounts = false,
+  }) {
     const startDate = new Date(periodStart);
     const endDate = new Date(periodEnd);
     if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime()) || startDate > endDate) return 0;
@@ -314,7 +316,10 @@ class BudgetService {
     if (!candidates.length) return 0;
 
     const projectLines = candidates.filter(line => line.project_id);
-    const projectConsumptions = projectLines.length
+    const projectActual = useProjectLineActualAmounts
+      ? projectLines.reduce((sum, line) => sum + Number(line.actual_amount || 0), 0)
+      : 0;
+    const projectConsumptions = projectLines.length && !useProjectLineActualAmounts
       ? await BudgetActualConsumption.find({
           company_id: companyId,
           budget_id: budgetId,
@@ -322,7 +327,9 @@ class BudgetService {
           document_date: { $gte: startDate, $lte: endDate },
         }).lean()
       : [];
-    let total = (projectConsumptions || []).reduce((sum, row) => sum + Number(row.amount || 0), 0);
+    let total = useProjectLineActualAmounts
+      ? projectActual
+      : (projectConsumptions || []).reduce((sum, row) => sum + Number(row.amount || 0), 0);
 
     const companyLinesByPeriod = new Map();
     for (const line of candidates.filter(item => !item.project_id)) {
@@ -447,6 +454,7 @@ class BudgetService {
         lines,
         periodStart,
         periodEnd,
+        useProjectLineActualAmounts: true,
       });
 
       const totalVariance = totalBudgeted - totalActual;
@@ -1390,6 +1398,7 @@ class BudgetService {
         lines,
         periodStart,
         periodEnd,
+        useProjectLineActualAmounts: true,
       });
 
       const variance = budgetedAmount - actualAmount;

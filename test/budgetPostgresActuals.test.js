@@ -30,4 +30,27 @@ describe('Budget Postgres actual totals', () => {
       jest.resetModules();
     }
   });
+
+  test('uses stored project budget-line actuals for budget list and summary totals', async () => {
+    jest.resetModules();
+    const BudgetService = require('../services/budgetService');
+
+    const total = await BudgetService.calculateLineActualTotal({
+      companyId: 'company_1',
+      budgetId: 'budget_1',
+      lines: [{
+        _id: 'line_1',
+        project_id: 'project_1',
+        period_month: 10,
+        period_year: 2026,
+        actual_amount: 1020000,
+      }],
+      periodStart: new Date('2026-10-15T00:00:00.000Z'),
+      periodEnd: new Date('2026-12-15T23:59:59.999Z'),
+      useProjectLineActualAmounts: true,
+    });
+
+    expect(total).toBe(1020000);
+    jest.resetModules();
+  });
 });
