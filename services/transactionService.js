@@ -33,15 +33,18 @@ async function runInPrismaTransaction(operation, options = {}) {
   const existing = getActiveTx();
   if (existing) return operation(existing);
 
+  const transactionOptions = {
+    maxWait: options.maxWait ?? TX_DEFAULTS.maxWait,
+    timeout: options.timeout ?? TX_DEFAULTS.timeout,
+  };
+  if (options.isolationLevel) transactionOptions.isolationLevel = options.isolationLevel;
+
   return prisma.$transaction(
     // The tx client is published on the async context so every compat-model
     // read/write in this scope resolves to it automatically. Without this the
     // transaction would be opened and then bypassed by its own body.
     async (tx) => runWithTx(tx, () => operation(tx)),
-    {
-      maxWait: options.maxWait ?? TX_DEFAULTS.maxWait,
-      timeout: options.timeout ?? TX_DEFAULTS.timeout,
-    },
+    transactionOptions,
   );
 }
 
