@@ -546,30 +546,21 @@ class ProjectService {
       laborCostByTask.set(row.taskId, costsByCurrency);
     }
     const budgetLines = allIncludedIds.length
-      ? await prisma.budgetLine.findMany({
-          where: {
-            companyId: String(companyId),
-            projectId: { in: allIncludedIds },
-          },
-          select: {
-            projectId: true,
-            budgetedAmount: true,
-            actualAmount: true,
-            encumberedAmount: true,
-            budget: { select: { status: true } },
-          },
-        })
+      ? await BudgetLine.find({
+          company_id: companyId,
+          project_id: { $in: allIncludedIds },
+        }).populate("budget_id", "status")
       : [];
     const approvedStatuses = new Set(["approved", "locked", "closed", "view_only"]);
 
     return projects.map((project) => {
       const includedIds = descendantsByProject.get(String(project._id));
       const approvedLines = budgetLines.filter((line) =>
-        includedIds.has(String(line.projectId)) && approvedStatuses.has(line.budget?.status));
+        includedIds.has(String(line.project_id)) && approvedStatuses.has(line.budget_id?.status));
       const totals = approvedLines.reduce((summary, line) => ({
-        budgeted: summary.budgeted + Number(line.budgetedAmount || 0),
-        actual: summary.actual + Number(line.actualAmount || 0),
-        encumbered: summary.encumbered + Number(line.encumberedAmount || 0),
+        budgeted: summary.budgeted + Number(line.budgeted_amount || 0),
+        actual: summary.actual + Number(line.actual_amount || 0),
+        encumbered: summary.encumbered + Number(line.encumbered_amount || 0),
       }), { budgeted: 0, actual: 0, encumbered: 0 });
       const projectCurrency = String(project.currency_code || "RWF").toUpperCase();
       const laborSpent = [...includedIds].reduce((sum, taskId) =>

@@ -85,22 +85,22 @@ describe("Project budget summary", () => {
       { id: "project_1", parentId: null, type: "project" },
       { id: "task_1", parentId: "project_1", type: "task" },
     ]);
-    prisma.budgetLine.findMany.mockResolvedValue([
+    mockBudgetLines.push(
       {
-        projectId: "project_1",
-        budgetedAmount: 3000000,
-        actualAmount: 1020000,
-        encumberedAmount: 0,
-        budget: { status: "approved" },
+        project_id: "task_1",
+        budgeted_amount: 3000000,
+        actual_amount: 1020000,
+        encumbered_amount: 0,
+        budget_id: { status: "approved" },
       },
       {
-        projectId: "project_1",
-        budgetedAmount: 500000,
-        actualAmount: 400000,
-        encumberedAmount: 0,
-        budget: { status: "pending_approval" },
+        project_id: "project_1",
+        budgeted_amount: 500000,
+        actual_amount: 400000,
+        encumbered_amount: 0,
+        budget_id: { status: "pending_approval" },
       },
-    ]);
+    );
     prisma.projectLaborEntry.findMany.mockResolvedValue([
       { taskId: "task_1", hours: 24, laborCost: 180000, currencyCode: "RWF" },
       { taskId: "task_1", hours: 1, laborCost: 500, currencyCode: "USD" },
@@ -114,12 +114,12 @@ describe("Project budget summary", () => {
       budget_remaining: 1800000,
       labor_spent: 180000,
     });
-    expect(prisma.budgetLine.findMany).toHaveBeenCalledWith(expect.objectContaining({
-      where: expect.objectContaining({
-        companyId: "company_1",
-        projectId: { in: ["project_1", "task_1"] },
-      }),
-    }));
+    const BudgetLine = require("../models/BudgetLine");
+    expect(BudgetLine.find).toHaveBeenCalledWith({
+      company_id: "company_1",
+      project_id: { $in: ["project_1", "task_1"] },
+    });
+    expect(prisma.budgetLine.findMany).not.toHaveBeenCalled();
   });
 
   test("includes approved timesheet hours on task list rows", async () => {
