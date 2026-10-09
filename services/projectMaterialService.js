@@ -371,6 +371,7 @@ class ProjectMaterialService {
             budgetLine = await assignBudgetLine(tx, {
               companyId, projectId: req.projectId, line, product, req, userId,
               date: issueMovements[0]?.movementDate || req.createdAt || new Date(),
+              strict: false,
             });
           }
           if (budgetLine) {
@@ -440,7 +441,35 @@ class ProjectMaterialService {
       if (!warehouse) throw fail("A selected warehouse was not found or is inactive", 404);
       if (input.task_id && !task) throw fail("A selected project task was not found", 404);
       if (task && !await this.isDescendant(companyId, task.id, projectId)) throw fail("Selected task does not belong to this project", 400);
-      lines.push({ id: generateObjectId(), companyId: String(companyId), projectId: String(projectId), taskId: task?.id || null, productId: product.id, warehouseId: warehouse.id, plannedQuantity: quantity, unitCost: number(product.averageCost) || number(product.costPrice), notes: String(input.notes || "") });
+      let budgetLineId;
+      if (input.budget_line_id) {
+        const eligibleProjectIds = [...new Set([String(projectId), ...(task ? [String(task.id)] : [])])];
+        const budgetLine = await prisma.budgetLine.findFirst({
+          where: {
+            id: String(input.budget_line_id),
+            companyId: String(companyId),
+            projectId: { in: eligibleProjectIds },
+            budget: { is: { status: { in: ACTIVE_BUDGET_STATUSES } } },
+          },
+          select: { id: true },
+        });
+        if (!budgetLine) {
+          throw fail("Choose an approved project budget line linked to this project or selected task.", 400);
+        }
+        budgetLineId = budgetLine.id;
+      }
+      lines.push({
+        id: generateObjectId(),
+        companyId: String(companyId),
+        projectId: String(projectId),
+        taskId: task?.id || null,
+        productId: product.id,
+        warehouseId: warehouse.id,
+        plannedQuantity: quantity,
+        unitCost: number(product.averageCost) || number(product.costPrice),
+        ...(budgetLineId ? { budgetLineId } : {}),
+        notes: String(input.notes || ""),
+      });
     }
     return prisma.projectMaterialRequisition.create({ data: {
       id, companyId: String(companyId), projectId: String(projectId), requisitionNo,

@@ -10,6 +10,7 @@ jest.mock("../lib/prisma", () => {
       findMany: jest.fn(),
       findFirst: jest.fn(),
       findUnique: jest.fn(),
+      create: jest.fn(),
       update: jest.fn(),
       delete: jest.fn(),
     },
@@ -140,6 +141,7 @@ describe("Project material budget actual reconciliation", () => {
       lines: [{ ...line, plannedQuantity: 5, reservedQuantity: 5, issuedQuantity: 0, returnedQuantity: 0, issuedCost: 0, returnedCost: 0, unitCost: 12, budgetLineId: null }],
     });
     prisma.projectMaterialRequisition.update.mockResolvedValue(requisition);
+    prisma.projectMaterialRequisition.create.mockResolvedValue(requisition);
     prisma.projectMaterialRequisition.findUnique.mockResolvedValue(requisition);
     prisma.product.findFirst.mockResolvedValue({ id: "product_1", name: "Concrete", cogsAccount: "COGS-01", currentStock: 100 });
     prisma.product.update.mockResolvedValue({});
@@ -209,7 +211,7 @@ describe("Project material budget actual reconciliation", () => {
     expect(prisma.budgetActualConsumption.create).toHaveBeenCalledTimes(1);
   });
 
-  test("rejects ambiguous matching budget lines instead of guessing", async () => {
+  test("skips ambiguous matching budget lines during reconciliation instead of guessing", async () => {
     prisma.budgetLine.findMany.mockResolvedValue([
       budgetLine,
       { ...budgetLine, id: "budget_line_2" },
@@ -217,33 +219,74 @@ describe("Project material budget actual reconciliation", () => {
 
     await expect(projectMaterialService.reconcileBudgetActuals(
       "company_1", "project_1", "user_1",
-    )).rejects.toMatchObject({
-      message: expect.stringContaining("more than one approved project budget line"),
-      statusCode: 422,
-      code: "MATERIAL_BUDGET_LINE_AMBIGUOUS",
+    )).resolves.toMatchObject({
+      reconciledLines: 0,
+      skippedLines: 1,
+      amount: 0,
     });
     expect(prisma.budgetLine.update).not.toHaveBeenCalled();
     expect(prisma.budgetActualConsumption.create).not.toHaveBeenCalled();
   });
 
-  test("returns an actionable validation error when product COGS has no budget-line match", async () => {
+  test("creates a requisition linked to a selected approved project budget line", async () => {
+    prisma.project.findFirst.mockResolvedValue({ id: "project_1", isActive: true });
     prisma.product.findFirst.mockResolvedValue({
       id: "product_1",
       name: "Cat6 Patch Cord 1m",
-      cogsAccount: null,
-      currentStock: 100,
       averageCost: 12,
+      isActive: true,
     });
+    prisma.warehouse.findFirst.mockResolvedValue({ id: "warehouse_1", isActive: true });
+    prisma.budgetLine.findFirst.mockResolvedValue({ id: "budget_line_1" });
 
-    await expect(projectMaterialService.issue(
-      "company_1", "project_1", "requisition_1", "line_1", 1, "user_1",
-    )).rejects.toMatchObject({
-      message: expect.stringContaining("Set the product's COGS account"),
-      statusCode: 422,
-      code: "MATERIAL_BUDGET_LINE_REQUIRED",
+    await projectMaterialService.create("company_1", "project_1", {
+      lines: [{
+        product_id: "product_1",
+        warehouse_id: "warehouse_1",
+        planned_quantity: 4,
+        budget_line_id: "budget_line_1",
+      }],
+    }, "user_1");
+
+    expect(prisma.budgetLine.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        id: "budget_line_1",
+        companyId: "company_1",
+        projectId: { in: ["project_1"] },
+        budget: { is: { status: { in: ["approved", "locked", "closed"] } } },
+      }),
+    }));
+    expect(prisma.projectMaterialRequisition.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        lines: {
+          create: [expect.objectContaining({ budgetLineId: "budget_line_1" })],
+        },
+      }),
+    }));
+  });
+
+  test("rejects a selected budget line outside the approved project scope", async () => {
+    prisma.project.findFirst.mockResolvedValue({ id: "project_1", isActive: true });
+    prisma.product.findFirst.mockResolvedValue({
+      id: "product_1",
+      name: "Cat6 Patch Cord 1m",
+      averageCost: 12,
+      isActive: true,
     });
-    expect(prisma.stockLevel.updateMany).not.toHaveBeenCalled();
-    expect(prisma.stockMovement.create).not.toHaveBeenCalled();
+    prisma.warehouse.findFirst.mockResolvedValue({ id: "warehouse_1", isActive: true });
+    prisma.budgetLine.findFirst.mockResolvedValue(null);
+
+    await expect(projectMaterialService.create("company_1", "project_1", {
+      lines: [{
+        product_id: "product_1",
+        warehouse_id: "warehouse_1",
+        planned_quantity: 4,
+        budget_line_id: "unrelated_budget_line",
+      }],
+    }, "user_1")).rejects.toThrow(
+      "Choose an approved project budget line linked to this project or selected task.",
+    );
+    expect(prisma.projectMaterialRequisition.create).not.toHaveBeenCalled();
   });
 
   test("repairs missing actuals on an already-linked issued material line", async () => {
