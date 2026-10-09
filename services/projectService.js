@@ -894,8 +894,9 @@ class ProjectService {
     return {
       project,
       budget_summary: summary,
-      line_count: approvedBudgetLines.length,
-      budget_lines: approvedBudgetLines,
+      line_count: budgetLines.length,
+      approved_line_count: approvedBudgetLines.length,
+      budget_lines: budgetLines,
       labor_summary: laborSummary,
       material_summary: {
         ...Object.fromEntries(Object.entries(materialSummary).map(([key, value]) => [key, key === "line_count" ? value : roundMoney(value)])),
