@@ -40,6 +40,13 @@ class ProjectController {
     catch (error) { next(error); }
   }
 
+  async reconcileMaterialBudgetActuals(req, res, next) {
+    try {
+      const { companyId, userId } = collaborationContext(req);
+      res.json({ success: true, data: await projectMaterialService.reconcileBudgetActuals(companyId, req.params.id, userId) });
+    } catch (error) { next(error); }
+  }
+
   async getClosureChecklist(req, res, next) {
     try { const { companyId } = collaborationContext(req); res.json({ success: true, data: await projectClosureService.checklist(companyId, req.params.id) }); }
     catch (error) { next(error); }

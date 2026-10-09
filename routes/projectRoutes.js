@@ -58,6 +58,7 @@ router.get("/:id/controls", authorize("projects", "read"), projectController.get
 router.post("/:id/controls", authorize("projects", "create"), projectController.createProjectControl);
 router.put("/:id/controls/:controlId", authorize("projects", "update"), projectController.updateProjectControl);
 router.get("/:id/material-requisitions", authorize("projects", "read"), projectController.getMaterialRequisitions);
+router.post("/:id/material-requisitions/reconcile-budget-actuals", authorize("projects", "update"), projectController.reconcileMaterialBudgetActuals);
 router.post("/:id/material-requisitions", authorize("projects", "create"), projectController.createMaterialRequisition);
 router.post("/:id/material-requisitions/:requisitionId/approve", authorize("projects", "update"), projectController.approveMaterialRequisition);
 router.post("/:id/material-requisitions/:requisitionId/cancel", authorize("projects", "update"), projectController.cancelMaterialRequisition);

@@ -3,9 +3,132 @@ const { generateObjectId } = require("../utils/objectId");
 
 const number = (value) => Number(value || 0);
 const round = (value) => Math.round(value * 100) / 100;
+const netIssuedBudgetCost = (line) => {
+  const issuedQuantity = number(line.issuedQuantity);
+  if (!issuedQuantity) return Math.max(0, round(number(line.issuedCost) - number(line.returnedCost)));
+  return round(number(line.issuedCost) * Math.max(0, issuedQuantity - number(line.returnedQuantity)) / issuedQuantity);
+};
 const fail = (message, status = 400) => Object.assign(new Error(message), { statusCode: status });
 const trackedMode = (product) => product?.trackSerialNumbers || product?.trackingType === "serial"
   ? "serial" : product?.trackBatch || product?.trackingType === "batch" ? "batch" : null;
+const ACTIVE_BUDGET_STATUSES = ["approved", "locked", "closed"];
+
+async function findBudgetLineForMaterial(tx, { companyId, projectId, taskId, product, date, strict = true }) {
+  const projectIds = [...new Set([taskId, projectId].filter(Boolean).map(String))];
+  const task = taskId
+    ? await tx.project.findFirst({
+        where: { id: String(taskId), companyId: String(companyId) },
+        select: { wbsCode: true },
+      })
+    : null;
+  const budgetLines = await tx.budgetLine.findMany({
+    where: {
+      companyId: String(companyId),
+      projectId: { in: projectIds },
+      budget: { is: { status: { in: ACTIVE_BUDGET_STATUSES } } },
+    },
+    select: {
+      id: true, budgetId: true, projectId: true, accountId: true, wbsCode: true,
+      actualAmount: true, periodMonth: true, periodYear: true,
+    },
+  });
+  if (!budgetLines.length) return null;
+
+  const accountRef = String(product.cogsAccount || "").trim();
+  const account = accountRef
+    ? await tx.chartOfAccount.findFirst({
+        where: { companyId: String(companyId), OR: [{ id: accountRef }, { code: accountRef }] },
+        select: { id: true },
+      })
+    : null;
+  const matches = account
+    ? budgetLines.filter((line) => String(line.accountId) === String(account.id))
+    : [];
+  const preferredProjectId = matches.some((line) => String(line.projectId) === String(taskId))
+    ? String(taskId)
+    : String(projectId);
+  const projectMatches = matches.filter((line) => String(line.projectId) === preferredProjectId);
+  const wbsMatches = task?.wbsCode
+    ? projectMatches.filter((line) => line.wbsCode === task.wbsCode)
+    : [];
+  const projectLevelMatches = projectMatches.filter((line) => !line.wbsCode);
+  const scopedMatches = wbsMatches.length ? wbsMatches : projectLevelMatches;
+  const scopedPeriodMatches = scopedMatches.filter((line) =>
+    line.periodMonth === date.getUTCMonth() + 1 && line.periodYear === date.getUTCFullYear());
+  const candidates = scopedPeriodMatches.length ? scopedPeriodMatches : scopedMatches;
+  if (candidates.length === 1) return candidates[0];
+  if (!strict) return null;
+
+  if (!accountRef || !account || !matches.length) {
+    throw fail(`Cannot post material cost to the project budget: ${product.name} needs a COGS account that matches a budget line.`);
+  }
+  throw fail(`Cannot choose a unique project budget line for ${product.name}. Ensure only one approved budget line uses its COGS account for this period.`);
+}
+
+async function postBudgetActual(tx, {
+  companyId, budgetLine, amount, documentType, documentId, documentNumber, documentDate,
+  sourceType, sourceId, notes, userId,
+}) {
+  if (!budgetLine || !amount) return;
+  const currentActual = number(budgetLine.actualAmount);
+  if (amount < 0 && currentActual + amount < -0.01) {
+    throw fail("Material return would reverse more budget actual than was recorded");
+  }
+  await tx.budgetLine.update({
+    where: { id: budgetLine.id },
+    data: { actualAmount: { increment: amount } },
+  });
+  await tx.budgetActualConsumption.create({
+    data: {
+      id: generateObjectId(),
+      companyId: String(companyId),
+      budgetId: budgetLine.budgetId,
+      budgetLineId: budgetLine.id,
+      accountId: budgetLine.accountId,
+      projectId: budgetLine.projectId,
+      wbsCode: budgetLine.wbsCode || null,
+      originType: sourceType,
+      documentType,
+      documentId: String(documentId),
+      documentNumber: String(documentNumber || ""),
+      documentDate: documentDate || new Date(),
+      amount: String(round(amount)),
+      sourceType,
+      sourceId: String(sourceId),
+      sourceNumber: String(documentNumber || ""),
+      notes,
+      createdById: userId ? String(userId) : null,
+    },
+  });
+}
+
+async function assignBudgetLine(tx, { companyId, projectId, line, product, req, userId, date = new Date(), strict = true }) {
+  if (line.budgetLineId) {
+    return tx.budgetLine.findFirst({ where: { id: line.budgetLineId, companyId: String(companyId) } });
+  }
+  const budgetLine = await findBudgetLineForMaterial(tx, {
+    companyId, projectId, taskId: line.taskId, product, date, strict,
+  });
+  if (!budgetLine) return null;
+
+  const previouslyUnposted = netIssuedBudgetCost(line);
+  if (previouslyUnposted > 0) {
+    await postBudgetActual(tx, {
+      companyId, budgetLine, amount: previouslyUnposted,
+      documentType: "project_material_issue", documentId: req.id,
+      documentNumber: req.requisitionNo, sourceType: "project_material_issue",
+      sourceId: line.id,
+      notes: `Reconciled previously issued material ${product.name}`,
+      userId,
+      documentDate: date,
+    });
+    budgetLine.actualAmount = number(budgetLine.actualAmount) + previouslyUnposted;
+  }
+  await tx.projectMaterialRequisitionLine.update({
+    where: { id: line.id }, data: { budgetLineId: budgetLine.id },
+  });
+  return budgetLine;
+}
 
 class ProjectMaterialService {
   async list(companyId, projectId) {
@@ -18,6 +141,7 @@ class ProjectMaterialService {
       for (const item of allProjects) if (item.parentId && projectIds.has(item.parentId) && !projectIds.has(item.id)) { projectIds.add(item.id); changed = true; }
       if (!changed) break;
     }
+
     const rows = await prisma.projectMaterialRequisition.findMany({
       where: { companyId: String(companyId), projectId: { in: [...projectIds] } },
       include: { lines: true }, orderBy: { createdAt: "desc" },
@@ -36,6 +160,69 @@ class ProjectMaterialService {
       ...row,
       lines: row.lines.map((line) => ({ ...line, product: productMap.get(line.productId) || null, warehouse: warehouseMap.get(line.warehouseId) || null, task: taskMap.get(line.taskId) || null })),
     }));
+  }
+
+  async reconcileBudgetActuals(companyId, projectId, userId) {
+    const project = await prisma.project.findFirst({
+      where: { id: String(projectId), companyId: String(companyId), isActive: true },
+    });
+    if (!project) throw fail("Project not found", 404);
+    const allProjects = await prisma.project.findMany({
+      where: { companyId: String(companyId), isActive: true, isTemplate: false },
+      select: { id: true, parentId: true },
+    });
+    const projectIds = new Set([String(projectId)]);
+    for (let pass = 0; pass < allProjects.length; pass += 1) {
+      let changed = false;
+      for (const item of allProjects) {
+        if (item.parentId && projectIds.has(item.parentId) && !projectIds.has(item.id)) {
+          projectIds.add(item.id);
+          changed = true;
+        }
+      }
+      if (!changed) break;
+    }
+    const rows = await prisma.projectMaterialRequisition.findMany({
+      where: {
+        companyId: String(companyId),
+        projectId: { in: [...projectIds] },
+        status: { in: ["issued", "partially_issued", "closed"] },
+      },
+      include: { lines: true },
+    });
+    return prisma.$transaction(async (tx) => {
+      let reconciled = 0;
+      let skipped = 0;
+      let amount = 0;
+      for (const req of rows) {
+        for (const line of req.lines) {
+          if (line.budgetLineId || number(line.issuedQuantity) <= 0) continue;
+          const product = await tx.product.findFirst({
+            where: { id: line.productId, companyId: String(companyId) },
+          });
+          if (!product) throw fail(`Material product ${line.productId} was not found`);
+          const issueMovement = await tx.stockMovement.findFirst({
+            where: {
+              companyId: String(companyId),
+              productId: line.productId,
+              referenceDocumentId: req.id,
+              referenceType: "project_material_issue",
+            },
+            orderBy: { movementDate: "desc" },
+            select: { movementDate: true },
+          });
+          const budgetLine = await assignBudgetLine(tx, {
+            companyId, projectId: req.projectId, line, product, req, userId,
+            date: issueMovement?.movementDate || req.createdAt || new Date(),
+          });
+          if (budgetLine) {
+            reconciled += 1;
+            amount += netIssuedBudgetCost(line);
+          } else skipped += 1;
+        }
+      }
+      return { reconciledLines: reconciled, skippedLines: skipped, amount: round(amount) };
+    }, { isolationLevel: "Serializable" });
   }
 
   async create(companyId, projectId, body, userId) {
@@ -161,6 +348,10 @@ class ProjectMaterialService {
       const previousStock = number(product.currentStock);
       if (qty > previousStock) throw fail("Issue quantity exceeds product on-hand stock");
       const unitCost = number(product.averageCost) || number(line.unitCost);
+      const budgetLine = await assignBudgetLine(tx, {
+        companyId, projectId: req.projectId, line, product, req, userId,
+      });
+      const issueCost = round(unitCost * qty);
       let trackedRemaining = qty;
       if (mode === "serial") {
         const toIssue = allocations.filter((item) => item.kind === "serial" && !item.issued).slice(0, qty);
@@ -195,9 +386,16 @@ class ProjectMaterialService {
         remainingToCost -= consumed;
       }
       await tx.product.update({ where: { id: product.id }, data: { currentStock: { decrement: qty }, reservedQuantity: { decrement: Math.min(qty, number(line.reservedQuantity)) } } });
-      await tx.projectMaterialRequisitionLine.update({ where: { id: line.id }, data: { issuedQuantity: { increment: qty }, issuedCost: { increment: round(unitCost * qty) }, reservedQuantity: { decrement: Math.min(qty, number(line.reservedQuantity)) }, trackingAllocations: allocations, unitCost } });
+      await tx.projectMaterialRequisitionLine.update({ where: { id: line.id }, data: { issuedQuantity: { increment: qty }, issuedCost: { increment: issueCost }, reservedQuantity: { decrement: Math.min(qty, number(line.reservedQuantity)) }, trackingAllocations: allocations, unitCost } });
+      await postBudgetActual(tx, {
+        companyId, budgetLine, amount: issueCost,
+        documentType: "project_material_issue", documentId: req.id,
+        documentNumber: req.requisitionNo, sourceType: "project_material_issue",
+        sourceId: line.id, notes: `Material issued: ${product.name}`,
+        userId,
+      });
       const trackingNote = mode === "serial" ? `; serials ${allocations.filter((item) => item.kind === "serial" && item.issued).map((item) => item.serialId).join(",")}` : mode === "batch" ? `; batches ${allocations.filter((item) => item.kind === "batch" && item.issuedQuantity).map((item) => `${item.batchId}:${item.issuedQuantity}`).join(",")}` : "";
-      await tx.stockMovement.create({ data: { id: generateObjectId(), companyId: String(companyId), productId: product.id, type: "out", reason: "dispatch", quantity: qty, previousStock, newStock: previousStock - qty, unitCost, totalCost: round(unitCost * qty), warehouseId: line.warehouseId, referenceType: "project_material_issue", referenceNumber: req.requisitionNo, referenceDocumentId: req.id, referenceModel: "ProjectMaterialRequisition", notes: `Project ${req.projectId}${line.taskId ? ` task ${line.taskId}` : ""}${trackingNote}`, performedById: userId ? String(userId) : null, movementDate: new Date() } });
+      await tx.stockMovement.create({ data: { id: generateObjectId(), companyId: String(companyId), productId: product.id, type: "out", reason: "dispatch", quantity: qty, previousStock, newStock: previousStock - qty, unitCost, totalCost: issueCost, warehouseId: line.warehouseId, referenceType: "project_material_issue", referenceNumber: req.requisitionNo, referenceDocumentId: req.id, referenceModel: "ProjectMaterialRequisition", notes: `Project ${req.projectId}${line.taskId ? ` task ${line.taskId}` : ""}${trackingNote}`, performedById: userId ? String(userId) : null, movementDate: new Date() } });
       const updatedLines = await tx.projectMaterialRequisitionLine.findMany({ where: { requisitionId: req.id } });
       const status = updatedLines.every((item) => number(item.issuedQuantity) >= number(item.plannedQuantity)) ? "issued" : "partially_issued";
       return tx.projectMaterialRequisition.update({ where: { id: req.id }, data: { status }, include: { lines: true } });
@@ -215,6 +413,14 @@ class ProjectMaterialService {
       if (qty > returnable) throw fail("Return quantity exceeds the unreturned issued quantity");
       const product = await tx.product.findFirst({ where: { id: line.productId, companyId: String(companyId) } });
       if (!product) throw fail("Material product not found", 404);
+      const budgetLine = await assignBudgetLine(tx, {
+        companyId, projectId: req.projectId, line, product, req, userId, strict: false,
+      });
+      const issueUnitCost = number(line.issuedQuantity) > 0
+        ? number(line.issuedCost) / number(line.issuedQuantity)
+        : number(line.unitCost);
+      const returnedBudgetCost = round(issueUnitCost * qty);
+      let budgetWarning = "";
       const mode = trackedMode(product);
       let allocations = Array.isArray(line.trackingAllocations) ? line.trackingAllocations.map((item) => ({ ...item })) : [];
       if (mode === "serial" && !Number.isInteger(qty)) throw fail(`${product.name} is serial tracked; return quantity must be a whole number`);
@@ -247,9 +453,30 @@ class ProjectMaterialService {
       await tx.product.update({ where: { id: product.id }, data: { currentStock: { increment: qty } } });
       await tx.inventoryLayer.create({ data: { id: generateObjectId(), companyId: String(companyId), productId: line.productId, warehouseId: line.warehouseId, qtyReceived: qty, qtyRemaining: qty, unitCost, sourceType: "project_material_return", sourceId: req.id, createdById: userId ? String(userId) : null } });
       await tx.projectMaterialRequisitionLine.update({ where: { id: line.id }, data: { returnedQuantity: { increment: qty }, returnedCost: { increment: round(unitCost * qty) }, trackingAllocations: allocations } });
+      if (budgetLine && returnedBudgetCost > 0) {
+        const amountToReverse = round(Math.min(returnedBudgetCost, Math.max(0, number(budgetLine.actualAmount))));
+        if (amountToReverse > 0) {
+          await postBudgetActual(tx, {
+            companyId, budgetLine, amount: -amountToReverse,
+            documentType: "project_material_return", documentId: req.id,
+            documentNumber: req.requisitionNo, sourceType: "project_material_return",
+            sourceId: line.id, notes: `Material returned: ${product.name}`,
+            userId,
+          });
+        }
+        if (amountToReverse < returnedBudgetCost) {
+          budgetWarning = `The stock return was recorded, but only ${amountToReverse.toLocaleString()} of ${returnedBudgetCost.toLocaleString()} could be reversed from budget actuals. Review the project budget actual before closing.`;
+        }
+      } else if (!budgetLine && number(line.issuedQuantity) > 0) {
+        budgetWarning = `The stock return was recorded, but ${product.name} could not be matched to an approved project budget line. Reconcile after fixing the material COGS account or budget line.`;
+      }
       const trackingNote = mode === "serial" ? `; serials ${allocations.filter((item) => item.kind === "serial" && item.returned).map((item) => item.serialId).join(",")}` : mode === "batch" ? `; batches ${allocations.filter((item) => item.kind === "batch" && item.returnedQuantity).map((item) => `${item.batchId}:${item.returnedQuantity}`).join(",")}` : "";
       await tx.stockMovement.create({ data: { id: generateObjectId(), companyId: String(companyId), productId: product.id, type: "in", reason: "return", quantity: qty, previousStock, newStock: previousStock + qty, unitCost, totalCost: round(unitCost * qty), warehouseId: line.warehouseId, referenceType: "project_material_return", referenceNumber: req.requisitionNo, referenceDocumentId: req.id, referenceModel: "ProjectMaterialRequisition", notes: `Project ${req.projectId} material return${trackingNote}`, performedById: userId ? String(userId) : null, movementDate: new Date() } });
-      return tx.projectMaterialRequisition.findUnique({ where: { id: req.id }, include: { lines: true } });
+      const updatedReq = await tx.projectMaterialRequisition.findUnique({ where: { id: req.id }, include: { lines: true } });
+      if (updatedReq && budgetWarning) {
+        return { ...updatedReq, budgetWarning };
+      }
+      return updatedReq;
     }, { isolationLevel: "Serializable" });
   }
 
