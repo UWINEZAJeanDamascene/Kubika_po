@@ -17,6 +17,7 @@ const FIELD_MAP = {
   account_id: { target: 'accountId', isId: true },
   source_type: { target: 'sourceType' },
   status: { target: 'status' },
+  encumbrance_date: { target: 'encumbranceDate' },
 };
 
 module.exports = buildTenantModel({
