@@ -138,9 +138,9 @@ exports.upsertLines = async (req, res) => {
     const companyId = req.user.company._id;
     const userId = req.user.id;
     const { id } = req.params;
-    const { lines } = req.body;
+    const { lines, replace_existing: replaceExisting = false } = req.body;
 
-    if (!lines || !Array.isArray(lines) || lines.length === 0) {
+    if (!Array.isArray(lines) || (lines.length === 0 && !replaceExisting)) {
       return res.status(400).json({ error: "lines array is required" });
     }
 
@@ -149,6 +149,7 @@ exports.upsertLines = async (req, res) => {
       id,
       lines,
       userId,
+      { replaceExisting },
     );
     res.json({ success: true, data: result });
   } catch (error) {

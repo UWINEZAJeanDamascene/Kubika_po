@@ -368,7 +368,7 @@ class BudgetService {
 
     if (data.periodStart) budgetData.periodStart = new Date(data.periodStart);
     if (data.periodEnd) budgetData.periodEnd = new Date(data.periodEnd);
-    if (data.amount != null) budgetData.amount = data.amount;
+    budgetData.amount = 0;
 
     const budget = new Budget(budgetData);
     const saved = await budget.save();
@@ -376,6 +376,7 @@ class BudgetService {
     // If items are provided inline, create budget lines
     if (data.items && Array.isArray(data.items) && data.items.length > 0) {
       await BudgetService.upsertLines(companyId, saved._id, data.items, userId);
+      return Budget.findOne({ _id: saved._id, company_id: companyId });
     }
 
     return saved;
@@ -512,7 +513,7 @@ class BudgetService {
 
     // Only allow updating safe fields
     const allowed = ['name', 'code', 'description', 'purpose', 'tags', 'type', 'department',
-      'owner_id', 'entity_id', 'parent_budget_id', 'notes', 'amount', 'periodStart', 'periodEnd', 'periodType',
+      'owner_id', 'entity_id', 'parent_budget_id', 'notes', 'periodStart', 'periodEnd', 'periodType',
       'budget_cycle', 'base_currency', 'exchange_rate_type', 'exchange_rate',
       'allow_multi_currency', 'allocation_method'];
     const updateData = {};
@@ -560,6 +561,7 @@ class BudgetService {
     // If items are provided, upsert lines
     if (data.items && Array.isArray(data.items) && data.items.length > 0) {
       await BudgetService.upsertLines(companyId, budgetId, data.items, userId);
+      return Budget.findOne({ _id: budgetId, company_id: companyId });
     }
 
     return budget;
@@ -606,7 +608,7 @@ class BudgetService {
   }
 
   // ── UPSERT LINES ─────────────────────────────────────────────────────
-  static async upsertLines(companyId, budgetId, lines, userId) {
+  static async upsertLines(companyId, budgetId, lines, userId, { replaceExisting = false } = {}) {
     const budget = await Budget.findOne({ _id: budgetId, company_id: companyId });
 
     if (!budget) {
@@ -628,6 +630,12 @@ class BudgetService {
     }
 
     const affectedProjectIds = new Set();
+    const previousLines = replaceExisting
+      ? await BudgetLine.find({ company_id: companyId, budget_id: budgetId }).select('_id project_id')
+      : [];
+    for (const line of previousLines) {
+      if (line.project_id) affectedProjectIds.add(String(line.project_id));
+    }
     const projectById = new Map();
     const lineIds = [...new Set(lines.map((line) => line.line_id).filter(Boolean).map(String))];
     const existingLineRows = lineIds.length
@@ -728,9 +736,24 @@ class BudgetService {
       };
     });
 
-    await BudgetLine.bulkWrite(ops);
+    if (ops.length) await BudgetLine.bulkWrite(ops);
+    if (replaceExisting) {
+      const submittedLineIds = new Set(lines.map((line) => line.line_id).filter(Boolean).map(String));
+      const removedLines = previousLines.filter((line) => !submittedLineIds.has(String(line._id)));
+      for (const line of removedLines) {
+        await BudgetLine.deleteOne({ _id: line._id, company_id: companyId, budget_id: budgetId });
+      }
+    }
+    const savedLines = await BudgetLine.find({ company_id: companyId, budget_id: budgetId }).lean();
+    const totalAmount = savedLines.reduce(
+      (sum, line) => sum + Number(line.budgeted_amount?.toString() || 0),
+      0,
+    );
+    budget.amount = Math.round(totalAmount * 100) / 100;
+    budget.updated_at = new Date();
+    await budget.save();
     await projectService.updateBudgetSpentForProjects(companyId, [...affectedProjectIds]);
-    return { upserted: lines.length };
+    return { upserted: lines.length, amount: budget.amount };
   }
 
   // ── GET LINES ────────────────────────────────────────────────────────
