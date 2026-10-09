@@ -11,7 +11,10 @@ const netIssuedBudgetCost = (line) => {
   if (!issuedQuantity) return Math.max(0, round(number(line.issuedCost) - number(line.returnedCost)));
   return round(number(line.issuedCost) * Math.max(0, issuedQuantity - number(line.returnedQuantity)) / issuedQuantity);
 };
-const fail = (message, status = 400) => Object.assign(new Error(message), { statusCode: status });
+const fail = (message, status = 400, code) => Object.assign(new Error(message), {
+  statusCode: status,
+  ...(code ? { code } : {}),
+});
 const trackedMode = (product) => product?.trackSerialNumbers || product?.trackingType === "serial"
   ? "serial" : product?.trackBatch || product?.trackingType === "batch" ? "batch" : null;
 const ACTIVE_BUDGET_STATUSES = ["approved", "locked", "closed"];
@@ -63,9 +66,17 @@ async function findBudgetLineForMaterial(tx, { companyId, projectId, taskId, pro
   if (!strict) return null;
 
   if (!accountRef || !account || !matches.length) {
-    throw fail(`Cannot post material cost to the project budget: ${product.name} needs a COGS account that matches a budget line.`);
+    throw fail(
+      `Cannot issue ${product.name}: its COGS account is missing or does not match an approved budget line for this project/task. Set the product's COGS account to the same Chart of Accounts account used by the approved project budget line, or add and approve a budget line for that account. No stock was issued.`,
+      422,
+      "MATERIAL_BUDGET_LINE_REQUIRED",
+    );
   }
-  throw fail(`Cannot choose a unique project budget line for ${product.name}. Ensure only one approved budget line uses its COGS account for this period.`);
+  throw fail(
+    `Cannot issue ${product.name}: more than one approved project budget line matches its COGS account for this task and period. Keep one matching line or link the material to a specific budget line before issuing. No stock was issued.`,
+    422,
+    "MATERIAL_BUDGET_LINE_AMBIGUOUS",
+  );
 }
 
 async function postBudgetActual(tx, {

@@ -214,11 +214,35 @@ describe("Project material budget actual reconciliation", () => {
       { ...budgetLine, id: "budget_line_2" },
     ]);
 
-    await expect(
-      projectMaterialService.reconcileBudgetActuals("company_1", "project_1", "user_1"),
-    ).rejects.toThrow("Cannot choose a unique project budget line");
+    await expect(projectMaterialService.reconcileBudgetActuals(
+      "company_1", "project_1", "user_1",
+    )).rejects.toMatchObject({
+      message: expect.stringContaining("more than one approved project budget line"),
+      statusCode: 422,
+      code: "MATERIAL_BUDGET_LINE_AMBIGUOUS",
+    });
     expect(prisma.budgetLine.update).not.toHaveBeenCalled();
     expect(prisma.budgetActualConsumption.create).not.toHaveBeenCalled();
+  });
+
+  test("returns an actionable validation error when product COGS has no budget-line match", async () => {
+    prisma.product.findFirst.mockResolvedValue({
+      id: "product_1",
+      name: "Cat6 Patch Cord 1m",
+      cogsAccount: null,
+      currentStock: 100,
+      averageCost: 12,
+    });
+
+    await expect(projectMaterialService.issue(
+      "company_1", "project_1", "requisition_1", "line_1", 1, "user_1",
+    )).rejects.toMatchObject({
+      message: expect.stringContaining("Set the product's COGS account"),
+      statusCode: 422,
+      code: "MATERIAL_BUDGET_LINE_REQUIRED",
+    });
+    expect(prisma.stockLevel.updateMany).not.toHaveBeenCalled();
+    expect(prisma.stockMovement.create).not.toHaveBeenCalled();
   });
 
   test("repairs missing actuals on an already-linked issued material line", async () => {
