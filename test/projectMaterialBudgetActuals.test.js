@@ -362,6 +362,37 @@ describe("Project material budget actual reconciliation", () => {
     );
   });
 
+  test("issues stock and posts COGS when no budget line matches, returning a reconciliation warning", async () => {
+    prisma.budgetLine.findMany.mockResolvedValue([]);
+
+    const result = await projectMaterialService.issue(
+      "company_1", "project_1", "requisition_1", "line_1", 2, "user_1",
+    );
+
+    expect(result).toEqual(expect.objectContaining({
+      budgetWarning: expect.stringContaining("no unique approved project budget line matched"),
+    }));
+    expect(prisma.stockMovement.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        referenceType: "project_material_issue",
+        quantity: 2,
+      }),
+    }));
+    expect(prisma.budgetLine.update).not.toHaveBeenCalled();
+    expect(prisma.budgetActualConsumption.create).not.toHaveBeenCalled();
+    expect(JournalService.createEntry).toHaveBeenCalledWith(
+      "company_1",
+      "user_1",
+      expect.objectContaining({
+        sourceType: "project_material_issue",
+        lines: [
+          expect.objectContaining({ accountCode: "5100", debit: 24, credit: 0 }),
+          expect.objectContaining({ accountCode: "1400", debit: 0, credit: 24 }),
+        ],
+      }),
+    );
+  });
+
   test("allows reissuing returned quantity on a fully issued requisition", async () => {
     const returnedLine = {
       ...line,

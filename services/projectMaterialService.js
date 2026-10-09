@@ -653,8 +653,11 @@ class ProjectMaterialService {
       if (qty > previousStock) throw fail("Issue quantity exceeds product on-hand stock");
       const unitCost = number(product.averageCost) || number(line.unitCost);
       const budgetLine = await assignBudgetLine(tx, {
-        companyId, projectId: req.projectId, line, product, req, userId,
+        companyId, projectId: req.projectId, line, product, req, userId, strict: false,
       });
+      const budgetWarning = budgetLine
+        ? ""
+        : `Stock was issued and the COGS journal was posted for ${product.name}, but no unique approved project budget line matched its COGS account. Select the correct budget line or fix the account mapping, then reconcile budget actuals.`;
       await reconcileMaterialBudgetActual(tx, { companyId, budgetLine, line, req, userId });
       const issueCost = round(unitCost * qty);
       const movementId = generateObjectId();
@@ -719,7 +722,8 @@ class ProjectMaterialService {
       const updatedLines = await tx.projectMaterialRequisitionLine.findMany({ where: { requisitionId: req.id } });
       const status = updatedLines.every((item) =>
         number(item.issuedQuantity) - number(item.returnedQuantity) >= number(item.plannedQuantity)) ? "issued" : "partially_issued";
-      return tx.projectMaterialRequisition.update({ where: { id: req.id }, data: { status }, include: { lines: true } });
+      const updatedReq = await tx.projectMaterialRequisition.update({ where: { id: req.id }, data: { status }, include: { lines: true } });
+      return budgetWarning ? { ...updatedReq, budgetWarning } : updatedReq;
     }, { timeout: 30000, isolationLevel: "Serializable" });
   }
 
