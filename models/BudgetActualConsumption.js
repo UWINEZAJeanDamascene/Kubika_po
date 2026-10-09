@@ -17,6 +17,7 @@ const FIELD_MAP = {
   account_id: { target: 'accountId', isId: true },
   origin_type: { target: 'originType' },
   document_type: { target: 'documentType' },
+  document_date: { target: 'documentDate' },
   project_id: { target: 'projectId', isId: true },
 };
 
