@@ -44,7 +44,7 @@ jest.mock('../models/BudgetLine', () => ({
           line.period_year === update.filter.period_year)
       ));
       if (existing) Object.assign(existing, update.update.$set);
-      else mockLineRows.push({ _id: `line_${mockLineRows.length + 1}`, ...update.update.$set });
+      else mockLineRows.push({ _id: update.filter._id, ...update.update.$set });
     }
   }),
   deleteOne: jest.fn(async (filter) => {
@@ -66,12 +66,29 @@ jest.mock('../services/projectService', () => ({
 }));
 
 const BudgetService = require('../services/budgetService');
+const { budgetRevisionTranslateCreate } = require('../utils/phase10Mappers');
 
 describe('Budget line total synchronization', () => {
   beforeEach(() => {
     mockLineRows.splice(0, mockLineRows.length);
     mockBudget.amount = 0;
     mockBudget.save.mockClear();
+  });
+
+  describe('Budget revision mapper', () => {
+    test('maps changed_by without emitting a schema-unknown createdById', () => {
+      const payload = budgetRevisionTranslateCreate({
+        company_id: 'company_1',
+        budget_id: 'budget_1',
+        changed_by: 'user_1',
+        revision_number: 1,
+        change_type: 'update',
+        description: 'Updated budget lines',
+      });
+
+      expect(payload.changedById).toBe('user_1');
+      expect(payload).not.toHaveProperty('createdById');
+    });
   });
 
   test('sets the budget header amount to the sum of its line items', async () => {
@@ -112,6 +129,31 @@ describe('Budget line total synchronization', () => {
     expect(mockLineRows[0].period_month).toBe(2);
     expect(mockLineRows[0].budgeted_amount).toBe(975);
     expect(mockBudget.amount).toBe(975);
+  });
+
+  test('allows separate lines with the same account, project, and period', async () => {
+    await BudgetService.upsertLines('company_1', 'budget_1', [
+      {
+        account_id: 'account_1',
+        project_id: 'project_1',
+        period_month: 1,
+        period_year: 2026,
+        budgeted_amount: 700,
+        category: 'Materials',
+      },
+      {
+        account_id: 'account_1',
+        project_id: 'project_1',
+        period_month: 1,
+        period_year: 2026,
+        budgeted_amount: 300,
+        category: 'Additional materials',
+      },
+    ], 'user_1', { replaceExisting: true });
+
+    expect(mockLineRows).toHaveLength(2);
+    expect(new Set(mockLineRows.map((line) => line._id)).size).toBe(2);
+    expect(mockBudget.amount).toBe(1000);
   });
 
   test('replaces removed lines and resets the total when all lines are removed', async () => {

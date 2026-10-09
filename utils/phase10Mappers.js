@@ -1534,7 +1534,7 @@ const BUDGET_REVISION_HEADER = {
 };
 
 function budgetRevisionTranslateCreate(data) {
-  return headerTranslateCreate(data, BUDGET_REVISION_HEADER, ['companyId', 'budgetId', 'affectedLineId', 'changedById', 'rolledBackById', 'relatedDocumentId'], {
+  return headerTranslateCreateNoCreator(data, BUDGET_REVISION_HEADER, ['companyId', 'budgetId', 'affectedLineId', 'changedById', 'rolledBackById', 'relatedDocumentId'], {
     budgetId: toIdString(data.budget_id || data.budgetId),
     amountImpact: moneyStr(data.amount_impact ?? 0),
     changedById: toIdString(data.changed_by || data.changedBy),

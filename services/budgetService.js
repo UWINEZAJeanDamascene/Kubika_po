@@ -19,6 +19,7 @@ const Project = require('../models/Project');
 const User = require('../models/User');
 const Role = require('../models/Role');
 const projectService = require('./projectService');
+const { generateObjectId } = require('../utils/objectId');
 
 const BUDGET_OVERRUN_THRESHOLD = 0.9; // 90% utilized = warning
 
@@ -647,16 +648,6 @@ class BudgetService {
       if (!line.line_id) continue;
       const current = existingLinesById.get(String(line.line_id));
       if (current?.project_id) affectedProjectIds.add(String(current.project_id));
-      const duplicate = await BudgetLine.findOne({
-        company_id: companyId,
-        budget_id: budgetId,
-        account_id: line.account_id,
-        project_id: line.project_id || null,
-        period_month: line.period_month,
-        period_year: line.period_year,
-        _id: { $ne: line.line_id },
-      });
-      if (duplicate) throw new Error('DUPLICATE_BUDGET_LINE');
     }
 
     // Validate every account and project belongs to this company
@@ -705,17 +696,10 @@ class BudgetService {
 
       return {
         updateOne: {
-          filter: line.line_id ? {
-            _id: line.line_id,
+          filter: {
+            _id: line.line_id || generateObjectId(),
             company_id: companyId,
             budget_id: budgetId,
-          } : {
-            company_id: companyId,
-            budget_id: budgetId,
-            account_id: line.account_id,
-            project_id: projectId,
-            period_month: line.period_month,
-            period_year: line.period_year
           },
           update: {
             $set: {
