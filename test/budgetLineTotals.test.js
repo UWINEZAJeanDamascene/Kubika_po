@@ -1,4 +1,5 @@
 const mockLineRows = [];
+const mockRevisionDocuments = [];
 const mockBudget = {
   _id: 'budget_1',
   company_id: 'company_1',
@@ -53,6 +54,19 @@ jest.mock('../models/BudgetLine', () => ({
   }),
 }));
 
+jest.mock('../models/BudgetRevision', () => class MockBudgetRevision {
+  constructor(data) {
+    Object.assign(this, data);
+    mockRevisionDocuments.push(this);
+  }
+
+  static findOne() {
+    return { sort: async () => null };
+  }
+
+  async save() {}
+});
+
 jest.mock('../models/ChartOfAccount', () => ({
   find: jest.fn(() => mockQueryRows([{ _id: 'account_1' }])),
 }));
@@ -88,6 +102,46 @@ describe('Budget line total synchronization', () => {
 
       expect(payload.changedById).toBe('user_1');
       expect(payload).not.toHaveProperty('createdById');
+    });
+
+    test('serializes snapshots as JSON and excludes compatibility methods', async () => {
+      const beforeSnapshot = {
+        _id: 'budget_1',
+        periodStart: new Date('2026-10-15T00:00:00.000Z'),
+        deleteOne: async () => {},
+      };
+      const afterSnapshot = {
+        _id: 'budget_1',
+        periodStart: new Date('2026-10-20T00:00:00.000Z'),
+        deleteOne: async () => {},
+      };
+
+      await BudgetService._createRevision({
+        company_id: 'company_1',
+        budget_id: 'budget_1',
+        change_type: 'update',
+        description: 'Updated budget dates',
+        changed_by: 'user_1',
+        field_changes: [{
+          field: 'periodStart',
+          old_value: beforeSnapshot.periodStart,
+          new_value: afterSnapshot.periodStart,
+        }],
+        before_snapshot: beforeSnapshot,
+        after_snapshot: afterSnapshot,
+      });
+
+      const revision = mockRevisionDocuments.at(-1);
+      expect(revision.before_snapshot).toEqual({
+        _id: 'budget_1',
+        periodStart: '2026-10-15T00:00:00.000Z',
+      });
+      expect(revision.after_snapshot).toEqual({
+        _id: 'budget_1',
+        periodStart: '2026-10-20T00:00:00.000Z',
+      });
+      expect(revision.field_changes[0].old_value).toBe('2026-10-15T00:00:00.000Z');
+      expect(revision.field_changes[0].new_value).toBe('2026-10-20T00:00:00.000Z');
     });
   });
 

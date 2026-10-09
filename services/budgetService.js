@@ -36,6 +36,12 @@ const MANAGER_ROLES = new Set([
 
 const normalizeRoleName = (name) => String(name || '').trim().toLowerCase().replace(/\s+/g, '_');
 
+function serializeJsonValue(value) {
+  return JSON.parse(JSON.stringify(value, (_key, item) => (
+    typeof item === 'function' ? undefined : item
+  )));
+}
+
 async function getBudgetActualMap(companyId, accountIds, start, end) {
   const ids = [...new Set((accountIds || []).filter(Boolean).map((id) => String(id)))];
   if (!ids.length) return {};
@@ -579,6 +585,13 @@ class BudgetService {
 
     const revision = new BudgetRevision({
       ...revisionData,
+      field_changes: serializeJsonValue(revisionData.field_changes || []),
+      before_snapshot: revisionData.before_snapshot
+        ? serializeJsonValue(revisionData.before_snapshot)
+        : null,
+      after_snapshot: revisionData.after_snapshot
+        ? serializeJsonValue(revisionData.after_snapshot)
+        : null,
       revision_number: revisionNumber,
       changed_at: new Date()
     });
