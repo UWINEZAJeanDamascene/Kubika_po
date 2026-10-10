@@ -4366,6 +4366,7 @@ model ProjectMilestone {
   dueDate        DateTime? @map("due_date") @db.Timestamptz(3)
   progressPercent Decimal @default(0) @map("progress_percent") @db.Decimal(5, 2)
   dependsOnIds   String[] @default([]) @map("depends_on_ids") @db.Char(24)
+  taskIds        String[] @default([]) @map("task_ids") @db.Char(24)
   completedAt    DateTime? @map("completed_at") @db.Timestamptz(3)
   createdById    String?  @map("created_by_id") @db.Char(24)
   createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)

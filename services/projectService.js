@@ -26,6 +26,22 @@ function taskProgressFromHours(task, actualHours) {
   return Number(task.progress_percent || 0);
 }
 
+function milestoneProgressFromTasks(milestone, tasksById) {
+  if (milestone.status === "completed") return 100;
+  const taskIds = milestone.taskIds || [];
+  if (!taskIds.length) return Number(milestone.progressPercent || 0);
+  let totalWeight = 0;
+  let completedWeight = 0;
+  for (const taskId of taskIds) {
+    const task = tasksById.get(String(taskId));
+    const weight = task && Number(task.estimated_hours) > 0 ? Number(task.estimated_hours) : 1;
+    const progress = !task || task.status === "cancelled" ? 0 : taskProgressFromHours(task, Number(task.actual_hours || 0));
+    totalWeight += weight;
+    completedWeight += weight * progress;
+  }
+  return totalWeight ? Math.round(completedWeight / totalWeight * 100) / 100 : 0;
+}
+
 /**
  * Project Service - Business logic for Project/Job-Level Budgeting
  */
@@ -161,7 +177,16 @@ class ProjectService {
     const toDate = to ? new Date(to) : new Date(new Date().getFullYear(), new Date().getMonth() + 1, 1);
     if (!Number.isFinite(fromDate.getTime()) || !Number.isFinite(toDate.getTime()) || fromDate > toDate) throw validationError("Calendar date range is invalid");
     const tasks = await Project.find({ company_id: companyId, type: "task", is_active: true, is_template: false, end_date: { $gte: fromDate, $lt: toDate } }).sort({ end_date: 1 }).populate("parent_id", "name project_code");
-    const milestones = await prisma.projectMilestone.findMany({ where: { companyId: String(companyId), dueDate: { gte: fromDate, lt: toDate } }, orderBy: { dueDate: "asc" } });
+    const queriedMilestones = await prisma.projectMilestone.findMany({ where: { companyId: String(companyId), dueDate: { gte: fromDate, lt: toDate } }, orderBy: { dueDate: "asc" } });
+    const milestoneGroups = new Map();
+    for (const milestone of queriedMilestones) {
+      const rows = milestoneGroups.get(milestone.projectId) || [];
+      rows.push(milestone);
+      milestoneGroups.set(milestone.projectId, rows);
+    }
+    const milestones = (await Promise.all([...milestoneGroups].map(([milestoneProjectId, rows]) =>
+      this.refreshMilestoneProgress(companyId, milestoneProjectId, rows),
+    ))).flat();
     const projectIds = [...new Set(milestones.map((item) => item.projectId))];
     const projects = projectIds.length ? await prisma.project.findMany({ where: { companyId: String(companyId), id: { in: projectIds } }, select: { id: true, name: true, projectCode: true } }) : [];
     const projectById = new Map(projects.map((item) => [item.id, item]));
@@ -175,7 +200,29 @@ class ProjectService {
     const project = await Project.findOne({ _id: projectId, company_id: companyId, is_template: false });
     if (!project) throw new Error("Project not found");
     const rows = await prisma.projectMilestone.findMany({ where: { companyId: String(companyId), projectId: String(projectId) }, orderBy: [{ dueDate: "asc" }, { createdAt: "asc" }] });
-    return rows.map((row) => ({ _id: row.id, company_id: row.companyId, project_id: row.projectId, name: row.name, description: row.description, assignee_id: row.assigneeId, status: row.status, priority: row.priority, due_date: row.dueDate, progress_percent: Number(row.progressPercent), depends_on_ids: row.dependsOnIds, completed_at: row.completedAt, created_by_id: row.createdById, created_at: row.createdAt, updated_at: row.updatedAt }));
+    const refreshed = await this.refreshMilestoneProgress(companyId, projectId, rows);
+    await this.rollupWbsProgress(companyId, projectId);
+    return refreshed.map((row) => ({ _id: row.id, company_id: row.companyId, project_id: row.projectId, name: row.name, description: row.description, assignee_id: row.assigneeId, status: row.status, priority: row.priority, due_date: row.dueDate, progress_percent: Number(row.progressPercent), depends_on_ids: row.dependsOnIds, task_ids: row.taskIds || [], completed_at: row.completedAt, created_by_id: row.createdById, created_at: row.createdAt, updated_at: row.updatedAt }));
+  }
+
+  async refreshMilestoneProgress(companyId, projectId, milestones) {
+    const linkedTaskIds = [...new Set(milestones.flatMap((item) => item.taskIds || []).map(String))];
+    if (!linkedTaskIds.length) return milestones;
+    const tasks = await this.getProjectTasks(companyId, projectId);
+    const tasksById = new Map(tasks.map((task) => [String(task._id), task]));
+    const refreshed = [];
+    for (const milestone of milestones) {
+      const progress = milestoneProgressFromTasks(milestone, tasksById);
+      if (Number(milestone.progressPercent) !== progress) {
+        refreshed.push(await prisma.projectMilestone.update({
+          where: { id: milestone.id },
+          data: { progressPercent: progress },
+        }));
+      } else {
+        refreshed.push(milestone);
+      }
+    }
+    return refreshed;
   }
 
   async saveProjectMilestone(companyId, projectId, milestoneId, data, userId) {
@@ -191,8 +238,25 @@ class ProjectService {
     const priority = data.priority ?? current?.priority ?? "medium";
     if (!statuses.includes(status)) throw validationError("Invalid milestone status");
     if (!priorities.includes(priority)) throw validationError("Invalid milestone priority");
-    const progress = status === "completed" ? 100 : Number(data.progress_percent ?? current?.progressPercent ?? 0);
+    const taskIdsInput = data.task_ids === undefined ? current?.taskIds || [] : data.task_ids;
+    if (!Array.isArray(taskIdsInput)) throw validationError("Linked tasks must be a list");
+    const taskIds = [...new Set(taskIdsInput.map(String))];
+    const projectTasks = taskIds.length ? await this.getProjectTasks(companyId, projectId) : [];
+    const projectTasksById = new Map(projectTasks.map((task) => [String(task._id), task]));
+    if (taskIds.some((id) => !projectTasksById.has(id) || projectTasksById.get(id).status === "cancelled")) {
+      throw validationError("Linked tasks must be active, non-cancelled tasks in this project");
+    }
+    const tasksById = projectTasksById;
+    const linkedTaskProgress = taskIds.length
+      ? milestoneProgressFromTasks({ status: "active", taskIds }, tasksById)
+      : null;
+    const progress = status === "completed"
+      ? 100
+      : linkedTaskProgress ?? Number(data.progress_percent ?? current?.progressPercent ?? 0);
     if (!Number.isFinite(progress) || progress < 0 || progress > 100) throw validationError("Progress must be between 0 and 100");
+    if (status === "completed" && current?.status !== "completed" && taskIds.length && linkedTaskProgress < 100) {
+      throw validationError("Linked tasks must reach 100% progress before completing this milestone");
+    }
     if (data.depends_on_ids !== undefined && !Array.isArray(data.depends_on_ids)) throw validationError("Milestone dependencies must be a list");
     const dependsOnIds = data.depends_on_ids === undefined ? current?.dependsOnIds || [] : [...new Set(data.depends_on_ids.map(String))];
     if (dependsOnIds.includes(String(milestoneId || ""))) throw validationError("A milestone cannot depend on itself");
@@ -222,19 +286,14 @@ class ProjectService {
       dueDate: data.due_date === undefined ? current?.dueDate ?? null : (data.due_date ? new Date(data.due_date) : null),
       progressPercent: progress,
       dependsOnIds,
+      taskIds,
       completedAt: status === "completed" ? current?.completedAt || new Date() : null,
     };
     const saved = current
       ? await prisma.projectMilestone.update({ where: { id: current.id }, data: values })
       : await prisma.projectMilestone.create({ data: { id: require("../utils/objectId").generateObjectId(), companyId: String(companyId), projectId: String(projectId), createdById: userId ? String(userId) : null, ...values } });
-    const milestones = await prisma.projectMilestone.findMany({ where: { companyId: String(companyId), projectId: String(projectId) } });
-    const children = await Project.find({ company_id: companyId, parent_id: projectId, is_active: true, is_template: false });
-    const weightOf = (item) => Number(item.estimated_hours) > 0 ? Number(item.estimated_hours) : 1;
-    const totalWeight = children.reduce((sum, item) => sum + weightOf(item), 0) + milestones.length;
-    const weightedProgress = children.reduce((sum, item) => sum + Number(item.progress_percent || 0) * weightOf(item), 0) + milestones.reduce((sum, item) => sum + Number(item.progressPercent), 0);
-    if (totalWeight) await Project.findByIdAndUpdate(projectId, { $set: { progress_percent: Math.round(weightedProgress / totalWeight * 100) / 100 } });
-    if (project.parent_id) await this.rollupWbsProgress(companyId, project.parent_id?._id || project.parent_id);
-    return { _id: saved.id, company_id: saved.companyId, project_id: saved.projectId, name: saved.name, description: saved.description, assignee_id: saved.assigneeId, status: saved.status, priority: saved.priority, due_date: saved.dueDate, progress_percent: Number(saved.progressPercent), depends_on_ids: saved.dependsOnIds, completed_at: saved.completedAt, created_by_id: saved.createdById, created_at: saved.createdAt, updated_at: saved.updatedAt };
+    await this.rollupWbsProgress(companyId, projectId);
+    return { _id: saved.id, company_id: saved.companyId, project_id: saved.projectId, name: saved.name, description: saved.description, assignee_id: saved.assigneeId, status: saved.status, priority: saved.priority, due_date: saved.dueDate, progress_percent: Number(saved.progressPercent), depends_on_ids: saved.dependsOnIds, task_ids: saved.taskIds || [], completed_at: saved.completedAt, created_by_id: saved.createdById, created_at: saved.createdAt, updated_at: saved.updatedAt };
   }
 
   async createTask(companyId, parentId, data, userId) {
@@ -297,12 +356,15 @@ class ProjectService {
       const parent = await Project.findOne({ _id: currentId, company_id: companyId });
       if (!parent) break;
       const children = await Project.find({ company_id: companyId, parent_id: currentId, is_active: true, is_template: false });
-      const milestones = await prisma.projectMilestone.findMany({ where: { companyId: String(companyId), projectId: String(currentId) } });
+      const milestones = await this.refreshMilestoneProgress(companyId, currentId, await prisma.projectMilestone.findMany({ where: { companyId: String(companyId), projectId: String(currentId) } }));
       if (children.length || milestones.length) {
+        const projectTasks = await this.getProjectTasks(companyId, currentId);
+        const taskProgressById = new Map(projectTasks.map((task) => [String(task._id), Number(task.progress_percent || 0)]));
         const childWeight = children.reduce((sum, child) => sum + (Number(child.estimated_hours) > 0 ? Number(child.estimated_hours) : 1), 0);
-        const totalWeight = childWeight + milestones.length;
-        const progress = (children.reduce((sum, child) => sum + Number(child.progress_percent || 0) * (Number(child.estimated_hours) > 0 ? Number(child.estimated_hours) : 1), 0) + milestones.reduce((sum, item) => sum + Number(item.progressPercent), 0)) / totalWeight;
-        await Project.findByIdAndUpdate(parent._id, { $set: { progress_percent: Math.round(progress * 100) / 100 } });
+        const standaloneMilestones = milestones.filter((item) => !(item.taskIds || []).length);
+        const totalWeight = childWeight + standaloneMilestones.length;
+        const progress = (children.reduce((sum, child) => sum + (taskProgressById.get(String(child._id)) ?? Number(child.progress_percent || 0)) * (Number(child.estimated_hours) > 0 ? Number(child.estimated_hours) : 1), 0) + standaloneMilestones.reduce((sum, item) => sum + Number(item.progressPercent), 0)) / totalWeight;
+        if (totalWeight) await Project.findByIdAndUpdate(parent._id, { $set: { progress_percent: Math.round(progress * 100) / 100 } });
       }
       currentId = parent.parent_id;
     }
@@ -630,6 +692,54 @@ class ProjectService {
       throw new Error("Project not found");
     }
 
+    if (project.type === "task" && (data.type !== undefined && data.type !== "task"
+      || data.is_active === false
+      || data.status === "cancelled")) {
+      const linkedMilestones = await prisma.projectMilestone.findMany({
+        where: { companyId: String(companyId), taskIds: { has: String(projectId) } },
+        select: { id: true },
+      });
+      if (linkedMilestones.length) {
+        throw validationError("Remove this task from its linked milestone before archiving it, cancelling it, or changing its type");
+      }
+    }
+    if (data.parent_id !== undefined && String(data.parent_id || "") !== String(project.parent_id?._id || project.parent_id || "")) {
+      const subtreeIds = new Set([String(projectId)]);
+      const collectIds = (nodes) => nodes.forEach((node) => {
+        subtreeIds.add(String(node._id));
+        if (node.children?.length) collectIds(node.children);
+      });
+      collectIds(await this.getWBSTree(companyId, projectId));
+      const subtreeTaskIds = project.type === "task"
+        ? [String(projectId)]
+        : [...subtreeIds].filter((id) => id !== String(projectId));
+      if (subtreeTaskIds.length) {
+        const taskRows = project.type === "task"
+          ? [{ _id: projectId, type: "task" }]
+          : await Project.find({ company_id: companyId, _id: { $in: subtreeTaskIds }, type: "task" });
+        const linkedTaskIds = taskRows.map((task) => String(task._id));
+        const linkedMilestones = linkedTaskIds.length
+          ? await prisma.projectMilestone.findMany({
+            where: { companyId: String(companyId), taskIds: { hasSome: linkedTaskIds } },
+            select: { projectId: true },
+          })
+          : [];
+        if (linkedMilestones.length) {
+          const destinationAncestors = new Set();
+          let ancestorId = data.parent_id ? String(data.parent_id) : null;
+          for (let depth = 0; ancestorId && depth < 20; depth += 1) {
+            if (destinationAncestors.has(ancestorId)) break;
+            destinationAncestors.add(ancestorId);
+            const ancestor = await Project.findOne({ _id: ancestorId, company_id: companyId });
+            ancestorId = ancestor?.parent_id ? String(ancestor.parent_id?._id || ancestor.parent_id) : null;
+          }
+          if (linkedMilestones.some((milestone) => !subtreeIds.has(String(milestone.projectId)) && !destinationAncestors.has(String(milestone.projectId)))) {
+            throw validationError("Moving this WBS item would separate linked milestone tasks from their project; update the milestone links first");
+          }
+        }
+      }
+    }
+
     const effective = { ...project, ...data };
     if (data.name !== undefined && !String(data.name).trim()) throw validationError("Project name is required");
     if (data.project_category !== undefined && !PROJECT_CATEGORIES.includes(data.project_category)) throw validationError("Invalid project category");
@@ -792,7 +902,14 @@ class ProjectService {
     }
     if (data.parent_id !== undefined || data.project_code !== undefined) await this.refreshWbsDescendants(companyId, projectId);
 
-    if (updated.parent_id && updated.type === "task") await this.rollupWbsProgress(companyId, updated.parent_id?._id || updated.parent_id);
+    const oldParentId = project.parent_id?._id || project.parent_id;
+    const updatedParentId = updated.parent_id?._id || updated.parent_id;
+    if (data.parent_id !== undefined && String(oldParentId || "") !== String(updatedParentId || "") && oldParentId) {
+      await this.rollupWbsProgress(companyId, oldParentId);
+    }
+    if (updatedParentId && (updated.type === "task" || data.parent_id !== undefined)) {
+      await this.rollupWbsProgress(companyId, updatedParentId);
+    }
     return updated;
   }
 
@@ -807,6 +924,16 @@ class ProjectService {
 
     if (!project) {
       throw new Error("Project not found");
+    }
+
+    if (project.type === "task") {
+      const linkedMilestones = await prisma.projectMilestone.findMany({
+        where: { companyId: String(companyId), taskIds: { has: String(projectId) } },
+        select: { id: true },
+      });
+      if (linkedMilestones.length) {
+        throw validationError("Remove this task from its linked milestone before archiving it");
+      }
     }
 
     const children = await Project.find({ company_id: companyId, parent_id: projectId, is_active: true, is_template: false });
@@ -1059,6 +1186,17 @@ class ProjectService {
       prisma.projectActivity.findMany({ where: { companyId: String(companyId), projectId: { in: descendantIds } }, orderBy: { createdAt: "desc" }, take: 200 }),
       prisma.projectDocument.findMany({ where: { companyId: String(companyId), projectId: { in: descendantIds } }, select: { id: true, fileName: true, mimeType: true, fileSize: true, createdAt: true }, orderBy: { createdAt: "desc" } }),
     ]);
+    const milestoneGroups = new Map();
+    for (const milestone of milestones) {
+      const rows = milestoneGroups.get(milestone.projectId) || [];
+      rows.push(milestone);
+      milestoneGroups.set(milestone.projectId, rows);
+    }
+    const currentMilestones = (await Promise.all([...milestoneGroups].map(([milestoneProjectId, rows]) =>
+      this.refreshMilestoneProgress(companyId, milestoneProjectId, rows),
+    ))).flat();
+    await this.rollupWbsProgress(companyId, projectId);
+    const currentProject = await Project.findOne({ _id: projectId, company_id: companyId, is_template: false });
     const today = new Date();
     const activeTasks = tasks.filter((task) => !["completed", "cancelled"].includes(task.status));
     const overdueTasks = activeTasks.filter((task) => task.end_date && new Date(task.end_date) < today);
@@ -1068,11 +1206,11 @@ class ProjectService {
     const taskHours = tasks.reduce((result, task) => { result.estimated += Number(task.estimated_hours || 0); result.actual += Number(task.actual_hours || task.timesheet_hours || 0); return result; }, { estimated: 0, actual: 0 });
     return {
       generated_at: new Date().toISOString(),
-      project,
+      project: currentProject,
       executive_summary: {
         task_count: tasks.length, task_status_counts: taskStatusCounts,
-        milestone_count: milestones.length, milestone_status_counts: milestoneStatusCounts,
-        progress_percent: Number(project.progress_percent || 0),
+        milestone_count: currentMilestones.length, milestone_status_counts: milestoneStatusCounts,
+        progress_percent: Number(currentProject.progress_percent || 0),
         planned_hours: Math.round(taskHours.estimated * 100) / 100,
         actual_hours: Math.round(taskHours.actual * 100) / 100,
         overdue_task_count: overdueTasks.length, overdue_milestone_count: overdueMilestones.length,
@@ -1082,7 +1220,7 @@ class ProjectService {
       },
       tasks,
       wbs_tree: wbs,
-      milestones: milestones.map((item) => ({ id: item.id, name: item.name, status: item.status, priority: item.priority, due_date: item.dueDate, progress_percent: Number(item.progressPercent), assignee_id: item.assigneeId })),
+      milestones: currentMilestones.map((item) => ({ id: item.id, name: item.name, status: item.status, priority: item.priority, due_date: item.dueDate, progress_percent: Number(item.progressPercent), task_ids: item.taskIds || [], assignee_id: item.assigneeId })),
       budget_lines: budget.budget_lines,
       material_requisitions: materialRequisitions,
       controls,

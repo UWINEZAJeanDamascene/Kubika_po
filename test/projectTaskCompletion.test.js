@@ -29,6 +29,7 @@ jest.mock("../services/sequenceService", () => ({}));
 jest.mock("../lib/prisma", () => ({
   prisma: {
     projectLaborEntry: { findMany: jest.fn(async () => []) },
+    projectMilestone: { findMany: jest.fn(async () => []) },
     projectTypeSetting: { findUnique: jest.fn(async () => null) },
     currency: { findUnique: jest.fn(async () => ({ isActive: true })) },
   },
