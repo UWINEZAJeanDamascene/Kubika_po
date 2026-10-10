@@ -6,6 +6,7 @@ const timesheetController = require('../controllers/timesheetController');
 
 router.post('/', protect, timesheetController.createTimesheet);
 router.get('/', protect, timesheetController.getTimesheets);
+router.get('/:id/audit', protect, timesheetController.getTimesheetAllocationAuditHistory);
 router.get('/:id', protect, timesheetController.getTimesheetById);
 router.put('/:id/correct-allocation', protect, requirePermissionOrRoles('timesheets', 'correct', ['admin', 'accountant', 'finance', 'finance_manager', 'project_controller']), timesheetController.correctTimesheetAllocation);
 router.put('/:id', protect, timesheetController.updateTimesheet);

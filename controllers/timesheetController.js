@@ -6,6 +6,41 @@ const { generateObjectId } = require('../utils/objectId');
 
 const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 
+async function findPostedPayrollCostPosting(client, companyId, employeeId, dayStart, dayEnd, month, year) {
+  const periodWhere = {
+    companyId,
+    employeeRefId: employeeId,
+    OR: [
+      { payPeriodStart: { lte: dayEnd }, payPeriodEnd: { gte: dayStart } },
+      {
+        AND: [
+          { period: { path: ['month'], equals: month } },
+          { period: { path: ['year'], equals: year } },
+        ],
+      },
+    ],
+  };
+  const payrollRecords = await client.payroll.findMany({
+    where: periodWhere,
+    select: { id: true, recordStatus: true },
+    take: 500,
+  });
+  if (payrollRecords.some((record) => ['finalised', 'paid'].includes(record.recordStatus))) {
+    return { finalized: true, journalPosted: false };
+  }
+  if (!payrollRecords.length) return null;
+  const postedJournal = await client.journalEntry.findFirst({
+    where: {
+      companyId,
+      sourceId: { in: payrollRecords.map((record) => record.id) },
+      sourceType: { in: ['payroll_salary', 'payroll_employer'] },
+      status: 'posted',
+    },
+    select: { id: true },
+  });
+  return postedJournal ? { finalized: false, journalPosted: true } : null;
+}
+
 exports.createTimesheet = async (req, res, next) => {
   try {
     const cid = req.user.company._id;
@@ -113,6 +148,31 @@ exports.getTimesheetById = async (req, res, next) => {
   } catch (e) { next(e); }
 };
 
+exports.getTimesheetAllocationAuditHistory = async (req, res, next) => {
+  try {
+    const cid = String(req.user.company._id);
+    const ts = await Timesheet.findOne({ _id: req.params.id, company: cid });
+    if (!ts) return res.status(404).json({ success: false, message: 'Not found' });
+    const events = await prisma.payrollAuditEvent.findMany({
+      where: { companyId: cid, entityType: 'timesheet', entityId: String(ts._id) },
+      orderBy: { createdAt: 'desc' },
+      take: 200,
+    });
+    const actorIds = [...new Set(events.map((event) => event.actorUserId).filter(Boolean))];
+    const actors = actorIds.length
+      ? await prisma.user.findMany({
+        where: { id: { in: actorIds } },
+        select: { id: true, name: true },
+      })
+      : [];
+    const actorNames = new Map(actors.map((actor) => [actor.id, actor.name]));
+    return res.json({
+      success: true,
+      data: events.map((event) => ({ ...event, actorName: actorNames.get(event.actorUserId) || null })),
+    });
+  } catch (e) { next(e); }
+};
+
 exports.deleteTimesheet = async (req, res, next) => {
   try {
     const cid = req.user.company._id;
@@ -161,6 +221,8 @@ exports.correctTimesheetAllocation = async (req, res, next) => {
     dayStart.setUTCHours(0, 0, 0, 0);
     const dayEnd = new Date(entryDate);
     dayEnd.setUTCHours(23, 59, 59, 999);
+    const entryMonth = entryDate.getUTCMonth() + 1;
+    const entryYear = entryDate.getUTCFullYear();
     const [closedAccountingPeriod, closedLegacyPeriod] = await Promise.all([
       prisma.accountingPeriod.findFirst({
         where: {
@@ -202,6 +264,18 @@ exports.correctTimesheetAllocation = async (req, res, next) => {
       });
     }
 
+    const existingPayrollPosting = await findPostedPayrollCostPosting(
+      prisma, cid, employeeId, dayStart, dayEnd, entryMonth, entryYear,
+    );
+    if (existingPayrollPosting) {
+      return res.status(409).json({
+        success: false,
+        message: existingPayrollPosting.finalized
+          ? 'Allocation cannot be corrected because payroll for this employee and period has been finalized or paid'
+          : 'Allocation cannot be corrected because a payroll journal for this employee and period is already posted',
+      });
+    }
+
     let nextLine;
     let replacementEntry = null;
     if (targetTaskId) {
@@ -217,11 +291,90 @@ exports.correctTimesheetAllocation = async (req, res, next) => {
       if (!root || !root.isActive || ['closed', 'cancelled'].includes(String(root.status).toLowerCase())) {
         return res.status(400).json({ success: false, message: 'Choose a task under an active, open project' });
       }
-      const labor = await projectLabor.buildApprovedLabor(cid, employeeId, normalized);
-      nextLine = labor.lines[0];
-      replacementEntry = labor.entries[0]
-        ? { ...labor.entries[0], timesheetId: String(ts._id), lineIndex }
-        : null;
+      const existingLaborEntry = oldLine.projectTaskId ? await prisma.projectLaborEntry.findFirst({
+        where: { companyId: cid, timesheetId: String(ts._id), lineIndex },
+        select: {
+          projectId: true,
+          hours: true,
+          hourlyRate: true,
+          laborCost: true,
+          currencyCode: true,
+          activityType: true,
+          notes: true,
+          entryDate: true,
+        },
+      }) : null;
+      let oldProjectId = oldLine.projectId || existingLaborEntry?.projectId || null;
+      if (oldLine.projectTaskId && !oldProjectId) {
+        let oldTask = await prisma.project.findFirst({
+          where: { id: String(oldLine.projectTaskId), companyId: cid, type: 'task' },
+          select: { id: true, parentId: true },
+        });
+        const visitedProjectIds = new Set();
+        while (oldTask?.parentId) {
+          if (visitedProjectIds.has(oldTask.id)) {
+            oldTask = null;
+            break;
+          }
+          visitedProjectIds.add(oldTask.id);
+          oldTask = await prisma.project.findFirst({
+            where: { id: oldTask.parentId, companyId: cid },
+            select: { id: true, parentId: true },
+          });
+        }
+        oldProjectId = oldTask?.id || null;
+      }
+      if (oldLine.projectTaskId && !oldProjectId) {
+        return res.status(409).json({
+          success: false,
+          message: 'Cannot verify the original project for this timesheet entry; contact an administrator',
+        });
+      }
+      if (oldLine.projectTaskId && oldProjectId && String(oldProjectId) !== String(root.id)) {
+        return res.status(409).json({
+          success: false,
+          message: 'Reassignment to a different project is not allowed; project budget moves require separate approval',
+        });
+      }
+      if (oldLine.projectTaskId) {
+        const hourlyRate = existingLaborEntry?.hourlyRate ?? oldLine.hourlyRate;
+        const laborCost = existingLaborEntry?.laborCost ?? oldLine.laborCost;
+        const currencyCode = oldLine.currencyCode || existingLaborEntry?.currencyCode;
+        if (hourlyRate == null || laborCost == null || !currencyCode) {
+          return res.status(409).json({
+            success: false,
+            message: 'The approved labor cost could not be verified; no allocation was changed',
+          });
+        }
+        nextLine = {
+          ...normalized[0],
+          hourlyRate: Number(hourlyRate),
+          laborCost: Number(laborCost),
+          currencyCode: String(currencyCode),
+        };
+        replacementEntry = {
+          id: generateObjectId(),
+          companyId: cid,
+          projectId: String(root.id),
+          taskId: String(normalized[0].projectTaskId),
+          timesheetId: String(ts._id),
+          employeeId,
+          lineIndex,
+          entryDate: existingLaborEntry?.entryDate || dayStart,
+          hours: Number(existingLaborEntry?.hours ?? oldLine.hoursWorked),
+          hourlyRate: Number(hourlyRate),
+          laborCost: Number(laborCost),
+          currencyCode: String(currencyCode),
+          activityType: String(existingLaborEntry?.activityType || oldLine.activityType || 'other'),
+          notes: String(existingLaborEntry?.notes ?? oldLine.notes ?? ''),
+        };
+      } else {
+        const labor = await projectLabor.buildApprovedLabor(cid, employeeId, normalized);
+        nextLine = labor.lines[0];
+        replacementEntry = labor.entries[0]
+          ? { ...labor.entries[0], timesheetId: String(ts._id), lineIndex }
+          : null;
+      }
     } else {
       nextLine = { ...oldLine, internalCode: targetInternalCode };
       delete nextLine.projectTaskId;
@@ -286,6 +439,15 @@ exports.correctTimesheetAllocation = async (req, res, next) => {
       });
       if (payrollPostedDuringCorrection) {
         throw Object.assign(new Error('Allocation cannot be corrected because payroll was posted during correction'), { statusCode: 409 });
+      }
+      const payrollPostingDuringCorrection = await findPostedPayrollCostPosting(
+        tx, cid, employeeId, dayStart, dayEnd, entryMonth, entryYear,
+      );
+      if (payrollPostingDuringCorrection) {
+        const message = payrollPostingDuringCorrection.finalized
+          ? 'Allocation cannot be corrected because payroll was finalized or paid during correction'
+          : 'Allocation cannot be corrected because a payroll journal was posted during correction';
+        throw Object.assign(new Error(message), { statusCode: 409 });
       }
       const updated = await tx.timesheet.updateMany({
         where: {
