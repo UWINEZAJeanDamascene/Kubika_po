@@ -78,4 +78,16 @@ describe("Task completion actual hours", () => {
       { new: true, runValidators: true },
     );
   });
+
+  test("records actual hours for a previously completed task with no saved hours", async () => {
+    task.status = "completed";
+
+    await projectService.updateProject("company_1", "task_1", { actual_hours: 24 });
+
+    expect(Project.findByIdAndUpdate).toHaveBeenCalledWith(
+      "task_1",
+      { $set: expect.objectContaining({ actual_hours: 24 }) },
+      { new: true, runValidators: true },
+    );
+  });
 });
