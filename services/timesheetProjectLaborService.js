@@ -1,6 +1,7 @@
 const { prisma } = require("../lib/prisma");
 const { generateObjectId } = require("../utils/objectId");
 
+const INTERNAL_TIME_CODES = new Set(["leave", "administration", "training", "other"]);
 const fail = (message) => Object.assign(new Error(message), { statusCode: 400, code: "TIMESHEET_PROJECT_VALIDATION_ERROR" });
 const toNumber = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
 
@@ -10,12 +11,24 @@ async function validateAndNormalizeLines(companyId, employeeId, lines) {
   for (const source of lines) {
     const line = { ...source };
     const taskId = line.projectTaskId || line.project_task_id || null;
-    if (!taskId) { delete line.projectTaskId; delete line.project_task_id; normalized.push(line); continue; }
+    const internalCode = String(line.internalCode || "").trim().toLowerCase();
+    if (!taskId) {
+      delete line.projectTaskId;
+      delete line.project_task_id;
+      delete line.projectId;
+      if (internalCode && !INTERNAL_TIME_CODES.has(internalCode)) throw fail("Choose a valid internal time code");
+      if (internalCode) line.internalCode = internalCode;
+      else delete line.internalCode;
+      normalized.push(line);
+      continue;
+    }
+    if (internalCode) throw fail("Choose either a project task or an internal time code, not both");
     if (!line.date || !Number.isFinite(new Date(line.date).getTime())) throw fail("Project task time entries require a valid work date");
     if (toNumber(line.hoursWorked) <= 0 || toNumber(line.hoursWorked) > 24) throw fail("Project task time entries must have between 0 and 24 hours");
     const task = await prisma.project.findFirst({ where: { id: String(taskId), companyId: String(companyId), type: "task", isActive: true, isTemplate: false }, select: { id: true, parentId: true } });
     if (!task) throw fail("Every project time entry must reference an active task in this company");
     line.projectTaskId = task.id;
+    delete line.internalCode;
     let root = task;
     while (root.parentId) {
       root = await prisma.project.findFirst({ where: { id: root.parentId, companyId: String(companyId) }, select: { id: true, parentId: true } });
@@ -26,6 +39,15 @@ async function validateAndNormalizeLines(companyId, employeeId, lines) {
     normalized.push(line);
   }
   return normalized;
+}
+
+function validateCompleteAllocations(lines) {
+  if (!Array.isArray(lines)) throw fail("Timesheet entries must be a list");
+  for (const line of lines) {
+    if (!line.projectTaskId && !INTERNAL_TIME_CODES.has(String(line.internalCode || "").trim().toLowerCase())) {
+      throw fail("Assign each timesheet entry to a project task or an internal time code before submission");
+    }
+  }
 }
 
 function summarize(lines) {
@@ -71,4 +93,4 @@ async function buildApprovedLabor(companyId, employeeId, lines) {
   };
 }
 
-module.exports = { validateAndNormalizeLines, summarize, buildApprovedLabor };
+module.exports = { validateAndNormalizeLines, validateCompleteAllocations, summarize, buildApprovedLabor, INTERNAL_TIME_CODES };

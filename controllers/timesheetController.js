@@ -2,6 +2,7 @@ const Timesheet = require('../models/Timesheet');
 const Employee = require('../models/Employee');
 const { prisma } = require('../lib/prisma');
 const projectLabor = require('../services/timesheetProjectLaborService');
+const { generateObjectId } = require('../utils/objectId');
 
 const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 
@@ -44,6 +45,7 @@ exports.approveTimesheet = async (req, res, next) => {
     if (ts.status !== 'submitted' && ts.status !== 'draft') return res.status(409).json({ success: false, message: `Cannot approve in status: ${ts.status}` });
     const employeeId = ts.employee?._id || ts.employee;
     const normalized = await projectLabor.validateAndNormalizeLines(cid, employeeId, ts.lines || []);
+    projectLabor.validateCompleteAllocations(normalized);
     const labor = await projectLabor.buildApprovedLabor(cid, employeeId, normalized);
     const totals = projectLabor.summarize(labor.lines);
     await prisma.$transaction(async (tx) => {
@@ -75,8 +77,12 @@ exports.submitTimesheet = async (req, res, next) => {
     const ts = await Timesheet.findOne({ _id: req.params.id, company: cid });
     if (!ts) return res.status(404).json({ success: false, message: 'Not found' });
     if (ts.status !== 'draft') return res.status(409).json({ success: false, message: `Cannot submit in status: ${ts.status}` });
+    const normalized = await projectLabor.validateAndNormalizeLines(cid, ts.employee?._id || ts.employee, ts.lines || []);
+    projectLabor.validateCompleteAllocations(normalized);
+    ts.lines = normalized;
     ts.status = 'submitted';
     ts.submittedAt = new Date();
+    ts.updatedBy = req.user.id;
     await ts.save();
     res.json({ success: true, data: ts });
   } catch (e) { next(e); }
@@ -115,5 +121,215 @@ exports.deleteTimesheet = async (req, res, next) => {
     if (ts.status === 'approved') return res.status(409).json({ success: false, message: 'Cannot delete approved timesheet' });
     await Timesheet.deleteOne({ _id: req.params.id });
     res.json({ success: true, message: 'Deleted' });
+  } catch (e) { next(e); }
+};
+
+exports.correctTimesheetAllocation = async (req, res, next) => {
+  try {
+    const cid = String(req.user.company._id);
+    const lineIndex = Number(req.body.lineIndex);
+    const reason = String(req.body.reason || '').trim();
+    if (req.body.lineIndex == null || !Number.isInteger(lineIndex) || lineIndex < 0) {
+      return res.status(400).json({ success: false, message: 'A valid timesheet line is required' });
+    }
+    if (!reason) return res.status(400).json({ success: false, message: 'A correction reason is required' });
+    if (reason.length > 500) return res.status(400).json({ success: false, message: 'Correction reason must be 500 characters or fewer' });
+
+    const ts = await Timesheet.findOne({ _id: req.params.id, company: cid });
+    if (!ts) return res.status(404).json({ success: false, message: 'Not found' });
+    if (ts.status !== 'approved') return res.status(409).json({ success: false, message: 'Only approved timesheets can be corrected' });
+    const lines = Array.isArray(ts.lines) ? ts.lines.map((line) => ({ ...line })) : [];
+    if (!lines[lineIndex]) return res.status(404).json({ success: false, message: 'Timesheet entry not found' });
+
+    const oldLine = lines[lineIndex];
+    const targetTaskId = req.body.projectTaskId ? String(req.body.projectTaskId) : null;
+    const targetInternalCode = String(req.body.internalCode || '').trim().toLowerCase();
+    if (targetTaskId && targetInternalCode) {
+      return res.status(400).json({ success: false, message: 'Choose either a project task or an internal time code' });
+    }
+    if (!targetTaskId && !projectLabor.INTERNAL_TIME_CODES.has(targetInternalCode)) {
+      return res.status(400).json({ success: false, message: 'Choose a valid internal time code' });
+    }
+
+    const employeeId = String(ts.employee?._id || ts.employee);
+    const entryDate = new Date(oldLine.date);
+    if (!Number.isFinite(entryDate.getTime())) {
+      return res.status(400).json({ success: false, message: 'The timesheet entry has an invalid work date' });
+    }
+
+    const dayStart = new Date(entryDate);
+    dayStart.setUTCHours(0, 0, 0, 0);
+    const dayEnd = new Date(entryDate);
+    dayEnd.setUTCHours(23, 59, 59, 999);
+    const [closedAccountingPeriod, closedLegacyPeriod] = await Promise.all([
+      prisma.accountingPeriod.findFirst({
+        where: {
+          companyId: cid,
+          startDate: { lte: dayEnd },
+          endDate: { gte: dayStart },
+          status: { in: ['closed', 'locked'] },
+        },
+        select: { id: true },
+      }),
+      prisma.period.findFirst({
+        where: {
+          companyId: cid,
+          startDate: { lte: dayEnd },
+          endDate: { gte: dayStart },
+          status: 'closed',
+        },
+        select: { id: true },
+      }),
+    ]);
+    if (closedAccountingPeriod || closedLegacyPeriod) {
+      return res.status(409).json({ success: false, message: 'Timesheet allocation cannot be corrected in a closed accounting period' });
+    }
+
+    const postedPayroll = await prisma.payrollRun.findFirst({
+      where: {
+        companyId: cid,
+        status: 'posted',
+        payPeriodStart: { lte: dayEnd },
+        payPeriodEnd: { gte: dayStart },
+        payrolls: { some: { employeeRefId: employeeId } },
+      },
+      select: { id: true, referenceNo: true },
+    });
+    if (postedPayroll) {
+      return res.status(409).json({
+        success: false,
+        message: `Allocation cannot be corrected because payroll run ${postedPayroll.referenceNo} is posted`,
+      });
+    }
+
+    let nextLine;
+    let replacementEntry = null;
+    if (targetTaskId) {
+      const normalized = await projectLabor.validateAndNormalizeLines(cid, employeeId, [{
+        ...oldLine,
+        projectTaskId: targetTaskId,
+        internalCode: undefined,
+      }]);
+      const root = await prisma.project.findFirst({
+        where: { id: normalized[0].projectId, companyId: cid },
+        select: { id: true, isActive: true, status: true },
+      });
+      if (!root || !root.isActive || ['closed', 'cancelled'].includes(String(root.status).toLowerCase())) {
+        return res.status(400).json({ success: false, message: 'Choose a task under an active, open project' });
+      }
+      const labor = await projectLabor.buildApprovedLabor(cid, employeeId, normalized);
+      nextLine = labor.lines[0];
+      replacementEntry = labor.entries[0]
+        ? { ...labor.entries[0], timesheetId: String(ts._id), lineIndex }
+        : null;
+    } else {
+      nextLine = { ...oldLine, internalCode: targetInternalCode };
+      delete nextLine.projectTaskId;
+      delete nextLine.project_task_id;
+      delete nextLine.projectId;
+      delete nextLine.hourlyRate;
+      delete nextLine.laborCost;
+      delete nextLine.currencyCode;
+    }
+
+    const oldAllocation = {
+      projectId: oldLine.projectId || null,
+      projectTaskId: oldLine.projectTaskId || null,
+      internalCode: oldLine.internalCode || null,
+    };
+    const newAllocation = {
+      projectId: nextLine.projectId || null,
+      projectTaskId: nextLine.projectTaskId || null,
+      internalCode: nextLine.internalCode || null,
+    };
+    if (oldAllocation.projectTaskId === newAllocation.projectTaskId
+      && oldAllocation.internalCode === newAllocation.internalCode) {
+      return res.status(400).json({ success: false, message: 'Choose a different allocation' });
+    }
+
+    lines[lineIndex] = nextLine;
+    const totals = projectLabor.summarize(lines);
+    const correctedAt = new Date();
+    await prisma.$transaction(async (tx) => {
+      const [closedAccountingPeriodAtCommit, closedLegacyPeriodAtCommit] = await Promise.all([
+        tx.accountingPeriod.findFirst({
+          where: {
+            companyId: cid,
+            startDate: { lte: dayEnd },
+            endDate: { gte: dayStart },
+            status: { in: ['closed', 'locked'] },
+          },
+          select: { id: true },
+        }),
+        tx.period.findFirst({
+          where: {
+            companyId: cid,
+            startDate: { lte: dayEnd },
+            endDate: { gte: dayStart },
+            status: 'closed',
+          },
+          select: { id: true },
+        }),
+      ]);
+      if (closedAccountingPeriodAtCommit || closedLegacyPeriodAtCommit) {
+        throw Object.assign(new Error('Timesheet allocation cannot be corrected in a closed accounting period'), { statusCode: 409 });
+      }
+      const payrollPostedDuringCorrection = await tx.payrollRun.findFirst({
+        where: {
+          companyId: cid,
+          status: 'posted',
+          payPeriodStart: { lte: dayEnd },
+          payPeriodEnd: { gte: dayStart },
+          payrolls: { some: { employeeRefId: employeeId } },
+        },
+        select: { id: true },
+      });
+      if (payrollPostedDuringCorrection) {
+        throw Object.assign(new Error('Allocation cannot be corrected because payroll was posted during correction'), { statusCode: 409 });
+      }
+      const updated = await tx.timesheet.updateMany({
+        where: {
+          id: String(ts._id),
+          companyId: cid,
+          status: 'approved',
+          updatedAt: ts.updatedAt,
+        },
+        data: {
+          lines,
+          ...totals,
+          updatedById: String(req.user.id),
+        },
+      });
+      if (updated.count !== 1) {
+        throw Object.assign(new Error('Timesheet changed during correction; refresh and try again'), { statusCode: 409 });
+      }
+      await tx.projectLaborEntry.deleteMany({
+        where: { companyId: cid, timesheetId: String(ts._id), lineIndex },
+      });
+      if (replacementEntry) await tx.projectLaborEntry.create({ data: replacementEntry });
+      await tx.payrollAuditEvent.create({
+        data: {
+          id: generateObjectId(),
+          companyId: cid,
+          actorUserId: String(req.user.id),
+          action: 'timesheet.allocation.corrected',
+          entityType: 'timesheet',
+          entityId: String(ts._id),
+          changes: {
+            lineIndex,
+            date: oldLine.date,
+            hoursWorked: oldLine.hoursWorked,
+            before: oldAllocation,
+            after: newAllocation,
+            reason,
+            correctedAt: correctedAt.toISOString(),
+          },
+        },
+      });
+    }, { isolationLevel: 'Serializable' });
+
+    const correctedTimesheet = await Timesheet.findOne({ _id: req.params.id, company: cid })
+      .populate('employee', 'firstName lastName employeeId laborType');
+    return res.json({ success: true, data: correctedTimesheet });
   } catch (e) { next(e); }
 };
