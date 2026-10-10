@@ -6,6 +6,8 @@ const task = {
   project_category: "internal",
   is_template: false,
   actual_hours: 0,
+  estimated_hours: 80,
+  progress_percent: 0,
 };
 
 const mockProjectUpdate = {
@@ -96,7 +98,7 @@ describe("Task completion actual hours", () => {
 
     expect(Project.findByIdAndUpdate).toHaveBeenCalledWith(
       "task_1",
-      { $set: expect.objectContaining({ actual_hours: 6.5 }) },
+      { $set: expect.objectContaining({ actual_hours: 6.5, progress_percent: 8.13 }) },
       { new: true, runValidators: true },
     );
   });

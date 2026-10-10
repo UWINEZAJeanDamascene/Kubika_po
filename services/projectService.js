@@ -17,6 +17,15 @@ function validationError(message) {
   return Object.assign(new Error(message), { statusCode: 400, code: "PROJECT_VALIDATION_ERROR" });
 }
 
+function taskProgressFromHours(task, actualHours) {
+  if (task.status === "completed") return 100;
+  const estimatedHours = Number(task.estimated_hours || 0);
+  if (estimatedHours > 0 && actualHours > 0) {
+    return Math.min(100, Math.round(actualHours / estimatedHours * 10000) / 100);
+  }
+  return Number(task.progress_percent || 0);
+}
+
 /**
  * Project Service - Business logic for Project/Job-Level Budgeting
  */
@@ -135,10 +144,12 @@ class ProjectService {
     }
     return tasks.map((task) => {
       const approvedHours = laborByTask.get(String(task._id))?.hours || 0;
+      const actualHours = Number(task.actual_hours || 0) || approvedHours;
       return {
         ...task,
-        actual_hours: Number(task.actual_hours || 0) || approvedHours,
+        actual_hours: actualHours,
         timesheet_hours: approvedHours,
+        progress_percent: taskProgressFromHours(task, actualHours),
         timesheet_labor_cost_by_currency: laborByTask.get(String(task._id))?.cost_by_currency || {},
       };
     })
@@ -569,6 +580,8 @@ class ProjectService {
         ? totals.budgeted
         : Number(project.budget_allocated || 0);
       const actualSpent = totals.actual + laborSpent;
+      const taskTimesheetHours = hoursByTask.get(String(project._id)) || 0;
+      const taskActualHours = Number(project.actual_hours || 0) || taskTimesheetHours;
       return {
         ...project,
         ...(approvedLines.length ? { budget_allocated: totals.budgeted } : {}),
@@ -576,8 +589,9 @@ class ProjectService {
         budget_remaining: budgetAllocated - actualSpent - totals.encumbered,
         labor_spent: laborSpent,
         ...(project.type === "task" ? {
-          timesheet_hours: hoursByTask.get(String(project._id)) || 0,
-          actual_hours: Number(project.actual_hours || 0) || hoursByTask.get(String(project._id)) || 0,
+          timesheet_hours: taskTimesheetHours,
+          actual_hours: taskActualHours,
+          progress_percent: taskProgressFromHours(project, taskActualHours),
         } : {}),
       };
     });
@@ -633,6 +647,11 @@ class ProjectService {
       if (data[field] !== undefined && (!Number.isFinite(Number(data[field])) || Number(data[field]) < 0)) throw validationError(`${field} must be zero or greater`);
     }
     if (data.progress_percent !== undefined && (!Number.isFinite(Number(data.progress_percent)) || Number(data.progress_percent) < 0 || Number(data.progress_percent) > 100)) throw validationError("Progress must be between 0 and 100");
+    if (effective.type === "task" && data.status !== "completed"
+      && (data.estimated_hours !== undefined || data.actual_hours !== undefined)
+      && Number(effective.estimated_hours) > 0 && Number(effective.actual_hours) > 0) {
+      data.progress_percent = taskProgressFromHours(effective, Number(effective.actual_hours));
+    }
     if (effective.type === "task" && data.depends_on_ids !== undefined) {
       data.depends_on_ids = await this.validateTaskDependencies(companyId, projectId, data.depends_on_ids);
     }

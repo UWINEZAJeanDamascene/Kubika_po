@@ -124,6 +124,8 @@ describe("Project budget summary", () => {
 
   test("includes approved timesheet hours on task list rows", async () => {
     mockProject.type = "task";
+    mockProject.estimated_hours = 50;
+    mockProject.progress_percent = 0;
     mockProject.actual_hours = 0;
     prisma.project.findMany.mockResolvedValue([{ id: "project_1", parentId: null, type: "task" }]);
     prisma.projectLaborEntry.findMany.mockResolvedValue([
@@ -135,5 +137,41 @@ describe("Project budget summary", () => {
 
     expect(projects[0].timesheet_hours).toBe(7.5);
     expect(projects[0].actual_hours).toBe(7.5);
+    expect(projects[0].progress_percent).toBe(15);
+  });
+
+  test("calculates task progress from manually recorded hours and caps it at 100%", async () => {
+    mockProject.type = "task";
+    mockProject.estimated_hours = 80;
+    mockProject.progress_percent = 0;
+    mockProject.actual_hours = 12;
+    prisma.project.findMany.mockResolvedValue([{ id: "project_1", parentId: null, type: "task" }]);
+    prisma.projectLaborEntry.findMany.mockResolvedValue([]);
+
+    const projects = await projectService.getAllProjects("company_1", { type: "task" });
+
+    expect(projects[0].progress_percent).toBe(15);
+
+    mockProject.actual_hours = 90;
+    const overEstimate = await projectService.getAllProjects("company_1", { type: "task" });
+
+    expect(overEstimate[0].progress_percent).toBe(100);
+  });
+
+  test("calculates progress for task rows returned in a project task panel", async () => {
+    mockProject._id = "project_1";
+    mockProject.type = "task";
+    mockProject.estimated_hours = 80;
+    mockProject.progress_percent = 0;
+    mockProject.actual_hours = 0;
+    prisma.projectLaborEntry.findMany.mockResolvedValue([
+      { taskId: "project_1", hours: 12 },
+    ]);
+    const getWBSTree = jest.spyOn(projectService, "getWBSTree").mockResolvedValue([]);
+
+    const tasks = await projectService.getProjectTasks("company_1", "project_1");
+
+    expect(tasks[0]).toMatchObject({ actual_hours: 12, progress_percent: 15 });
+    getWBSTree.mockRestore();
   });
 });
