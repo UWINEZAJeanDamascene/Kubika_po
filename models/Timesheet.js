@@ -11,6 +11,8 @@ const {
 
 const FIELD_MAP = {
   employee: { target: 'employeeId', isId: true },
+  periodMonth: { target: 'periodMonth' },
+  periodYear: { target: 'periodYear' },
   status: { target: 'status' },
   approvedBy: { target: 'approvedById', isId: true },
 };

@@ -90,4 +90,14 @@ describe("Task completion actual hours", () => {
       { new: true, runValidators: true },
     );
   });
+
+  test("updates actual hours while a task is still in progress", async () => {
+    await projectService.updateProject("company_1", "task_1", { actual_hours: 6.5 });
+
+    expect(Project.findByIdAndUpdate).toHaveBeenCalledWith(
+      "task_1",
+      { $set: expect.objectContaining({ actual_hours: 6.5 }) },
+      { new: true, runValidators: true },
+    );
+  });
 });
