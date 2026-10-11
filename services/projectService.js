@@ -32,14 +32,31 @@ function milestoneProgressFromTasks(milestone, tasksById) {
   if (!taskIds.length) return Number(milestone.progressPercent || 0);
   let totalWeight = 0;
   let completedWeight = 0;
+  const taskDetails = [];
   for (const taskId of taskIds) {
     const task = tasksById.get(String(taskId));
     const weight = task && Number(task.estimated_hours) > 0 ? Number(task.estimated_hours) : 1;
     const progress = !task || task.status === "cancelled" ? 0 : taskProgressFromHours(task, Number(task.actual_hours || 0));
     totalWeight += weight;
     completedWeight += weight * progress;
+    taskDetails.push({
+      taskId,
+      taskName: task?.name,
+      taskStatus: task?.status,
+      weight,
+      progress,
+      found: !!task,
+    });
   }
-  return totalWeight ? Math.round(completedWeight / totalWeight * 100) / 100 : 0;
+  const result = totalWeight ? Math.round(completedWeight / totalWeight * 100) / 100 : 0;
+  console.log("[MILESTONE_PROGRESS_CALCULATION]", {
+    taskIds,
+    taskDetails,
+    totalWeight,
+    completedWeight,
+    result,
+  });
+  return result;
 }
 
 /**
@@ -265,10 +282,15 @@ class ProjectService {
     };
     console.log("[MILESTONE_COMPLETION_VALIDATION]", {
       milestoneId,
-      completionValidationDebug
+      projectId,
+      companyId,
+      data_task_ids: data.task_ids,
+      completionValidationDebug,
+      willThrow: status === "completed" && current?.status !== "completed" && taskIds.length && linkedTaskProgress < 100
     });
     
     if (status === "completed" && current?.status !== "completed" && taskIds.length && linkedTaskProgress < 100) {
+      console.log("[MILESTONE_COMPLETION_VALIDATION] THROWING ERROR");
       throw validationError("Linked tasks must reach 100% progress before completing this milestone");
     }
     if (data.depends_on_ids !== undefined && !Array.isArray(data.depends_on_ids)) throw validationError("Milestone dependencies must be a list");
