@@ -1,6 +1,8 @@
 const mockSystemSettingsUpsert = jest.fn();
 const mockSystemSettingsUpdate = jest.fn();
 const mockAuditCreate = jest.fn();
+const mockPolicyFindFirst = jest.fn();
+const mockPolicyCreate = jest.fn();
 const mockTransaction = jest.fn();
 
 jest.mock("../lib/prisma", () => ({
@@ -10,6 +12,10 @@ jest.mock("../lib/prisma", () => ({
       update: mockSystemSettingsUpdate,
     },
     payrollAuditEvent: { create: mockAuditCreate },
+    laborCostingPolicy: {
+      findFirst: mockPolicyFindFirst,
+      create: mockPolicyCreate,
+    },
     $transaction: mockTransaction,
   },
 }));
@@ -23,12 +29,20 @@ describe("labor costing settings controller", () => {
       update: mockSystemSettingsUpdate,
     },
     payrollAuditEvent: { create: mockAuditCreate },
+    laborCostingPolicy: {
+      findFirst: mockPolicyFindFirst,
+      create: mockPolicyCreate,
+    },
   };
   const before = {
     id: "settings-1",
     laborCostingBasis: "gross_salary",
     laborStandardHoursPerWeek: 40,
     laborCostRoleRates: {},
+    effectiveFrom: new Date("1900-01-01T00:00:00.000Z"),
+    basis: "gross_salary",
+    standardWeeklyHours: 40,
+    roleRates: {},
   };
   const after = {
     id: "settings-1",
@@ -54,6 +68,8 @@ describe("labor costing settings controller", () => {
     mockSystemSettingsUpsert.mockResolvedValue(before);
     mockSystemSettingsUpdate.mockResolvedValue(after);
     mockAuditCreate.mockResolvedValue({});
+    mockPolicyFindFirst.mockResolvedValue(before);
+    mockPolicyCreate.mockImplementation(({ data }) => Promise.resolve(data));
     mockTransaction.mockImplementation((callback) => callback(tx));
   });
 
@@ -62,6 +78,7 @@ describe("labor costing settings controller", () => {
       basis: "gross_plus_employer_contributions",
       standardWeeklyHours: 45,
       roleRates: {},
+      effectiveDate: "2026-10-11",
     });
 
     expect(res.json).toHaveBeenCalledWith({
@@ -70,6 +87,7 @@ describe("labor costing settings controller", () => {
         basis: "gross_plus_employer_contributions",
         standardWeeklyHours: 45,
         roleRates: {},
+        effectiveDate: "2026-10-11",
       },
     });
     expect(mockAuditCreate).toHaveBeenCalledWith({
@@ -79,8 +97,8 @@ describe("labor costing settings controller", () => {
         action: "settings.update",
         entityType: "labor_costing_settings",
         changes: {
-          before: { basis: "gross_salary", standardWeeklyHours: 40, roleRates: {} },
-          after: { basis: "gross_plus_employer_contributions", standardWeeklyHours: 45, roleRates: {} },
+          before: { basis: "gross_salary", standardWeeklyHours: 40, roleRates: {}, effectiveDate: "1900-01-01" },
+          after: { basis: "gross_plus_employer_contributions", standardWeeklyHours: 45, roleRates: {}, effectiveDate: "2026-10-11" },
         },
       }),
     });
@@ -93,6 +111,7 @@ describe("labor costing settings controller", () => {
       basis: "gross_plus_employer_contributions",
       standardWeeklyHours: 45,
       roleRates: {},
+      effectiveDate: "2026-10-11",
     });
 
     expect(res.status).toHaveBeenCalledWith(500);
@@ -107,6 +126,19 @@ describe("labor costing settings controller", () => {
       basis: "gross_salary",
       standardWeeklyHours: 0,
       roleRates: {},
+      effectiveDate: "2026-10-11",
+    });
+
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(mockTransaction).not.toHaveBeenCalled();
+  });
+
+  test("rejects an invalid effective date before writing", async () => {
+    const res = await call({
+      basis: "gross_salary",
+      standardWeeklyHours: 40,
+      roleRates: {},
+      effectiveDate: "2026-02-31",
     });
 
     expect(res.status).toHaveBeenCalledWith(400);

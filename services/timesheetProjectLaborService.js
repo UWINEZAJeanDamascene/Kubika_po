@@ -67,19 +67,6 @@ async function buildApprovedLabor(companyId, employeeId, lines) {
     where: { companyId: String(companyId) },
     select: { laborCostingBasis: true, laborStandardHoursPerWeek: true, laborCostRoleRates: true },
   });
-  const costingBasis = settings?.laborCostingBasis || "gross_salary";
-  const standardWeeklyHours = settings
-    ? toNumber(settings.laborStandardHoursPerWeek)
-    : 40;
-  if (standardWeeklyHours <= 0 || standardWeeklyHours > 168) {
-    throw fail("The company standard work week is invalid; contact an administrator");
-  }
-  if (!["gross_salary", "gross_plus_employer_contributions", "manual_employee_or_role"].includes(costingBasis)) {
-    throw fail("The company project labor costing basis is invalid; contact an administrator");
-  }
-  const roleRates = settings?.laborCostRoleRates && typeof settings.laborCostRoleRates === "object"
-    ? settings.laborCostRoleRates
-    : {};
   const costingByIndex = new Map();
   const entryDateByIndex = new Map();
   for (const [lineIndex, line] of lines.entries()) {
@@ -87,6 +74,26 @@ async function buildApprovedLabor(companyId, employeeId, lines) {
     const entryDate = new Date(line.date);
     entryDate.setUTCHours(0, 0, 0, 0);
     entryDateByIndex.set(lineIndex, entryDate);
+    const policy = await prisma.laborCostingPolicy.findFirst({
+      where: { companyId: String(companyId), effectiveFrom: { lte: entryDate } },
+      orderBy: [{ effectiveFrom: "desc" }, { createdAt: "desc" }],
+    });
+    const costingBasis = policy?.basis || settings?.laborCostingBasis || "gross_salary";
+    const standardWeeklyHours = policy
+      ? toNumber(policy.standardWeeklyHours)
+      : settings
+        ? toNumber(settings.laborStandardHoursPerWeek)
+        : 40;
+    if (standardWeeklyHours <= 0 || standardWeeklyHours > 168) {
+      throw fail("The company standard work week is invalid; contact an administrator");
+    }
+    if (!["gross_salary", "gross_plus_employer_contributions", "manual_employee_or_role"].includes(costingBasis)) {
+      throw fail("The company project labor costing basis is invalid; contact an administrator");
+    }
+    const roleRates = (policy?.roleRates ?? settings?.laborCostRoleRates) &&
+      typeof (policy?.roleRates ?? settings?.laborCostRoleRates) === "object"
+      ? (policy?.roleRates ?? settings?.laborCostRoleRates)
+      : {};
     const salaryAsOf = new Date(entryDate);
     salaryAsOf.setUTCHours(23, 59, 59, 999);
     const history = await prisma.salaryHistory.findFirst({
@@ -126,9 +133,12 @@ async function buildApprovedLabor(companyId, employeeId, lines) {
       : 0;
     let hourlyRate;
     let employerContributions = 0;
+    let contributionDetails = null;
     let effectiveCostBasis = costingBasis;
+    let employeeManualRate = 0;
     if (costingBasis === "manual_employee_or_role") {
-      hourlyRate = toNumber(salary.manualHourlyRate) || roleRate;
+      employeeManualRate = toNumber(salary.manualHourlyRate);
+      hourlyRate = employeeManualRate || roleRate;
       effectiveCostBasis = toNumber(salary.manualHourlyRate) > 0 ? "manual_employee" : "manual_role";
       if (hourlyRate <= 0) {
         throw fail("Set an effective employee or role hourly rate before approving project task hours");
@@ -136,7 +146,8 @@ async function buildApprovedLabor(companyId, employeeId, lines) {
     } else {
       if (monthlyGross <= 0) throw fail("Set an effective monthly salary for this employee before approving project task hours");
       if (costingBasis === "gross_plus_employer_contributions") {
-        employerContributions = calculateEmployerContributions(salary, entryDate).totalEmployerContributions;
+        contributionDetails = calculateEmployerContributions(salary, entryDate);
+        employerContributions = contributionDetails.totalEmployerContributions;
       }
       hourlyRate = Math.round(((monthlyGross + employerContributions) / monthlyHours) * 10000) / 10000;
     }
@@ -155,6 +166,41 @@ async function buildApprovedLabor(companyId, employeeId, lines) {
         monthlyHours: Math.round(monthlyHours * 10000) / 10000,
         salaryHistoryId: history?.id || null,
         effectiveDate: entryDate.toISOString().slice(0, 10),
+        salaryInputs: {
+          basicSalary: toNumber(salary.basicSalary),
+          transportAllowance: toNumber(salary.transportAllowance),
+          housingAllowance: toNumber(salary.housingAllowance),
+          otherAllowances: toNumber(salary.otherAllowances),
+          currency: String(salary.currency || "RWF").toUpperCase().slice(0, 3),
+          salaryEffectiveDate: salary.effectiveDate
+            ? new Date(salary.effectiveDate).toISOString().slice(0, 10)
+            : null,
+        },
+        policy: {
+          id: policy?.id || null,
+          effectiveDate: policy?.effectiveFrom
+            ? new Date(policy.effectiveFrom).toISOString().slice(0, 10)
+            : null,
+          basis: costingBasis,
+          standardWeeklyHours,
+          roleRates,
+          matchedRole: roleKey || null,
+          matchedRoleRate: roleRate || null,
+        },
+        rate: {
+          hourlyRate,
+          employeeManualRate: employeeManualRate || null,
+          roleRate: roleRate || null,
+        },
+        employerContributionDetails: contributionDetails ? {
+          grossSalary: contributionDetails.grossSalary,
+          rssbEmployerPension: contributionDetails.rssbEmployerPension,
+          rssbEmployerMaternity: contributionDetails.rssbEmployerMaternity,
+          occupationalHazard: contributionDetails.occupationalHazard,
+          totalEmployerContributions: contributionDetails.totalEmployerContributions,
+          ruleEffectiveDate: contributionDetails.ruleEffectiveDate,
+          rates: contributionDetails.rates,
+        } : null,
       },
     });
   }

@@ -315,6 +315,21 @@ model SystemSettings {
   @@map("system_settings")
 }
 
+model LaborCostingPolicy {
+  id                 String   @id @db.Char(24)
+  companyId          String   @map("company_id") @db.Char(24)
+  effectiveFrom      DateTime @map("effective_from") @db.Date
+  basis              String
+  standardWeeklyHours Decimal @map("standard_weekly_hours") @db.Decimal(7, 2)
+  roleRates          Json     @default("{}") @map("role_rates")
+  actorUserId        String?  @map("actor_user_id") @db.Char(24)
+  createdAt          DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  company            Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, effectiveFrom(sort: Desc), createdAt(sort: Desc)])
+  @@map("labor_costing_policies")
+}
+
 model WarehouseInventoryCost {
   id          String   @id @db.Char(24)
   companyId   String   @map("company_id") @db.Char(24)
@@ -700,6 +715,7 @@ model Company {
   projectActivity             ProjectActivity[]
   projectDocuments            ProjectDocument[]
   projectLaborEntries         ProjectLaborEntry[]
+  laborCostingPolicies        LaborCostingPolicy[]
   projectTypeSettings         ProjectTypeSetting[]
   purchaseOrders              PurchaseOrder[]
   purchaseReturns             PurchaseReturn[]

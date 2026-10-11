@@ -15,6 +15,21 @@ function toApi(settings) {
   };
 }
 
+function toApiPolicy(policy) {
+  return {
+    basis: policy.basis,
+    standardWeeklyHours: Number(policy.standardWeeklyHours),
+    roleRates: policy.roleRates || {},
+    effectiveDate: new Date(policy.effectiveFrom).toISOString().slice(0, 10),
+  };
+}
+
+function parseEffectiveDate(value) {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const date = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(date.getTime()) && date.toISOString().slice(0, 10) === value ? date : null;
+}
+
 function normalizeRoleRates(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw Object.assign(new Error("roleRates must be a map of role names to hourly rates"), { statusCode: 400 });
@@ -44,7 +59,23 @@ exports.getLaborCostingSettings = async (req, res) => {
         laborCostRoleRates: true,
       },
     });
-    return res.json({ success: true, data: toApi(settings) });
+    let policy = await prisma.laborCostingPolicy.findFirst({
+      where: { companyId, effectiveFrom: { lte: new Date() } },
+      orderBy: [{ effectiveFrom: "desc" }, { createdAt: "desc" }],
+    });
+    if (!policy) {
+      policy = await prisma.laborCostingPolicy.create({
+        data: {
+          id: generateObjectId(),
+          companyId,
+          effectiveFrom: new Date("1900-01-01T00:00:00.000Z"),
+          basis: settings.laborCostingBasis,
+          standardWeeklyHours: settings.laborStandardHoursPerWeek,
+          roleRates: settings.laborCostRoleRates || {},
+        },
+      });
+    }
+    return res.json({ success: true, data: toApiPolicy(policy) });
   } catch (error) {
     console.error("Failed to fetch labor costing settings:", error);
     return res.status(500).json({ success: false, message: "Failed to fetch labor costing settings" });
@@ -55,9 +86,13 @@ exports.updateLaborCostingSettings = async (req, res) => {
   try {
     const companyId = String(req.companyId || req.user.company._id);
     const userId = String(req.user.id || req.user._id);
-    const { basis, standardWeeklyHours, roleRates } = req.body || {};
+    const { basis, standardWeeklyHours, roleRates, effectiveDate } = req.body || {};
     if (!BASIS_OPTIONS.has(basis)) {
       return res.status(400).json({ success: false, message: "Choose a valid project labor costing basis" });
+    }
+    const effectiveFrom = parseEffectiveDate(effectiveDate);
+    if (!effectiveFrom) {
+      return res.status(400).json({ success: false, message: "Choose a valid effective date in YYYY-MM-DD format" });
     }
     if (typeof standardWeeklyHours !== "number" || !Number.isFinite(standardWeeklyHours) || standardWeeklyHours <= 0 || standardWeeklyHours > 168) {
       return res.status(400).json({ success: false, message: "Standard weekly hours must be greater than 0 and no more than 168" });
@@ -75,24 +110,67 @@ exports.updateLaborCostingSettings = async (req, res) => {
           laborCostRoleRates: true,
         },
       });
-      const before = toApi(current);
-      const updated = await tx.systemSettings.update({
+      let baseline = await tx.laborCostingPolicy.findFirst({
         where: { companyId },
-        data: {
-          laborCostingBasis: basis,
-          laborStandardHoursPerWeek: standardWeeklyHours,
-          laborCostRoleRates: normalizedRoleRates,
-          lastUpdatedBy: userId,
-        },
-        select: {
-          id: true,
-          laborCostingBasis: true,
-          laborStandardHoursPerWeek: true,
-          laborCostRoleRates: true,
-        },
+        orderBy: [{ effectiveFrom: "desc" }, { createdAt: "desc" }],
       });
-      const after = toApi(updated);
-      if (JSON.stringify(before) !== JSON.stringify(after)) {
+      if (!baseline) {
+        baseline = await tx.laborCostingPolicy.create({
+          data: {
+            id: generateObjectId(),
+            companyId,
+            effectiveFrom: new Date("1900-01-01T00:00:00.000Z"),
+            basis: current.laborCostingBasis,
+            standardWeeklyHours: current.laborStandardHoursPerWeek,
+            roleRates: current.laborCostRoleRates || {},
+          },
+        });
+      }
+      const previousPolicy = await tx.laborCostingPolicy.findFirst({
+        where: { companyId, effectiveFrom: { lte: effectiveFrom } },
+        orderBy: [{ effectiveFrom: "desc" }, { createdAt: "desc" }],
+      });
+      const before = previousPolicy ? toApiPolicy(previousPolicy) : toApi(baseline);
+      const after = {
+        basis,
+        standardWeeklyHours,
+        roleRates: normalizedRoleRates,
+        effectiveDate,
+      };
+      const policyChanged = JSON.stringify({
+        basis: before.basis,
+        standardWeeklyHours: before.standardWeeklyHours,
+        roleRates: before.roleRates,
+      }) !== JSON.stringify({
+        basis: after.basis,
+        standardWeeklyHours: after.standardWeeklyHours,
+        roleRates: after.roleRates,
+      });
+      if (policyChanged) {
+        await tx.laborCostingPolicy.create({
+          data: {
+            id: generateObjectId(),
+            companyId,
+            effectiveFrom,
+            basis,
+            standardWeeklyHours,
+            roleRates: normalizedRoleRates,
+            actorUserId: userId,
+          },
+        });
+        const activePolicy = await tx.laborCostingPolicy.findFirst({
+          where: { companyId, effectiveFrom: { lte: new Date() } },
+          orderBy: [{ effectiveFrom: "desc" }, { createdAt: "desc" }],
+        });
+        await tx.systemSettings.update({
+          where: { companyId },
+          data: {
+            laborCostingBasis: activePolicy?.basis || current.laborCostingBasis,
+            laborStandardHoursPerWeek: activePolicy?.standardWeeklyHours || current.laborStandardHoursPerWeek,
+            laborCostRoleRates: activePolicy?.roleRates || current.laborCostRoleRates,
+            lastUpdatedBy: userId,
+          },
+        });
         await tx.payrollAuditEvent.create({
           data: {
             id: generateObjectId(),
@@ -107,9 +185,9 @@ exports.updateLaborCostingSettings = async (req, res) => {
           },
         });
       }
-      return updated;
+      return policyChanged ? after : before;
     });
-    return res.json({ success: true, data: toApi(settings) });
+    return res.json({ success: true, data: settings });
   } catch (error) {
     if (error.statusCode === 400) {
       return res.status(400).json({ success: false, message: error.message });

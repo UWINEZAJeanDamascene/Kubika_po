@@ -82,6 +82,11 @@ function calculateEmployerContributions(salary = {}, periodDate = new Date()) {
     occupationalHazard,
     totalEmployerContributions: roundMoney(rssbEmployerPension + rssbEmployerMaternity + occupationalHazard),
     ruleEffectiveDate: rssbRule.effectiveFrom,
+    rates: {
+      pensionEmployerRate: rssbRule.pensionEmployerRate,
+      maternityEmployerRate: rssbRule.maternityEmployerRate,
+      occupationalHazardEmployerRate: rssbRule.occupationalHazardEmployerRate,
+    },
   };
 }
 
