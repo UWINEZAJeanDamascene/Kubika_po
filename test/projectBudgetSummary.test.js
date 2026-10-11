@@ -40,6 +40,7 @@ jest.mock("../lib/prisma", () => ({
 }));
 
 const { prisma } = require("../lib/prisma");
+const Project = require("../models/Project");
 const projectService = require("../services/projectService");
 
 describe("Project budget summary", () => {
@@ -47,6 +48,7 @@ describe("Project budget summary", () => {
     mockBudgetLines.splice(0, mockBudgetLines.length);
     mockProject.type = "project";
     mockProject.actual_hours = 0;
+    Project.find.mockReturnValue(mockQuery([mockProject]));
   });
 
   test("lists linked lines while counting only approved budgets in project totals", async () => {
@@ -120,6 +122,38 @@ describe("Project budget summary", () => {
       project_id: { $in: ["project_1", "task_1"] },
     });
     expect(prisma.budgetLine.findMany).not.toHaveBeenCalled();
+  });
+
+  test("preserves calculated list totals when serializing Prisma-backed project documents", async () => {
+    prisma.project.findMany.mockResolvedValue([
+      { id: "project_1", parentId: null, type: "project" },
+      { id: "task_1", parentId: "project_1", type: "task" },
+    ]);
+    mockBudgetLines.push({
+      project_id: "project_1",
+      budgeted_amount: 3000000,
+      actual_amount: 1020000,
+      encumbered_amount: 0,
+      budget_id: { status: "approved" },
+    });
+    prisma.projectLaborEntry.findMany.mockResolvedValue([
+      { taskId: "task_1", hours: 10, laborCost: 30750, currencyCode: "RWF" },
+    ]);
+
+    const projectDocument = { ...mockProject };
+    projectDocument.toObject = () => ({ ...mockProject });
+    projectDocument.toJSON = () => projectDocument.toObject();
+    Project.find.mockReturnValue(mockQuery([projectDocument]));
+
+    const projects = await projectService.getAllProjects("company_1", { type: "project" });
+    const serializedProject = JSON.parse(JSON.stringify(projects[0]));
+
+    expect(serializedProject).toMatchObject({
+      budget_allocated: 3000000,
+      budget_spent: 1050750,
+      budget_remaining: 1949250,
+      labor_spent: 30750,
+    });
   });
 
   test("includes approved timesheet hours on task list rows", async () => {

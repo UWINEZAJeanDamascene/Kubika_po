@@ -663,6 +663,7 @@ class ProjectService {
     const approvedStatuses = new Set(["approved", "locked", "closed", "view_only"]);
 
     return projects.map((project) => {
+      const projectData = typeof project.toObject === "function" ? project.toObject() : project;
       const includedIds = descendantsByProject.get(String(project._id));
       const approvedLines = budgetLines.filter((line) =>
         includedIds.has(String(line.project_id)) && approvedStatuses.has(line.budget_id?.status));
@@ -681,7 +682,7 @@ class ProjectService {
       const taskTimesheetHours = hoursByTask.get(String(project._id)) || 0;
       const taskActualHours = Number(project.actual_hours || 0) || taskTimesheetHours;
       return {
-        ...project,
+        ...projectData,
         ...(approvedLines.length ? { budget_allocated: totals.budgeted } : {}),
         budget_spent: actualSpent,
         budget_remaining: budgetAllocated - actualSpent - totals.encumbered,
