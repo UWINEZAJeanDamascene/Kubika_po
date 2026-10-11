@@ -1,8 +1,10 @@
 const mockSystemSettingsUpsert = jest.fn();
 const mockSystemSettingsUpdate = jest.fn();
 const mockAuditCreate = jest.fn();
+const mockAuditFindMany = jest.fn();
 const mockPolicyFindFirst = jest.fn();
 const mockPolicyCreate = jest.fn();
+const mockUserFindMany = jest.fn();
 const mockTransaction = jest.fn();
 
 jest.mock("../lib/prisma", () => ({
@@ -11,11 +13,12 @@ jest.mock("../lib/prisma", () => ({
       upsert: mockSystemSettingsUpsert,
       update: mockSystemSettingsUpdate,
     },
-    payrollAuditEvent: { create: mockAuditCreate },
+    payrollAuditEvent: { create: mockAuditCreate, findMany: mockAuditFindMany },
     laborCostingPolicy: {
       findFirst: mockPolicyFindFirst,
       create: mockPolicyCreate,
     },
+    user: { findMany: mockUserFindMany },
     $transaction: mockTransaction,
   },
 }));
@@ -28,11 +31,12 @@ describe("labor costing settings controller", () => {
       upsert: mockSystemSettingsUpsert,
       update: mockSystemSettingsUpdate,
     },
-    payrollAuditEvent: { create: mockAuditCreate },
+    payrollAuditEvent: { create: mockAuditCreate, findMany: mockAuditFindMany },
     laborCostingPolicy: {
       findFirst: mockPolicyFindFirst,
       create: mockPolicyCreate,
     },
+    user: { findMany: mockUserFindMany },
   };
   const before = {
     id: "settings-1",
@@ -68,8 +72,10 @@ describe("labor costing settings controller", () => {
     mockSystemSettingsUpsert.mockResolvedValue(before);
     mockSystemSettingsUpdate.mockResolvedValue(after);
     mockAuditCreate.mockResolvedValue({});
+    mockAuditFindMany.mockResolvedValue([]);
     mockPolicyFindFirst.mockResolvedValue(before);
     mockPolicyCreate.mockImplementation(({ data }) => Promise.resolve(data));
+    mockUserFindMany.mockResolvedValue([{ id: "admin-1", name: "Test Admin" }]);
     mockTransaction.mockImplementation((callback) => callback(tx));
   });
 
@@ -113,11 +119,37 @@ describe("labor costing settings controller", () => {
       roleRates: {},
       effectiveDate: "2026-10-11",
     });
-
     expect(res.status).toHaveBeenCalledWith(500);
     expect(res.json).toHaveBeenCalledWith({
       success: false,
       message: "Failed to update labor costing settings",
+    });
+  });
+
+  test("returns actor names with policy audit history", async () => {
+    const event = {
+      id: "audit-1",
+      actorUserId: "admin-1",
+      action: "settings.update",
+      changes: {
+        before: { basis: "gross_salary", standardWeeklyHours: 40, roleRates: {}, effectiveDate: "1900-01-01" },
+        after: { basis: "gross_plus_employer_contributions", standardWeeklyHours: 45, roleRates: {}, effectiveDate: "2026-10-11" },
+      },
+      createdAt: new Date("2026-10-11T17:00:00.000Z"),
+    };
+    mockAuditFindMany.mockResolvedValue([event]);
+    const req = { companyId: "company-1", user: { company: { _id: "company-1" } } };
+    const res = { status: jest.fn(() => res), json: jest.fn(() => res) };
+
+    await controller.getLaborCostingAudit(req, res);
+
+    expect(mockUserFindMany).toHaveBeenCalledWith({
+      where: { id: { in: ["admin-1"] } },
+      select: { id: true, name: true },
+    });
+    expect(res.json).toHaveBeenCalledWith({
+      success: true,
+      data: [{ ...event, actorName: "Test Admin" }],
     });
   });
 

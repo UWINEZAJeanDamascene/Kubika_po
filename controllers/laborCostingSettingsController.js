@@ -206,7 +206,18 @@ exports.getLaborCostingAudit = async (req, res) => {
       take: 50,
       select: { id: true, actorUserId: true, action: true, changes: true, createdAt: true },
     });
-    return res.json({ success: true, data: events });
+    const actorIds = [...new Set(events.map((event) => event.actorUserId).filter(Boolean))];
+    const actors = actorIds.length
+      ? await prisma.user.findMany({
+        where: { id: { in: actorIds } },
+        select: { id: true, name: true },
+      })
+      : [];
+    const actorNames = new Map(actors.map((actor) => [actor.id, actor.name]));
+    return res.json({
+      success: true,
+      data: events.map((event) => ({ ...event, actorName: actorNames.get(event.actorUserId) || null })),
+    });
   } catch (error) {
     console.error("Failed to fetch labor costing audit history:", error);
     return res.status(500).json({ success: false, message: "Failed to fetch labor costing audit history" });
