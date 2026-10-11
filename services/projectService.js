@@ -254,6 +254,20 @@ class ProjectService {
       ? 100
       : linkedTaskProgress ?? Number(data.progress_percent ?? current?.progressPercent ?? 0);
     if (!Number.isFinite(progress) || progress < 0 || progress > 100) throw validationError("Progress must be between 0 and 100");
+    
+    // Debug logging for completion validation
+    const completionValidationDebug = {
+      status,
+      currentStatus: current?.status,
+      taskIds: taskIds.length,
+      linkedTaskProgress,
+      shouldValidate: status === "completed" && current?.status !== "completed" && taskIds.length && linkedTaskProgress < 100
+    };
+    console.log("[MILESTONE_COMPLETION_VALIDATION]", {
+      milestoneId,
+      completionValidationDebug
+    });
+    
     if (status === "completed" && current?.status !== "completed" && taskIds.length && linkedTaskProgress < 100) {
       throw validationError("Linked tasks must reach 100% progress before completing this milestone");
     }
