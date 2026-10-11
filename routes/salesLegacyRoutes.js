@@ -7,6 +7,7 @@ const heldSaleController = require('../controllers/posHeldSaleController');
 const {
   createDirectSale,
   getPosProducts,
+  getPosAvailableSerialNumbers,
   getReceipt
 } = require('../controllers/salesLegacyController');
 
@@ -31,6 +32,7 @@ router.post('/direct-sale', canCreateSale, logAction('sales_legacy_direct_sale')
 
 // Get products for POS with stock availability
 router.get('/products', canReadPosCatalog, getPosProducts);
+router.get('/products/:productId/serial-numbers', canReadPosCatalog, getPosAvailableSerialNumbers);
 
 // Get receipt for printing
 router.get('/receipt/:invoiceId', canReadSale, getReceipt);

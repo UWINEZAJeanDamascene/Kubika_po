@@ -1124,6 +1124,64 @@ exports.getPosProducts = async (req, res, next) => {
 };
 
 /**
+ * @desc    Get saleable serial numbers for a POS product in the selected warehouse
+ * @route   GET /api/sales-legacy/products/:productId/serial-numbers
+ * @access  Private
+ */
+exports.getPosAvailableSerialNumbers = async (req, res, next) => {
+  try {
+    const companyId = req.user.company._id;
+    const { productId } = req.params;
+    const { warehouseId } = req.query;
+
+    if (!isObjectIdString(productId) || !isObjectIdString(warehouseId)) {
+      return res.status(400).json({
+        success: false,
+        message: 'A valid product and warehouse are required.',
+      });
+    }
+
+    const [product, warehouse] = await Promise.all([
+      Product.findOne({
+        _id: productId,
+        company: companyId,
+        isActive: true,
+        $or: [
+          { trackingType: 'serial' },
+          { trackSerialNumbers: true },
+        ],
+      }).select('_id'),
+      Warehouse.findOne({
+        _id: warehouseId,
+        company: companyId,
+        isActive: { $ne: false },
+      }).select('_id'),
+    ]);
+
+    if (!product) {
+      return res.status(404).json({ success: false, message: 'Serial-tracked product not found.' });
+    }
+    if (!warehouse) {
+      return res.status(404).json({ success: false, message: 'Warehouse not found.' });
+    }
+
+    const serialNumbers = await StockSerialNumber.find({
+      company: companyId,
+      product: productId,
+      warehouse: warehouseId,
+      status: { $in: ['in_stock', 'returned'] },
+    })
+      .select('_id serialNo')
+      .sort({ serialNo: 1 })
+      .lean();
+
+    return res.status(200).json({ success: true, data: serialNumbers });
+  } catch (error) {
+    return next(error);
+  }
+};
+
+/**
  * @desc    Get receipt data for printing
  * @route   GET /api/sales-legacy/receipt/:invoiceId
  * @access  Private
