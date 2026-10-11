@@ -2,6 +2,17 @@ const Employee = require("../models/Employee");
 const SalaryHistory = require("../models/SalaryHistory");
 const Payroll = require("../models/Payroll");
 const { parsePagination, paginationMeta } = require("../utils/pagination");
+const { canReadCompensation } = require("../middleware/compensationAccess");
+
+async function employeeForResponse(employee, includeCompensation) {
+  const data = typeof employee.toObject === "function" ? employee.toObject() : { ...employee };
+  if (!includeCompensation) {
+    delete data.currentSalary;
+    delete data.payrollHistory;
+    delete data.grossSalary;
+  }
+  return data;
+}
 
 async function generateNextEmployeeId(companyId) {
   const employees = await Employee.find({ company: companyId })
@@ -47,10 +58,11 @@ exports.getEmployees = async (req, res, next) => {
         .limit(limit),
     ]);
 
+    const includeCompensation = await canReadCompensation(req);
     res.json({
       success: true,
       count: employees.length,
-      data: employees,
+      data: await Promise.all(employees.map((employee) => employeeForResponse(employee, includeCompensation))),
       pagination: paginationMeta(page, limit, total),
     });
   } catch (error) {
@@ -81,6 +93,7 @@ exports.getNextEmployeeId = async (req, res, next) => {
 exports.getEmployeeById = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
+    const includeCompensation = await canReadCompensation(req);
 
     const employee = await Employee.findOne({
       _id: req.params.id,
@@ -94,21 +107,20 @@ exports.getEmployeeById = async (req, res, next) => {
       });
     }
 
-    // Fetch last 6 payroll records for this employee
-    const payrollHistory = await Payroll.find({
-      company: companyId,
-      employee_id: employee._id,
-    })
-      .select("period salary grossSalary deductions netPay record_status createdAt")
-      .sort({ payPeriodStart: -1 })
-      .limit(6)
-      .lean();
-
+    const payrollHistory = includeCompensation
+      ? await Payroll.find({
+        company: companyId,
+        employee_id: employee._id,
+      })
+        .select("period salary grossSalary deductions netPay record_status createdAt")
+        .sort({ payPeriodStart: -1 })
+        .limit(6)
+        .lean()
+      : [];
     res.json({
       success: true,
       data: {
-        ...employee.toObject(),
-        payrollHistory,
+        ...(await employeeForResponse({ ...employee.toObject(), payrollHistory }, includeCompensation)),
       },
     });
   } catch (error) {
@@ -153,6 +165,18 @@ exports.createEmployee = async (req, res, next) => {
       defaultDirectPercentage,
       costCenter,
     } = req.body;
+
+    if (salary && !(await canReadCompensation(req))) {
+      return res.status(403).json({ success: false, message: "Only authorized compensation users can set an employee's initial salary" });
+    }
+    if (salary?.agreedWeeklyHours != null &&
+      (typeof salary.agreedWeeklyHours !== "number" || salary.agreedWeeklyHours <= 0 || salary.agreedWeeklyHours > 168)) {
+      return res.status(400).json({ success: false, message: "salary.agreedWeeklyHours must be greater than 0 and no more than 168" });
+    }
+    if (salary?.manualHourlyRate != null &&
+      (typeof salary.manualHourlyRate !== "number" || salary.manualHourlyRate < 0)) {
+      return res.status(400).json({ success: false, message: "salary.manualHourlyRate must be a non-negative number" });
+    }
 
     if (!firstName || !lastName) {
       return res.status(400).json({
@@ -228,6 +252,8 @@ exports.createEmployee = async (req, res, next) => {
         transportAllowance: salary.transportAllowance || 0,
         housingAllowance: salary.housingAllowance || 0,
         otherAllowances: salary.otherAllowances || 0,
+        agreedWeeklyHours: salary.agreedWeeklyHours ?? null,
+        manualHourlyRate: salary.manualHourlyRate ?? null,
         effectiveDate,
         currency: salary.currency || "RWF",
       };
@@ -248,6 +274,8 @@ exports.createEmployee = async (req, res, next) => {
         transportAllowance: salary.transportAllowance || 0,
         housingAllowance: salary.housingAllowance || 0,
         otherAllowances: salary.otherAllowances || 0,
+        agreedWeeklyHours: salary.agreedWeeklyHours ?? null,
+        manualHourlyRate: salary.manualHourlyRate ?? null,
         currency: salary.currency || "RWF",
         effectiveDate,
         endDate: null,
@@ -256,9 +284,10 @@ exports.createEmployee = async (req, res, next) => {
       });
     }
 
+    const includeCompensation = await canReadCompensation(req);
     res.status(201).json({
       success: true,
-      data: employee,
+      data: await employeeForResponse(employee, includeCompensation),
     });
   } catch (error) {
     next(error);
@@ -330,9 +359,10 @@ exports.updateEmployee = async (req, res, next) => {
     employee.updatedBy = userId;
     await employee.save();
 
+    const includeCompensation = await canReadCompensation(req);
     res.json({
       success: true,
-      data: employee,
+      data: await employeeForResponse(employee, includeCompensation),
     });
   } catch (error) {
     next(error);
@@ -364,6 +394,8 @@ exports.changeSalary = async (req, res, next) => {
       transportAllowance,
       housingAllowance,
       otherAllowances,
+      agreedWeeklyHours,
+      manualHourlyRate,
       effectiveDate,
       reason,
     } = req.body;
@@ -373,6 +405,12 @@ exports.changeSalary = async (req, res, next) => {
         success: false,
         message: "basicSalary is required and must be a non-negative number",
       });
+    }
+    if (agreedWeeklyHours != null && (typeof agreedWeeklyHours !== "number" || agreedWeeklyHours <= 0 || agreedWeeklyHours > 168)) {
+      return res.status(400).json({ success: false, message: "agreedWeeklyHours must be greater than 0 and no more than 168" });
+    }
+    if (manualHourlyRate !== undefined && manualHourlyRate !== null && (typeof manualHourlyRate !== "number" || manualHourlyRate < 0)) {
+      return res.status(400).json({ success: false, message: "manualHourlyRate must be a non-negative number" });
     }
 
     const effDate = effectiveDate ? new Date(effectiveDate) : new Date();
@@ -410,6 +448,10 @@ exports.changeSalary = async (req, res, next) => {
       transportAllowance: transportAllowance || 0,
       housingAllowance: housingAllowance || 0,
       otherAllowances: otherAllowances || 0,
+      agreedWeeklyHours: agreedWeeklyHours ?? null,
+      manualHourlyRate: manualHourlyRate !== undefined
+        ? manualHourlyRate
+        : employee.currentSalary?.manualHourlyRate ?? null,
       currency: "RWF",
       effectiveDate: effDate,
       endDate: null,
@@ -423,6 +465,10 @@ exports.changeSalary = async (req, res, next) => {
       transportAllowance: transportAllowance || 0,
       housingAllowance: housingAllowance || 0,
       otherAllowances: otherAllowances || 0,
+      agreedWeeklyHours: agreedWeeklyHours ?? null,
+      manualHourlyRate: manualHourlyRate !== undefined
+        ? manualHourlyRate
+        : employee.currentSalary?.manualHourlyRate ?? null,
       effectiveDate: effDate,
       currency: "RWF",
     };
@@ -537,9 +583,10 @@ exports.terminateEmployee = async (req, res, next) => {
 
     await employee.save();
 
+    const includeCompensation = await canReadCompensation(req);
     res.json({
       success: true,
-      data: employee,
+      data: await employeeForResponse(employee, includeCompensation),
       message: "Employee terminated successfully",
     });
   } catch (error) {
@@ -576,11 +623,12 @@ exports.deleteEmployee = async (req, res, next) => {
       // Soft delete: mark as inactive
       employee.status = "inactive";
       await employee.save();
+      const includeCompensation = await canReadCompensation(req);
       return res.json({
         success: true,
         message:
           "Employee marked as inactive (payroll history exists). Use terminate for terminated employees.",
-        data: employee,
+        data: await employeeForResponse(employee, includeCompensation),
       });
     }
 

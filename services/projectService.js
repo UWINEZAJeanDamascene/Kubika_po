@@ -166,7 +166,10 @@ class ProjectService {
     if (root.type === "task") tasks.push(root);
     visit(tree);
     const taskIds = tasks.map((task) => String(task._id));
-    const laborRows = taskIds.length ? await prisma.projectLaborEntry.findMany({ where: { companyId: String(companyId), taskId: { in: taskIds } } }) : [];
+    const laborRows = taskIds.length ? await prisma.projectLaborEntry.findMany({
+      where: { companyId: String(companyId), taskId: { in: taskIds } },
+      select: { taskId: true, hours: true, laborCost: true, currencyCode: true },
+    }) : [];
     const laborByTask = new Map();
     for (const row of laborRows) {
       const summary = laborByTask.get(row.taskId) || { hours: 0, cost_by_currency: {} };
@@ -1077,6 +1080,7 @@ class ProjectService {
     const laborEntries = await prisma.projectLaborEntry.findMany({
       where: { companyId: String(companyId), taskId: { in: [...includedIds].map(String) } },
       orderBy: [{ entryDate: "desc" }, { createdAt: "desc" }],
+      select: { taskId: true, hours: true, laborCost: true, currencyCode: true },
     });
     const laborByCurrency = new Map();
     const laborByTask = new Map();

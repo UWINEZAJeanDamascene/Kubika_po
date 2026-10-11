@@ -64,6 +64,27 @@ function taxBandBreakdown(taxableIncome, bands) {
   }).filter((line) => line.taxableAmount > 0);
 }
 
+function calculateEmployerContributions(salary = {}, periodDate = new Date()) {
+  const rssbRule = effectiveRule(RSSB_RULES, periodDate, "RSSB");
+  const grossSalary = roundMoney(
+    amount(salary.basicSalary, "Basic salary") +
+    amount(salary.transportAllowance, "Transport allowance") +
+    amount(salary.housingAllowance, "Housing allowance") +
+    amount(salary.otherAllowances, "Other allowances"),
+  );
+  const rssbEmployerPension = roundMoney(grossSalary * rssbRule.pensionEmployerRate);
+  const rssbEmployerMaternity = roundMoney(grossSalary * rssbRule.maternityEmployerRate);
+  const occupationalHazard = roundMoney(grossSalary * rssbRule.occupationalHazardEmployerRate);
+  return {
+    grossSalary,
+    rssbEmployerPension,
+    rssbEmployerMaternity,
+    occupationalHazard,
+    totalEmployerContributions: roundMoney(rssbEmployerPension + rssbEmployerMaternity + occupationalHazard),
+    ruleEffectiveDate: rssbRule.effectiveFrom,
+  };
+}
+
 function calculateRwandaPayroll({ salary = {}, additionalIncome = {}, deductions = {}, employee = {}, periodDate, proration = null }) {
   const asOf = periodDate || new Date();
   const payeRule = effectiveRule(PAYE_RULES, asOf, "PAYE");
@@ -195,4 +216,4 @@ function calculateRwandaPayroll({ salary = {}, additionalIncome = {}, deductions
   };
 }
 
-module.exports = { PAYE_RULES, RSSB_RULES, calculateRwandaPayroll };
+module.exports = { PAYE_RULES, RSSB_RULES, calculateRwandaPayroll, calculateEmployerContributions };

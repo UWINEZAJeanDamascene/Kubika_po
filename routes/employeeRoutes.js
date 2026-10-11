@@ -13,12 +13,17 @@ const {
 } = require('../controllers/employeeController');
 const { protect } = require('../middleware/auth');
 const { requirePermissionOrRoles } = require('../middleware/rbacMiddleware');
+const { requireCompensationAccess, requireCompensationWriteForSalaryPayload } = require('../middleware/compensationAccess');
 
 router.use(protect);
 
 router.route('/')
   .get(requirePermissionOrRoles('employees', 'read', ['admin', 'manager']), getEmployees)
-  .post(requirePermissionOrRoles('employees', 'create', ['admin', 'manager']), createEmployee);
+  .post(
+    requirePermissionOrRoles('employees', 'create', ['admin', 'manager']),
+    requireCompensationWriteForSalaryPayload,
+    createEmployee,
+  );
 
 router.route('/next-id')
   .get(requirePermissionOrRoles('employees', 'create', ['admin', 'manager']), getNextEmployeeId);
@@ -29,10 +34,13 @@ router.route('/:id')
   .delete(requirePermissionOrRoles('employees', 'delete', ['admin', 'manager']), deleteEmployee);
 
 router.route('/:id/salary')
-  .put(requirePermissionOrRoles('employees', 'update', ['admin', 'manager']), changeSalary);
+  .put(requireCompensationAccess('write_compensation'), changeSalary);
 
 router.route('/:id/salary-history')
-  .get(requirePermissionOrRoles('employees', 'read', ['admin', 'manager']), getSalaryHistory);
+  .get(
+    requireCompensationAccess('read_compensation'),
+    getSalaryHistory,
+  );
 
 router.route('/:id/terminate')
   .put(requirePermissionOrRoles('employees', 'update', ['admin', 'manager']), terminateEmployee);

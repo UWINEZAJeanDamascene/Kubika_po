@@ -255,6 +255,7 @@ describe("approved timesheet allocation correction", () => {
       activityType: "production",
       notes: "Existing labor row",
       entryDate: new Date("2026-01-10T00:00:00.000Z"),
+      costingSnapshot: { basis: "gross_salary", monthlyGross: 300000, monthlyHours: 173.3333 },
     });
     timesheet.lines = [{
       date: "2026-01-10",
@@ -297,6 +298,7 @@ describe("approved timesheet allocation correction", () => {
         lineIndex: 0,
         hourlyRate: 25,
         laborCost: 75,
+        costingSnapshot: { basis: "gross_salary", monthlyGross: 300000, monthlyHours: 173.3333 },
       }),
     });
     expect(mockBuildApprovedLabor).not.toHaveBeenCalled();

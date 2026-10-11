@@ -1,5 +1,6 @@
 const { prisma } = require("../lib/prisma");
 const { generateObjectId } = require("../utils/objectId");
+const { calculateEmployerContributions } = require("./rwandaPayrollRules");
 
 const INTERNAL_TIME_CODES = new Set(["leave", "administration", "training", "other"]);
 const fail = (message) => Object.assign(new Error(message), { statusCode: 400, code: "TIMESHEET_PROJECT_VALIDATION_ERROR" });
@@ -58,8 +59,27 @@ function summarize(lines) {
 }
 
 async function buildApprovedLabor(companyId, employeeId, lines) {
-  const employee = await prisma.employee.findFirst({ where: { id: String(employeeId), companyId: String(companyId) }, select: { currentSalary: true } });
-  const linkedLines = lines.filter((line) => line.projectTaskId);
+  const employee = await prisma.employee.findFirst({
+    where: { id: String(employeeId), companyId: String(companyId) },
+    select: { currentSalary: true, position: true },
+  });
+  const settings = await prisma.systemSettings.findUnique({
+    where: { companyId: String(companyId) },
+    select: { laborCostingBasis: true, laborStandardHoursPerWeek: true, laborCostRoleRates: true },
+  });
+  const costingBasis = settings?.laborCostingBasis || "gross_salary";
+  const standardWeeklyHours = settings
+    ? toNumber(settings.laborStandardHoursPerWeek)
+    : 40;
+  if (standardWeeklyHours <= 0 || standardWeeklyHours > 168) {
+    throw fail("The company standard work week is invalid; contact an administrator");
+  }
+  if (!["gross_salary", "gross_plus_employer_contributions", "manual_employee_or_role"].includes(costingBasis)) {
+    throw fail("The company project labor costing basis is invalid; contact an administrator");
+  }
+  const roleRates = settings?.laborCostRoleRates && typeof settings.laborCostRoleRates === "object"
+    ? settings.laborCostRoleRates
+    : {};
   const costingByIndex = new Map();
   const entryDateByIndex = new Map();
   for (const [lineIndex, line] of lines.entries()) {
@@ -73,15 +93,76 @@ async function buildApprovedLabor(companyId, employeeId, lines) {
       where: { companyId: String(companyId), employeeId: String(employeeId), effectiveDate: { lte: salaryAsOf }, OR: [{ endDate: null }, { endDate: { gte: entryDate } }] },
       orderBy: { effectiveDate: "desc" },
     });
-    const salary = history || (employee?.currentSalary && typeof employee.currentSalary === "object" ? employee.currentSalary : {});
-    const monthlyCompensation = toNumber(salary.grossSalary ?? salary.grossPay ?? (toNumber(salary.basicSalary) + toNumber(salary.transportAllowance) + toNumber(salary.housingAllowance) + toNumber(salary.otherAllowances)));
-    if (monthlyCompensation <= 0) throw fail("Set an effective monthly salary for this employee before approving project task hours");
-    const hourlyRate = Math.round(monthlyCompensation / 173.333333 * 10000) / 10000;
+    let salary = history;
+    if (!salary && employee?.currentSalary && typeof employee.currentSalary === "object") {
+      const currentEffectiveDate = employee.currentSalary.effectiveDate
+        ? new Date(employee.currentSalary.effectiveDate)
+        : null;
+      const futureHistory = await prisma.salaryHistory.findFirst({
+        where: {
+          companyId: String(companyId),
+          employeeId: String(employeeId),
+          effectiveDate: { gt: salaryAsOf },
+        },
+        orderBy: { effectiveDate: "asc" },
+        select: { id: true },
+      });
+      if (!futureHistory && (!currentEffectiveDate || currentEffectiveDate <= entryDate)) {
+        salary = employee.currentSalary;
+      }
+    }
+    salary = salary || {};
+    const monthlyGross = toNumber(salary.grossSalary ?? salary.grossPay ?? (
+      toNumber(salary.basicSalary) +
+      toNumber(salary.transportAllowance) +
+      toNumber(salary.housingAllowance) +
+      toNumber(salary.otherAllowances)
+    ));
+    const agreedWeeklyHours = toNumber(salary.agreedWeeklyHours) || standardWeeklyHours;
+    const monthlyHours = agreedWeeklyHours * 52 / 12;
+    const roleKey = String(employee?.position || "").trim().toLowerCase();
+    const roleRate = roleKey && Object.prototype.hasOwnProperty.call(roleRates, roleKey)
+      ? toNumber(roleRates[roleKey])
+      : 0;
+    let hourlyRate;
+    let employerContributions = 0;
+    let effectiveCostBasis = costingBasis;
+    if (costingBasis === "manual_employee_or_role") {
+      hourlyRate = toNumber(salary.manualHourlyRate) || roleRate;
+      effectiveCostBasis = toNumber(salary.manualHourlyRate) > 0 ? "manual_employee" : "manual_role";
+      if (hourlyRate <= 0) {
+        throw fail("Set an effective employee or role hourly rate before approving project task hours");
+      }
+    } else {
+      if (monthlyGross <= 0) throw fail("Set an effective monthly salary for this employee before approving project task hours");
+      if (costingBasis === "gross_plus_employer_contributions") {
+        employerContributions = calculateEmployerContributions(salary, entryDate).totalEmployerContributions;
+      }
+      hourlyRate = Math.round(((monthlyGross + employerContributions) / monthlyHours) * 10000) / 10000;
+    }
     const currencyCode = String(salary.currency || "RWF").toUpperCase().slice(0, 3);
     const laborCost = Math.round(toNumber(line.hoursWorked) * hourlyRate * 100) / 100;
-    costingByIndex.set(lineIndex, { hourlyRate, laborCost, currencyCode });
+    costingByIndex.set(lineIndex, {
+      hourlyRate,
+      laborCost,
+      currencyCode,
+      costingSnapshot: {
+        basis: effectiveCostBasis,
+        monthlyGross,
+        monthlyEmployerContributions: employerContributions,
+        agreedWeeklyHours,
+        standardWeeklyHours,
+        monthlyHours: Math.round(monthlyHours * 10000) / 10000,
+        salaryHistoryId: history?.id || null,
+        effectiveDate: entryDate.toISOString().slice(0, 10),
+      },
+    });
   }
-  const costedLines = lines.map((line, lineIndex) => line.projectTaskId ? { ...line, ...costingByIndex.get(lineIndex) } : line);
+  const costedLines = lines.map((line, lineIndex) => {
+    if (!line.projectTaskId) return line;
+    const { costingSnapshot, ...lineCost } = costingByIndex.get(lineIndex);
+    return { ...line, ...lineCost };
+  });
   return {
     lines: costedLines,
     entries: costedLines.flatMap((line, lineIndex) => line.projectTaskId ? [{
@@ -89,6 +170,7 @@ async function buildApprovedLabor(companyId, employeeId, lines) {
       employeeId: String(employeeId), lineIndex, entryDate: entryDateByIndex.get(lineIndex),
       hours: toNumber(line.hoursWorked), hourlyRate: line.hourlyRate, laborCost: line.laborCost,
       currencyCode: line.currencyCode, activityType: String(line.activityType || "other"), notes: String(line.notes || ""),
+      costingSnapshot: costingByIndex.get(lineIndex)?.costingSnapshot || {},
     }] : []),
   };
 }

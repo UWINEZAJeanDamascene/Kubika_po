@@ -475,6 +475,8 @@ function salaryHistoryToApi(row) {
     transportAllowance: qtyNum(row.transportAllowance),
     housingAllowance: qtyNum(row.housingAllowance),
     otherAllowances: qtyNum(row.otherAllowances),
+    agreedWeeklyHours: row.agreedWeeklyHours != null ? qtyNum(row.agreedWeeklyHours) : null,
+    manualHourlyRate: row.manualHourlyRate != null ? qtyNum(row.manualHourlyRate) : null,
     currency: row.currency,
     effectiveDate: row.effectiveDate,
     endDate: row.endDate ?? null,
@@ -486,7 +488,8 @@ function salaryHistoryToApi(row) {
 
 const SALARY_HISTORY_HEADER = {
   employee: 'employeeId', basicSalary: 'basicSalary', transportAllowance: 'transportAllowance',
-  housingAllowance: 'housingAllowance', otherAllowances: 'otherAllowances', currency: 'currency',
+  housingAllowance: 'housingAllowance', otherAllowances: 'otherAllowances',
+  agreedWeeklyHours: 'agreedWeeklyHours', manualHourlyRate: 'manualHourlyRate', currency: 'currency',
   effectiveDate: 'effectiveDate', endDate: 'endDate', reason: 'reason', changedBy: 'changedById',
 };
 
@@ -497,6 +500,8 @@ function salaryHistoryTranslateCreate(data) {
     transportAllowance: moneyStr(data.transportAllowance ?? 0),
     housingAllowance: moneyStr(data.housingAllowance ?? 0),
     otherAllowances: moneyStr(data.otherAllowances ?? 0),
+    agreedWeeklyHours: data.agreedWeeklyHours != null ? moneyStr(data.agreedWeeklyHours) : null,
+    manualHourlyRate: data.manualHourlyRate != null ? moneyStr(data.manualHourlyRate) : null,
   });
 }
 const salaryHistoryTranslateUpdate = genericTranslateUpdate(SALARY_HISTORY_HEADER, ['employeeId', 'changedById']);

@@ -6,6 +6,44 @@ const { generateObjectId } = require('../utils/objectId');
 
 const monthNames = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 
+exports.getTimesheetCostingFormula = async (req, res, next) => {
+  try {
+    const companyId = String(req.user.company._id);
+    const timesheet = await prisma.timesheet.findFirst({
+      where: { id: String(req.params.id), companyId },
+      select: { id: true, status: true },
+    });
+    if (!timesheet) return res.status(404).json({ success: false, message: 'Timesheet not found' });
+    if (timesheet.status !== 'approved') {
+      return res.status(409).json({ success: false, message: 'Costing formula is available after timesheet approval' });
+    }
+    const entries = await prisma.projectLaborEntry.findMany({
+      where: { companyId, timesheetId: timesheet.id },
+      orderBy: { lineIndex: 'asc' },
+      select: {
+        lineIndex: true,
+        entryDate: true,
+        hours: true,
+        hourlyRate: true,
+        laborCost: true,
+        currencyCode: true,
+        costingSnapshot: true,
+      },
+    });
+    return res.json({
+      success: true,
+      data: entries.map((entry) => ({
+        ...entry,
+        hours: Number(entry.hours),
+        hourlyRate: Number(entry.hourlyRate),
+        laborCost: Number(entry.laborCost),
+      })),
+    });
+  } catch (error) {
+    return next(error);
+  }
+};
+
 async function findPostedPayrollCostPosting(client, companyId, employeeId, dayStart, dayEnd, month, year) {
   const periodWhere = {
     companyId,
@@ -302,6 +340,7 @@ exports.correctTimesheetAllocation = async (req, res, next) => {
           activityType: true,
           notes: true,
           entryDate: true,
+          costingSnapshot: true,
         },
       }) : null;
       let oldProjectId = oldLine.projectId || existingLaborEntry?.projectId || null;
@@ -367,6 +406,7 @@ exports.correctTimesheetAllocation = async (req, res, next) => {
           currencyCode: String(currencyCode),
           activityType: String(existingLaborEntry?.activityType || oldLine.activityType || 'other'),
           notes: String(existingLaborEntry?.notes ?? oldLine.notes ?? ''),
+          costingSnapshot: existingLaborEntry?.costingSnapshot || {},
         };
       } else {
         const labor = await projectLabor.buildApprovedLabor(cid, employeeId, normalized);
