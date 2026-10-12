@@ -165,6 +165,7 @@ class ProjectService {
     });
     if (root.type === "task") tasks.push(root);
     visit(tree);
+    if (tasks.length) await Project.populate(tasks, { path: "manager_id", select: "firstName lastName email" });
     const taskIds = tasks.map((task) => String(task._id));
     const laborRows = taskIds.length ? await prisma.projectLaborEntry.findMany({
       where: { companyId: String(companyId), taskId: { in: taskIds } },
@@ -192,12 +193,32 @@ class ProjectService {
       .sort((a, b) => String(a.end_date || "").localeCompare(String(b.end_date || "")) || String(a.wbs_code).localeCompare(String(b.wbs_code)));
   }
 
-  async getProjectCalendarItems(companyId, from, to) {
+  async getProjectCalendarItems(companyId, from, to, projectId) {
     const fromDate = from ? new Date(from) : new Date(new Date().getFullYear(), new Date().getMonth(), 1);
     const toDate = to ? new Date(to) : new Date(new Date().getFullYear(), new Date().getMonth() + 1, 1);
     if (!Number.isFinite(fromDate.getTime()) || !Number.isFinite(toDate.getTime()) || fromDate > toDate) throw validationError("Calendar date range is invalid");
-    const tasks = await Project.find({ company_id: companyId, type: "task", is_active: true, is_template: false, end_date: { $gte: fromDate, $lt: toDate } }).sort({ end_date: 1 }).populate("parent_id", "name project_code");
-    const queriedMilestones = await prisma.projectMilestone.findMany({ where: { companyId: String(companyId), dueDate: { gte: fromDate, lt: toDate } }, orderBy: { dueDate: "asc" } });
+    if (!projectId) throw validationError("Select a project to view its calendar");
+    const root = await Project.findOne({ _id: String(projectId), company_id: String(companyId), is_template: false });
+    if (!root) throw validationError("Selected project was not found");
+    const allNodes = await Project.find({ company_id: String(companyId), is_template: false }).select("_id parent_id").lean();
+    const scopedProjectIds = new Set([String(root._id)]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const node of allNodes) {
+        const parentId = node.parent_id?._id || node.parent_id;
+        if (parentId && scopedProjectIds.has(String(parentId)) && !scopedProjectIds.has(String(node._id))) {
+          scopedProjectIds.add(String(node._id));
+          changed = true;
+        }
+      }
+    }
+    const taskQuery = { company_id: companyId, type: "task", is_active: true, is_template: false, end_date: { $gte: fromDate, $lt: toDate } };
+    taskQuery._id = { $in: [...scopedProjectIds] };
+    const tasks = await Project.find(taskQuery).sort({ end_date: 1 }).populate("parent_id", "name project_code");
+    const milestoneWhere = { companyId: String(companyId), dueDate: { gte: fromDate, lt: toDate } };
+    milestoneWhere.projectId = { in: [...scopedProjectIds] };
+    const queriedMilestones = await prisma.projectMilestone.findMany({ where: milestoneWhere, orderBy: { dueDate: "asc" } });
     const milestoneGroups = new Map();
     for (const milestone of queriedMilestones) {
       const rows = milestoneGroups.get(milestone.projectId) || [];

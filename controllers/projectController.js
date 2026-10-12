@@ -137,7 +137,7 @@ class ProjectController {
   async getCalendarItems(req, res, next) {
     try {
       const companyId = req.companyId || req.company?._id || req.user?.company?._id || req.user?.company;
-      res.json({ success: true, data: await projectService.getProjectCalendarItems(companyId, req.query.from, req.query.to) });
+      res.json({ success: true, data: await projectService.getProjectCalendarItems(companyId, req.query.from, req.query.to, req.query.projectId) });
     } catch (error) { next(error); }
   }
 
