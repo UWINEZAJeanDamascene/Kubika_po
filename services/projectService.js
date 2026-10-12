@@ -830,6 +830,16 @@ class ProjectService {
       }
       data.progress_percent = 100;
       data.completed_at = new Date();
+    } else if (data.status === "completed" && effective.type !== "task") {
+      // Completion is a controlled project-close event. Once its required
+      // operational/financial checks pass, archive it immediately while
+      // preserving the project and its full audit trail.
+      if (project.status !== "completed") {
+        const closure = await require("./projectClosureService").checklist(companyId, projectId);
+        if (!closure.can_close) throw validationError(`Project closure checklist is incomplete: ${closure.blockers.map((item) => item.label).join("; ")}`);
+      }
+      data.actual_end_date = data.actual_end_date || new Date();
+      data.is_active = false;
     } else if (data.status && data.status !== "completed" && project.status === "completed") {
       data.completed_at = null;
       if (effective.type === "task") data.actual_end_date = null;
