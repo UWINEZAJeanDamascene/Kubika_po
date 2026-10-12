@@ -123,7 +123,39 @@ async function consume(companyId, productId, qty, opts = {}) {
   }
 }
 
-module.exports = { createLayer, consume };
+async function consumeAvailable(companyId, productId, qty, opts = {}) {
+  const session = opts.session || null;
+  const layers = await InventoryLayer.find({
+    company: companyId,
+    product: productId,
+    qtyRemaining: { $gt: 0 },
+    ...(opts.warehouse ? { warehouse: opts.warehouse } : {}),
+  })
+    .sort({ receiptDate: 1 })
+    .session(session);
+  let remaining = Number(qty);
+  const allocations = [];
+  for (const layer of layers) {
+    if (remaining <= 0) break;
+    const available = Math.max(0, Number(layer.qtyRemaining) || 0);
+    const taken = Math.min(available, remaining);
+    if (!taken) continue;
+    const unitCost = Number(layer.unitCost) || 0;
+    const amount = taken * unitCost;
+    layer.qtyRemaining = available - taken;
+    await layer.save({ session });
+    allocations.push({ layerId: layer._id, qty: taken, unitCost, amount });
+    remaining -= taken;
+  }
+  return {
+    allocations,
+    consumed: Number(qty) - remaining,
+    shortfall: remaining,
+    totalCost: allocations.reduce((total, allocation) => total + allocation.amount, 0),
+  };
+}
+
+module.exports = { createLayer, consume, consumeAvailable };
 
 /**
  * Reserve quantity across InventoryBatch entries (FIFO by receivedDate).

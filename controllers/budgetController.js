@@ -668,6 +668,9 @@ exports.createEncumbrance = async (req, res) => {
 
     res.status(201).json({ success: true, data: encumbrance, message: "Encumbrance created successfully" });
   } catch (error) {
+    if (error.code === "P2034") {
+      return res.status(409).json({ error: "Another budget transaction used this balance first. Refresh and retry." });
+    }
     if (error.message === "BUDGET_NOT_FOUND") {
       return res.status(404).json({ error: "Budget not found" });
     }
@@ -677,8 +680,14 @@ exports.createEncumbrance = async (req, res) => {
     if (error.message === "BUDGET_LINE_NOT_FOUND") {
       return res.status(404).json({ error: "No budget line found for this account" });
     }
+    if (error.message === "BUDGET_ACCOUNT_MISMATCH") {
+      return res.status(400).json({ error: "The account does not match the selected budget line" });
+    }
+    if (error.message === "ENCUMBRANCE_AMOUNT_INVALID") {
+      return res.status(400).json({ error: "Encumbrance amount must be a positive finite amount" });
+    }
     if (error.message === "INSUFFICIENT_BUDGET") {
-      return res.status(400).json({ error: "Insufficient available budget for this encumbrance" });
+      return res.status(409).json({ error: "Insufficient available budget for this encumbrance" });
     }
     if (error.message === "ENCUMBRANCE_ALREADY_EXISTS") {
       return res.status(400).json({ error: "An encumbrance already exists for this source document" });
@@ -800,6 +809,9 @@ exports.adjustEncumbrance = async (req, res) => {
 
     res.json({ success: true, data: encumbrance, message: "Encumbrance adjusted successfully" });
   } catch (error) {
+    if (error.code === "P2034") {
+      return res.status(409).json({ error: "Another budget transaction used this balance first. Refresh and retry." });
+    }
     if (error.message === "ENCUMBRANCE_NOT_FOUND") {
       return res.status(404).json({ error: "Encumbrance not found" });
     }
@@ -810,7 +822,7 @@ exports.adjustEncumbrance = async (req, res) => {
       return res.status(400).json({ error: "New amount cannot be below already liquidated amount" });
     }
     if (error.message === "INSUFFICIENT_BUDGET_FOR_ADJUSTMENT") {
-      return res.status(400).json({ error: "Insufficient budget for this adjustment" });
+      return res.status(409).json({ error: "Insufficient budget for this adjustment" });
     }
     res.status(400).json({ error: error.message });
   }

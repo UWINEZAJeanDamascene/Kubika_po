@@ -92,9 +92,12 @@ async function buildReport(companyId, till) {
   const cashSales = roundMoney(cashActivity
     .filter((activity) => activity.type === 'cash_sale')
     .reduce((sum, activity) => sum + number(activity.amount), 0));
+  const cashGiftCardIssues = roundMoney(cashActivity
+    .filter((activity) => activity.type === 'gift_card_issue')
+    .reduce((sum, activity) => sum + number(activity.amount), 0));
   const openingFloat = roundMoney(till.openingFloat);
   const expectedCash = roundMoney(till.expectedCash ?? openingFloat);
-  const computedExpectedCash = roundMoney(openingFloat + cashSales - cashRefunds);
+  const computedExpectedCash = roundMoney(openingFloat + cashSales + cashGiftCardIssues - cashRefunds);
   const countedCash = till.closingCount == null ? null : roundMoney(till.closingCount);
   const taxBuckets = lineRows.map((row) => ({
     code: row.tax_code || 'UNASSIGNED',
@@ -131,6 +134,7 @@ async function buildReport(companyId, till) {
     cash: {
       openingFloat,
       cashSales,
+      cashGiftCardIssues,
       cashRefunds: roundMoney(cashRefunds),
       expectedCash,
       computedExpectedCash,

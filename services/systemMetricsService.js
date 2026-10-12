@@ -86,7 +86,7 @@ function recordRequest(durationMs, statusCode, route) {
     // Stop adding new routes rather than evicting: a full map still describes
     // the busiest routes accurately, and eviction would bias the percentiles.
     if (routeStats.size >= MAX_ROUTES) return;
-    entry = { count: 0, errors: 0, totalMs: 0, durations: [] };
+    entry = { count: 0, errors: 0, totalMs: 0, durations: [], samples: [] };
     routeStats.set(route, entry);
   }
   entry.count++;
@@ -94,6 +94,8 @@ function recordRequest(durationMs, statusCode, route) {
   if (statusCode >= 400) entry.errors++;
   entry.durations.push(Math.round(durationMs));
   if (entry.durations.length > MAX_ROUTE_SAMPLES) entry.durations.shift();
+  entry.samples.push({ timestamp: Date.now(), durationMs: Math.round(durationMs), statusCode: Number(statusCode) || 500 });
+  if (entry.samples.length > MAX_ROUTE_SAMPLES) entry.samples.shift();
 }
 
 /**
@@ -160,6 +162,9 @@ function getRouteMetrics(limit = 20) {
   const rows = [];
   for (const [route, e] of routeStats) {
     const s = summarize(e.durations);
+    const recentSamples = (e.samples || []).filter((sample) => Date.now() - sample.timestamp <= 15 * 60 * 1000);
+    const recentErrors = recentSamples.filter((sample) => sample.statusCode >= 500).length;
+    const recentDurations = recentSamples.map((sample) => sample.durationMs).sort((a, b) => a - b);
     rows.push({
       route,
       count: e.count,
@@ -169,6 +174,13 @@ function getRouteMetrics(limit = 20) {
       p99_ms: s.p99_ms,
       max_ms: s.max_ms,
       error_rate: Math.round((e.errors / e.count) * 10000) / 100,
+      recent_15m: {
+        count: recentSamples.length,
+        errors: recentErrors,
+        error_rate: recentSamples.length ? Math.round((recentErrors / recentSamples.length) * 10000) / 100 : 0,
+        server_error_rate: recentSamples.length ? Math.round((recentErrors / recentSamples.length) * 10000) / 100 : 0,
+        p95_ms: recentDurations.length ? recentDurations[Math.max(0, Math.ceil(recentDurations.length * 0.95) - 1)] : 0,
+      },
     });
   }
   rows.sort((a, b) => b.p95_ms - a.p95_ms);

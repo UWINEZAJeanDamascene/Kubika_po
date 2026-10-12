@@ -14,6 +14,7 @@ const FIELD_MAP = {
   code: { target: 'code', transform: (v) => ({ code: typeof v === 'string' ? v.toUpperCase() : v }) },
   description: { target: 'description' },
   location: { target: 'location' },
+  priceListId: { target: 'priceListId', isId: true },
   inventoryAccount: { target: 'inventoryAccount' },
   isDefault: { target: 'isDefault' },
   totalProducts: { target: 'totalProducts' },

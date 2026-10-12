@@ -353,6 +353,11 @@ function stockTransferLineToApi(row) {
     product: row.productId,
     qty: decimalToNumber(row.qty, 0),
     unitCost: row.unitCost != null ? decimalToNumber(row.unitCost, 0) : null,
+    qtyReceived: decimalToNumber(row.qtyReceived, 0),
+    inTransitQty: decimalToNumber(row.inTransitQty, 0),
+    inTransitValue: decimalToNumber(row.inTransitValue, 0),
+    inventoryIdentity: row.inventoryIdentity ?? {},
+    receivedIdentity: row.receivedIdentity ?? {},
     notes: row.notes ?? null,
     createdBy: row.createdById ?? null,
     ...mapTimestamps(row),
@@ -373,6 +378,7 @@ function stockTransferToApi(row) {
     lineCount,
     status: row.status,
     transferDate: row.transferDate,
+    expectedArrivalAt: row.expectedArrivalAt ?? null,
     completedDate: row.completedDate ?? null,
     reason: row.reason,
     notes: row.notes ?? null,
@@ -381,6 +387,23 @@ function stockTransferToApi(row) {
     receivedBy: row.receivedById ?? null,
     receivedDate: row.receivedDate ?? null,
     receivedNotes: row.receivedNotes ?? null,
+    discrepancyBy: row.discrepancyById ?? null,
+    discrepancyAt: row.discrepancyAt ?? null,
+    cancelledBy: row.cancelledById ?? null,
+    cancelledAt: row.cancelledAt ?? null,
+    inTransitValue: decimalToNumber(row.inTransitValue, 0),
+    discrepancies: (row.discrepancies || []).map((item) => ({
+      _id: item.id,
+      transfer: item.transferId,
+      transferLine: item.transferLineId,
+      expectedQty: decimalToNumber(item.expectedQty, 0),
+      receivedQty: decimalToNumber(item.receivedQty, 0),
+      varianceQty: decimalToNumber(item.varianceQty, 0),
+      notes: item.notes ?? null,
+      recordedBy: item.recordedById,
+      recordedAt: item.recordedAt,
+      createdAt: item.createdAt,
+    })),
     referenceNumber: row.referenceNumber ?? null,
     signatures: row.signatures ?? [],
     journalEntry: row.journalEntryId ?? null,
@@ -397,6 +420,7 @@ const STOCK_TRANSFER_INPUT = {
   toWarehouse: 'toWarehouseId',
   status: 'status',
   transferDate: 'transferDate',
+  expectedArrivalAt: 'expectedArrivalAt',
   completedDate: 'completedDate',
   reason: 'reason',
   notes: 'notes',
@@ -405,6 +429,11 @@ const STOCK_TRANSFER_INPUT = {
   receivedBy: 'receivedById',
   receivedDate: 'receivedDate',
   receivedNotes: 'receivedNotes',
+  discrepancyBy: 'discrepancyById',
+  discrepancyAt: 'discrepancyAt',
+  cancelledBy: 'cancelledById',
+  cancelledAt: 'cancelledAt',
+  inTransitValue: 'inTransitValue',
   referenceNumber: 'referenceNumber',
   signatures: 'signatures',
   journalEntry: 'journalEntryId',
@@ -416,14 +445,14 @@ async function stockTransferTranslateCreate(data) {
   return {
     ...tenantCreateBase(data),
     ...pickMapped(data, STOCK_TRANSFER_INPUT, {
-      idFields: ['fromWarehouseId', 'toWarehouseId', 'confirmedById', 'receivedById', 'journalEntryId', 'createdById'],
+      idFields: ['fromWarehouseId', 'toWarehouseId', 'confirmedById', 'receivedById', 'discrepancyById', 'cancelledById', 'journalEntryId', 'createdById'],
     }),
   };
 }
 
 function stockTransferTranslateUpdate(update = {}) {
   return pickMapped(mergeUpdatePayload(update), STOCK_TRANSFER_INPUT, {
-    idFields: ['fromWarehouseId', 'toWarehouseId', 'confirmedById', 'receivedById', 'journalEntryId', 'createdById'],
+    idFields: ['fromWarehouseId', 'toWarehouseId', 'confirmedById', 'receivedById', 'discrepancyById', 'cancelledById', 'journalEntryId', 'createdById'],
   });
 }
 
@@ -433,6 +462,11 @@ const STOCK_TRANSFER_LINE_INPUT = {
   product: 'productId',
   qty: 'qty',
   unitCost: 'unitCost',
+  qtyReceived: 'qtyReceived',
+  inTransitQty: 'inTransitQty',
+  inTransitValue: 'inTransitValue',
+  inventoryIdentity: 'inventoryIdentity',
+  receivedIdentity: 'receivedIdentity',
   notes: 'notes',
   createdBy: 'createdById',
 };

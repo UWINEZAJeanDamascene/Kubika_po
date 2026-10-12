@@ -38,11 +38,9 @@ const {
 const {
   getStockTransfers,
   getStockTransfer,
-  createStockTransfer,
-  approveStockTransfer,
-  completeStockTransfer,
-  cancelStockTransfer
+  createStockTransfer
 } = require('../controllers/stockTransferController');
+const stockTransferLifecycle = require('../controllers/stockTransferController');
 
 // Stock Audit routes
 const {
@@ -167,11 +165,12 @@ router.route('/transfers')
 
 router.route('/transfers/:id')
   .get(requirePermissionOrRoles('stock_transfers', 'read', ['admin', 'stock_manager', 'warehouse_manager']), getStockTransfer)
-  .post(requirePermissionOrRoles('stock_transfers', 'approve', ['admin']), approveStockTransfer);
+  .post(requirePermissionOrRoles('stock_transfers', 'approve', ['admin']), stockTransferLifecycle.dispatch);
 
-router.post('/transfers/:id/approve', requirePermissionOrRoles('stock_transfers', 'approve', ['admin']), logAction('stock'), approveStockTransfer);
-router.post('/transfers/:id/complete', requirePermissionOrRoles('stock_transfers', 'update', ['admin', 'stock_manager', 'warehouse_manager']), logAction('stock'), completeStockTransfer);
-router.post('/transfers/:id/cancel', requirePermissionOrRoles('stock_transfers', 'delete', ['admin']), logAction('stock'), cancelStockTransfer);
+router.post('/transfers/:id/approve', requirePermissionOrRoles('stock_transfers', 'approve', ['admin']), logAction('stock'), stockTransferLifecycle.dispatch);
+router.post('/transfers/:id/complete', requirePermissionOrRoles('stock_transfers', 'update', ['admin', 'stock_manager', 'warehouse_manager']), logAction('stock'), stockTransferLifecycle.receive);
+router.post('/transfers/:id/receive', requirePermissionOrRoles('stock_transfers', 'update', ['admin', 'stock_manager', 'warehouse_manager']), logAction('stock'), stockTransferLifecycle.receive);
+router.post('/transfers/:id/cancel', requirePermissionOrRoles('stock_transfers', 'delete', ['admin']), logAction('stock'), stockTransferLifecycle.cancel);
 
 // ========== STOCK AUDIT ROUTES ==========
 router.route('/audits')

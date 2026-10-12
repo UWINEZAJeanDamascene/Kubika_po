@@ -3,6 +3,7 @@ const DeliveryNote = require("../models/DeliveryNote");
 const SalesOrder = require("../models/SalesOrder");
 const Product = require("../models/Product");
 const Client = require("../models/Client");
+const Project = require("../models/Project");
 const StockMovement = require("../models/StockMovement");
 const InvoiceReceiptMetadata = require("../models/InvoiceReceiptMetadata");
 const PDFDocument = require("pdfkit");
@@ -40,6 +41,26 @@ const normalizeId = (value) => {
   if (typeof value === 'string' || typeof value === 'number') return String(value);
   return String(value._id || value.id || value);
 };
+
+async function validateInvoiceProjectAssignments(lines, companyId, clientId) {
+  const ids = [...new Set((lines || []).map((line) => normalizeId(line.projectId || line.project_id)).filter(Boolean))];
+  if (!ids.length) return;
+  const projects = await Project.find({
+    _id: { $in: ids },
+    company_id: companyId,
+    is_template: false,
+    is_active: true,
+  });
+  if (projects.length !== ids.length) {
+    throw Object.assign(new Error("One or more invoice lines reference a project that is unavailable in this company."), { statusCode: 400 });
+  }
+  for (const project of projects) {
+    const linkedClientId = normalizeId(project.client_id);
+    if (linkedClientId && linkedClientId !== normalizeId(clientId)) {
+      throw Object.assign(new Error(`Project ${project.name} belongs to a different client.`), { statusCode: 400 });
+    }
+  }
+}
 
 async function hydrateInvoiceRelations(docOrDocs, companyId) {
   const docs = Array.isArray(docOrDocs) ? docOrDocs : [docOrDocs];
@@ -290,6 +311,8 @@ exports.createInvoice = async (req, res, next) => {
       });
     }
 
+    await validateInvoiceProjectAssignments(invoiceLines, companyId, clientId);
+
     // Validate products and check stock.
     //
     // Products are fetched in ONE query rather than one per line. This loop
@@ -354,6 +377,7 @@ exports.createInvoice = async (req, res, next) => {
 
       return {
         ...line,
+        projectId: normalizeId(line.projectId || line.project_id) || null,
         productName: line.productName || product?.name,
         productCode: line.productCode || line.itemCode || product?.sku,
         qty: qty,
@@ -477,6 +501,7 @@ exports.updateInvoice = async (req, res, next) => {
 
     // If lines are updated, validate stock and products
     if (lines) {
+      await validateInvoiceProjectAssignments(lines, companyId, req.body.client || invoice.client);
       // Validate products are active
       const __lineProducts1 = await loadLineProducts(Product, lines, companyId);
       for (const line of lines) {
@@ -601,6 +626,7 @@ exports.updateInvoice = async (req, res, next) => {
           lineTotal: Number(line.lineTotal || 0), unitCost: Number(line.unitCost || 0),
           cogsAmount: Number(line.cogsAmount || 0),
           warehouseId: line.warehouse ? normalizeId(line.warehouse) : null,
+          projectId: line.projectId || line.project_id ? normalizeId(line.projectId || line.project_id) : null,
         })) });
       }
       return Invoice.findOne({ _id: req.params.id, company: companyId });
@@ -1263,7 +1289,7 @@ exports.generateInvoicePDF = async (req, res, next) => {
     const invoice = await Invoice.findOne({
       _id: req.params.id,
       company: companyId,
-    }).select({ client: 1, lines: 1, createdBy: 1, referenceNo: 1, invoiceNumber: 1, status: 1, invoiceDate: 1, dueDate: 1, items: 1, payments: 1, ebm: 1, terms: 1, notes: 1 }).lean();
+    }).select({ client: 1, lines: 1, createdBy: 1, referenceNo: 1, invoiceNumber: 1, status: 1, invoiceDate: 1, dueDate: 1, items: 1, payments: 1, ebm: 1, terms: 1, notes: 1, totalDiscount: 1, posPromotion: 1, subtotal: 1, taxAmount: 1, totalAmount: 1, grandTotal: 1, amountPaid: 1, amountOutstanding: 1 }).lean();
     await hydrateInvoiceRelations(invoice);
 
     if (!invoice) {
@@ -1548,12 +1574,24 @@ exports.generateInvoicePDF = async (req, res, next) => {
     }
 
     const totalsX = doc.page.width - 300;
+    const invoiceLineDiscount = (invoice.items || invoice.lines || []).reduce((sum, line) => {
+      const base = Number(line.lineSubtotal ?? line.subtotal ?? (Number(line.quantity || line.qty || 0) * Number(line.unitPrice || line.price || 0)));
+      return sum + Math.max(0, base) * Math.max(0, Number(line.discountPct || 0)) / 100;
+    }, 0);
+    const pdfDiscountAmount = Math.max(Number(invoice.totalDiscount || 0), Number(invoice.posPromotion?.discountAmount || 0), invoiceLineDiscount);
+    const pdfDiscountLabel = invoice.posPromotion?.name
+      ? `Promotion: ${invoice.posPromotion.name}`
+      : invoice.posPromotion?.code
+        ? `Promotion: ${invoice.posPromotion.code}`
+        : "Discount";
     let ty = drawTaxBreakdown(doc, {
       x: totalsX,
       y,
       width: 250,
       ebm: invoice.ebm || {},
       fallback: invoice.toObject ? invoice.toObject({ virtuals: true }) : invoice,
+      discountAmount: pdfDiscountAmount,
+      discountLabel: pdfDiscountLabel,
     }) + 8;
 
     if (invoice.amountPaid > 0) {

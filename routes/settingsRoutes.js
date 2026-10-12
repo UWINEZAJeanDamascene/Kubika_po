@@ -5,6 +5,7 @@ const laborCostingSettingsController = require('../controllers/laborCostingSetti
 const { protect } = require('../middleware/auth')
 const { attachCompanyId } = require('../middleware/companyContext')
 const { requireLaborCostingAccess } = require('../middleware/laborCostingAccess')
+const { authorize } = require('../middleware/authorize')
 
 // All routes require authentication and company context
 router.use(protect)
@@ -14,7 +15,7 @@ router.use(attachCompanyId)
 router.get('/', systemSettingsController.getSettings)
 
 // PUT /api/settings - Update settings (admin only)
-router.put('/', systemSettingsController.updateSettings)
+router.put('/', authorize('settings', 'update'), systemSettingsController.updateSettings)
 
 router.get(
   '/labor-costing/audit',

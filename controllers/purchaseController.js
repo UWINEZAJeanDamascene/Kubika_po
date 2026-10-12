@@ -313,7 +313,15 @@ exports.createPurchase = async (req, res, next) => {
         BudgetService.releaseEncumbrance(companyId, 'purchase', purchase._id.toString(),
           'Direct purchase creation rolled back after a budget line failed', req.user.id, encumbrance._id)));
       await purchase.deleteOne();
-      return res.status(400).json({ success: false, message: encErr.message || 'Unable to reserve the selected budget lines' });
+      const conflict = encErr.code === 'P2034' || encErr.message === 'INSUFFICIENT_BUDGET';
+      return res.status(conflict ? 409 : 400).json({
+        success: false,
+        message: encErr.code === 'P2034'
+          ? 'Another transaction used this budget balance first. Refresh and retry.'
+          : encErr.message === 'INSUFFICIENT_BUDGET'
+            ? 'The purchase exceeds the remaining budget available for this line.'
+            : encErr.message || 'Unable to reserve the selected budget lines',
+      });
     }
 
     // Create journal entry for the purchase (Inventory + VAT Debit, Accounts Payable Credit)

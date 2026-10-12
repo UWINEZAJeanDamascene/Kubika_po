@@ -1,4 +1,5 @@
 const Expense = require("../models/Expense");
+const Encumbrance = require("../models/Encumbrance");
 const mongoose = require("mongoose");
 const { BankAccount, BankTransaction } = require("../models/BankAccount");
 const ChartOfAccount = require("../models/ChartOfAccount");
@@ -6,6 +7,7 @@ const JournalService = require("../services/journalService");
 const JournalEntry = require("../models/JournalEntry");
 const AuditService = require("../services/auditService");
 const BudgetService = require("../services/budgetService");
+const { runInTransaction } = require("../services/transactionService");
 
 // @desc    Get all expenses for a company
 // @route   GET /api/expenses
@@ -278,6 +280,21 @@ exports.createExpense = async (req, res, next) => {
     // Normalize Rwanda fields
     const normalizedDepartmentId = department_id || departmentId || null;
 
+    const hasBudget = Boolean(budget_id);
+    const hasBudgetLine = Boolean(budget_line_id);
+    if (hasBudget !== hasBudgetLine) {
+      return res.status(400).json({
+        success: false,
+        message: "Select both a budget and a budget line, or leave both empty.",
+      });
+    }
+    if (hasBudget && (!mongoose.Types.ObjectId.isValid(String(budget_id)) || !mongoose.Types.ObjectId.isValid(String(budget_line_id)))) {
+      return res.status(400).json({
+        success: false,
+        message: "The selected budget or budget line is invalid. No expense was saved.",
+      });
+    }
+
     const expense = new Expense({
       company: companyId,
       createdBy: req.user._id,
@@ -307,18 +324,37 @@ exports.createExpense = async (req, res, next) => {
       isVATRecoverable: isVATRecoverable !== undefined ? isVATRecoverable : true,
     });
 
-    await expense.save();
-
-    // Create encumbrance if budget is specified
-    if (expense.budget_id && expense.budget_line_id) {
+    // A budget-coded expense and its reservation are one financial operation.
+    // Serializable isolation prevents concurrent requests from both consuming
+    // the same remaining budget; any reservation failure rolls back the expense.
+    if (hasBudget) {
       try {
-        const BudgetService = require('../services/budgetService');
-        await BudgetService.createEncumbranceFromExpense(expense, req.user._id);
-        console.log('[createExpense] Encumbrance created for expense:', expense._id);
-      } catch (encErr) {
-        console.error('Error creating encumbrance for expense:', encErr);
-        // Don't fail the expense creation if encumbrance fails
+        await runInTransaction(async () => {
+          await expense.save();
+          const reservation = await BudgetService.createEncumbranceFromExpense(expense, req.user._id);
+          expense.encumbrance_id = reservation.encumbrance_id;
+        }, { isolationLevel: "Serializable" });
+      } catch (budgetError) {
+        if (budgetError.code === "P2034" || budgetError.message === "INSUFFICIENT_BUDGET_FUNDS") {
+          return res.status(409).json({
+            success: false,
+            message: budgetError.message === "INSUFFICIENT_BUDGET_FUNDS"
+              ? "This expense exceeds the remaining budget. No expense was saved."
+              : "Another transaction changed this budget. Refresh the budget and retry; no expense was saved.",
+          });
+        }
+        if (["BUDGET_NOT_FOUND", "BUDGET_NOT_ACTIVE", "BUDGET_LINE_NOT_FOUND", "BUDGET_ACCOUNT_MISMATCH", "ENCUMBRANCE_ALREADY_EXISTS", "EXPENSE_AMOUNT_INVALID"].includes(budgetError.message)
+          || ["P2003", "P2023"].includes(budgetError.code)) {
+          return res.status(400).json({
+            success: false,
+            message: "The selected budget allocation is invalid. No expense was saved.",
+            code: budgetError.message,
+          });
+        }
+        throw budgetError;
       }
+    } else {
+      await expense.save();
     }
 
     // If expense is paid immediately, create journal entry and bank transaction
@@ -464,6 +500,44 @@ exports.updateExpense = async (req, res, next) => {
     // Don't allow changing company or createdBy
     const { company, createdBy, bankAccountId, department_id, ...updateData } = req.body;
 
+    const hasBudgetIdUpdate = Object.prototype.hasOwnProperty.call(updateData, "budget_id")
+      || Object.prototype.hasOwnProperty.call(updateData, "budgetId");
+    const hasBudgetLineUpdate = Object.prototype.hasOwnProperty.call(updateData, "budget_line_id")
+      || Object.prototype.hasOwnProperty.call(updateData, "budgetLineId");
+    const requestedBudgetId = updateData.budget_id ?? updateData.budgetId;
+    const requestedBudgetLineId = updateData.budget_line_id ?? updateData.budgetLineId;
+    if (hasBudgetIdUpdate || hasBudgetLineUpdate) {
+      const effectiveBudgetId = hasBudgetIdUpdate ? requestedBudgetId : expense.budget_id;
+      const effectiveBudgetLineId = hasBudgetLineUpdate ? requestedBudgetLineId : expense.budget_line_id;
+      if (Boolean(effectiveBudgetId) !== Boolean(effectiveBudgetLineId)) {
+        return res.status(400).json({ success: false, message: "Select both a budget and a budget line, or leave both empty." });
+      }
+      if (String(effectiveBudgetId || "") !== String(expense.budget_id || "")
+        || String(effectiveBudgetLineId || "") !== String(expense.budget_line_id || "")) {
+        return res.status(409).json({ success: false, message: "Budget coding cannot be changed after an expense is created. Cancel and recreate the expense with the correct budget allocation." });
+      }
+      delete updateData.budget_id;
+      delete updateData.budgetId;
+      delete updateData.budget_line_id;
+      delete updateData.budgetLineId;
+    }
+
+    if (expense.budget_id) {
+      const currentAmounts = {
+        amount: Number(expense.amount || 0),
+        total_amount: Number(expense.total_amount || 0),
+        totalAmount: Number(expense.total_amount || 0),
+        tax_amount: Number(expense.tax_amount || 0),
+        taxAmount: Number(expense.tax_amount || 0),
+      };
+      for (const [field, current] of Object.entries(currentAmounts)) {
+        if (Object.prototype.hasOwnProperty.call(updateData, field)
+          && Number(updateData[field]) !== current) {
+          return res.status(409).json({ success: false, message: "The amount of a budget-committed expense cannot be edited. Cancel and recreate it with the corrected amount." });
+        }
+      }
+    }
+
     // Check if expense is being marked as paid with bank transfer
     const isBeingPaid = updateData.paid === true && !expense.paid;
     const paymentMethod = updateData.paymentMethod || updateData.payment_method;
@@ -496,7 +570,30 @@ exports.updateExpense = async (req, res, next) => {
     }
 
     Object.assign(expense, updateData);
-    await expense.save();
+    if (expense.budget_id && expense.budget_line_id) {
+      try {
+        await runInTransaction(async () => {
+          // Repair legacy rows missing a reservation before allowing further
+          // edits. New rows already have this reference from atomic creation.
+          if (!expense.encumbrance_id) {
+            const reservation = await BudgetService.createEncumbranceFromExpense(expense, req.user._id);
+            expense.encumbrance_id = reservation.encumbrance_id;
+          }
+          await expense.save();
+        }, { isolationLevel: "Serializable" });
+      } catch (budgetError) {
+        if (budgetError.code === "P2034" || budgetError.message === "INSUFFICIENT_BUDGET_FUNDS") {
+          return res.status(409).json({ success: false, message: "The expense could not be saved because its budget is no longer available. Refresh and retry." });
+        }
+        if (["BUDGET_NOT_FOUND", "BUDGET_NOT_ACTIVE", "BUDGET_LINE_NOT_FOUND", "BUDGET_ACCOUNT_MISMATCH", "ENCUMBRANCE_ALREADY_EXISTS", "EXPENSE_AMOUNT_INVALID"].includes(budgetError.message)
+          || ["P2003", "P2023"].includes(budgetError.code)) {
+          return res.status(400).json({ success: false, message: "The expense's budget allocation is invalid; no changes were saved.", code: budgetError.message || budgetError.code });
+        }
+        throw budgetError;
+      }
+    } else {
+      await expense.save();
+    }
 
     // Get expense account code for proper journal posting
     let expenseAccountCode = null;
@@ -617,9 +714,36 @@ exports.deleteExpense = async (req, res, next) => {
         .json({ success: false, message: "Expense not found" });
     }
 
-    // Soft delete - mark as cancelled
-    expense.status = "cancelled";
-    await expense.save();
+    try {
+      await runInTransaction(async () => {
+        if (expense.encumbrance_id) {
+          const encumbrance = await Encumbrance.findOne({
+            _id: expense.encumbrance_id,
+            company_id: companyId,
+          });
+          if (!encumbrance) throw new Error("EXPENSE_ENCUMBRANCE_MISSING");
+          if (Number(encumbrance.liquidated_amount || 0) > 0 || expense.paid) {
+            throw new Error("PAID_BUDGET_EXPENSE_REQUIRES_REVERSAL");
+          }
+          await BudgetService.releaseEncumbranceFromExpense(
+            expense._id,
+            "Expense cancelled",
+            req.user._id,
+          );
+          expense.encumbrance_id = null;
+        }
+        expense.status = "cancelled";
+        await expense.save();
+      }, { isolationLevel: "Serializable" });
+    } catch (cancelError) {
+      if (cancelError.message === "PAID_BUDGET_EXPENSE_REQUIRES_REVERSAL") {
+        return res.status(409).json({ success: false, message: "This expense has already affected payment or actuals. Reverse it through the accounting workflow before cancellation." });
+      }
+      if (cancelError.message === "EXPENSE_ENCUMBRANCE_MISSING") {
+        return res.status(409).json({ success: false, message: "The linked budget commitment is missing. The expense was not cancelled; contact an administrator to reconcile the budget." });
+      }
+      throw cancelError;
+    }
 
     res.json({
       success: true,

@@ -139,6 +139,7 @@ function invoiceLineToApi(row) {
       unitCost: moneyStr(row.unitCost),
       cogsAmount: moneyStr(row.cogsAmount),
       warehouse: row.warehouseId ?? null,
+      projectId: row.projectId ?? null,
       qtyDelivered: qtyNum(row.qtyDelivered),
       qtyCredited: qtyNum(row.qtyCredited),
       itemCode: row.productCode ?? null,
@@ -291,6 +292,7 @@ async function invoiceTranslateCreate(data) {
       unitCost: line.unitCost ?? 0,
       cogsAmount: line.cogsAmount ?? 0,
       warehouseId: line.warehouse ? toIdString(line.warehouse) : null,
+      projectId: line.projectId || line.project_id ? toIdString(line.projectId || line.project_id) : null,
       qtyCredited: line.qtyCredited ?? 0,
       qtyDelivered: line.qtyDelivered ?? 0,
     };

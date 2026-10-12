@@ -203,6 +203,8 @@ class BudgetService {
     notes,
     created_by,
   }) {
+    const { runInTransaction } = require('./transactionService');
+    return runInTransaction(async () => {
     const numericAmount = parseFloat(amount);
     if (!numericAmount || numericAmount <= 0) {
       return null;
@@ -246,12 +248,15 @@ class BudgetService {
     }
 
     return budgetLine;
+    }, { isolationLevel: 'Serializable' });
   }
 
   // Supplier returns reverse the receipt's project/budget actual. The AP
   // settlement itself must not affect project spend; only the accepted return
   // quantity reverses the original receipt actual.
   static async reverseActualConsumptionToLine({ companyId, budgetLineId, amount, document_id, document_number, source_id, source_number, created_by, notes }) {
+    const { runInTransaction } = require('./transactionService');
+    return runInTransaction(async () => {
     const numericAmount = parseFloat(amount);
     if (!Number.isFinite(numericAmount) || numericAmount <= 0) return null;
     const budgetLine = await BudgetLine.findById(budgetLineId);
@@ -273,6 +278,7 @@ class BudgetService {
     await reversal.save();
     if (budgetLine.project_id) await projectService.updateBudgetSpentForProjects(companyId, [budgetLine.project_id]);
     return budgetLine;
+    }, { isolationLevel: 'Serializable' });
   }
 
   static async getActualConsumptions(companyId, budgetId, filters = {}) {
@@ -3190,39 +3196,66 @@ class BudgetService {
       throw new Error('EXPENSE_MISSING_BUDGET_INFO');
     }
 
-    // Verify budget line exists and belongs to the budget
+    const companyId = expense.company || expense.company_id;
+    const budget = await Budget.findOne({
+      _id: expense.budget_id,
+      company_id: companyId,
+    });
+    if (!budget) {
+      throw new Error('BUDGET_NOT_FOUND');
+    }
+    if (!['approved', 'active', 'locked'].includes(budget.status)) {
+      throw new Error('BUDGET_NOT_ACTIVE');
+    }
+
+    // Verify budget line exists, belongs to this budget and uses the same
+    // account as the expense so actuals and the reservation hit one allocation.
     const budgetLine = await BudgetLine.findOne({
       _id: expense.budget_line_id,
       budget_id: expense.budget_id,
-      company_id: expense.company || expense.company_id
+      company_id: companyId
     });
 
     if (!budgetLine) {
       throw new Error('BUDGET_LINE_NOT_FOUND');
     }
+    if (String(budgetLine.account_id) !== String(expense.expense_account_id)) {
+      throw new Error('BUDGET_ACCOUNT_MISMATCH');
+    }
 
-    // Calculate remaining budget for the line
-    const currentBudgeted = parseFloat(budgetLine.budgeted_amount?.toString() || '0');
-    const totalAmount = expense.total_amount || expense.amount || 0;
+    const totalAmount = Math.round(Number(expense.total_amount || expense.amount || 0) * 100) / 100;
+    if (!Number.isFinite(totalAmount) || totalAmount <= 0) {
+      throw new Error('EXPENSE_AMOUNT_INVALID');
+    }
 
-    // Check if there's enough budget remaining
-    const companyId = expense.company || expense.company_id;
-    const existingEncumbrances = await Encumbrance.aggregate([
-      {
-        $match: {
-          budget_line_id: new mongoose.Types.ObjectId(expense.budget_line_id),
-          company_id: new mongoose.Types.ObjectId(companyId),
-          status: { $in: ['active', 'partially_liquidated'] }
-        }
+    // Availability must subtract posted actuals and only the still-open part of
+    // other commitments. Summing original encumbrance amounts would either
+    // double-count partially received orders or free a fully liquidated amount
+    // for spending again.
+    const openCommitmentTotals = await dbClient().encumbrance.aggregate({
+      where: {
+        companyId: String(companyId),
+        budgetLineId: String(expense.budget_line_id),
+        status: { in: ['active', 'partially_liquidated'] },
       },
-      { $group: { _id: null, total: { $sum: '$encumbered_amount' } } }
-    ]);
+      _sum: { remainingAmount: true },
+    });
+    const totalEncumbered = Number(openCommitmentTotals._sum.remainingAmount || 0);
+    const currentBudgeted = Number(budgetLine.budgeted_amount || 0);
+    const currentActual = Number(budgetLine.actual_amount || 0);
+    const remainingBudget = Math.max(0, currentBudgeted - currentActual - totalEncumbered);
 
-    const totalEncumbered = existingEncumbrances[0]?.total ? parseFloat(existingEncumbrances[0].total.toString()) : 0;
-    const remainingBudget = currentBudgeted - totalEncumbered;
-
-    if (totalAmount > remainingBudget) {
+    if (totalAmount > remainingBudget + 0.0001) {
       throw new Error('INSUFFICIENT_BUDGET_FUNDS');
+    }
+
+    const existingEncumbrance = await Encumbrance.findOne({
+      company_id: companyId,
+      source_type: 'expense_request',
+      source_id: expense._id.toString(),
+    });
+    if (existingEncumbrance) {
+      throw new Error('ENCUMBRANCE_ALREADY_EXISTS');
     }
 
     // Create encumbrance
@@ -3247,6 +3280,12 @@ class BudgetService {
 
     await encumbrance.save();
 
+    // Keep the line-level balance used by project summaries in sync with the
+    // detailed encumbrance ledger. The outer expense transaction makes these
+    // writes atomic with the expense and the reservation record.
+    budgetLine.encumbered_amount = (Number(budgetLine.encumbered_amount || 0) + totalAmount).toFixed(2);
+    await budgetLine.save();
+
     // Update expense with encumbrance reference
     await Expense.findByIdAndUpdate(expense._id, {
       encumbrance_id: encumbrance._id
@@ -3255,11 +3294,13 @@ class BudgetService {
     return {
       encumbrance_id: encumbrance._id,
       encumbered_amount: totalAmount,
-      remaining_budget: remainingBudget - totalAmount
+      remaining_budget: Math.max(0, remainingBudget - totalAmount)
     };
   }
 
   static async liquidateEncumbranceFromExpense(expense, userId, paymentInfo = {}) {
+    const { runInTransaction } = require('./transactionService');
+    return runInTransaction(async () => {
     if (!expense.encumbrance_id) {
       throw new Error('EXPENSE_NO_ENCUMBRANCE');
     }
@@ -3323,9 +3364,12 @@ class BudgetService {
       remaining_amount: encumbrance.remaining_amount,
       status: encumbrance.status
     };
+    }, { isolationLevel: 'Serializable' });
   }
 
   static async releaseEncumbranceFromExpense(expenseId, reason, userId) {
+    const { runInTransaction } = require('./transactionService');
+    return runInTransaction(async () => {
     const expense = await Expense.findById(expenseId);
     if (!expense || !expense.encumbrance_id) {
       throw new Error('EXPENSE_NO_ENCUMBRANCE');
@@ -3350,20 +3394,35 @@ class BudgetService {
 
     await encumbrance.save();
 
-    // Clear encumbrance reference from expense
-    await Expense.findByIdAndUpdate(expenseId, {
-      encumbrance_id: null
+    const budgetLine = await BudgetLine.findOne({
+      _id: encumbrance.budget_line_id,
+      budget_id: encumbrance.budget_id,
+      company_id: expense.company || expense.company_id,
     });
+    if (!budgetLine) {
+      throw new Error('BUDGET_LINE_NOT_FOUND');
+    }
+    const currentLineEncumbered = Number(budgetLine.encumbered_amount || 0);
+    budgetLine.encumbered_amount = Math.max(0, currentLineEncumbered - remainingAmount).toFixed(2);
+    await budgetLine.save();
+
+    // Clear encumbrance reference from expense
+    expense.encumbrance_id = null;
+    await expense.save();
 
     return {
       encumbrance_id: encumbrance._id,
       released_amount: remainingAmount,
       reason
     };
+
+    }, { isolationLevel: 'Serializable' });
   }
 
   // ── GENERAL ENCUMBRANCE METHODS ─────────────────────────────────────────
   static async createEncumbrance(companyId, data, userId) {
+    const { runInTransaction } = require('./transactionService');
+    return runInTransaction(async () => {
     const { budget_id, budget_line_id, account_id, source_type, source_id, source_number, description, amount, expected_liquidation_date, notes } = data;
 
     if (!budget_id || !budget_line_id || !account_id || !source_type || !source_id || !amount || !description) {
@@ -3391,26 +3450,30 @@ class BudgetService {
       throw new Error('BUDGET_LINE_NOT_FOUND');
     }
 
-    // Calculate remaining budget for the line
-    const currentBudgeted = parseFloat(budgetLine.budgeted_amount?.toString() || '0');
-    const totalAmount = parseFloat(amount);
+    if (String(budgetLine.account_id) !== String(account_id)) {
+      throw new Error('BUDGET_ACCOUNT_MISMATCH');
+    }
 
-    // Check if there's enough budget remaining
-    const existingEncumbrances = await Encumbrance.aggregate([
-      {
-        $match: {
-          budget_line_id: new mongoose.Types.ObjectId(budget_line_id),
-          company_id: new mongoose.Types.ObjectId(companyId),
-          status: { $in: ['active', 'partially_liquidated'] }
-        }
+    const totalAmount = Math.round(Number(amount) * 100) / 100;
+    if (!Number.isFinite(totalAmount) || totalAmount <= 0) throw new Error('ENCUMBRANCE_AMOUNT_INVALID');
+
+    // The effective balance is budget minus actuals minus still-open
+    // commitments. Liquidated commitments are represented by actual_amount,
+    // so they must not become available again after their encumbrance closes.
+    const openCommitmentTotals = await dbClient().encumbrance.aggregate({
+      where: {
+        companyId: String(companyId),
+        budgetLineId: String(budget_line_id),
+        status: { in: ['active', 'partially_liquidated'] },
       },
-      { $group: { _id: null, total: { $sum: '$encumbered_amount' } } }
-    ]);
+      _sum: { remainingAmount: true },
+    });
+    const totalEncumbered = Number(openCommitmentTotals._sum.remainingAmount || 0);
+    const currentBudgeted = Number(budgetLine.budgeted_amount || 0);
+    const currentActual = Number(budgetLine.actual_amount || 0);
+    const remainingBudget = Math.max(0, currentBudgeted - currentActual - totalEncumbered);
 
-    const totalEncumbered = existingEncumbrances[0]?.total ? parseFloat(existingEncumbrances[0].total.toString()) : 0;
-    const remainingBudget = currentBudgeted - totalEncumbered;
-
-    if (totalAmount > remainingBudget) {
+    if (totalAmount > remainingBudget + 0.0001) {
       throw new Error('INSUFFICIENT_BUDGET');
     }
 
@@ -3455,9 +3518,12 @@ class BudgetService {
     await budgetLine.save();
 
     return encumbrance;
+    }, { isolationLevel: 'Serializable' });
   }
 
   static async liquidateEncumbrance(companyId, sourceType, sourceId, data, userId) {
+    const { runInTransaction } = require('./transactionService');
+    return runInTransaction(async () => {
     const { document_type, document_id, document_number, amount, date, notes, budget_line_id, encumbrance_id } = data;
 
     if (!document_type || !document_id || !amount) {
@@ -3530,6 +3596,8 @@ class BudgetService {
     }
 
     return encumbrance;
+
+    }, { isolationLevel: 'Serializable' });
   }
 
   static async getEncumbrances(companyId, budgetId, filters = {}) {
@@ -3586,6 +3654,8 @@ class BudgetService {
   }
 
   static async releaseEncumbrance(companyId, sourceType, sourceId, reason, userId, encumbranceId = null) {
+    const { runInTransaction } = require('./transactionService');
+    return runInTransaction(async () => {
     const lookup = {
       source_type: sourceType,
       source_id: sourceId.toString(),
@@ -3626,9 +3696,13 @@ class BudgetService {
     }
 
     return encumbrance;
+
+    }, { isolationLevel: 'Serializable' });
   }
 
   static async adjustEncumbrance(companyId, encumbranceId, newAmount, reason, userId) {
+    const { runInTransaction } = require('./transactionService');
+    return runInTransaction(async () => {
     const encumbrance = await Encumbrance.findOne({
       _id: encumbranceId,
       company_id: companyId
@@ -3643,40 +3717,35 @@ class BudgetService {
     }
 
     const currentLiquidated = parseFloat(encumbrance.liquidated_amount?.toString() || '0');
-    const newAmountNum = parseFloat(newAmount);
+    const newAmountNum = Math.round(Number(newAmount) * 100) / 100;
 
-    if (newAmountNum < currentLiquidated) {
+    if (!Number.isFinite(newAmountNum) || newAmountNum <= 0 || newAmountNum < currentLiquidated) {
       throw new Error('NEW_AMOUNT_BELOW_LIQUIDATED');
     }
 
-    // Check if there's enough budget for the increase
-    if (newAmountNum > parseFloat(encumbrance.encumbered_amount?.toString() || '0')) {
-      const budgetLine = await BudgetLine.findById(encumbrance.budget_line_id);
-      if (budgetLine) {
-        const currentBudgeted = parseFloat(budgetLine.budgeted_amount?.toString() || '0');
-        const currentEncumbered = parseFloat(budgetLine.encumbered_amount?.toString() || '0');
-        const additionalAmount = newAmountNum - parseFloat(encumbrance.encumbered_amount?.toString() || '0');
+    const budgetLine = await BudgetLine.findOne({
+      _id: encumbrance.budget_line_id,
+      budget_id: encumbrance.budget_id,
+      company_id: companyId,
+    });
+    if (!budgetLine) throw new Error('BUDGET_LINE_NOT_FOUND');
 
-        // Get existing encumbrances on this line
-        const existingEncumbrances = await Encumbrance.aggregate([
-          {
-            $match: {
-              budget_line_id: encumbrance.budget_line_id,
-              company_id: new mongoose.Types.ObjectId(companyId),
-              _id: { $ne: encumbrance._id },
-              status: { $in: ['active', 'partially_liquidated'] }
-            }
-          },
-          { $group: { _id: null, total: { $sum: '$encumbered_amount' } } }
-        ]);
-
-        const totalOtherEncumbered = existingEncumbrances[0]?.total ? parseFloat(existingEncumbrances[0].total.toString()) : 0;
-        const remainingBudget = currentBudgeted - totalOtherEncumbered;
-
-        if (additionalAmount > remainingBudget) {
-          throw new Error('INSUFFICIENT_BUDGET_FOR_ADJUSTMENT');
-        }
-      }
+    const otherCommitmentTotals = await dbClient().encumbrance.aggregate({
+      where: {
+        companyId: String(companyId),
+        budgetLineId: String(encumbrance.budget_line_id),
+        id: { not: String(encumbrance._id) },
+        status: { in: ['active', 'partially_liquidated'] },
+      },
+      _sum: { remainingAmount: true },
+    });
+    const otherRemainingCommitments = Number(otherCommitmentTotals._sum.remainingAmount || 0);
+    const currentBudgeted = Number(budgetLine.budgeted_amount || 0);
+    const currentActual = Number(budgetLine.actual_amount || 0);
+    const availableForThisCommitment = Math.max(0, currentBudgeted - currentActual - otherRemainingCommitments);
+    const newRemainingAmount = Math.max(0, newAmountNum - currentLiquidated);
+    if (newRemainingAmount > availableForThisCommitment + 0.0001) {
+      throw new Error('INSUFFICIENT_BUDGET_FOR_ADJUSTMENT');
     }
 
     const oldAmount = parseFloat(encumbrance.encumbered_amount?.toString() || '0');
@@ -3691,15 +3760,13 @@ class BudgetService {
 
     // Update budget line encumbered amount
     if (encumbrance.budget_line_id) {
-      const budgetLine = await BudgetLine.findById(encumbrance.budget_line_id);
-      if (budgetLine) {
-        const currentEncumbered = parseFloat(budgetLine.encumbered_amount?.toString() || '0');
-        budgetLine.encumbered_amount = (currentEncumbered + difference).toString();
-        await budgetLine.save();
-      }
+      const currentEncumbered = parseFloat(budgetLine.encumbered_amount?.toString() || '0');
+      budgetLine.encumbered_amount = Math.max(0, currentEncumbered + difference).toFixed(2);
+      await budgetLine.save();
     }
 
     return encumbrance;
+    }, { isolationLevel: 'Serializable' });
   }
 }
 

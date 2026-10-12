@@ -308,6 +308,10 @@ model SystemSettings {
   notifyOnLowStock               Boolean  @default(true) @map("notify_on_low_stock")
   notifyOnOverdueInvoice         Boolean  @default(true) @map("notify_on_overdue_invoice")
   overdueInvoiceAlertDays        Int      @default(7) @map("overdue_invoice_alert_days")
+  posOfflineEnabled              Boolean  @default(false) @map("pos_offline_enabled")
+  posOfflineMaxHours             Int      @default(24) @map("pos_offline_max_hours")
+  posOfflineQueueLimit           Float    @default(1000000) @map("pos_offline_queue_limit")
+  posNegativeStockEscalationDays Int      @default(3) @map("pos_negative_stock_escalation_days")
   lastUpdatedBy                  String?  @map("last_updated_by") @db.Char(24)
   createdAt                      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt                      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
@@ -515,6 +519,72 @@ model PosSaleRequestRecovery {
   @@unique([companyId, replacementRequestKey])
   @@index([companyId, originalRequestKey, createdAt])
   @@map("pos_sale_request_recoveries")
+}
+
+model PosOfflineSnapshot {
+  id           String   @id @db.Char(24)
+  companyId    String   @map("company_id") @db.Char(24)
+  userId       String   @map("user_id") @db.Char(24)
+  deviceId     String   @map("device_id") @db.VarChar(160)
+  registerId   String   @map("register_id") @db.Char(24)
+  warehouseId  String   @map("warehouse_id") @db.Char(24)
+  tillSessionId String  @map("till_session_id") @db.Char(24)
+  snapshotData Json     @map("snapshot_data")
+  queueLimit   Decimal  @map("queue_limit") @db.Decimal(19, 2)
+  usedValue    Decimal  @default(0) @map("used_value") @db.Decimal(19, 2)
+  issuedAt     DateTime @map("issued_at") @db.Timestamptz(3)
+  expiresAt    DateTime @map("expires_at") @db.Timestamptz(3)
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([companyId, userId, deviceId, registerId, expiresAt])
+  @@map("pos_offline_snapshots")
+}
+
+model PosOfflineSale {
+  id              String   @id @db.Char(24)
+  companyId       String   @map("company_id") @db.Char(24)
+  snapshotId      String   @map("snapshot_id") @db.Char(24)
+  offlineSaleId   String   @map("offline_sale_id") @db.VarChar(100)
+  requestKey      String   @map("request_key") @db.VarChar(100)
+  cashierId       String   @map("cashier_id") @db.Char(24)
+  deviceId        String   @map("device_id") @db.VarChar(160)
+  registerId      String   @map("register_id") @db.Char(24)
+  warehouseId     String   @map("warehouse_id") @db.Char(24)
+  invoiceId       String   @map("invoice_id") @db.Char(24)
+  total           Decimal  @db.Decimal(19, 2)
+  payloadHash     String   @map("payload_hash") @db.Char(64)
+  reportedSaleAt  DateTime @map("reported_sale_at") @db.Timestamptz(3)
+  syncedAt        DateTime @default(now()) @map("synced_at") @db.Timestamptz(3)
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([companyId, offlineSaleId])
+  @@unique([companyId, requestKey])
+  @@index([companyId, snapshotId, syncedAt])
+  @@index([companyId, registerId, syncedAt])
+  @@map("pos_offline_sales")
+}
+
+model PosOfflineConflict {
+  id               String    @id @db.Char(24)
+  companyId        String    @map("company_id") @db.Char(24)
+  offlineSaleId    String    @map("offline_sale_id") @db.VarChar(100)
+  invoiceId        String    @map("invoice_id") @db.Char(24)
+  productId        String    @map("product_id") @db.Char(24)
+  warehouseId      String    @map("warehouse_id") @db.Char(24)
+  conflictType     String    @map("conflict_type") @db.VarChar(24)
+  details          Json
+  status           String    @default("open") @db.VarChar(24)
+  escalationAt     DateTime  @map("escalation_at") @db.Timestamptz(3)
+  resolvedAt       DateTime? @map("resolved_at") @db.Timestamptz(3)
+  resolvedById     String?   @map("resolved_by_id") @db.Char(24)
+  resolution       String?   @db.VarChar(40)
+  resolutionReason String?   @map("resolution_reason")
+  createdAt        DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt        DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@index([companyId, status, escalationAt])
+  @@index([companyId, invoiceId])
+  @@map("pos_offline_conflicts")
 }
 
 model InterestAccrual {
@@ -763,8 +833,12 @@ model Company {
   tillSessions                TillSession[]
   posRegisters                PosRegister[]
   posPromotions               PosPromotion[]
+  posStoredValueAccounts      PosStoredValueAccount[]
+  posStoredValueLedger        PosStoredValueLedger[]
   posManagerApprovals          PosManagerApproval[]
   posHeldSales                PosHeldSale[]
+  priceLists                  PriceList[]
+  priceListItems              PriceListItem[]
   timesheets                  Timesheet[]
   users                       User[]
   warehouses                  Warehouse[]
@@ -1100,6 +1174,53 @@ model PosPromotion {
   @@map("pos_promotions")
 }
 
+/// Monetary stored value accepted as POS tender. Codes are stored as hashes;
+/// all balance movements are kept in PosStoredValueLedger for auditability.
+model PosStoredValueAccount {
+  id             String                 @id @db.Char(24)
+  companyId      String                 @map("company_id") @db.Char(24)
+  clientId       String?                @map("client_id") @db.Char(24)
+  kind           String                 @db.VarChar(20)
+  codeHash       String?                @map("code_hash") @db.VarChar(64)
+  codeSuffix     String?                @map("code_suffix") @db.VarChar(8)
+  currencyCode   String                 @default("RWF") @map("currency_code") @db.VarChar(3)
+  balance        Decimal                @default(0) @db.Decimal(19, 2)
+  isActive       Boolean                @default(true) @map("is_active")
+  expiresAt      DateTime?              @map("expires_at") @db.Timestamptz(3)
+  createdById    String?                @map("created_by_id") @db.Char(24)
+  createdAt      DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime               @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company        Company                @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  ledger         PosStoredValueLedger[]
+
+  @@unique([companyId, codeHash])
+  @@unique([companyId, clientId, kind, currencyCode])
+  @@index([companyId, kind, isActive])
+  @@index([companyId, clientId, kind])
+  @@map("pos_stored_value_accounts")
+}
+
+model PosStoredValueLedger {
+  id             String               @id @db.Char(24)
+  companyId      String               @map("company_id") @db.Char(24)
+  accountId      String               @map("account_id") @db.Char(24)
+  invoiceId      String?              @map("invoice_id") @db.Char(24)
+  kind           String               @db.VarChar(20)
+  entryType      String               @map("entry_type") @db.VarChar(20)
+  amount         Decimal              @db.Decimal(19, 2)
+  balanceAfter   Decimal              @map("balance_after") @db.Decimal(19, 2)
+  reference      String?              @db.VarChar(120)
+  notes          String?
+  createdById    String?              @map("created_by_id") @db.Char(24)
+  createdAt      DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  company        Company              @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  account        PosStoredValueAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, accountId, createdAt(sort: Desc)])
+  @@index([companyId, invoiceId])
+  @@map("pos_stored_value_ledger")
+}
+
 /// Customer prepayments recognised as revenue over time. `recognitions` holds the
 /// schedule rows ({ _id, amount, date, description, status, journalEntryId }).
 model DeferredRevenue {
@@ -1191,6 +1312,7 @@ model Category {
 model Warehouse {
   id                    String                @id @db.Char(24)
   companyId             String                @map("company_id") @db.Char(24)
+  priceListId           String?               @map("price_list_id") @db.Char(24)
   name                  String
   code                  String
   description           String?
@@ -1230,13 +1352,51 @@ model Warehouse {
   stockSerialNumbers    StockSerialNumber[]
   transfersFrom         StockTransfer[]       @relation("TransferFrom")
   transfersTo           StockTransfer[]       @relation("TransferTo")
+  priceList             PriceList?             @relation(fields: [priceListId], references: [id], onDelete: SetNull)
   company               Company               @relation(fields: [companyId], references: [id], onDelete: Cascade)
 
   @@unique([companyId, code])
   @@index([companyId])
+  @@index([companyId, priceListId])
   @@index([companyId, isActive])
   @@index([companyId, rraBranchId])
   @@map("warehouses")
+}
+
+model PriceList {
+  id          String          @id @db.Char(24)
+  companyId   String          @map("company_id") @db.Char(24)
+  name        String          @db.VarChar(120)
+  description String          @default("")
+  isActive    Boolean         @default(true) @map("is_active")
+  createdById String?         @map("created_by_id") @db.Char(24)
+  createdAt   DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company     Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  items       PriceListItem[]
+  warehouses  Warehouse[]
+
+  @@unique([companyId, name])
+  @@index([companyId, isActive])
+  @@map("price_lists")
+}
+
+model PriceListItem {
+  id          String    @id @db.Char(24)
+  companyId   String    @map("company_id") @db.Char(24)
+  priceListId String    @map("price_list_id") @db.Char(24)
+  productId   String    @map("product_id") @db.Char(24)
+  price       Decimal   @db.Decimal(19, 4)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  priceList   PriceList @relation(fields: [priceListId], references: [id], onDelete: Cascade)
+  product     Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([priceListId, productId])
+  @@index([companyId, priceListId])
+  @@index([companyId, productId])
+  @@map("price_list_items")
 }
 
 model Client {
@@ -1401,6 +1561,7 @@ model Product {
   stockMovements        StockMovement[]
   stockSerialNumbers    StockSerialNumber[]
   transferLines         StockTransferLine[]
+  priceListItems        PriceListItem[]
 
   @@unique([companyId, sku])
   @@index([companyId])
@@ -1703,6 +1864,7 @@ model StockTransfer {
   toWarehouseId   String              @map("to_warehouse_id") @db.Char(24)
   status          StockTransferStatus @default(draft)
   transferDate    DateTime            @default(now()) @map("transfer_date") @db.Timestamptz(3)
+  expectedArrivalAt DateTime?          @map("expected_arrival_at") @db.Timestamptz(3)
   completedDate   DateTime?           @map("completed_date") @db.Timestamptz(3)
   reason          StockTransferReason @default(rebalance)
   notes           String?
@@ -1711,6 +1873,11 @@ model StockTransfer {
   receivedById    String?             @map("received_by") @db.Char(24)
   receivedDate    DateTime?           @map("received_date") @db.Timestamptz(3)
   receivedNotes   String?             @map("received_notes")
+  discrepancyById String?             @map("discrepancy_by") @db.Char(24)
+  discrepancyAt   DateTime?           @map("discrepancy_at") @db.Timestamptz(3)
+  cancelledById   String?             @map("cancelled_by") @db.Char(24)
+  cancelledAt     DateTime?           @map("cancelled_at") @db.Timestamptz(3)
+  inTransitValue  Decimal             @default(0) @map("in_transit_value") @db.Decimal(19, 2)
   referenceNumber String?             @map("reference_number")
   signatures      Json                @default("[]")
   journalEntryId  String?             @map("journal_entry_id") @db.Char(24)
@@ -1719,6 +1886,7 @@ model StockTransfer {
   createdAt       DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt       DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
   lines           StockTransferLine[]
+  discrepancies   StockTransferDiscrepancy[]
   company         Company             @relation(fields: [companyId], references: [id], onDelete: Cascade)
   fromWarehouse   Warehouse           @relation("TransferFrom", fields: [fromWarehouseId], references: [id])
   journalEntry    JournalEntry?       @relation(fields: [journalEntryId], references: [id])
@@ -1738,6 +1906,11 @@ model StockTransferLine {
   productId   String        @map("product_id") @db.Char(24)
   qty         Decimal       @db.Decimal(19, 4)
   unitCost    Decimal?      @map("unit_cost") @db.Decimal(19, 6)
+  qtyReceived Decimal       @default(0) @map("qty_received") @db.Decimal(19, 4)
+  inTransitQty Decimal      @default(0) @map("in_transit_qty") @db.Decimal(19, 4)
+  inTransitValue Decimal    @default(0) @map("in_transit_value") @db.Decimal(19, 2)
+  inventoryIdentity Json    @default("{}") @map("inventory_identity")
+  receivedIdentity Json     @default("{}") @map("received_identity")
   notes       String?
   createdById String?       @map("created_by") @db.Char(24)
   createdAt   DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
@@ -1745,10 +1918,30 @@ model StockTransferLine {
   company     Company       @relation(fields: [companyId], references: [id], onDelete: Cascade)
   product     Product       @relation(fields: [productId], references: [id])
   transfer    StockTransfer @relation(fields: [transferId], references: [id], onDelete: Cascade)
+  discrepancies StockTransferDiscrepancy[]
 
   @@index([transferId])
   @@index([companyId, transferId])
   @@map("stock_transfer_lines")
+}
+
+model StockTransferDiscrepancy {
+  id            String        @id @db.Char(24)
+  companyId     String        @map("company_id") @db.Char(24)
+  transferId    String        @map("transfer_id") @db.Char(24)
+  transferLineId String       @map("transfer_line_id") @db.Char(24)
+  expectedQty   Decimal       @map("expected_qty") @db.Decimal(19, 4)
+  receivedQty   Decimal       @map("received_qty") @db.Decimal(19, 4)
+  varianceQty   Decimal       @map("variance_qty") @db.Decimal(19, 4)
+  notes         String?
+  recordedById  String        @map("recorded_by") @db.Char(24)
+  recordedAt    DateTime      @default(now()) @map("recorded_at") @db.Timestamptz(3)
+  createdAt     DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  transfer      StockTransfer @relation(fields: [transferId], references: [id], onDelete: Cascade)
+  transferLine  StockTransferLine @relation(fields: [transferLineId], references: [id], onDelete: Cascade)
+
+  @@index([companyId, transferId])
+  @@map("stock_transfer_discrepancies")
 }
 
 model StockAudit {
@@ -2295,13 +2488,16 @@ model InvoiceLine {
   unitCost     Decimal    @default(0) @map("unit_cost") @db.Decimal(19, 6)
   cogsAmount   Decimal    @default(0) @map("cogs_amount") @db.Decimal(19, 2)
   warehouseId  String?    @map("warehouse_id") @db.Char(24)
+  projectId    String?    @map("project_id") @db.Char(24)
   qtyCredited  Decimal    @default(0) @map("qty_credited") @db.Decimal(19, 4)
   invoice      Invoice    @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
   product      Product    @relation(fields: [productId], references: [id])
   warehouse    Warehouse? @relation(fields: [warehouseId], references: [id])
+  project      Project?   @relation(fields: [projectId], references: [id], onDelete: SetNull)
 
   @@index([invoiceId])
   @@index([companyId, productId])
+  @@index([companyId, projectId])
   @@map("invoice_lines")
 }
 
@@ -4432,6 +4628,7 @@ model Project {
   documents          ProjectDocument[]
   laborEntries       ProjectLaborEntry[] @relation("ProjectLaborProject")
   laborTaskEntries   ProjectLaborEntry[] @relation("ProjectLaborTask")
+  invoiceLines       InvoiceLine[]
   taxRate            TaxRate?                  @relation("ProjectTaxRate", fields: [taxRateId], references: [id], onDelete: SetNull)
 
   @@unique([companyId, projectCode])
@@ -5349,6 +5546,7 @@ enum StockSerialStatus {
   in_stock
   reserved
   dispatched
+  in_transit
   returned
   scrapped
 }

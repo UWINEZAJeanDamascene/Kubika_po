@@ -16,6 +16,11 @@ const FIELD_MAP = {
   companyId: { target: 'companyId', isId: true },
   transfer: { target: 'transferId', isId: true },
   product: { target: 'productId', isId: true },
+  qtyReceived: { target: 'qtyReceived' },
+  inTransitQty: { target: 'inTransitQty' },
+  inTransitValue: { target: 'inTransitValue' },
+  inventoryIdentity: { target: 'inventoryIdentity' },
+  receivedIdentity: { target: 'receivedIdentity' },
   createdAt: { target: 'createdAt' },
   updatedAt: { target: 'updatedAt' },
 };

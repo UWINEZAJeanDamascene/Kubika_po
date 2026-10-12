@@ -16,7 +16,15 @@ jest.mock('../models/StockSerialNumber', () => ({ find: jest.fn(), updateMany: j
 jest.mock('../models/StockBatch', () => ({ find: jest.fn() }));
 jest.mock('../models/InventoryBatch', () => ({ find: jest.fn() }));
 jest.mock('../services/transactionService', () => ({ runInTransaction: jest.fn() }));
-jest.mock('../services/inventoryService', () => ({ consume: jest.fn(), reduceLayers: jest.fn() }));
+jest.mock('../services/posRegisterService', () => ({
+  findClaimedRegister: jest.fn(async (_companyId, registerId) => ({ _id: registerId, code: registerId })),
+  registerClaimRequiredError: () => Object.assign(new Error('Register claim required'), { statusCode: 403 }),
+}));
+jest.mock('../services/inventoryService', () => ({
+  consume: jest.fn(),
+  consumeAvailable: jest.fn(),
+  reduceLayers: jest.fn(),
+}));
 jest.mock('../services/journalService', () => ({
   getMappedAccountCode: jest.fn(),
   createDebitLine: jest.fn((account, amount, desc) => ({ accountCode: account, debit: amount, credit: 0, description: desc })),
@@ -54,6 +62,7 @@ const cacheService = require('../services/cacheService');
 const { consumeApproval } = require('../controllers/posManagerApprovalController');
 const { dbClient } = require('../lib/prisma');
 const { createDirectSale } = require('../controllers/salesLegacyController');
+const { issueCapability } = require('../services/posOfflineCapabilityService');
 const {
   IDS,
   mockRes,
@@ -218,6 +227,44 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     );
   });
 
+  test('rejects client prices that do not match the warehouse-assigned price list', async () => {
+    const { db } = stubHappyPathDeps();
+    db.$queryRawUnsafe.mockImplementation(async (sql) => (
+      String(sql).includes('FROM warehouses w')
+        ? [{ priceListId: '888888888888888888888888', productId: IDS.product, price: '1200' }]
+        : []
+    ));
+    const res = mockRes();
+
+    await createDirectSale(makeReq({
+      body: checkoutBody({ items: [saleLine({ unitPrice: 1000, catalogUnitPrice: 1000 })] }),
+    }), res, jest.fn());
+
+    expect(res.statusCode).toBe(409);
+    expect(res.body.code).toBe('POS_PRICE_CHANGED');
+    expect(Invoice.create).not.toHaveBeenCalled();
+  });
+
+  test('uses the warehouse-assigned product price as the sale-time invoice snapshot', async () => {
+    const { db } = stubHappyPathDeps();
+    db.$queryRawUnsafe.mockImplementation(async (sql) => (
+      String(sql).includes('FROM warehouses w')
+        ? [{ priceListId: '888888888888888888888888', productId: IDS.product, price: '1200' }]
+        : []
+    ));
+    const res = mockRes();
+
+    await createDirectSale(makeReq({
+      body: checkoutBody({
+        items: [saleLine({ unitPrice: 1200, catalogUnitPrice: 1200 })],
+        paymentAmount: 1416,
+      }),
+    }), res, (error) => { throw error; });
+
+    expect(res.statusCode).toBe(201);
+    expect(Invoice.create.mock.calls[0][0][0].lines[0].unitPrice).toBe(1200);
+  });
+
   test('rejects unpaid walk-in sales before creating a customer or invoice', async () => {
     stubHappyPathDeps();
     const res = mockRes();
@@ -364,7 +411,9 @@ describe('POS E2E — checkout (sales-legacy)', () => {
   test('idempotent retry replays the completed invoice instead of double-selling', async () => {
     CurrencyService.getCompanyBase.mockResolvedValue('RWF');
     const body = checkoutBody();
-    const payloadHash = require('crypto').createHash('sha256').update(JSON.stringify(body)).digest('hex');
+    const hashPayload = { ...body };
+    delete hashPayload.deviceId;
+    const payloadHash = require('crypto').createHash('sha256').update(JSON.stringify(hashPayload)).digest('hex');
     const priorInvoice = buildInvoiceDoc({
       grandTotal: 1180,
       client: IDS.client,
@@ -473,5 +522,106 @@ describe('POS E2E — checkout (sales-legacy)', () => {
     await createDirectSale(makeReq({ body: checkoutBody() }), res, jest.fn());
     expect(res.statusCode).toBe(409);
     expect(res.body.code).toBe('ERR_INSUFFICIENT_STOCK');
+  });
+
+  test('posts signed offline checkout against snapshot prices and records a stock conflict', async () => {
+    const { db } = stubHappyPathDeps();
+    process.env.JWT_SECRET = 'unit-test-secret-that-is-at-least-32-characters';
+    const issuedAt = Date.now() - 1000;
+    const expiresAt = issuedAt + 24 * 60 * 60 * 1000;
+    const snapshotId = '333333333333333333333333';
+    const snapshotData = {
+      products: {
+        [IDS.product]: {
+          name: 'Widget at snapshot',
+          sku: 'WID-SNAP',
+          unit: 'pcs',
+          price: 1000,
+          taxRate: 18,
+          taxCode: 'B',
+          isStockable: true,
+          trackingType: 'none',
+          averageCost: 400,
+          availableStock: 3,
+          serialNumbers: [],
+        },
+      },
+      promotions: [],
+      negativeStockAllowed: false,
+      escalationDays: 3,
+    };
+    db.$queryRawUnsafe.mockImplementation(async (sql) => {
+      const statement = String(sql);
+      if (statement.includes('SELECT request_key AS')) return [];
+      if (statement.includes('FROM pos_offline_snapshots WHERE id = $1 AND company_id = $2 FOR UPDATE')) {
+        return [{ queueLimit: 10000, usedValue: 0 }];
+      }
+      if (statement.includes('FROM pos_offline_snapshots WHERE id =')) {
+        return [{
+          id: snapshotId,
+          warehouseId: IDS.warehouse,
+          tillSessionId: IDS.till,
+          snapshotData,
+          queueLimit: 10000,
+          expiresAt: new Date(expiresAt),
+        }];
+      }
+      if (statement.includes('INSERT INTO pos_sale_requests')) return [{ requestKey: 'claimed' }];
+      if (statement.includes('INSERT INTO stock_levels')) return [{ previousStock: 0, newStock: -1, reservedStock: 0 }];
+      return [];
+    });
+    inventoryService.consumeAvailable.mockResolvedValue({ allocations: [], consumed: 0, shortfall: 1, totalCost: 0 });
+    Product.find.mockReturnValue(leanFind([catalogProduct({ sellingPrice: 1400 })]));
+    StockLevel.find.mockReturnValue({ lean: jest.fn().mockResolvedValue(stockLevelRows(0, 0)) });
+    const offlineSaleId = 'offline-sale-00000001';
+    const requestData = checkoutBody({
+      deviceId: IDS.deviceId,
+      offlineSnapshotCapability: issueCapability({
+        id: snapshotId,
+        companyId: IDS.company,
+        userId: IDS.cashier,
+        deviceId: IDS.deviceId,
+        registerId: IDS.registerId,
+        warehouseId: IDS.warehouse,
+        tillSessionId: IDS.till,
+        issuedAt,
+        expiresAt,
+      }),
+      offlineSaleId,
+      offlineCreatedAt: new Date(issuedAt + 500).toISOString(),
+      items: [saleLine({
+        taxRate: 18,
+        taxCode: 'B',
+        unit: 'pcs',
+        catalogUnitPrice: 1000,
+        unitPrice: 1000,
+      })],
+    });
+    const res = mockRes();
+    await createDirectSale(makeReq({
+      body: requestData,
+      headers: { 'Idempotency-Key': 'offline-idempotency-key-0001' },
+    }), res, (error) => { throw error; });
+
+    expect(res.statusCode).toBe(201);
+    expect(res.body.offlineConflictCount).toBe(1);
+    expect(Invoice.create.mock.calls[0][0][0].lines[0].unitPrice).toBe(1000);
+    expect(db.$executeRawUnsafe).toHaveBeenCalledWith(
+      expect.stringContaining('INSERT INTO pos_offline_conflicts'),
+      expect.any(String),
+      IDS.company,
+      offlineSaleId,
+      IDS.invoice,
+      IDS.product,
+      IDS.warehouse,
+      'stock',
+      expect.stringContaining('"shortage":1'),
+      expect.any(Date),
+    );
+    expect(inventoryService.consumeAvailable).toHaveBeenCalled();
+    expect(StockMovement.insertMany).toHaveBeenCalledWith(
+      expect.arrayContaining([expect.objectContaining({ totalCost: 400 })]),
+      expect.objectContaining({ session: null }),
+    );
   });
 });

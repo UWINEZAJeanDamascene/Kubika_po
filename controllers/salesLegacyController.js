@@ -38,11 +38,14 @@ const CurrencyService = require('../services/CurrencyService');
 const cacheService = require('../services/cacheService');
 const emailService = require('../services/emailService');
 const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
-const { createHash } = require('crypto');
+const { createHash, randomBytes } = require('crypto');
 const { dbClient } = require('../lib/prisma');
 const { consumeApproval: consumePosManagerApproval } = require('./posManagerApprovalController');
 const ebmService = require('../services/ebmService');
 const EBMSalesService = require('../services/ebmSalesService');
+const { verifyCapability: verifyPosOfflineCapability } = require('../services/posOfflineCapabilityService');
+const { getWarehousePriceListPrices, effectivePrice } = require('../services/priceListService');
+const { getWarehouseTransferVisibility } = require('../services/posTransferVisibilityService');
 
 function hashPosSalePayload(payload) {
   const canonical = { ...(payload || {}) };
@@ -186,6 +189,7 @@ exports.createDirectSale = async (req, res, next) => {
   let companyId;
   let requestKey = '';
   let payloadHash = '';
+  let offlineContext = null;
   try {
     companyId = req.user.company._id;
     // Mock mode is intentionally manual so development/test checkouts never
@@ -201,6 +205,37 @@ exports.createDirectSale = async (req, res, next) => {
     if (!claimedRegister) throw registerClaimRequiredError();
     payloadHash = hashPosSalePayload(req.body);
     if (requestKey && await replayPosSaleIfPresent(req, res, { companyId, requestKey, payloadHash })) return;
+    if (req.body.offlineSnapshotCapability || req.body.offlineSaleId || req.body.offlineCreatedAt) {
+      const claims = verifyPosOfflineCapability(req.body.offlineSnapshotCapability);
+      const offlineSaleId = String(req.body.offlineSaleId || '').trim();
+      const saleCreatedAt = new Date(req.body.offlineCreatedAt);
+      if (!/^[a-zA-Z0-9_-]{16,100}$/.test(offlineSaleId) || !Number.isFinite(saleCreatedAt.getTime())
+        || saleCreatedAt.getTime() < claims.issuedAt || saleCreatedAt.getTime() > claims.expiresAt
+        || String(claims.companyId) !== String(companyId)
+        || String(claims.userId) !== String(req.user.id)
+        || String(claims.deviceId) !== String(req.body.deviceId || '')
+        || String(claims.registerId) !== String(requestedRegisterId)) {
+        return res.status(403).json({ success: false, code: 'POS_OFFLINE_CAPABILITY_BINDING_INVALID', message: 'The signed offline POS capability does not authorize this cashier, device, register, or sale time.' });
+      }
+      const snapshots = await dbClient().$queryRawUnsafe(
+        'SELECT id, warehouse_id AS "warehouseId", till_session_id AS "tillSessionId", snapshot_data AS "snapshotData", queue_limit AS "queueLimit", expires_at AS "expiresAt" FROM pos_offline_snapshots WHERE id = $1 AND company_id = $2 AND user_id = $3 AND device_id = $4 AND register_id = $5 LIMIT 1',
+        claims.id, companyId, req.user.id, req.body.deviceId, requestedRegisterId,
+      );
+      const snapshot = snapshots[0];
+      if (!snapshot || String(snapshot.warehouseId) !== String(req.body.warehouseId || '')
+        || String(snapshot.tillSessionId) !== String(req.body.tillSession?.id || '')
+        || new Date(snapshot.expiresAt).getTime() !== claims.expiresAt) {
+        return res.status(403).json({ success: false, code: 'POS_OFFLINE_SNAPSHOT_UNAVAILABLE', message: 'The signed offline catalog snapshot is unavailable or does not match this sale.' });
+      }
+      offlineContext = {
+        claims,
+        snapshotId: String(snapshot.id),
+        snapshotData: typeof snapshot.snapshotData === 'string' ? JSON.parse(snapshot.snapshotData) : snapshot.snapshotData,
+        queueLimit: Number(snapshot.queueLimit),
+        offlineSaleId,
+        saleCreatedAt,
+      };
+    }
 
     const invoiceCurrency = await CurrencyService.getCompanyBase(companyId);
     const {
@@ -219,6 +254,10 @@ exports.createDirectSale = async (req, res, next) => {
       tillSession,
       promotionId,
     } = req.body;
+    if (offlineContext && (paymentMethod !== 'cash' || Array.isArray(req.body.payments) && req.body.payments.length
+      || req.body.splitTender === true)) {
+      return res.status(400).json({ success: false, code: 'POS_OFFLINE_CASH_ONLY', message: 'Offline POS accepts only a single cash payment.' });
+    }
 
     // Validation
     if (!Array.isArray(items) || items.length === 0) {
@@ -296,17 +335,34 @@ exports.createDirectSale = async (req, res, next) => {
     } catch (batchErr) {
       console.warn('[createDirectSale] Batch product load failed:', batchErr.message);
     }
+    const priceListPricing = offlineContext
+      ? { priceListId: null, priceByProduct: new Map() }
+      : await getWarehousePriceListPrices(companyId, warehouseId, productIds);
+    let allowNegativeStock = Boolean(offlineContext?.snapshotData.negativeStockAllowed);
+    if (!offlineContext) {
+      const stockPolicy = await dbClient().$queryRawUnsafe(
+        'SELECT allow_negative_stock AS "allowNegativeStock" FROM system_settings WHERE company_id = $1 LIMIT 1',
+        String(companyId),
+      );
+      allowNegativeStock = stockPolicy[0]?.allowNegativeStock === true;
+    }
 
     let promotion = null;
     const promotionDiscountPctByIndex = new Map();
     let promotionDiscountAmount = 0;
     if (promotionId) {
-      const now = new Date();
-      const promotionRows = await dbClient().$queryRawUnsafe(
-        'SELECT id, name, code, discount_type AS "discountType", value FROM pos_promotions WHERE id = $1 AND company_id = $2 AND is_active = TRUE AND starts_at <= $3 AND ends_at > $3',
-        String(promotionId), String(companyId), now,
-      );
-      promotion = promotionRows[0] || null;
+      if (offlineContext) {
+        promotion = (offlineContext.snapshotData.promotions || []).find((entry) => String(entry.id) === String(promotionId)) || null;
+        if (promotion && (offlineContext.saleCreatedAt < new Date(promotion.startsAt)
+          || offlineContext.saleCreatedAt >= new Date(promotion.endsAt))) promotion = null;
+      } else {
+        const now = new Date();
+        const promotionRows = await dbClient().$queryRawUnsafe(
+          'SELECT id, name, code, discount_type AS "discountType", value FROM pos_promotions WHERE id = $1 AND company_id = $2 AND is_active = TRUE AND starts_at <= $3 AND ends_at > $3',
+          String(promotionId), String(companyId), now,
+        );
+        promotion = promotionRows[0] || null;
+      }
       if (!promotion) return res.status(409).json({ success: false, code: 'POS_PROMOTION_UNAVAILABLE', message: 'This promotion is no longer active. Refresh the POS promotions and retry.' });
       const promotionValue = Number(promotion.value);
       const maxPercent = Math.min(100, Math.max(1, Number(process.env.POS_PROMOTION_MAX_PERCENT) || 50));
@@ -317,8 +373,11 @@ exports.createDirectSale = async (req, res, next) => {
       }
       const bases = items.map((item) => {
         const product = productsMap.get(String(item.productId));
+        const snapshotProduct = offlineContext?.snapshotData.products?.[String(item.productId)];
         const quantity = Number(item.quantity);
-        const price = Number(product?.sellingPrice);
+        const price = offlineContext
+          ? Number(snapshotProduct?.price)
+          : product ? effectivePrice(String(product._id), product.sellingPrice, priceListPricing.priceByProduct) : NaN;
         const requestedPrice = item.unitPrice == null ? price : Number(item.unitPrice);
         if (!product || !Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(price)
           || Math.abs(requestedPrice - price) > 0.000001 || Number(item.discountPct || 0) !== 0) return null;
@@ -346,6 +405,7 @@ exports.createDirectSale = async (req, res, next) => {
     const invoiceLines = [];
     const stockUpdates = [];
     const missingProducts = [];
+    const offlineConflicts = [];
     const selectedWarehouseLevels = await StockLevel.find({
       company_id: companyId,
       warehouse_id: warehouseId,
@@ -363,14 +423,28 @@ exports.createDirectSale = async (req, res, next) => {
         continue;
       }
 
+      const snapshotProduct = offlineContext?.snapshotData.products?.[String(item.productId)];
+      if (offlineContext && !snapshotProduct) {
+        return res.status(403).json({ success: false, code: 'POS_OFFLINE_PRODUCT_NOT_IN_SNAPSHOT', message: 'A sale item was not included in the signed offline catalog snapshot.' });
+      }
       const quantity = Number(item.quantity);
-      const productPrice = Number(product.sellingPrice);
+      const productPrice = offlineContext
+        ? Number(snapshotProduct.price)
+        : effectivePrice(String(product._id), product.sellingPrice, priceListPricing.priceByProduct);
       const requestedUnitPrice = item.unitPrice == null ? productPrice : Number(item.unitPrice);
       const requestedDiscountPct = item.discountPct == null ? 0 : Number(item.discountPct);
       const discountPct = promotion
         ? Number(promotionDiscountPctByIndex.get(itemIndex) || 0)
         : requestedDiscountPct;
-      if (item.catalogUnitPrice != null && Math.abs(Number(item.catalogUnitPrice) - productPrice) > 0.000001) {
+      if (offlineContext && (
+        item.catalogUnitPrice == null
+        || Math.abs(Number(item.catalogUnitPrice) - productPrice) > 0.000001
+        || Math.abs(requestedUnitPrice - productPrice) > 0.000001
+        || Number(item.discountPct || 0) !== 0
+      )) {
+        return res.status(403).json({ success: false, code: 'POS_OFFLINE_PRICE_SNAPSHOT_MISMATCH', message: `${snapshotProduct.name} price or discount does not match the signed offline catalog.` });
+      }
+      if (!offlineContext && item.catalogUnitPrice != null && Math.abs(Number(item.catalogUnitPrice) - productPrice) > 0.000001) {
         return res.status(409).json({
           success: false,
           code: 'POS_PRICE_CHANGED',
@@ -399,15 +473,20 @@ exports.createDirectSale = async (req, res, next) => {
         if (!promotion) requiresManagerApproval = true;
       }
       
-      const isStockable = product.isStockable !== false;
+      const isStockable = offlineContext ? snapshotProduct.isStockable !== false : product.isStockable !== false;
       const serialNumbers = Array.isArray(item.serialNumbers)
         ? item.serialNumbers.map((serial) => String(serial).trim().toUpperCase()).filter(Boolean)
         : [];
-      const productTrackingType = product.trackingType === 'serial' || product.trackSerialNumbers
+      const productTrackingType = offlineContext
+        ? snapshotProduct.trackingType
+        : product.trackingType === 'serial' || product.trackSerialNumbers
         ? 'serial'
         : product.trackingType === 'batch' || product.trackBatch
           ? 'batch'
           : (product.trackingType || 'none');
+      if (offlineContext && productTrackingType === 'batch') {
+        return res.status(409).json({ success: false, code: 'POS_OFFLINE_BATCH_TRACKING_UNSUPPORTED', message: `${product.name} uses batch tracking and cannot be sold from this offline POS snapshot.` });
+      }
       if (isStockable && productTrackingType === 'serial') {
         if (serialNumbers.length !== quantity || new Set(serialNumbers).size !== serialNumbers.length) {
           return res.status(400).json({ success: false, code: 'POS_SERIALS_REQUIRED', message: `Enter exactly ${quantity} unique serial number(s) for ${product.name}.` });
@@ -419,7 +498,11 @@ exports.createDirectSale = async (req, res, next) => {
           serialNo: { $in: serialNumbers },
           status: { $in: ['in_stock', 'returned'] },
         }).select('_id serialNo').lean();
-        if (availableSerials.length !== serialNumbers.length) {
+        const signedSerials = new Set((snapshotProduct?.serialNumbers || []).map((serial) => String(serial).toUpperCase()));
+        if (offlineContext && serialNumbers.some((serial) => !signedSerials.has(serial))) {
+          return res.status(403).json({ success: false, code: 'POS_OFFLINE_SERIAL_NOT_IN_SNAPSHOT', message: `A serial number for ${product.name} was not available in the signed offline snapshot.` });
+        }
+        if (availableSerials.length !== serialNumbers.length && !offlineContext) {
           const found = new Set(availableSerials.map((serial) => String(serial.serialNo).toUpperCase()));
           const unavailable = serialNumbers.filter((serial) => !found.has(serial));
           return res.status(409).json({ success: false, code: 'POS_SERIAL_UNAVAILABLE', message: `Serial number(s) unavailable in this warehouse for ${product.name}: ${unavailable.join(', ')}` });
@@ -432,7 +515,8 @@ exports.createDirectSale = async (req, res, next) => {
         const availableStock = stockLevel
           ? Math.max(0, Number(stockLevel.qty_on_hand || 0) - Number(stockLevel.qty_reserved || 0))
           : 0;
-        if (availableStock < quantity) {
+        if (availableStock < quantity && !offlineContext
+          && !(allowNegativeStock && productTrackingType === 'none')) {
           return res.status(409).json({
             success: false,
             code: 'ERR_INSUFFICIENT_STOCK',
@@ -444,7 +528,7 @@ exports.createDirectSale = async (req, res, next) => {
       const subtotal = roundMoney(quantity * unitPrice);
       const discountAmount = roundMoney(subtotal * (discountPct / 100));
       const netAmount = roundMoney(subtotal - discountAmount);
-      const taxRate = resolveProductTaxRate(product);
+      const taxRate = offlineContext ? Number(snapshotProduct.taxRate) : resolveProductTaxRate(product);
       if (!Number.isFinite(taxRate) || taxRate < 0 || taxRate > 100) {
         return res.status(422).json({
           success: false,
@@ -452,7 +536,10 @@ exports.createDirectSale = async (req, res, next) => {
           message: `The configured tax rate for ${product.name} is invalid`,
         });
       }
-      const taxCode = product.taxCode || (taxRate > 0 ? 'B' : 'A');
+      const taxCode = offlineContext ? snapshotProduct.taxCode : (product.taxCode || (taxRate > 0 ? 'B' : 'A'));
+      if (offlineContext && (Number(item.taxRate) !== taxRate || String(item.taxCode || '') !== String(taxCode))) {
+        return res.status(403).json({ success: false, code: 'POS_OFFLINE_TAX_SNAPSHOT_MISMATCH', message: `${product.name} tax settings do not match the signed offline catalog.` });
+      }
       const taxAmount = roundMoney(netAmount * (taxRate / 100));
       const lineTotal = roundMoney(netAmount + taxAmount);
       if (![subtotal, discountAmount, netAmount, taxAmount, lineTotal].every(Number.isFinite)
@@ -466,11 +553,11 @@ exports.createDirectSale = async (req, res, next) => {
 
       invoiceLines.push({
         product: product._id,
-        productCode: product.sku || '',
-        productName: product.name,
-        description: item.description || product.name,
+        productCode: offlineContext ? snapshotProduct.sku : (product.sku || ''),
+        productName: offlineContext ? snapshotProduct.name : product.name,
+        description: offlineContext ? snapshotProduct.name : (item.description || product.name),
         qty: quantity,
-        unit: item.unit || product.unit || 'pcs',
+        unit: offlineContext ? snapshotProduct.unit : (item.unit || product.unit || 'pcs'),
         unitPrice: unitPrice,
         discountPct: discountPct,
         taxCode: taxCode,
@@ -485,12 +572,14 @@ exports.createDirectSale = async (req, res, next) => {
         stockUpdates.push({
           product,
           quantity,
+          trackingType: productTrackingType,
           warehouseId,
           lineData: {
             productName: product.name,
-            unitCost: Number(product.averageCost) || 0,
+            unitCost: offlineContext ? Number(snapshotProduct.averageCost) || 0 : Number(product.averageCost) || 0,
             serialNumbers,
           },
+          offlineAvailableStock: offlineContext ? Number(snapshotProduct.availableStock) || 0 : undefined,
         });
       }
     }
@@ -519,7 +608,8 @@ exports.createDirectSale = async (req, res, next) => {
 
     // Determine payment status
     const normalizedPaymentReference = String(paymentReference || '').trim();
-    const supportedPaymentMethods = ['cash', 'card', 'bank_transfer', 'mobile_money', 'cheque'];
+    const storedValueMethods = ['gift_card', 'store_credit', 'loyalty'];
+    const supportedPaymentMethods = ['cash', 'card', 'bank_transfer', 'mobile_money', 'cheque', ...storedValueMethods];
     const rawPayments = Array.isArray(requestedPayments) && requestedPayments.length
       ? requestedPayments
       : [{ paymentMethod, amount: paymentAmount, reference: normalizedPaymentReference, bankAccountId }];
@@ -559,6 +649,15 @@ exports.createDirectSale = async (req, res, next) => {
         }
         transactionReferences.add(referenceKey);
       }
+      if (amount > 0 && ['gift_card', 'store_credit'].includes(method) && reference.length < 8) {
+        return res.status(400).json({ success: false, code: 'POS_STORED_VALUE_CODE_REQUIRED', message: `Enter the ${method.replace('_', ' ')} code for payment ${index + 1}.` });
+      }
+      if (amount > 0 && method === 'loyalty' && (!clientId || clientId === 'walk-in')) {
+        return res.status(400).json({ success: false, code: 'POS_LOYALTY_CUSTOMER_REQUIRED', message: 'Select a registered customer to redeem loyalty credit.' });
+      }
+      if (amount > 0 && storedValueMethods.includes(method) && offlineContext) {
+        return res.status(400).json({ success: false, code: 'POS_STORED_VALUE_OFFLINE_UNAVAILABLE', message: 'Gift card, store credit, and loyalty payments require an online balance check.' });
+      }
       normalizedPayments.push({ paymentMethod: method, amount, reference, bankAccountId: entry?.bankAccountId || (rawPayments.length === 1 ? bankAccountId : null) || null });
     }
     for (const tender of normalizedPayments) tender.amount = roundMoney(tender.amount);
@@ -570,6 +669,10 @@ exports.createDirectSale = async (req, res, next) => {
         code: 'ERR_INVALID_PAYMENT_AMOUNT',
         message: 'Payment amount must be a valid non-negative number',
       });
+    }
+    if (offlineContext && (normalizedPayments.some((tender) => tender.paymentMethod !== 'cash')
+      || amountTendered < grandTotal - 0.009 || !requestKey)) {
+      return res.status(400).json({ success: false, code: 'POS_OFFLINE_CASH_ONLY', message: 'Offline POS requires an idempotency key and full cash payment.' });
     }
     // Card is not a cash-equivalent tender. Until a terminal/provider
     // confirms authorization and settlement, accepting it here would mark an
@@ -626,6 +729,23 @@ exports.createDirectSale = async (req, res, next) => {
           error.code = 'POS_IDEMPOTENCY_DUPLICATE';
           throw error;
         }
+      }
+      if (offlineContext) {
+        const snapshotRows = await dbClient().$queryRawUnsafe(
+          'SELECT queue_limit AS "queueLimit", used_value AS "usedValue" FROM pos_offline_snapshots WHERE id = $1 AND company_id = $2 FOR UPDATE',
+          offlineContext.snapshotId, String(companyId),
+        );
+        const snapshotRow = snapshotRows[0];
+        if (!snapshotRow || Number(snapshotRow.usedValue) + grandTotal > Number(snapshotRow.queueLimit)) {
+          throw Object.assign(new Error('This register has reached its authorized offline queued-value limit.'), {
+            code: 'POS_OFFLINE_VALUE_LIMIT',
+            statusCode: 409,
+          });
+        }
+        await dbClient().$executeRawUnsafe(
+          'UPDATE pos_offline_snapshots SET used_value = used_value + $1::numeric WHERE id = $2 AND company_id = $3',
+          grandTotal, offlineContext.snapshotId, String(companyId),
+        );
       }
 
       if (requiresManagerApproval) {
@@ -703,6 +823,7 @@ exports.createDirectSale = async (req, res, next) => {
         taxAmount: totalTax,
         totalAmount: grandTotal,
         grandTotal: grandTotal,
+        ...(offlineContext ? { invoiceDate: offlineContext.saleCreatedAt } : {}),
         amountPaid: amountPaid,
         amountOutstanding: amountOutstanding,
         notes: notes || '',
@@ -716,6 +837,87 @@ exports.createDirectSale = async (req, res, next) => {
       }], { session });
 
       invoice = invoice[0];
+
+      // Stored-value balances are locked and debited inside the sale transaction.
+      // This prevents concurrent tills from spending the same balance twice.
+      let storedValuePaid = 0;
+      for (const tender of appliedPayments.filter((payment) => storedValueMethods.includes(payment.paymentMethod))) {
+        const kind = tender.paymentMethod;
+        let accountRows;
+        if (kind === 'loyalty') {
+          accountRows = await dbClient().$queryRawUnsafe(
+            'SELECT id, balance, currency_code AS "currencyCode", client_id AS "clientId", expires_at AS "expiresAt" FROM pos_stored_value_accounts WHERE company_id = $1 AND client_id = $2 AND kind = $3 AND is_active = TRUE FOR UPDATE',
+            String(companyId), String(client._id), kind,
+          );
+        } else {
+          const codeHash = createHash('sha256').update(String(tender.reference || '').replace(/\s+/g, '').toUpperCase()).digest('hex');
+          accountRows = await dbClient().$queryRawUnsafe(
+            'SELECT id, balance, currency_code AS "currencyCode", client_id AS "clientId", expires_at AS "expiresAt", code_suffix AS "codeSuffix" FROM pos_stored_value_accounts WHERE company_id = $1 AND code_hash = $2 AND kind = $3 AND is_active = TRUE FOR UPDATE',
+            String(companyId), codeHash, kind,
+          );
+        }
+        const storedAccount = accountRows?.[0];
+        if (!storedAccount || storedAccount.expiresAt && new Date(storedAccount.expiresAt) <= new Date()) {
+          const error = new Error(`${kind.replace('_', ' ')} account is unavailable or expired.`);
+          error.code = 'POS_STORED_VALUE_UNAVAILABLE';
+          throw error;
+        }
+        if (String(storedAccount.currencyCode).toUpperCase() !== String(invoiceCurrency).toUpperCase()) {
+          const error = new Error(`${kind.replace('_', ' ')} must use ${invoiceCurrency}; cross-currency redemption is not supported.`);
+          error.code = 'POS_STORED_VALUE_CURRENCY_MISMATCH';
+          throw error;
+        }
+        if (storedAccount.clientId && String(storedAccount.clientId) !== String(client._id)) {
+          const error = new Error('This store credit belongs to another customer.');
+          error.code = 'POS_STORED_VALUE_CUSTOMER_MISMATCH';
+          throw error;
+        }
+        const balance = Number(storedAccount.balance || 0);
+        if (tender.amount > balance + 0.00005) {
+          const error = new Error(`${kind.replace('_', ' ')} balance is ${balance.toFixed(2)} ${invoiceCurrency}; the tender exceeds the available balance.`);
+          error.code = 'POS_STORED_VALUE_INSUFFICIENT';
+          throw error;
+        }
+        const updatedRows = await dbClient().$queryRawUnsafe(
+          'UPDATE pos_stored_value_accounts SET balance = balance - $1::numeric, updated_at = CURRENT_TIMESTAMP WHERE id = $2 AND company_id = $3 AND balance >= $1::numeric RETURNING balance',
+          tender.amount, String(storedAccount.id), String(companyId),
+        );
+        if (!updatedRows.length) {
+          const error = new Error(`${kind.replace('_', ' ')} balance changed during checkout. Refresh the balance and retry.`);
+          error.code = 'POS_STORED_VALUE_BALANCE_CONFLICT';
+          throw error;
+        }
+        await dbClient().$executeRawUnsafe(
+          'INSERT INTO pos_stored_value_ledger (id, company_id, account_id, invoice_id, kind, entry_type, amount, balance_after, reference, created_by_id, created_at) VALUES ($1, $2, $3, $4, $5, \'redeem\', $6, $7, $8, $9, CURRENT_TIMESTAMP)',
+          randomBytes(12).toString('hex'), String(companyId), String(storedAccount.id), String(invoice._id), kind,
+          tender.amount, Number(updatedRows[0].balance), kind === 'loyalty' ? null : String(storedAccount.codeSuffix || tender.reference.slice(-4)), String(req.user.id),
+        );
+        storedValuePaid += tender.amount;
+        tender.storedValueAccountId = String(storedAccount.id);
+        tender.reference = kind === 'loyalty' ? '' : String(storedAccount.codeSuffix || tender.reference.slice(-4));
+      }
+
+      // Loyalty is issued as monetary reward credit: 1% of the discounted,
+      // pre-tax amount funded by non-credit tenders. The same sale journal
+      // records the reward expense and matching customer-credit liability.
+      let loyaltyEarned = 0;
+      let loyaltyAccountId = null;
+      const qualifyingPaidSales = Math.max(0, paidAmount - storedValuePaid);
+      if (clientId && clientId !== 'walk-in' && grandTotal > 0 && qualifyingPaidSales > 0) {
+        loyaltyEarned = roundMoney(netSales * Math.min(1, qualifyingPaidSales / grandTotal) * 0.01);
+        if (loyaltyEarned > 0) {
+          const walletRows = await dbClient().$queryRawUnsafe(
+            'INSERT INTO pos_stored_value_accounts (id, company_id, client_id, kind, currency_code, balance, is_active, created_by_id, created_at, updated_at) VALUES ($1, $2, $3, \'loyalty\', $4, $5, TRUE, $6, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT (company_id, client_id, kind, currency_code) DO UPDATE SET balance = pos_stored_value_accounts.balance + EXCLUDED.balance, updated_at = CURRENT_TIMESTAMP RETURNING id, balance',
+            randomBytes(12).toString('hex'), String(companyId), String(client._id), String(invoiceCurrency).toUpperCase(), loyaltyEarned, String(req.user.id),
+          );
+          const wallet = walletRows[0];
+          loyaltyAccountId = String(wallet.id);
+          await dbClient().$executeRawUnsafe(
+            'INSERT INTO pos_stored_value_ledger (id, company_id, account_id, invoice_id, kind, entry_type, amount, balance_after, reference, notes, created_by_id, created_at) VALUES ($1, $2, $3, $4, \'loyalty\', \'earn\', $5, $6, $7, \'1% of paid discounted pre-tax POS sales\', $8, CURRENT_TIMESTAMP)',
+            randomBytes(12).toString('hex'), String(companyId), loyaltyAccountId, String(invoice._id), loyaltyEarned, Number(wallet.balance), String(invoice.referenceNo), String(req.user.id),
+          );
+        }
+      }
       if (promotion) {
         await dbClient().$executeRawUnsafe(
           'UPDATE invoices SET pos_promotion = $1::jsonb WHERE id = $2 AND company_id = $3',
@@ -749,32 +951,62 @@ exports.createDirectSale = async (req, res, next) => {
         const { product, quantity, warehouseId: selectedWarehouseId, lineData } = stockUpdate;
         const stockLevel = stockLevelByProduct.get(String(product._id));
         const reserved = Number(stockLevel?.qty_reserved || 0);
-        const stockLevelUpdate = await StockLevel.updateMany(
-          {
-            company_id: companyId,
-            product_id: product._id,
-            warehouse_id: selectedWarehouseId,
-            qty_reserved: reserved,
-            qty_on_hand: { $gte: quantity + reserved },
-          },
-          {
-            $inc: { qty_on_hand: -quantity },
-            $set: { last_movement_at: new Date(), last_movement_type: 'dispatch' },
-          },
-        );
-        if (!stockLevelUpdate.matchedCount) {
-          const error = new Error(`Insufficient stock at the selected warehouse for ${product.name}`);
-          error.code = 'WAREHOUSE_STOCK_CHANGED';
-          error.productName = product.name;
-          throw error;
+        let actualAvailableStock = stockLevel
+          ? Math.max(0, Number(stockLevel.qty_on_hand || 0) - reserved)
+          : 0;
+        if (offlineContext || (allowNegativeStock && stockUpdate.trackingType === 'none')) {
+          const stockRows = await dbClient().$queryRawUnsafe(
+            `INSERT INTO stock_levels (id, company_id, product_id, warehouse_id, qty_on_hand, qty_reserved, qty_on_order, avg_cost, total_value, last_movement_at, last_movement_type, created_at, updated_at) VALUES ($1, $2, $3, $4, -$5::numeric, 0, 0, $6::numeric, 0, CURRENT_TIMESTAMP, 'dispatch', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT (company_id, product_id, warehouse_id) DO UPDATE SET qty_on_hand = stock_levels.qty_on_hand - $5::numeric, last_movement_at = CURRENT_TIMESTAMP, last_movement_type = 'dispatch', updated_at = CURRENT_TIMESTAMP RETURNING (qty_on_hand + $5::numeric) AS "previousStock", qty_on_hand AS "newStock", qty_reserved AS "reservedStock"`,
+            randomBytes(12).toString('hex'), String(companyId), String(product._id), String(selectedWarehouseId),
+            quantity, Number(product.averageCost) || 0,
+          );
+          const stockRow = stockRows[0];
+          actualAvailableStock = Math.max(0, Number(stockRow.previousStock) - Number(stockRow.reservedStock));
+          const shortage = Math.max(0, quantity - actualAvailableStock);
+          if (shortage > 0 && offlineContext) {
+            offlineConflicts.push({
+              conflictType: 'stock',
+              productId: String(product._id),
+              productName: product.name,
+              warehouseId: String(selectedWarehouseId),
+              details: { quantity, available: actualAvailableStock, shortage },
+            });
+          }
+        } else {
+          const stockLevelUpdate = await StockLevel.updateMany(
+            {
+              company_id: companyId,
+              product_id: product._id,
+              warehouse_id: selectedWarehouseId,
+              qty_reserved: reserved,
+              qty_on_hand: { $gte: quantity + reserved },
+            },
+            {
+              $inc: { qty_on_hand: -quantity },
+              $set: { last_movement_at: new Date(), last_movement_type: 'dispatch' },
+            },
+          );
+          if (!stockLevelUpdate.matchedCount) {
+            const error = new Error(`Insufficient stock at the selected warehouse for ${product.name}`);
+            error.code = 'WAREHOUSE_STOCK_CHANGED';
+            error.productName = product.name;
+            throw error;
+          }
         }
-        const trackingType = product.trackingType || 'none';
+        const trackingType = stockUpdate.trackingType || product.trackingType || 'none';
         let unitCost = 0;
         let cogsAmount = 0;
 
         let batchAllocations = [];
         if (trackingType === 'none') {
-          try {
+          if (offlineContext || allowNegativeStock) {
+            const consumeResult = await inventoryService.consumeAvailable(
+              companyId, product._id, quantity, { method: 'fifo', warehouse: selectedWarehouseId, session },
+            );
+            const fallbackUnitCost = Number(product.averageCost) || 0;
+            cogsAmount = consumeResult.totalCost + consumeResult.shortfall * fallbackUnitCost;
+            unitCost = quantity > 0 ? cogsAmount / quantity : fallbackUnitCost;
+          } else try {
             const consumeResult = await inventoryService.consume(
               companyId,
               product._id,
@@ -810,28 +1042,55 @@ exports.createDirectSale = async (req, res, next) => {
             warehouse: selectedWarehouseId,
           });
         } else if (trackingType === 'serial') {
-          unitCost = product.averageCost ? Number(product.averageCost.toString()) : 0;
+          unitCost = offlineContext
+            ? Number(offlineContext.snapshotData.products[String(product._id)]?.averageCost) || 0
+            : (product.averageCost ? Number(product.averageCost.toString()) : 0);
           cogsAmount = unitCost * quantity;
           const serialNumbers = lineData.serialNumbers || [];
-          const serialUpdate = await StockSerialNumber.updateMany(
-            {
-              company: companyId,
-              product: product._id,
-              warehouse: selectedWarehouseId,
-              serialNo: { $in: serialNumbers },
-              status: { $in: ['in_stock', 'returned'] },
-            },
-            { $set: { status: 'dispatched', dispatchedVia: invoice._id } },
-            { session },
-          );
-          if (serialUpdate.modifiedCount !== serialNumbers.length) {
-            const error = new Error(`One or more serial numbers for ${product.name} are no longer available`);
-            error.code = 'POS_SERIAL_UNAVAILABLE';
-            throw error;
+          const serialQuery = {
+            company: companyId,
+            product: product._id,
+            warehouse: selectedWarehouseId,
+            serialNo: { $in: serialNumbers },
+            status: { $in: ['in_stock', 'returned'] },
+          };
+          const availableAtCommit = offlineContext && serialNumbers.length
+            ? await StockSerialNumber.find(serialQuery).select('serialNo').session(session).lean()
+            : null;
+          if (offlineContext && availableAtCommit.length !== serialNumbers.length) {
+            const found = new Set(availableAtCommit.map((serial) => String(serial.serialNo).toUpperCase()));
+            offlineConflicts.push({
+              conflictType: 'serial',
+              productId: String(product._id),
+              productName: product.name,
+              warehouseId: String(selectedWarehouseId),
+              details: {
+                quantity,
+                requestedSerialNumbers: serialNumbers,
+                unavailableSerialNumbers: serialNumbers.filter((serial) => !found.has(serial)),
+              },
+            });
+          } else {
+            const serialUpdate = await StockSerialNumber.updateMany(
+              serialQuery,
+              { $set: { status: 'dispatched', dispatchedVia: invoice._id } },
+              { session },
+            );
+            if (serialUpdate.modifiedCount !== serialNumbers.length) {
+              const error = new Error(`One or more serial numbers for ${product.name} are no longer available`);
+              error.code = 'POS_SERIAL_UNAVAILABLE';
+              throw error;
+            }
           }
         }
 
         totalCOGS += cogsAmount;
+        if (offlineContext || (allowNegativeStock && trackingType === 'none')) {
+          await dbClient().$executeRawUnsafe(
+            'UPDATE stock_levels SET total_value = total_value - $1::numeric, updated_at = CURRENT_TIMESTAMP WHERE company_id = $2 AND product_id = $3 AND warehouse_id = $4',
+            cogsAmount, String(companyId), String(product._id), String(selectedWarehouseId),
+          );
+        }
 
         const stockBefore = Number(product.currentStock) || 0;
         productUpdates.push({
@@ -857,8 +1116,10 @@ exports.createDirectSale = async (req, res, next) => {
           referenceModel: 'Invoice',
           referenceNumber: invoice.referenceNo,
           batchNumber: batchAllocations.map((allocation) => `${allocation.batchNo}:${allocation.quantity}`).join(', ') || undefined,
-          serialNumbers: lineData.serialNumbers || [],
-          notes: `Direct sale - Invoice ${invoice.referenceNo}`,
+          serialNumbers: offlineConflicts.some((conflict) => conflict.conflictType === 'serial'
+            && conflict.productId === String(product._id)) ? [] : (lineData.serialNumbers || []),
+          notes: `Direct sale - Invoice ${invoice.referenceNo}${offlineConflicts.some((conflict) => conflict.conflictType === 'serial'
+            && conflict.productId === String(product._id)) ? ' (serial assignment pending manager resolution)' : ''}`,
           performedBy: req.user.id,
           movementDate: new Date(),
         });
@@ -870,6 +1131,27 @@ exports.createDirectSale = async (req, res, next) => {
       }
       if (stockMovementCreates.length > 0) {
         await StockMovement.insertMany(stockMovementCreates, { session });
+      }
+      if (offlineContext) {
+        await dbClient().$executeRawUnsafe(
+          'INSERT INTO pos_offline_sales (id, company_id, snapshot_id, offline_sale_id, request_key, cashier_id, device_id, register_id, warehouse_id, invoice_id, total, payload_hash, reported_sale_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::numeric, $12, $13::timestamptz)',
+          randomBytes(12).toString('hex'), String(companyId), offlineContext.snapshotId,
+          offlineContext.offlineSaleId, requestKey, String(req.user.id), String(req.body.deviceId),
+          String(requestedRegisterId), String(warehouseId), String(invoice._id), grandTotal,
+          payloadHash, offlineContext.saleCreatedAt,
+        );
+        const escalationAt = new Date(
+          offlineContext.saleCreatedAt.getTime()
+          + Math.max(1, Number(offlineContext.snapshotData.escalationDays) || 3) * 24 * 60 * 60 * 1000,
+        );
+        for (const conflict of offlineConflicts) {
+          await dbClient().$executeRawUnsafe(
+            'INSERT INTO pos_offline_conflicts (id, company_id, offline_sale_id, invoice_id, product_id, warehouse_id, conflict_type, details, escalation_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::timestamptz)',
+            randomBytes(12).toString('hex'), String(companyId), offlineContext.offlineSaleId,
+            String(invoice._id), conflict.productId, conflict.warehouseId, conflict.conflictType,
+            JSON.stringify({ productName: conflict.productName, ...conflict.details }), escalationAt,
+          );
+        }
       }
 
       // 3. Post balanced revenue and COGS entries in the same transaction as
@@ -916,7 +1198,15 @@ exports.createDirectSale = async (req, res, next) => {
       for (const tender of appliedPayments) {
         const paymentBankAccount = tender.bankAccountId ? paymentAccounts.get(String(tender.bankAccountId)) : null;
         let settlementAccount;
-        if (paymentBankAccount) {
+        if (tender.paymentMethod === 'gift_card') {
+          settlementAccount = await JournalService.getMappedAccountCode(
+            companyId, 'sales', 'giftCardLiability', DEFAULT_ACCOUNTS.deferredRevenue || '2850',
+          );
+        } else if (tender.paymentMethod === 'store_credit' || tender.paymentMethod === 'loyalty') {
+          settlementAccount = await JournalService.getMappedAccountCode(
+            companyId, 'sales', 'customerAdvances', DEFAULT_ACCOUNTS.customerAdvances || '2860',
+          );
+        } else if (paymentBankAccount) {
           settlementAccount = paymentBankAccount.ledgerAccountId;
         } else if (tender.paymentMethod === 'mobile_money') {
           settlementAccount = await JournalService.getMappedAccountCode(
@@ -944,6 +1234,20 @@ exports.createDirectSale = async (req, res, next) => {
       if (netSales > 0) {
         revenueLines.push(JournalService.createCreditLine(
           salesAccount, netSales, `Sales revenue - Invoice ${invoice.referenceNo}`,
+        ));
+      }
+      if (loyaltyEarned > 0) {
+        const loyaltyExpense = await JournalService.getMappedAccountCode(
+          companyId, 'sales', 'salesReturns', DEFAULT_ACCOUNTS.salesReturns || '4100',
+        );
+        const loyaltyLiability = await JournalService.getMappedAccountCode(
+          companyId, 'sales', 'customerAdvances', DEFAULT_ACCOUNTS.customerAdvances || '2860',
+        );
+        revenueLines.push(JournalService.createDebitLine(
+          loyaltyExpense, loyaltyEarned, `Loyalty credit earned - Invoice ${invoice.referenceNo}`,
+        ));
+        revenueLines.push(JournalService.createCreditLine(
+          loyaltyLiability, loyaltyEarned, `Loyalty credit liability - Invoice ${invoice.referenceNo}`,
         ));
       }
       if (totalTax > 0) {
@@ -981,7 +1285,9 @@ exports.createDirectSale = async (req, res, next) => {
             paymentMethod: tender.paymentMethod,
             reference: tender.reference || null,
             bankAccountId: tender.bankAccountId || null,
+            storedValueAccountId: tender.storedValueAccountId || null,
           })),
+          loyaltyCreditEarned: loyaltyEarned,
         },
       }];
       if (cogsLines.length > 0) {
@@ -1028,6 +1334,7 @@ exports.createDirectSale = async (req, res, next) => {
           paymentMethod: tender.paymentMethod,
           reference: tender.reference || '',
           bankAccountId: tender.bankAccountId || null,
+          ...(tender.storedValueAccountId ? { storedValueAccountId: tender.storedValueAccountId } : {}),
           ...(changeDue > 0 && tender.paymentMethod === 'cash' && index === firstCashPayment
             ? { receivedAmount: cashTendered, changeGiven: changeDue }
             : {}),
@@ -1127,6 +1434,7 @@ exports.createDirectSale = async (req, res, next) => {
       message: 'Direct sale completed successfully',
       data: invoice,
       changeDue,
+      ...(offlineContext ? { offlineConflictCount: offlineConflicts.length } : {}),
     });
 
   } catch (error) {
@@ -1267,13 +1575,17 @@ exports.getPosProducts = async (req, res, next) => {
       ? Buffer.from(JSON.stringify({ name: lastProduct.name, id: String(lastProduct._id) })).toString('base64url')
       : null;
 
-    const warehouseStockLevels = warehouseId && products.length
-      ? await StockLevel.find({
+    const [warehouseStockLevels, priceListPricing, transferVisibility] = await Promise.all([
+      warehouseId && products.length
+      ? StockLevel.find({
           company_id: companyId,
           warehouse_id: warehouseId,
           product_id: { $in: products.map((product) => product._id) },
         }).lean()
-      : [];
+      : [],
+      getWarehousePriceListPrices(companyId, warehouseId, products.map((product) => product._id)),
+      getWarehouseTransferVisibility(companyId, warehouseId, products.map((product) => product._id)),
+    ]);
     const warehouseStockByProduct = new Map(
       warehouseStockLevels.map((level) => [String(level.product_id), level]),
     );
@@ -1289,7 +1601,8 @@ exports.getPosProducts = async (req, res, next) => {
         name: p.name,
         sku: p.sku,
         barcode: p.barcode,
-        sellingPrice: toNumber(p.sellingPrice),
+        sellingPrice: effectivePrice(String(p._id), toNumber(p.sellingPrice), priceListPricing.priceByProduct),
+        standardSellingPrice: toNumber(p.sellingPrice),
         unit: p.unit,
         taxRate: resolveProductTaxRate(p),
         taxCode: p.taxCode || 'A',
@@ -1299,6 +1612,8 @@ exports.getPosProducts = async (req, res, next) => {
         averageCost: toNumber(p.averageCost),
         category: p.category,
         isAvailable: currentStock > 0 || p.isStockable === false,
+        incomingTransfers: transferVisibility[String(p._id)]?.incoming || [],
+        outgoingTransfers: transferVisibility[String(p._id)]?.outgoing || [],
         trackingType: p.trackingType === 'serial' || p.trackSerialNumbers
           ? 'serial'
           : p.trackingType === 'batch' || p.trackBatch ? 'batch' : (p.trackingType || 'none'),

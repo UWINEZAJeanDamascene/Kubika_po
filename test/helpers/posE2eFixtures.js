@@ -13,6 +13,7 @@ const IDS = {
   creditNote: '333333333333333333333333',
   approval: '444444444444444444444444',
   registerId: 'reg-e2e-1',
+  deviceId: '77777777-7777-4777-8777-777777777777',
 };
 
 function mockRes() {
@@ -79,6 +80,7 @@ function checkoutBody(overrides = {}) {
   return {
     warehouseId: IDS.warehouse,
     registerId: IDS.registerId,
+    deviceId: IDS.deviceId,
     tillSession: { id: IDS.till },
     items: [saleLine()],
     paymentMethod: 'cash',

@@ -53,7 +53,11 @@ exports.updateSettings = async (req, res) => {
       'document_theme_color',
       'notify_on_low_stock',
       'notify_on_overdue_invoice',
-      'overdue_invoice_alert_days'
+      'overdue_invoice_alert_days',
+      'pos_offline_enabled',
+      'pos_offline_max_hours',
+      'pos_offline_queue_limit',
+      'pos_negative_stock_escalation_days'
     ]
 
     // Filter to only allowed fields
@@ -107,6 +111,22 @@ exports.updateSettings = async (req, res) => {
           message: 'overdue_invoice_alert_days must be a positive number'
         })
       }
+    }
+
+    if (filteredData.pos_offline_enabled !== undefined && typeof filteredData.pos_offline_enabled !== 'boolean') {
+      return res.status(400).json({ success: false, message: 'pos_offline_enabled must be a boolean' })
+    }
+    if (filteredData.pos_offline_max_hours !== undefined
+      && (!Number.isInteger(filteredData.pos_offline_max_hours) || filteredData.pos_offline_max_hours < 1 || filteredData.pos_offline_max_hours > 720)) {
+      return res.status(400).json({ success: false, message: 'pos_offline_max_hours must be an integer from 1 to 720' })
+    }
+    if (filteredData.pos_offline_queue_limit !== undefined
+      && (typeof filteredData.pos_offline_queue_limit !== 'number' || !Number.isFinite(filteredData.pos_offline_queue_limit) || filteredData.pos_offline_queue_limit < 1 || filteredData.pos_offline_queue_limit > 1000000000)) {
+      return res.status(400).json({ success: false, message: 'pos_offline_queue_limit must be between 1 and 1,000,000,000' })
+    }
+    if (filteredData.pos_negative_stock_escalation_days !== undefined
+      && (!Number.isInteger(filteredData.pos_negative_stock_escalation_days) || filteredData.pos_negative_stock_escalation_days < 1 || filteredData.pos_negative_stock_escalation_days > 365)) {
+      return res.status(400).json({ success: false, message: 'pos_negative_stock_escalation_days must be an integer from 1 to 365' })
     }
 
     // Validate theme color if provided

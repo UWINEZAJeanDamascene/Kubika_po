@@ -98,6 +98,7 @@ function warehouseToApi(row) {
     code: row.code,
     description: row.description ?? null,
     location: row.location ?? {},
+    priceListId: row.priceListId ?? null,
     inventoryAccount: row.inventoryAccount ?? null,
     isActive: Boolean(row.isActive),
     isDefault: Boolean(row.isDefault),

@@ -493,6 +493,10 @@ async function getRouteMetrics(limit = 20) {
         const samples = parseSamples(unwrapPipelineResult(values[i * 3 + 2]));
         const count = toFiniteNumber(stats.count);
         const summary = summarizeDurations(samples.map((sample) => sample.durationMs));
+        const recentCutoff = Date.now() - 15 * 60 * 1000;
+        const recentSamples = samples.filter((sample) => toFiniteNumber(sample.timestamp) >= recentCutoff);
+        const recentErrors = recentSamples.filter((sample) => Number(sample.statusCode) >= 500).length;
+        const recentDurations = recentSamples.map((sample) => toFiniteNumber(sample.durationMs)).sort((a, b) => a - b);
         rows.push({
           route: String(label),
           count,
@@ -503,6 +507,13 @@ async function getRouteMetrics(limit = 20) {
           max_ms: summary.max_ms,
           error_rate: count ? Math.round((toFiniteNumber(stats.errors) / count) * 10000) / 100 : 0,
           sample_window: samples.length,
+          recent_15m: {
+            count: recentSamples.length,
+            errors: recentErrors,
+            error_rate: recentSamples.length ? Math.round((recentErrors / recentSamples.length) * 10000) / 100 : 0,
+            server_error_rate: recentSamples.length ? Math.round((recentErrors / recentSamples.length) * 10000) / 100 : 0,
+            p95_ms: recentDurations.length ? recentDurations[Math.max(0, Math.ceil(recentDurations.length * 0.95) - 1)] : 0,
+          },
         });
       }
     } else {
@@ -517,6 +528,10 @@ async function getRouteMetrics(limit = 20) {
         const samples = parseSamples(rawSamples);
         const count = toFiniteNumber(stats.count);
         const summary = summarizeDurations(samples.map((sample) => sample.durationMs));
+        const recentCutoff = Date.now() - 15 * 60 * 1000;
+        const recentSamples = samples.filter((sample) => toFiniteNumber(sample.timestamp) >= recentCutoff);
+        const recentErrors = recentSamples.filter((sample) => Number(sample.statusCode) >= 500).length;
+        const recentDurations = recentSamples.map((sample) => toFiniteNumber(sample.durationMs)).sort((a, b) => a - b);
         rows.push({
           route: String(label),
           count,
@@ -527,6 +542,13 @@ async function getRouteMetrics(limit = 20) {
           max_ms: summary.max_ms,
           error_rate: count ? Math.round((toFiniteNumber(stats.errors) / count) * 10000) / 100 : 0,
           sample_window: samples.length,
+          recent_15m: {
+            count: recentSamples.length,
+            errors: recentErrors,
+            error_rate: recentSamples.length ? Math.round((recentErrors / recentSamples.length) * 10000) / 100 : 0,
+            server_error_rate: recentSamples.length ? Math.round((recentErrors / recentSamples.length) * 10000) / 100 : 0,
+            p95_ms: recentDurations.length ? recentDurations[Math.max(0, Math.ceil(recentDurations.length * 0.95) - 1)] : 0,
+          },
         });
       }
     }

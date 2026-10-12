@@ -31,9 +31,29 @@ function transferSignature(action, req, notes = "") {
 exports.create = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const payload = { ...req.body, company: companyId, createdBy: req.user.id };
+    const items = Array.isArray(req.body.items) ? req.body.items : (Array.isArray(req.body.lines) ? req.body.lines : []);
+    const payload = { ...req.body, company: companyId, createdBy: req.user.id || req.user._id };
+    delete payload.items;
+    delete payload.lines;
     payload.signatures = [transferSignature("created", req, req.body.notes || "")];
     const transfer = await StockTransfer.create(payload);
+    for (const item of items) {
+      await StockTransferLine.create({
+        company: companyId,
+        transfer: transfer._id,
+        product: item.product?._id || item.product,
+        qty: item.qty ?? item.quantity,
+        unitCost: item.unitCost,
+        notes: item.notes || null,
+        createdBy: req.user.id || req.user._id,
+        inventoryIdentity: {
+          ...(item.inventoryIdentity || {}),
+          ...(Array.isArray(item.serialNumbers) ? { serialNumbers: item.serialNumbers } : {}),
+          ...(Array.isArray(item.batches) ? { batches: item.batches } : {}),
+          ...(item.batchNumber ? { batchNumber: item.batchNumber } : {}),
+        },
+      });
+    }
     res.status(201).json({ success: true, data: transfer });
   } catch (err) {
     next(err);
@@ -66,13 +86,11 @@ exports.confirm = async (req, res, next) => {
   try {
     const transfer = await stockTransferService.confirmTransfer(
       req.params.id,
-      {},
+      { actorId: req.user.id || req.user._id, notes: req.body?.notes },
     );
-    transfer.confirmedBy = req.user.id || req.user._id;
-    transfer.confirmedAt = transfer.confirmedAt || new Date();
     transfer.signatures = [
       ...(transfer.signatures || []),
-      transferSignature("confirmed", req, req.body?.notes || "Transfer confirmed"),
+      transferSignature("dispatched", req, req.body?.notes || "Transfer dispatched"),
     ];
     await transfer.save();
     EBMStockService.submitBranchTransfer(transfer._id, {
@@ -92,6 +110,27 @@ exports.confirm = async (req, res, next) => {
           code: "INSUFFICIENT_STOCK",
           product: err.product,
         });
+    if (["INVALID_STATUS", "SAME_WAREHOUSE", "ACTOR_REQUIRED", "EMPTY_TRANSFER"].includes(err.code)) {
+      return res.status(err.code === "SAME_WAREHOUSE" ? 422 : 400).json({ success: false, code: err.code });
+    }
+    next(err);
+  }
+};
+
+exports.dispatch = exports.confirm;
+
+exports.receive = async (req, res, next) => {
+  try {
+    const transfer = await stockTransferService.receiveTransfer(req.params.id, {
+      actorId: req.user.id || req.user._id,
+      notes: req.body?.receivedNotes || req.body?.notes,
+      lines: req.body?.lines || req.body?.items,
+    });
+    res.json({ success: true, data: transfer });
+  } catch (err) {
+    if (["INVALID_STATUS", "INVALID_RECEIPT", "INVALID_RECEIPT_IDENTITY", "ACTOR_REQUIRED"].includes(err.code)) {
+      return res.status(err.code === "INVALID_STATUS" ? 400 : 422).json({ success: false, code: err.code, message: err.message });
+    }
     next(err);
   }
 };
@@ -100,7 +139,7 @@ exports.cancel = async (req, res, next) => {
   try {
     const transfer = await stockTransferService.cancelTransfer(
       req.params.id,
-      {},
+      { actorId: req.user.id || req.user._id, notes: req.body?.notes || req.body?.reason },
     );
     transfer.signatures = [
       ...(transfer.signatures || []),
@@ -109,6 +148,9 @@ exports.cancel = async (req, res, next) => {
     await transfer.save();
     res.json({ success: true, data: transfer });
   } catch (err) {
+    if (["INVALID_STATUS", "POST_DISPATCH_CANCELLATION_FORBIDDEN", "ACTOR_REQUIRED"].includes(err.code)) {
+      return res.status(err.code === "POST_DISPATCH_CANCELLATION_FORBIDDEN" ? 409 : 400).json({ success: false, code: err.code });
+    }
     next(err);
   }
 };
@@ -365,6 +407,12 @@ exports.createStockTransfer = async (req, res, next) => {
         product: item.product,
         qty,
         unitCost,
+        inventoryIdentity: {
+          ...(item.inventoryIdentity || {}),
+          ...(Array.isArray(item.serialNumbers) ? { serialNumbers: item.serialNumbers } : {}),
+          ...(Array.isArray(item.batches) ? { batches: item.batches } : {}),
+          ...(item.batchNumber ? { batchNumber: item.batchNumber } : {}),
+        },
         notes: item.notes || null,
         createdBy: req.user.id,
       });

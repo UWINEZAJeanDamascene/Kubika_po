@@ -6,6 +6,7 @@ const emailService = require('../services/emailService');
 const Company = require('../models/Company');
 const Supplier = require('../models/Supplier');
 const { emitDataChanged } = require('../lib/realtimeEvents');
+const { runInTransaction } = require('../services/transactionService');
 
 const sendPOEmail = async (po, action, companyId) => {
   try {
@@ -128,8 +129,7 @@ exports.approvePurchaseOrder = async (req, res, next) => {
       resolvedLines.push({ line, index, budgetLine });
     }
 
-    const createdEncumbrances = [];
-    try {
+    await runInTransaction(async () => {
       for (const { line, index, budgetLine } of resolvedLines) {
         const subtotal = (Number(line.qtyOrdered) || 0) * (Number(line.unitCost) || 0);
         const calculatedTotal = subtotal + subtotal * ((Number(line.taxRate) || 0) / 100);
@@ -150,26 +150,27 @@ exports.approvePurchaseOrder = async (req, res, next) => {
           notes: 'Commitment created on purchase order approval',
         }, userId);
         line.encumbrance_id = String(encumbrance._id);
-        createdEncumbrances.push(encumbrance);
       }
 
       po.status = 'approved';
       po.approvedBy = userId;
       po.approvedAt = new Date();
       await po.save();
-    } catch (approvalError) {
-      // Do not leave budget commitments behind if approval cannot be completed.
-      await Promise.allSettled(createdEncumbrances.map((encumbrance) =>
-        BudgetService.releaseEncumbrance(companyId, 'purchase_order', po._id.toString(),
-          'Approval rolled back after a later budget line failed validation', userId, encumbrance._id)));
-      throw approvalError;
-    }
+    }, { isolationLevel: 'Serializable' });
 
     emitDataChanged(companyId, 'purchaseOrders');
     if (req.body.sendEmail) sendPOEmail(po, 'approved', companyId);
 
     res.json({ success: true, data: po });
-  } catch (err) { next(err); }
+  } catch (err) {
+    if (err.code === 'P2034') {
+      return res.status(409).json({ success: false, message: 'Another transaction used this budget balance first. Refresh and retry approval.' });
+    }
+    if (err.message === 'INSUFFICIENT_BUDGET') {
+      return res.status(409).json({ success: false, message: 'This purchase order exceeds the remaining budget available for one or more lines.' });
+    }
+    next(err);
+  }
 };
 
 exports.cancelPurchaseOrder = async (req, res, next) => {

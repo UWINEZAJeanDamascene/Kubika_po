@@ -19,9 +19,20 @@ const FIELD_MAP = {
   toWarehouse: { target: 'toWarehouseId', isId: true },
   status: { target: 'status' },
   transferDate: { target: 'transferDate' },
+  expectedArrivalAt: { target: 'expectedArrivalAt' },
   reason: { target: 'reason' },
   journalEntry: { target: 'journalEntryId', isId: true },
   createdBy: { target: 'createdById', isId: true },
+  confirmedBy: { target: 'confirmedById', isId: true },
+  confirmedAt: { target: 'confirmedAt' },
+  receivedBy: { target: 'receivedById', isId: true },
+  receivedDate: { target: 'receivedDate' },
+  receivedNotes: { target: 'receivedNotes' },
+  discrepancyBy: { target: 'discrepancyById', isId: true },
+  discrepancyAt: { target: 'discrepancyAt' },
+  cancelledBy: { target: 'cancelledById', isId: true },
+  cancelledAt: { target: 'cancelledAt' },
+  inTransitValue: { target: 'inTransitValue' },
   createdAt: { target: 'createdAt' },
   updatedAt: { target: 'updatedAt' },
 };
@@ -38,11 +49,20 @@ function buildInclude(populate = []) {
         select: {
           id: true, companyId: true, transferId: true, productId: true,
           qty: true, unitCost: true, notes: true, createdById: true,
+          qtyReceived: true, inTransitQty: true, inTransitValue: true,
+          inventoryIdentity: true, receivedIdentity: true,
           createdAt: true, updatedAt: true,
           product: { select: { id: true, name: true, sku: true, unit: true } },
         },
       },
     };
+  inc.discrepancies = {
+    select: {
+      id: true, companyId: true, transferId: true, transferLineId: true,
+      expectedQty: true, receivedQty: true, varianceQty: true, notes: true,
+      recordedById: true, recordedAt: true, createdAt: true,
+    },
+  };
   for (const p of populate) {
     const path = typeof p === 'object' ? p.path : p;
     if (path === 'fromWarehouse') inc.fromWarehouse = { select: { id: true, name: true, code: true } };

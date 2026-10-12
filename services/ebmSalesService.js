@@ -332,7 +332,9 @@ async function resolvePaymentCode(invoice, companyId, paymentMethod = null) {
       payments[0]?.paymentMethod ||
       (payments.length ? "cash" : "credit"),
   );
-  const namePatterns = method.includes("mobile")
+  const namePatterns = method.includes("gift card") || method.includes("store credit") || method.includes("loyalty")
+    ? ["cash"]
+    : method.includes("mobile")
     ? ["mobile money", "momo"]
     : method.includes("bank")
       ? ["bank", "transfer"]

@@ -233,6 +233,12 @@ async function initializeServer() {
   app.post('/api/health/gc', cors(), healthController.gcHint);
   // Performance metrics only — see healthController.performanceMetrics.
   app.get('/api/performance', cors(), healthController.performanceMetrics);
+  app.get('/api/performance/pos-operations', protect, (req, res, next) => {
+    if (!req.isPlatformAdmin && req.user?.role !== 'platform_admin') {
+      return res.status(403).json({ success: false, message: 'Platform administrator access is required.' });
+    }
+    return require('./controllers/posObservabilityController').getPosOperations(req, res, next);
+  });
   app.get('/api/performance/readiness', cors(), healthController.performanceReadiness);
   // Browser timing is anonymous, bounded, best-effort telemetry. It is rate
   // limited so it cannot become an ingestion or memory-amplification vector.

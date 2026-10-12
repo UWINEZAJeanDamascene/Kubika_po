@@ -14,7 +14,9 @@ const fields = {
   require_po_approval: 'requirePoApproval', po_approval_threshold: 'poApprovalThreshold', require_invoice_approval: 'requireInvoiceApproval',
   document_terms_and_conditions: 'documentTermsAndConditions', document_theme_color: 'documentThemeColor',
   notify_on_low_stock: 'notifyOnLowStock', notify_on_overdue_invoice: 'notifyOnOverdueInvoice',
-  overdue_invoice_alert_days: 'overdueInvoiceAlertDays', last_updated_by: 'lastUpdatedBy',
+  overdue_invoice_alert_days: 'overdueInvoiceAlertDays', pos_offline_enabled: 'posOfflineEnabled',
+  pos_offline_max_hours: 'posOfflineMaxHours', pos_offline_queue_limit: 'posOfflineQueueLimit',
+  pos_negative_stock_escalation_days: 'posNegativeStockEscalationDays', last_updated_by: 'lastUpdatedBy',
 };
 const FIELD_MAP = Object.fromEntries(Object.entries(fields).map(([source, target]) => [source, { target, isId: /Id$/.test(target) || target === 'companyId' }]));
 FIELD_MAP._id = { target: 'id', isId: true };

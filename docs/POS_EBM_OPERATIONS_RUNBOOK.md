@@ -11,6 +11,19 @@ For store supervisors, finance operations, and workspace administrators. Use the
 
 In the application, open **EBM Control Center** from the Purchases section. Its **Retry** tab is the durable EBM queue. The invoice's own EBM tab shows fiscal status and the fiscal receipt when one has been issued.
 
+## POS operations dashboard and alert thresholds
+
+Platform administrators can open **Platform Admin â†’ System Health â†’ POS Operations & Service Objectives**. The snapshot refreshes every 30 seconds and reports fleet-wide POS checkout 5xx rate from the recent bounded route sample, closed till variances, retryable EBM queue age, and EBM submission latency. It is a global operations view; it does not expose customer or invoice payloads.
+
+Default thresholds are:
+
+- POS checkout: critical above 5% HTTP 5xx across at least 20 samples in 15 minutes. Expected validation/permission responses (4xx) do not count as server failures.
+- Till variance: warn at the configured manager variance threshold (default RWF 50,000); mark critical when five or more shifts cross it in 24 hours.
+- EBM queue lag: warn at 5 minutes and critical at 15 minutes for the oldest pending/retryable failed item.
+- EBM latency objective: at least 95% of mature queue records submitted within 5 minutes. The 24-hour denominator includes records older than the target, including still-pending and failed records.
+
+Operators can tune these server environment variables: `POS_TILL_LARGE_VARIANCE_THRESHOLD_RWF`, `POS_CHECKOUT_ALERT_MIN_SAMPLES`, `POS_CHECKOUT_5XX_ALERT_PCT`, `POS_EBM_SLO_TARGET_PCT`, `POS_EBM_SLO_TARGET_SECONDS`, `POS_EBM_LAG_WARNING_SECONDS`, and `POS_EBM_LAG_CRITICAL_SECONDS`. Restart the API after changing them. Dashboard alerts are visible to platform administrators while viewing System Health; route these signals to an external paging system if unattended notification is required.
+
 ## 1. EBM queue item failed
 
 ### Triage

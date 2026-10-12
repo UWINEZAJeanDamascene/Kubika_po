@@ -1084,6 +1084,11 @@ class ProjectService {
       throw new Error("Project not found");
     }
 
+    const companyCurrency = (await prisma.company.findUnique({
+      where: { id: String(companyId) },
+      select: { baseCurrency: true },
+    }))?.baseCurrency || "RWF";
+
     // Get budget lines for this project
     const allNodes = await Project.find({ company_id: companyId, is_template: false });
     const includedIds = new Set([String(projectId)]);
@@ -1103,7 +1108,7 @@ class ProjectService {
       project_id: { $in: [...includedIds] },
     })
       .populate("account_id", "code name type")
-      .populate("budget_id", "name fiscal_year status")
+      .populate("budget_id", "name fiscal_year status base_currency")
       .populate("project_id", "name project_code wbs_code type");
     const approvedStatuses = new Set(["approved", "locked", "closed", "view_only"]);
     const approvedBudgetLines = budgetLines.filter((line) => approvedStatuses.has(line.budget_id?.status));
@@ -1162,6 +1167,69 @@ class ProjectService {
       }
       return summary;
     }, { planned_cost: 0, issued_cost: 0, open_commitment: 0, planned_quantity: 0, issued_quantity: 0, returned_quantity: 0, line_count: 0 });
+    const roundMoney = (amount) => Math.round(amount * 100) / 100;
+
+    // Revenue is recognized from posted invoices only. Draft/cancelled invoices
+    // do not count; confirmed credit-note lines reverse the originating project
+    // invoice line so sales returns reduce recognized revenue.
+    const linkedInvoiceLines = await prisma.invoiceLine.findMany({
+      where: {
+        companyId: String(companyId),
+        projectId: { in: [...includedIds].map(String) },
+        invoice: {
+          companyId: String(companyId),
+          status: { in: ["confirmed", "partially_paid", "fully_paid"] },
+        },
+      },
+      select: {
+        id: true, projectId: true, lineSubtotal: true, discountPct: true,
+        invoice: { select: { referenceNo: true, currencyCode: true, invoiceDate: true } },
+      },
+    });
+    const invoiceLineById = new Map(linkedInvoiceLines.map((line) => [line.id, line]));
+    const linkedCredits = linkedInvoiceLines.length
+      ? await prisma.creditNoteLine.findMany({
+        where: {
+          companyId: String(companyId),
+          invoiceLineId: { in: [...invoiceLineById.keys()] },
+          creditNote: {
+            companyId: String(companyId),
+            status: { in: ["confirmed", "issued", "applied", "partially_refunded", "refunded"] },
+          },
+        },
+        select: {
+          invoiceLineId: true, lineSubtotal: true, discountPct: true,
+          creditNote: { select: { currencyCode: true } },
+        },
+      })
+      : [];
+    const revenueByCurrency = new Map();
+    const addRevenue = (currencyCode, amount) => {
+      const currency = currencyCode || "RWF";
+      revenueByCurrency.set(currency, (revenueByCurrency.get(currency) || 0) + amount);
+    };
+    for (const line of linkedInvoiceLines) {
+      const gross = Number(line.lineSubtotal || 0);
+      addRevenue(line.invoice.currencyCode, gross * (1 - Number(line.discountPct || 0) / 100));
+    }
+    for (const credit of linkedCredits) {
+      const baseInvoiceLine = invoiceLineById.get(credit.invoiceLineId);
+      if (!baseInvoiceLine) continue;
+      // Credit note normalization stores lineSubtotal after the source
+      // invoice-line discount has already been applied.
+      const discountedCreditAmount = Number(credit.lineSubtotal || 0);
+      addRevenue(credit.creditNote.currencyCode || baseInvoiceLine.invoice.currencyCode,
+        -discountedCreditAmount);
+    }
+    const revenueRows = [...revenueByCurrency.entries()].map(([currency_code, amount]) => ({
+      currency_code,
+      amount: roundMoney(amount),
+    }));
+    const projectCurrency = String(project.currency_code || "RWF").toUpperCase();
+    const mixedRevenueCurrencies = revenueRows.some((row) => row.currency_code !== projectCurrency);
+    const recognizedRevenue = mixedRevenueCurrencies
+      ? null
+      : roundMoney(revenueByCurrency.get(projectCurrency) || 0);
     const taskLaborRates = new Map();
     for (const entry of laborEntries) {
       const row = taskLaborRates.get(entry.taskId) || { hours: 0, cost: 0, currency: entry.currencyCode || "RWF" };
@@ -1186,29 +1254,49 @@ class ProjectService {
       laborForecastByCurrency.set(posted.currency, forecast);
     }
 
-    // Calculate totals
-    const summary = approvedBudgetLines.reduce(
-      (acc, line) => {
-        acc.total_budgeted += Number(line.budgeted_amount || 0);
-        acc.total_actual += Number(line.actual_amount || 0);
-        acc.total_encumbered += Number(line.encumbered_amount || 0);
-        return acc;
-      },
-      {
-        total_budgeted: 0,
-        total_actual: 0,
-        total_encumbered: 0,
-      }
-    );
+    // Budget lines inherit their parent budget's base currency. Keep sums
+    // grouped by that currency: exchange rates are budget input rates, not a
+    // reliable historical conversion into a project's currency.
+    const budgetTotalsByCurrency = new Map();
+    for (const line of approvedBudgetLines) {
+      const currency = String(line.budget_id?.base_currency || companyCurrency).toUpperCase();
+      const totals = budgetTotalsByCurrency.get(currency) || {
+        currency_code: currency, total_budgeted: 0, total_actual: 0, total_encumbered: 0,
+      };
+      totals.total_budgeted += Number(line.budgeted_amount || 0);
+      totals.total_actual += Number(line.actual_amount || 0);
+      totals.total_encumbered += Number(line.encumbered_amount || 0);
+      budgetTotalsByCurrency.set(currency, totals);
+    }
+    const budgetCurrencyRows = [...budgetTotalsByCurrency.values()].map((totals) => ({
+      ...totals,
+      total_remaining: roundMoney(totals.total_budgeted - totals.total_actual - totals.total_encumbered),
+      total_budgeted: roundMoney(totals.total_budgeted),
+      total_actual: roundMoney(totals.total_actual),
+      total_encumbered: roundMoney(totals.total_encumbered),
+    }));
+    const budgetCurrencies = budgetCurrencyRows.map((row) => row.currency_code);
+    const mixedBudgetCurrencies = budgetCurrencies.length > 1;
+    const budgetCurrency = budgetCurrencies[0] || companyCurrency;
+    const sameCurrencyTotals = budgetCurrencyRows[0] || {
+      currency_code: budgetCurrency, total_budgeted: 0, total_actual: 0, total_encumbered: 0, total_remaining: 0,
+    };
+    const summary = mixedBudgetCurrencies
+      ? { total_budgeted: null, total_actual: null, total_encumbered: null, total_remaining: null, currency_code: null, currency_consistent: false, by_currency: budgetCurrencyRows }
+      : { ...sameCurrencyTotals, currency_consistent: true, by_currency: budgetCurrencyRows };
 
-    summary.total_remaining =
-      summary.total_budgeted - summary.total_actual - summary.total_encumbered;
-
-    const roundMoney = (amount) => Math.round(amount * 100) / 100;
-    const budgetForecastCost = summary.total_actual + summary.total_encumbered;
+    const budgetForecastCost = mixedBudgetCurrencies ? null : sameCurrencyTotals.total_actual + sameCurrencyTotals.total_encumbered;
     const contractValue = Number(project.contract_value || 0);
-    const forecastProjectMargin = contractValue - budgetForecastCost;
-    const forecastProjectMarginPct = contractValue > 0 ? (forecastProjectMargin / contractValue) * 100 : null;
+    const projectCurrencyMatchesBudget = projectCurrency === budgetCurrency;
+    const forecastComparable = !mixedBudgetCurrencies && projectCurrencyMatchesBudget;
+    const forecastProjectMargin = forecastComparable ? contractValue - budgetForecastCost : null;
+    const forecastProjectMarginPct = forecastProjectMargin !== null && contractValue > 0 ? (forecastProjectMargin / contractValue) * 100 : null;
+    const actualProjectMargin = recognizedRevenue === null || mixedBudgetCurrencies || !projectCurrencyMatchesBudget
+      ? null
+      : roundMoney(recognizedRevenue - sameCurrencyTotals.total_actual);
+    const actualProjectMarginPct = recognizedRevenue > 0 && actualProjectMargin !== null
+      ? (actualProjectMargin / recognizedRevenue) * 100
+      : null;
 
     return {
       project,
@@ -1224,14 +1312,32 @@ class ProjectService {
       },
       financial_summary: {
         currency_code: project.currency_code || "RWF",
-        committed_cost: roundMoney(summary.total_encumbered),
-        forecast_budget_cost: roundMoney(budgetForecastCost),
-        budget_variance_at_completion: roundMoney(summary.total_budgeted - budgetForecastCost),
+        budget_currency_code: budgetCurrency,
+        budget_currency_consistent: !mixedBudgetCurrencies,
+        budget_totals_by_currency: budgetCurrencyRows,
+        committed_cost: mixedBudgetCurrencies ? null : roundMoney(sameCurrencyTotals.total_encumbered),
+        forecast_budget_cost: budgetForecastCost === null ? null : roundMoney(budgetForecastCost),
+        budget_variance_at_completion: mixedBudgetCurrencies ? null : roundMoney(sameCurrencyTotals.total_budgeted - budgetForecastCost),
         contract_value: roundMoney(contractValue),
-        forecast_margin: roundMoney(forecastProjectMargin),
+        forecast_margin: forecastProjectMargin === null ? null : roundMoney(forecastProjectMargin),
         forecast_margin_percent: forecastProjectMarginPct === null ? null : Math.round(forecastProjectMarginPct * 100) / 100,
-        revenue_basis: "contract_value",
-        revenue_note: "Invoice revenue is not linked to projects in the current data model; this margin uses contract value.",
+        recognized_invoice_revenue: recognizedRevenue,
+        recognized_invoice_revenue_by_currency: revenueRows,
+        actual_budget_cost: mixedBudgetCurrencies ? null : roundMoney(sameCurrencyTotals.total_actual),
+        actual_contribution_margin: actualProjectMargin,
+        actual_contribution_margin_percent: actualProjectMarginPct === null ? null : Math.round(actualProjectMarginPct * 100) / 100,
+        actual_margin_basis: "recognized_invoice_revenue_less_posted_project_budget_actuals_before_separately_reported_labor",
+        actual_margin_note: mixedBudgetCurrencies
+          ? `Project margin is unavailable because linked budget lines use multiple currencies (${budgetCurrencies.join(", ")}). Review budget totals by currency.`
+          : !projectCurrencyMatchesBudget
+            ? `Project margin is unavailable because the project uses ${projectCurrency} while linked budget costs use ${budgetCurrency}. Convert using approved transaction-date rates before comparing.`
+            : mixedRevenueCurrencies
+          ? `Project margin is unavailable because recognized invoice revenue is not all in ${projectCurrency}. Review revenue by currency before comparing with project costs.`
+          : "Actual contribution margin uses confirmed invoice revenue less posted project budget actuals. It excludes separately reported labor actuals to avoid double counting where payroll is already included in budget actuals.",
+        linked_invoice_line_count: linkedInvoiceLines.length,
+        revenue_basis: "confirmed_invoice_lines",
+        forecast_revenue_basis: "contract_value",
+        revenue_note: "Forecast revenue uses contract value. Actual recognized revenue is sourced from confirmed invoice lines assigned to this project, less linked confirmed credit notes.",
         labor_forecast_by_currency: [...laborForecastByCurrency.values()].map((row) => ({ ...row, amount: roundMoney(row.amount), hours: Math.round(row.hours * 100) / 100 })),
         unpriced_remaining_labor_hours: Math.round(unpricedRemainingHours * 100) / 100,
         labor_forecast_note: "Remaining task hours are estimated from task estimates minus approved actual hours and priced using each task's approved labor rate. Labor is shown separately from budget costs to avoid possible double counting.",
@@ -1385,19 +1491,20 @@ class ProjectService {
     const lines = await BudgetLine.find({
       company_id: companyId,
       project_id: { $in: [...includedIds] },
-    }).populate("budget_id", "status");
+    }).populate("budget_id", "status base_currency");
     const approvedStatuses = new Set(["approved", "locked", "closed", "view_only"]);
     const approvedLines = lines.filter((line) => approvedStatuses.has(line.budget_id?.status));
 
-    const totals = approvedLines.reduce(
-      (acc, line) => {
-        acc.budgeted += parseFloat(line.budgeted_amount?.toString() || "0");
-        acc.spent += parseFloat(line.actual_amount?.toString() || "0");
-        acc.encumbered += parseFloat(line.encumbered_amount?.toString() || "0");
-        return acc;
-      },
-      { budgeted: 0, spent: 0, encumbered: 0 }
-    );
+    const companyCurrency = (await prisma.company.findUnique({ where: { id: String(companyId) }, select: { baseCurrency: true } }))?.baseCurrency || "RWF";
+    const totalsByCurrency = new Map();
+    for (const line of approvedLines) {
+      const currency = String(line.budget_id?.base_currency || companyCurrency).toUpperCase();
+      const totals = totalsByCurrency.get(currency) || { budgeted: 0, spent: 0, encumbered: 0 };
+      totals.budgeted += parseFloat(line.budgeted_amount?.toString() || "0");
+      totals.spent += parseFloat(line.actual_amount?.toString() || "0");
+      totals.encumbered += parseFloat(line.encumbered_amount?.toString() || "0");
+      totalsByCurrency.set(currency, totals);
+    }
 
     const project = await Project.findOne({
       _id: projectId,
@@ -1405,6 +1512,12 @@ class ProjectService {
     });
 
     if (project) {
+      // These legacy project fields have no currency metadata. Only maintain
+      // them when a single budget currency matches the project's currency.
+      const currencies = [...totalsByCurrency.keys()];
+      const comparable = currencies.length <= 1 && (!currencies.length || currencies[0] === String(project.currency_code || "RWF").toUpperCase());
+      if (!comparable) return project;
+      const totals = totalsByCurrency.values().next().value || { budgeted: 0, spent: 0, encumbered: 0 };
       if (approvedLines.length) project.budget_allocated = totals.budgeted;
       project.budget_spent = totals.spent;
       const budgetCeiling = approvedLines.length ? totals.budgeted : Number(project.budget_allocated || 0);
