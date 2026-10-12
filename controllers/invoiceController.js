@@ -948,7 +948,7 @@ exports.cancelInvoice = async (req, res, next) => {
       payments: 1,
       stockReserved: 1,
       stockDeducted: 1,
-    }).lean();
+    });
 
     if (Array.isArray(invoice?.lines)) {
       const productIds = [...new Set(invoice.lines.map((line) => normalizeId(line.product)).filter(Boolean))];

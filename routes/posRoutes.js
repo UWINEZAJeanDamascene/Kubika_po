@@ -20,19 +20,21 @@ const {
   openDrawer,
   closeDrawer,
   getDrawer,
-  getReceipt
+  getReceipt,
 } = require('../controllers/posController');
 
-// All POS routes require authentication
+// All POS routes require authentication.
+// Checkout and cash-drawer writes are retired; sales-legacy + tills are canonical.
 router.use(protect);
 router.use(invalidatePosReads);
 
-router.post('/sale', requirePermissionOrRoles('point_of_sale', 'create', ['admin', 'manager', 'sales']), logAction('pos_sale'), createSale);
-router.post('/sale/:id/pay', requirePermissionOrRoles('point_of_sale', 'pay', ['admin', 'accountant', 'sales']), logAction('pos_payment'), addPayment);
+router.post('/sale', requirePermissionOrRoles('point_of_sale', 'create', ['admin', 'manager', 'sales']), logAction('pos_sale_retired'), createSale);
+router.post('/sale/:id/pay', requirePermissionOrRoles('point_of_sale', 'pay', ['admin', 'accountant', 'sales']), logAction('pos_payment_retired'), addPayment);
+// Receipt alias for older clients — prefer GET /api/sales-legacy/receipt/:invoiceId
 router.get('/sale/:id/receipt', requirePermissionOrRoles('point_of_sale', 'read', ['admin', 'accountant', 'manager', 'sales', 'viewer']), cachePosReads, getReceipt);
 
-router.post('/drawer/open', requirePermissionOrRoles('point_of_sale', 'open', ['admin', 'manager', 'sales']), logAction('drawer_open'), openDrawer);
-router.post('/drawer/close', requirePermissionOrRoles('point_of_sale', 'close', ['admin', 'manager', 'sales']), logAction('drawer_close'), closeDrawer);
+router.post('/drawer/open', requirePermissionOrRoles('point_of_sale', 'open', ['admin', 'manager', 'sales']), logAction('drawer_open_retired'), openDrawer);
+router.post('/drawer/close', requirePermissionOrRoles('point_of_sale', 'close', ['admin', 'manager', 'sales']), logAction('drawer_close_retired'), closeDrawer);
 router.get('/drawer/:drawerId', requirePermissionOrRoles('point_of_sale', 'read', ['admin', 'accountant', 'manager', 'sales', 'viewer']), cachePosReads, getDrawer);
 
 module.exports = router;

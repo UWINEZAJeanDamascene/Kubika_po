@@ -1,16 +1,5 @@
 const Invoice = require('../models/Invoice');
-const Client = require('../models/Client');
-const Product = require('../models/Product');
-const CashDrawer = require('../models/CashDrawer');
-const StockMovement = require('../models/StockMovement');
-const mongoose = require('mongoose');
 const Company = require('../models/Company');
-const { BankAccount } = require('../models/BankAccount');
-const JournalService = require('../services/journalService');
-const { runInTransaction } = require('../services/transactionService');
-const emailService = require('../services/emailService');
-const EBMProductService = require('../services/ebmProductService');
-const EBMSalesService = require('../services/ebmSalesService');
 const slowQueryMonitor = require('../utils/slowQueryMonitor');
 const {
   extractPayloadTotals,
@@ -30,524 +19,101 @@ async function timedQuery(label, fn) {
   }
 }
 
-const sendPOSEmail = async (invoice, company, client, action = 'created') => {
-  try {
-    const config = require('../src/config/environment').getConfig();
-    if (!config.features?.emailNotifications) {
-      console.log('[POS Email] Email notifications disabled');
-      return false;
-    }
+const SUCCESSOR_CHECKOUT = '/api/sales-legacy/direct-sale';
+const SUCCESSOR_TILL_OPEN = '/api/tills/open';
+const SUCCESSOR_TILL_CLOSE = '/api/tills/close';
+const SUCCESSOR_TILL_ACTIVE = '/api/tills/active';
+const SUCCESSOR_RECEIPT = '/api/sales-legacy/receipt/:invoiceId';
 
-    const clientEmail = client?.contact?.email || client?.email;
-    if (!clientEmail) {
-      console.warn('[POS Email] No client email found for invoice:', invoice.invoiceNumber || invoice._id);
-      return false;
-    }
+function setDeprecatedHeaders(res, successorPath) {
+  res.set({
+    Deprecation: 'true',
+    Sunset: 'Sat, 01 Aug 2026 00:00:00 GMT',
+    Link: `<${successorPath}>; rel="successor-version"`,
+  });
+}
 
-    // Populate product data for email
-    const invoiceWithProducts = await Invoice.findById(invoice._id).populate('items.product', 'name');
-    const sent = await emailService.sendInvoiceEmail(invoiceWithProducts, company, client);
-    if (!sent) {
-      console.warn('[POS Email] sendInvoiceEmail returned false for invoice:', invoice.invoiceNumber || invoice._id);
-    }
-    return !!sent;
-  } catch (err) {
-    console.error('[POS Email] Failed to send email:', err && err.message ? err.message : err);
-    return false;
-  }
-};
+function getReceiptUnit(itemName, unit) {
+  const normalizedUnit = String(unit || '').trim();
+  if (!normalizedUnit) return '';
 
-// Create a sale (POS) - supports split payments
-exports.createSale = async (req, res, next) => {
-  try {
-    const companyId = req.user.company._id;
-    const { items = [], payments = [], clientId, clientInfo, drawerId, notes } = req.body;
+  const escapedUnit = normalizedUnit.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const packageSize = new RegExp(`(?:^|\\s)\\d+(?:\\.\\d+)?\\s*${escapedUnit}(?=$|\\s|[^a-z])`, 'i');
+  return packageSize.test(String(itemName || '')) ? '' : normalizedUnit;
+}
 
-    // Invoice, stock, bank/drawer and journal postings form one accounting
-    // unit. The compat layer joins this Prisma transaction automatically.
-    const sale = await runInTransaction(async () => {
+function gone(res, { code, message, use, successorPath }) {
+  setDeprecatedHeaders(res, successorPath);
+  return res.status(410).json({
+    success: false,
+    code,
+    message,
+    use,
+  });
+}
 
-    const company = await timedQuery('pos_createSale_company', () => Company.findById(companyId).lean());
-    const defaultTaxRate = company?.settings?.taxRate ?? 0;
-    const defaultTaxCode = (defaultTaxRate > 0 ? 'B' : 'A');
+/**
+ * Legacy checkout is retired. The only supported POS sale path is
+ * POST /api/sales-legacy/direct-sale (till session + warehouse + idempotency).
+ */
+exports.createSale = async (req, res) => gone(res, {
+  code: 'POS_CHECKOUT_PATH_RETIRED',
+  message: 'POST /api/pos/sale is retired. Complete POS checkouts with POST /api/sales-legacy/direct-sale.',
+  use: SUCCESSOR_CHECKOUT,
+  successorPath: SUCCESSOR_CHECKOUT,
+});
 
-    if (!items || items.length === 0) {
-      return res.status(400).json({ success: false, message: 'No items in sale' });
-    }
-    await EBMProductService.assertProductsRegistered(companyId, items.map((item) => item.product));
+/**
+ * Follow-on payments against the retired POS sale API are not supported.
+ * Record additional tender through AR receipts or a new sales-legacy checkout.
+ */
+exports.addPayment = async (req, res) => gone(res, {
+  code: 'POS_PAYMENT_PATH_RETIRED',
+  message: 'POST /api/pos/sale/:id/pay is retired. Use sales-legacy checkout for POS tender, or AR receipts for invoice collections.',
+  use: SUCCESSOR_CHECKOUT,
+  successorPath: SUCCESSOR_CHECKOUT,
+});
 
-    const productIds = items.map((item) => item.product);
-    const productsMap = new Map();
-    if (productIds.length > 0) {
-      const products = await timedQuery('pos_createSale_products_batch', () =>
-        Product.find({ _id: { $in: productIds }, company: companyId }).select('name sku taxCode taxRate unit').lean()
-      );
-      products.forEach((p) => productsMap.set(p._id.toString(), p));
-    }
+/** Cash drawers are replaced by till sessions (/api/tills). */
+exports.openDrawer = async (req, res) => gone(res, {
+  code: 'POS_DRAWER_PATH_RETIRED',
+  message: 'POST /api/pos/drawer/open is retired. Open a cashier shift with POST /api/tills/open.',
+  use: SUCCESSOR_TILL_OPEN,
+  successorPath: SUCCESSOR_TILL_OPEN,
+});
 
-    // Resolve or create walk-in client
-    let client = null;
-    if (clientId) {
-      client = await timedQuery('pos_createSale_client', () => Client.findOne({ _id: clientId, company: companyId }));
-    }
+exports.closeDrawer = async (req, res) => gone(res, {
+  code: 'POS_DRAWER_PATH_RETIRED',
+  message: 'POST /api/pos/drawer/close is retired. Close the cashier shift with POST /api/tills/close.',
+  use: SUCCESSOR_TILL_CLOSE,
+  successorPath: SUCCESSOR_TILL_CLOSE,
+});
 
-    if (!client) {
-      client = await timedQuery('pos_createSale_walkin', () => Client.findOne({ company: companyId, code: 'WALKIN' }));
-      if (!client) {
-        client = await timedQuery('pos_createSale_walkin_create', () =>
-          Client.create({
-            company: companyId,
-            name: (clientInfo && clientInfo.name) || 'Walk-in Customer',
-            code: 'WALKIN',
-            type: 'individual',
-            contact: clientInfo?.contact || {}
-          })
-        );
-      }
-    }
+exports.getDrawer = async (req, res) => gone(res, {
+  code: 'POS_DRAWER_PATH_RETIRED',
+  message: 'GET /api/pos/drawer/:drawerId is retired. Read the active till with GET /api/tills/active.',
+  use: SUCCESSOR_TILL_ACTIVE,
+  successorPath: SUCCESSOR_TILL_ACTIVE,
+});
 
-    // Build invoice items - ensure product references and calculate simple subtotals
-    const invoiceItems = [];
-    for (const it of items) {
-      const product = productsMap.get(it.product.toString());
-      if (!product) return res.status(400).json({ success: false, message: 'Invalid product in items' });
-
-      const quantity = it.quantity || 1;
-      const unitPrice = it.unitPrice != null ? it.unitPrice : 0;
-      const discount = it.discount || 0;
-      // Normalize tax code and rate - prefer product defaults
-      let itemTaxCode = it.taxCode || product.taxCode || defaultTaxCode; // prefer item -> product -> company
-      // Derive rate from product or company settings if not provided
-      let derivedRateFromCode = product?.taxRate != null ? product.taxRate : (itemTaxCode === 'B' ? (company?.settings?.taxRate ?? 18) : 0);
-      let itemTaxRate = (it.taxRate != null ? it.taxRate : (product?.taxRate != null ? product.taxRate : derivedRateFromCode));
-      // Ensure consistency: if rate > 0, code must be 'B'; if rate = 0, code 'A' or 'None'
-      if (itemTaxRate > 0 && itemTaxCode !== 'B') itemTaxCode = 'B';
-      if ((itemTaxRate === 0 || itemTaxRate == null) && itemTaxCode !== 'A' && itemTaxCode !== 'None') itemTaxCode = 'A';
-
-      const itemSubtotal = quantity * unitPrice;
-      const netAmount = itemSubtotal - discount;
-      const taxAmount = netAmount * (itemTaxRate / 100);
-
-      invoiceItems.push({
-        product: product._id,
-        itemCode: product.sku,
-        description: product.name,
-        quantity: quantity,
-        unit: it.unit || product.unit,
-        unitPrice: unitPrice,
-        discount: discount,
-        taxCode: itemTaxCode,
-        taxRate: itemTaxRate,
-        taxAmount: taxAmount,
-        subtotal: itemSubtotal,
-        totalWithTax: netAmount + taxAmount
-      });
-    }
-
-    const invoice = new Invoice({
-      company: companyId,
-      client: client._id,
-      customerName: client.name,
-      customerTin: client.taxId || undefined,
-      customerAddress: client.contact?.address || undefined,
-      items: invoiceItems,
-      invoiceDate: new Date(),
-      dueDate: new Date(),
-      createdBy: req.user.id,
-      notes: notes || ''
-    });
-
-    // Attach payments if provided
-    if (payments && payments.length) {
-      const invalidPayment = payments.some((payment) =>
-        !Number.isFinite(Number(payment.amount)) || Number(payment.amount) <= 0
-        || !['cash', 'bank_transfer', 'cheque', 'mobile_money'].includes(payment.paymentMethod)
-        || (['bank_transfer', 'cheque', 'mobile_money'].includes(payment.paymentMethod)
-          && !String(payment.reference || '').trim())
-        || String(payment.reference || '').trim().length > 120,
-      );
-      if (invalidPayment) {
-        const error = new Error('Each POS payment must have a supported method, positive amount, and a reference for transfers, mobile money, or cheques.');
-        error.statusCode = 400;
-        throw error;
-      }
-      payments.forEach(p => invoice.payments.push({
-        amount: p.amount,
-        paymentMethod: p.paymentMethod,
-        reference: String(p.reference || '').trim(),
-        notes: p.notes,
-        bankAccountId: p.bankAccountId,
-        recordedBy: req.user.id
-      }));
-
-      invoice.amountPaid = invoice.payments.reduce((s, p) => s + (p.amount || 0), 0);
-    }
-
-    // Saving will compute totals via pre-save hook
-    await timedQuery('pos_createSale_invoice_save', () => invoice.save());
-    if ((invoice.amountPaid || 0) > (invoice.roundedAmount || 0) + 0.01) {
-      const error = new Error('POS payments cannot exceed the sale total.');
-      error.statusCode = 400;
-      throw error;
-    }
-
-    // Deduct stock for each sold item AND create stock movement records
-    const productUpdates = [];
-    const stockMovementCreates = [];
-
-    const stockProductIds = invoiceItems.map(it => it.product);
-    const stockProductsMap = new Map();
-    if (stockProductIds.length > 0) {
-      const stockProducts = await timedQuery('pos_createSale_stock_products', () =>
-        Product.find({ _id: { $in: stockProductIds } }).select('currentStock').lean()
-      );
-      stockProducts.forEach(p => stockProductsMap.set(p._id.toString(), Number(p.currentStock) || 0));
-    }
-
-    for (const it of invoiceItems) {
-      const previousStock = stockProductsMap.get(it.product.toString()) ?? 0;
-      const qtySold = it.quantity || 0;
-      const newStock = Math.max(0, previousStock - qtySold);
-
-      productUpdates.push({
-        updateOne: {
-          filter: { _id: it.product },
-          update: { $inc: { currentStock: -qtySold }, lastSaleDate: new Date() },
-        },
-      });
-
-      stockMovementCreates.push({
-        company: companyId,
-        product: it.product,
-        type: 'sale',
-        quantity: -qtySold,
-        previousStock,
-        newStock,
-        reference: invoice.invoiceNumber,
-        notes: `POS Sale - ${invoice.invoiceNumber}`,
-        createdBy: req.user.id,
-      });
-    }
-
-    if (productUpdates.length > 0) {
-      await timedQuery('pos_createSale_stock_bulkWrite', () => Product.bulkWrite(productUpdates));
-    }
-    if (stockMovementCreates.length > 0) {
-      await timedQuery('pos_createSale_stock_movements', () => StockMovement.insertMany(stockMovementCreates));
-    }
-
-    // Record cash transactions in drawer when payment method is cash
-    if (drawerId) {
-      const drawer = await CashDrawer.findOne({ company: companyId, drawerId });
-      if (!drawer || drawer.status !== 'open') {
-        throw new Error('The selected cash drawer is not open. The sale was not committed.');
-      }
-      invoice.payments.forEach(p => {
-        if (p.paymentMethod === 'cash') {
-          drawer.transactions.push({
-            type: 'sale',
-            amount: p.amount,
-            paymentMethod: p.paymentMethod,
-            reference: p.reference,
-            notes: `Sale ${invoice._id}`,
-            recordedBy: req.user.id
-          });
-        }
-      });
-      await drawer.save();
-    }
-
-    // Validate linked bank accounts before posting. JournalService creates the
-    // matching bank transactions from the posted bank debit lines atomically.
-    const bankPaymentMethods = ['bank_transfer', 'cheque', 'mobile_money'];
-    for (const p of invoice.payments) {
-      if (bankPaymentMethods.includes(p.paymentMethod)) {
-        if (!p.bankAccountId) {
-          throw new Error(`A bank account is required for ${p.paymentMethod} payments. The sale was not committed.`);
-        }
-        const bankAccount = await BankAccount.findOne({
-          _id: p.bankAccountId,
-          company: companyId,
-          isActive: true
-        });
-        if (!bankAccount) {
-          throw new Error('The selected bank account is unavailable. The sale was not committed.');
-        }
-      }
-    }
-
-    // Create journal entry for POS sale
-    {
-      const DEFAULT_ACCOUNTS = require('../constants/chartOfAccounts').DEFAULT_ACCOUNTS;
-      const lines = [];
-      
-      // Debit: Cash/Bank (based on payment method)
-      for (const p of invoice.payments) {
-        let cashAccount = DEFAULT_ACCOUNTS.cashInHand;
-        if (bankPaymentMethods.includes(p.paymentMethod)) {
-          const bankAccount = await BankAccount.findById(p.bankAccountId);
-          if (!bankAccount?.ledgerAccountId) {
-            throw new Error('The selected bank account has no linked ledger account. The sale was not committed.');
-          }
-          cashAccount = bankAccount.ledgerAccountId;
-        } else if (p.paymentMethod === 'mobile_money') {
-          cashAccount = DEFAULT_ACCOUNTS.mtnMoMo;
-        }
-        
-        lines.push(JournalService.createDebitLine(
-          cashAccount,
-          p.amount,
-          `POS Sale - ${invoice.invoiceNumber}`
-        ));
-      }
-      
-      const grossAmount = Number(invoice.roundedAmount || invoice.totalAmount || 0);
-      const paidAmount = Number(invoice.amountPaid || 0);
-      const outstandingAmount = Math.max(0, grossAmount - paidAmount);
-      const vatAmount = Number(invoice.totalTax || invoice.taxAmount || 0);
-      const netSalesAmount = Math.max(0, grossAmount - vatAmount);
-
-      // Credit: Sales Revenue (net of VAT) and VAT Output when applicable.
-      if (netSalesAmount > 0) {
-        lines.push(JournalService.createCreditLine(
-          DEFAULT_ACCOUNTS.salesRevenue,
-          netSalesAmount,
-          `POS Sale - ${invoice.invoiceNumber}`
-        ));
-      }
-
-      if (vatAmount > 0) {
-        lines.push(JournalService.createCreditLine(
-          DEFAULT_ACCOUNTS.vatOutput,
-          vatAmount,
-          `POS Sale - ${invoice.invoiceNumber} VAT`
-        ));
-      }
-
-      if (outstandingAmount > 0) {
-        lines.push(JournalService.createDebitLine(
-          DEFAULT_ACCOUNTS.accountsReceivable,
-          outstandingAmount,
-          `POS Sale - ${invoice.invoiceNumber} - Receivable`
-        ));
-      }
-      
-      await JournalService.createEntry(companyId, req.user.id, {
-        date: new Date(),
-        description: `POS Sale - Invoice ${invoice.invoiceNumber}`,
-        sourceType: 'invoice',
-        sourceId: invoice._id,
-        sourceReference: invoice.invoiceNumber,
-        lines,
-        isAutoGenerated: true
-      });
-    }
-
-    // Sync client totals and outstanding balance for POS sale
-    const clientDoc = await Client.findOne({ _id: client._id, company: companyId });
-    if (!clientDoc) {
-      throw new Error('The sale customer could not be updated. The sale was not committed.');
-    }
-    const paid = invoice.amountPaid || 0;
-    const rounded = invoice.roundedAmount || 0;
-    const outstandingDelta = Math.max(0, rounded - paid);
-    clientDoc.outstandingBalance = Math.max(0, (clientDoc.outstandingBalance || 0) + outstandingDelta);
-    clientDoc.totalPurchases = (clientDoc.totalPurchases || 0) + rounded;
-    clientDoc.lastPurchaseDate = new Date();
-    await clientDoc.save();
-
-    // Send email notification
-    const sendEmailOnCreate = req.body.sendEmail || false;
-    if (sendEmailOnCreate) {
-      const ok = await sendPOSEmail(invoice, company, client, 'created');
-      if (!ok) console.warn('[POS Email] Email not sent for invoice:', invoice.invoiceNumber || invoice._id);
-    }
-
-    let responseInvoice = invoice;
-    try {
-      responseInvoice = await EBMSalesService.markPending(invoice._id, companyId);
-      if (!responseInvoice) responseInvoice = invoice;
-    } catch (ebmPendingErr) {
-      console.warn('Failed to mark POS sale as EBM pending', ebmPendingErr.message);
-    }
-
-    return { responseInvoice, invoiceId: invoice._id };
-    });
-
-    // The response is sent only after the transaction commits. EBM submission
-    // remains asynchronous and can never delay or partially commit the sale.
-    res.status(201).json({ success: true, data: sale.responseInvoice });
-
-    EBMSalesService.submitInvoiceAsync(sale.invoiceId, {
-      companyId,
-      userId: req.user.id,
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-// Add a payment to an existing sale (split payments)
-exports.addPayment = async (req, res, next) => {
-  try {
-    const companyId = req.user.company._id;
-    const updatedInvoice = await runInTransaction(async () => {
-      const invoice = await timedQuery('pos_addPayment_findInvoice', () => Invoice.findOne({ _id: req.params.id, company: companyId }));
-      if (!invoice) {
-        const error = new Error('Sale not found');
-        error.statusCode = 404;
-        throw error;
-      }
-
-      const { amount: rawAmount, paymentMethod, reference, notes, drawerId, bankAccountId } = req.body;
-      const amount = Number(rawAmount);
-      if (!Number.isFinite(amount) || amount <= 0
-        || !['cash', 'bank_transfer', 'cheque', 'mobile_money'].includes(paymentMethod)) {
-        const error = new Error('Enter a positive payment amount and a supported payment method.');
-        error.statusCode = 400;
-        throw error;
-      }
-      const normalizedReference = String(reference || '').trim();
-      if ((['bank_transfer', 'cheque', 'mobile_money'].includes(paymentMethod) && !normalizedReference)
-        || normalizedReference.length > 120) {
-        const error = new Error('Enter a payment reference for transfers, mobile money, or cheques (maximum 120 characters).');
-        error.statusCode = 400;
-        throw error;
-      }
-      const remaining = Math.max(0, Number(invoice.roundedAmount || 0) - Number(invoice.amountPaid || 0));
-      if (amount > remaining + 0.01) {
-        const error = new Error('Payment cannot exceed the outstanding sale balance.');
-        error.statusCode = 400;
-        throw error;
-      }
-
-      const bankPaymentMethods = ['bank_transfer', 'cheque', 'mobile_money'];
-      let bankAccount = null;
-      if (bankPaymentMethods.includes(paymentMethod)) {
-        if (!bankAccountId) throw new Error(`A bank account is required for ${paymentMethod} payments.`);
-        bankAccount = await timedQuery('pos_addPayment_bankAccount', () => BankAccount.findOne({
-          _id: bankAccountId,
-          company: companyId,
-          isActive: true,
-        }));
-        if (!bankAccount?.ledgerAccountId) throw new Error('The selected bank account is unavailable or has no linked ledger account.');
-      }
-
-      invoice.payments.push({ amount, paymentMethod, reference: normalizedReference, notes, bankAccountId, recordedBy: req.user.id });
-      const savedPayment = invoice.payments[invoice.payments.length - 1];
-      invoice.amountPaid = (invoice.amountPaid || 0) + amount;
-      invoice.balance = Math.max(0, Number(invoice.roundedAmount || 0) - invoice.amountPaid);
-      if (invoice.balance <= 0.01) {
-        invoice.status = 'paid';
-        invoice.paidDate = new Date();
-      } else {
-        invoice.status = 'partial';
-      }
-      await timedQuery('pos_addPayment_invoice_save', () => invoice.save());
-
-      if (drawerId && paymentMethod === 'cash') {
-        const drawer = await timedQuery('pos_addPayment_drawer', () => CashDrawer.findOne({ company: companyId, drawerId }));
-        if (!drawer || drawer.status !== 'open') throw new Error('The selected cash drawer is not open.');
-        drawer.transactions.push({ type: 'sale', amount, paymentMethod, reference, notes, recordedBy: req.user.id });
-        await timedQuery('pos_addPayment_drawer_save', () => drawer.save());
-      }
-
-      const clientDoc = await timedQuery('pos_addPayment_client', () => Client.findOne({ _id: invoice.client, company: companyId }));
-      if (!clientDoc) throw new Error('The sale customer could not be updated.');
-      clientDoc.outstandingBalance = Math.max(0, (clientDoc.outstandingBalance || 0) - amount);
-      await timedQuery('pos_addPayment_client_save', () => clientDoc.save());
-
-      await JournalService.createInvoicePaymentEntry(companyId, req.user.id, {
-        amount,
-        paymentMethod,
-        paymentId: savedPayment?._id,
-        bankAccountId: bankAccount?._id || null,
-        bankAccountCode: bankAccount?.ledgerAccountId || null,
-        invoiceId: invoice._id,
-        invoiceNumber: invoice.invoiceNumber,
-        customerName: invoice.customerName,
-        date: new Date(),
-      });
-
-      return invoice;
-    });
-
-    res.json({ success: true, data: updatedInvoice });
-  } catch (error) {
-    next(error);
-  }
-};
-
-// Open cash drawer
-exports.openDrawer = async (req, res, next) => {
-  try {
-    const companyId = req.user.company._id;
-    const { drawerId, openingBalance = 0, notes } = req.body;
-    if (!drawerId) return res.status(400).json({ success: false, message: 'drawerId required' });
-
-    let drawer = await timedQuery('pos_openDrawer_find', () => CashDrawer.findOne({ company: companyId, drawerId }));
-    if (!drawer) {
-      drawer = await timedQuery('pos_openDrawer_create', () => CashDrawer.create({ company: companyId, drawerId, openingBalance, status: 'open', openedBy: req.user.id, openedAt: new Date(), notes }));
-    } else {
-      drawer.status = 'open';
-      drawer.openingBalance = openingBalance;
-      drawer.openedBy = req.user.id;
-      drawer.openedAt = new Date();
-      drawer.notes = notes || drawer.notes;
-      drawer.transactions = drawer.transactions || [];
-      await timedQuery('pos_openDrawer_save', () => drawer.save());
-    }
-
-    res.json({ success: true, data: drawer });
-  } catch (error) {
-    next(error);
-  }
-};
-
-// Close cash drawer
-exports.closeDrawer = async (req, res, next) => {
-  try {
-    const companyId = req.user.company._id;
-    const { drawerId, closingBalance = 0, notes } = req.body;
-    if (!drawerId) return res.status(400).json({ success: false, message: 'drawerId required' });
-
-    const drawer = await timedQuery('pos_closeDrawer_find', () => CashDrawer.findOne({ company: companyId, drawerId }));
-    if (!drawer) return res.status(404).json({ success: false, message: 'Drawer not found' });
-
-    drawer.status = 'closed';
-    drawer.closingBalance = closingBalance;
-    drawer.closedBy = req.user.id;
-    drawer.closedAt = new Date();
-    drawer.notes = notes || drawer.notes;
-    await timedQuery('pos_closeDrawer_save', () => drawer.save());
-
-    res.json({ success: true, data: drawer });
-  } catch (error) {
-    next(error);
-  }
-};
-
-// Get drawer status and transactions
-exports.getDrawer = async (req, res, next) => {
-  try {
-    const companyId = req.user.company._id;
-    const drawerId = req.params.drawerId;
-    if (!drawerId) return res.status(400).json({ success: false, message: 'drawerId required' });
-
-    const drawer = await timedQuery('pos_getDrawer', () => CashDrawer.findOne({ company: companyId, drawerId }).populate('transactions.recordedBy', 'name email'));
-    if (!drawer) return res.status(404).json({ success: false, message: 'Drawer not found' });
-
-    res.json({ success: true, data: drawer });
-  } catch (error) {
-    next(error);
-  }
-};
-
-// Return printable receipt data for a sale
+/**
+ * Printable POS receipt (shared by /api/pos/sale/:id/receipt and
+ * /api/sales-legacy/receipt/:invoiceId). Accepts either :id or :invoiceId.
+ */
 exports.getReceipt = async (req, res, next) => {
   try {
     const companyId = req.user.company._id;
-    const invoice = await timedQuery('pos_getReceipt_invoice', () => Invoice.findOne({ _id: req.params.id, company: companyId })
+    const invoiceId = req.params.invoiceId || req.params.id;
+    if (!invoiceId) {
+      return res.status(400).json({ success: false, message: 'Invoice id is required' });
+    }
+
+    // Thin alias kept for older clients; prefer sales-legacy receipt URL.
+    if (req.params.id && !req.params.invoiceId) {
+      setDeprecatedHeaders(res, SUCCESSOR_RECEIPT.replace(':invoiceId', invoiceId));
+    }
+
+    const invoice = await timedQuery('pos_getReceipt_invoice', () => Invoice.findOne({ _id: invoiceId, company: companyId })
       .populate('client', 'name contact code taxId type')
       .populate('createdBy', 'name email')
       .populate('lines.product', 'name sku unit ebm'));
@@ -569,12 +135,16 @@ exports.getReceipt = async (req, res, next) => {
       phone: company?.phone || '',
     };
     data.receiptPrintedAt = new Date();
+    data.discountAmount = Number(data.totalDiscount) || 0;
+    data.discountAmountRwf = formatRwf(data.discountAmount);
+    data.promotionLabel = data.posPromotion?.name || data.posPromotion?.code || null;
     data.receiptLines = (data.items || data.lines || []).map((line) => {
       const tax = lineTaxDetails(line);
+      const itemName = line.product?.name || line.productName || line.description || 'Item';
       return {
-        itemName: line.product?.name || line.productName || line.description || 'Item',
+        itemName,
         quantity: line.quantity || line.qty || 0,
-        unit: line.unit || line.product?.unit || '',
+        unit: getReceiptUnit(itemName, line.unit || line.product?.unit),
         unitPriceRwf: formatRwf(line.unitPrice),
         taxType: tax.taxTyCd,
         taxTypeLabel: tax.taxTypeLabel,
@@ -593,13 +163,14 @@ exports.getReceipt = async (req, res, next) => {
       grandTotalRwf: formatRwf(totals.totAmt),
     };
     data.paymentReceipt = {
-      methods: (data.payments || []).map((payment) => ({
+      methods: (data.payments || []).filter((payment) => Number(payment.amount) > 0).map((payment) => ({
         method: String(payment.paymentMethod || 'cash').replace(/_/g, ' '),
         amountRwf: formatRwf(payment.amount),
         reference: payment.reference || null,
       })),
       amountPaidRwf: formatRwf(data.amountPaid),
-      changeGivenRwf: formatRwf(Math.max(0, Number(data.amountPaid || 0) - Number(data.grandTotal || data.totalAmount || 0))),
+      changeGivenRwf: formatRwf((data.payments || []).reduce((sum, payment) => sum + (Number(payment.changeGiven) || 0), 0)
+        || Math.max(0, Number(data.amountPaid || 0) - Number(data.grandTotal || data.totalAmount || 0))),
     };
     data.ebm.rcptNoDisplay = data.ebm.rcptNo || (ebmStatus === 'pending' ? 'Pending RRA' : placeholder);
     data.ebm.rcptDtDisplay = data.ebm.rcptDt ? formatReceiptDate(data.ebm.rcptDt) : placeholder;

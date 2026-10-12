@@ -897,6 +897,19 @@ exports.recordRefund = async (req, res, next) => {
       if (!bankAccount) return res.status(404).json({ success: false, message: 'The selected refund account was not found or is inactive.' });
     }
 
+    let refundTill = null;
+    if (note.posOrigin) {
+      const { prisma } = require('../lib/prisma');
+      refundTill = await prisma.tillSession.findFirst({
+        where: { companyId: String(companyId), openedById: String(req.user.id), status: 'open' },
+        orderBy: { openedAt: 'desc' },
+        select: { id: true, registerId: true },
+      });
+      if (!refundTill) {
+        return res.status(409).json({ success: false, code: 'POS_REFUND_TILL_REQUIRED', message: 'Open your POS till before recording a refund so the refund appears in the shift report.' });
+      }
+    }
+
     const { runInTransaction } = require('../services/transactionService');
     const { dbClient } = require('../lib/prisma');
     const { DEFAULT_ACCOUNTS } = require('../constants/chartOfAccounts');
@@ -959,6 +972,8 @@ exports.recordRefund = async (req, res, next) => {
         refundedBy: req.user.id,
         refundedAt: refundDate,
         bankAccountId: bankAccount?._id || null,
+        tillSessionId: refundTill?.id || null,
+        registerId: refundTill?.registerId || null,
         journalEntryId: journalEntry?._id || null,
         arAmount: refundFromAR,
         customerCreditAmount: refundFromCustomerCredit,
@@ -986,6 +1001,28 @@ exports.recordRefund = async (req, res, next) => {
         const conflict = new Error('This credit note has already been refunded up to its available balance. Refresh and try again.');
         conflict.statusCode = 409;
         throw conflict;
+      }
+
+      if (normalizedMethod === 'cash' && refundTill) {
+        const { dbClient } = require('../lib/prisma');
+        const activity = {
+          type: 'cash_refund',
+          amount: refundAmount,
+          creditNoteId: String(note._id),
+          reference: creditReference,
+          recordedBy: String(req.user.id),
+          recordedAt: refundDate.toISOString(),
+        };
+        const updatedTill = await dbClient().$executeRawUnsafe(
+          'UPDATE till_sessions SET expected_cash = expected_cash - $1::numeric, cash_activity = cash_activity || $2::jsonb, updated_at = CURRENT_TIMESTAMP WHERE company_id = $3 AND id = $4 AND opened_by = $5 AND status = \'open\'',
+          refundAmount, JSON.stringify([activity]), String(companyId), String(refundTill.id), String(req.user.id),
+        );
+        if (updatedTill !== 1) {
+          const error = new Error('The till closed while this refund was being recorded. No refund was completed.');
+          error.code = 'POS_TILL_SESSION_CHANGED';
+          error.statusCode = 409;
+          throw error;
+        }
       }
 
       if (refundFromAR > 0) {

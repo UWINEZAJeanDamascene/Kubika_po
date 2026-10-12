@@ -77,8 +77,8 @@ exports.getClients = async (req, res, next) => {
     }
 
     const CLIENT_LIST_SELECT = req.query.forPicker === '1'
-      ? '_id name code contact type isActive taxId paymentTerms'
-      : '_id name code type contact isActive outstandingBalance totalPurchases lastPurchaseDate taxId paymentTerms createdAt updatedAt';
+      ? '_id name code contact type isActive taxId paymentTerms creditLimit outstandingBalance'
+      : '_id name code type contact isActive creditLimit outstandingBalance totalPurchases lastPurchaseDate taxId paymentTerms createdAt updatedAt';
 
     const total = await Client.countDocuments(query);
     const clients = await Client.find(query)
@@ -429,8 +429,8 @@ exports.getClientsWithStats = async (req, res, next) => {
     }
 
     const CLIENT_LIST_SELECT = req.query.forPicker === '1'
-      ? '_id name code contact type isActive taxId paymentTerms'
-      : '_id name code type contact isActive outstandingBalance totalPurchases lastPurchaseDate taxId paymentTerms createdAt updatedAt';
+      ? '_id name code contact type isActive taxId paymentTerms creditLimit outstandingBalance'
+      : '_id name code type contact isActive creditLimit outstandingBalance totalPurchases lastPurchaseDate taxId paymentTerms createdAt updatedAt';
 
     const total = await Client.countDocuments(query);
     const clients = await Client.find(query)

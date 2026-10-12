@@ -129,7 +129,7 @@ function extractPayloadTotals(ebm = {}, fallback = {}) {
   };
 }
 
-function drawTaxBreakdown(doc, { x, y, width = 250, ebm = {}, fallback = {}, title = "INVOICE TOTALS", negative = false } = {}) {
+function drawTaxBreakdown(doc, { x, y, width = 250, ebm = {}, fallback = {}, title = "INVOICE TOTALS", negative = false, discountAmount = 0, discountLabel = "Discount" } = {}) {
   const totals = extractPayloadTotals(ebm, fallback);
   const sign = negative ? -1 : 1;
   const rows = [
@@ -140,7 +140,8 @@ function drawTaxBreakdown(doc, { x, y, width = 250, ebm = {}, fallback = {}, tit
   ].filter(([, amount]) => Math.round(Math.abs(amount)) !== 0);
 
   const rowHeight = 16;
-  const height = 56 + rows.length * rowHeight + 48;
+  const hasDiscount = toNumber(discountAmount) > 0;
+  const height = 56 + rows.length * rowHeight + 48 + (hasDiscount ? rowHeight : 0);
   doc.rect(x, y, width, height).fillAndStroke("#ffffff", "#e5e7eb");
   doc.fillColor("#111827").font("Helvetica-Bold").fontSize(10).text(title, x + 10, y + 9);
   let cy = y + 29;
@@ -155,6 +156,13 @@ function drawTaxBreakdown(doc, { x, y, width = 250, ebm = {}, fallback = {}, tit
   doc.text("Total Taxable Amount:", x + 10, cy, { width: width - 115 });
   doc.text(formatRwf(sign * totals.totTaxblAmt), x + width - 110, cy, { width: 100, align: "right" });
   cy += rowHeight;
+  if (hasDiscount) {
+    doc.fillColor("#047857").font("Helvetica-Bold");
+    doc.text(discountLabel, x + 10, cy, { width: width - 115 });
+    doc.text(formatRwf(-Math.abs(toNumber(discountAmount))), x + width - 110, cy, { width: 100, align: "right" });
+    doc.fillColor("#374151").font("Helvetica");
+    cy += rowHeight;
+  }
   doc.text("Total VAT (18%):", x + 10, cy, { width: width - 115 });
   doc.text(formatRwf(sign * totals.totTaxAmt), x + width - 110, cy, { width: 100, align: "right" });
   cy += rowHeight + 2;

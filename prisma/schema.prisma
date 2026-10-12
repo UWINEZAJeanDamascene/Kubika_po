@@ -497,6 +497,26 @@ model PosSaleRequest {
   @@map("pos_sale_requests")
 }
 
+/// Auditable manager-authorized re-key operations used to recover a distinct
+/// saved checkout when its browser idempotency key belongs to another sale.
+model PosSaleRequestRecovery {
+  id                    String   @id @db.Char(24)
+  companyId             String   @map("company_id") @db.Char(24)
+  originalRequestKey    String   @map("original_request_key") @db.VarChar(100)
+  replacementRequestKey String   @map("replacement_request_key") @db.VarChar(100)
+  pendingPayloadHash    String   @map("pending_payload_hash") @db.Char(64)
+  originalPayloadHash   String   @map("original_payload_hash") @db.Char(64)
+  originalInvoiceId     String   @map("original_invoice_id") @db.Char(24)
+  initiatedById         String   @map("initiated_by_id") @db.Char(24)
+  approvedById          String   @map("approved_by_id") @db.Char(24)
+  reason                String
+  createdAt             DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@unique([companyId, replacementRequestKey])
+  @@index([companyId, originalRequestKey, createdAt])
+  @@map("pos_sale_request_recoveries")
+}
+
 model InterestAccrual {
   id                    String   @id @db.Char(24)
   companyId             String   @map("company_id") @db.Char(24)
@@ -741,6 +761,8 @@ model Company {
   taxTransactions             TaxTransaction[]
   taxes                       Tax[]
   tillSessions                TillSession[]
+  posRegisters                PosRegister[]
+  posPromotions               PosPromotion[]
   posManagerApprovals          PosManagerApproval[]
   posHeldSales                PosHeldSale[]
   timesheets                  Timesheet[]
@@ -996,6 +1018,8 @@ model TillSession {
   handoverFromId String?         @map("handover_from_id") @db.Char(24)
   handoverToId   String?         @map("handover_to_id") @db.Char(24)
   closeNotes     String?         @map("close_notes")
+  zReport        Json?           @map("z_report")
+  zReportGeneratedAt DateTime?   @map("z_report_generated_at") @db.Timestamptz(3)
   openedAt     DateTime          @default(now()) @map("opened_at") @db.Timestamptz(3)
   closedAt     DateTime?         @map("closed_at") @db.Timestamptz(3)
   createdAt    DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
@@ -1009,6 +1033,29 @@ model TillSession {
   @@index([companyId, openedById, registerId, status])
   @@index([companyId, status, openedAt(sort: Desc)])
   @@map("till_sessions")
+}
+
+/// Company-managed POS registers with a short-lived one-time device claim code.
+model PosRegister {
+  id              String    @id @db.Char(24)
+  companyId       String    @map("company_id") @db.Char(24)
+  code            String    @db.VarChar(80)
+  name            String    @db.VarChar(120)
+  location        String?   @db.VarChar(160)
+  isActive        Boolean   @default(true) @map("is_active")
+  claimedDeviceId String?   @map("claimed_device_id") @db.VarChar(80)
+  claimedAt       DateTime? @map("claimed_at") @db.Timestamptz(3)
+  claimCodeHash   String?   @map("claim_code_hash") @db.VarChar(64)
+  claimExpiresAt  DateTime? @map("claim_expires_at") @db.Timestamptz(3)
+  createdById     String?   @map("created_by_id") @db.Char(24)
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company         Company   @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, code])
+  @@unique([companyId, claimedDeviceId])
+  @@index([companyId, isActive])
+  @@map("pos_registers")
 }
 
 /// Short-lived, one-use, second-person approval for sensitive POS operations.
@@ -1030,6 +1077,27 @@ model PosManagerApproval {
   @@index([companyId, cashierId, action, expiresAt])
   @@index([companyId, subjectId, action])
   @@map("pos_manager_approvals")
+}
+
+/// Manager-approved POS promotion rules with explicit validity windows.
+model PosPromotion {
+  id          String   @id @db.Char(24)
+  companyId   String   @map("company_id") @db.Char(24)
+  name        String   @db.VarChar(120)
+  code        String   @db.VarChar(40)
+  discountType String  @map("discount_type") @db.VarChar(16)
+  value       Decimal  @db.Decimal(19, 4)
+  startsAt    DateTime @map("starts_at") @db.Timestamptz(3)
+  endsAt      DateTime @map("ends_at") @db.Timestamptz(3)
+  isActive    Boolean  @default(true) @map("is_active")
+  createdById String   @map("created_by_id") @db.Char(24)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+  company     Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, code])
+  @@index([companyId, isActive, startsAt, endsAt])
+  @@map("pos_promotions")
 }
 
 /// Customer prepayments recognised as revenue over time. `recognitions` holds the
@@ -2128,6 +2196,8 @@ model Invoice {
   deliveryNoteId           String?                  @map("delivery_note_id") @db.Char(24)
   status                   String                   @default("draft")
   posOrigin                Boolean                  @default(false) @map("pos_origin")
+  tillSessionId            String?                  @map("till_session_id") @db.Char(24)
+  registerId               String?                  @map("register_id")
   currencyCode             String                   @default("RWF") @map("currency_code")
   exchangeRate             Decimal                  @default(1) @map("exchange_rate") @db.Decimal(19, 6)
   subtotal                 Decimal                  @default(0) @db.Decimal(19, 2)
@@ -2152,6 +2222,7 @@ model Invoice {
   autoConfirm              Boolean                  @default(false) @map("auto_confirm")
   generatedFromRecurringId String?                  @map("generated_from_recurring_id") @db.Char(24)
   payments                 Json                     @default("[]")
+  posPromotion             Json?                    @map("pos_promotion")
   ebm                      Json                     @default("{}")
   terms                    String?
   notes                    String?
@@ -2173,6 +2244,7 @@ model Invoice {
   @@unique([companyId, referenceNo])
   @@index([companyId, status, dueDate])
   @@index([companyId, invoiceDate(sort: Desc)])
+  @@index([companyId, tillSessionId, invoiceDate(sort: Desc)], map: "invoices_company_till_session_invoice_date_idx")
   @@index([companyId, clientId, status])
   @@index([companyId, badDebtWrittenOff], map: "invoices_company_bad_debt_idx")
   @@map("invoices")

@@ -173,9 +173,27 @@ function invoiceToApi(row) {
   const taxAmount = headerTax > 0 ? headerTax : linesTax;
   const totalAmount = headerTotal > 0 ? headerTotal : linesTotal;
   const amountPaid = qtyNum(row.amountPaid);
+  const lineDiscount = lines.reduce((sum, line) => sum + (
+    (Number(line.lineSubtotal) || 0) * (Number(line.discountPct) || 0) / 100
+  ), 0);
+  const posPromotion = row.posPromotion ?? null;
+  const totalDiscount = qtyNum(row.totalDiscount) > 0
+    ? qtyNum(row.totalDiscount)
+    : Math.max(lineDiscount, qtyNum(posPromotion?.discountAmount));
   const outstanding = row.amountOutstanding != null
     ? Math.round(Math.max(0, qtyNum(row.amountOutstanding)) * 100) / 100
     : Math.round(Math.max(0, totalAmount - amountPaid) * 100) / 100;
+  // POS amounts are persisted to cents. Older sales could retain a partial
+  // status from a sub-cent float difference while the stored paid/balance
+  // figures correctly show a settlement. Present the financially consistent
+  // terminal status in API reads without rewriting historical ledger rows.
+  const status = row.status !== 'cancelled'
+    && row.status !== 'draft'
+    && totalAmount > 0
+    && amountPaid >= totalAmount - 0.009
+    && outstanding <= 0.009
+    ? 'fully_paid'
+    : row.status;
   return {
     _id: row.id,
     company: row.companyId,
@@ -188,8 +206,10 @@ function invoiceToApi(row) {
     quotation: row.quotationId ?? null,
     salesOrder: row.salesOrderId ?? null,
     deliveryNote: row.deliveryNoteId ?? null,
-    status: row.status,
+    status,
     posOrigin: Boolean(row.posOrigin),
+    tillSessionId: row.tillSessionId ?? null,
+    registerId: row.registerId ?? null,
     badDebtWrittenOff: Boolean(row.badDebtWrittenOff),
     writtenOffAt: row.writtenOffAt ?? null,
     writtenOffBy: row.writtenOffById ?? null,
@@ -207,7 +227,8 @@ function invoiceToApi(row) {
     balance: moneyStr(outstanding),
     totalAEx: qtyNum(row.totalAEx),
     totalB18: qtyNum(row.totalB18),
-    totalDiscount: qtyNum(row.totalDiscount),
+    totalDiscount: moneyStr(totalDiscount),
+    posPromotion,
     invoiceDate: row.invoiceDate,
     date: row.invoiceDate,
     dueDate: row.dueDate,

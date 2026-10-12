@@ -8,6 +8,9 @@ const ACTIONS = {
   discount: { resource: 'sales_invoices', permission: 'approve' },
   void: { resource: 'sales_invoices', permission: 'delete' },
   refund: { resource: 'credit_notes', permission: 'approve' },
+  till_force_close: { resource: 'tills', permission: 'close' },
+  till_large_variance_close: { resource: 'tills', permission: 'close' },
+  checkout_recovery: { resource: 'sales_invoices', permission: 'approve' },
 };
 
 const hashPayload = (payload) => createHash('sha256').update(JSON.stringify(payload || {})).digest('hex');
@@ -76,6 +79,58 @@ exports.createApproval = async (req, res, next) => {
 
     const subjectId = req.body.subjectId ? String(req.body.subjectId) : null;
     let tillSessionId = null;
+    if (action === 'till_force_close') {
+      tillSessionId = String(payload?.tillSessionId || subjectId || '');
+      const counted = Number(payload?.closingCount);
+      const reason = String(payload?.closeReason || '').trim();
+      const activeTill = tillSessionId && Number.isFinite(counted) && counted >= 0 && reason.length >= 10
+        ? await prisma.tillSession.findFirst({
+          where: { id: tillSessionId, companyId, status: 'open', openedById: { not: cashierId } },
+          select: { id: true },
+        })
+        : null;
+      if (!activeTill) return res.status(409).json({ success: false, code: 'POS_TILL_FORCE_CLOSE_INVALID', message: 'A different cashier’s open till, counted cash, and a reason of at least 10 characters are required.' });
+    }
+    if (action === 'till_large_variance_close') {
+      tillSessionId = String(payload?.tillSessionId || subjectId || '');
+      const counted = Number(payload?.closingCount);
+      const submittedExpectedCash = Number(payload?.expectedCash);
+      const submittedVariance = Number(payload?.variance);
+      const reason = String(payload?.closeReason || '').trim();
+      const configuredThreshold = Number(process.env.POS_TILL_LARGE_VARIANCE_THRESHOLD_RWF);
+      const threshold = Number.isFinite(configuredThreshold) && configuredThreshold > 0 ? configuredThreshold : 50000;
+      const activeTill = tillSessionId && Number.isFinite(counted) && counted >= 0 && reason.length >= 10
+        ? await prisma.tillSession.findFirst({
+          where: { id: tillSessionId, companyId, openedById: cashierId, status: 'open' },
+          select: { id: true, openingFloat: true, expectedCash: true },
+        })
+        : null;
+      const expectedCash = Number(activeTill?.expectedCash ?? activeTill?.openingFloat) || 0;
+      const variance = Math.round((counted - expectedCash) * 100) / 100;
+      if (!activeTill || String(subjectId || '') !== tillSessionId
+        || !Number.isFinite(submittedExpectedCash) || !Number.isFinite(submittedVariance)
+        || Math.abs(submittedExpectedCash - expectedCash) > 0.001
+        || Math.abs(submittedVariance - variance) > 0.001
+        || Math.abs(variance) < threshold) {
+        return res.status(409).json({
+          success: false,
+          code: 'POS_TILL_LARGE_VARIANCE_APPROVAL_INVALID',
+          message: 'This approval requires your own open till, a counted amount at or above the configured manager threshold, and a reason of at least 10 characters.',
+        });
+      }
+    }
+    if (action === 'checkout_recovery') {
+      const recoveryKey = String(payload?.requestKey || '').trim();
+      const reason = String(payload?.reason || '').trim();
+      const pendingRequest = payload?.requestData;
+      if (!/^[a-zA-Z0-9_-]{16,100}$/.test(recoveryKey)
+        || payload?.confirmedNoMatchingSale !== true
+        || reason.length < 10
+        || !pendingRequest || typeof pendingRequest !== 'object' || Array.isArray(pendingRequest)
+        || !payload?.linkedInvoiceId) {
+        return res.status(400).json({ success: false, code: 'POS_CHECKOUT_RECOVERY_CONFIRMATION_REQUIRED', message: 'Review the linked invoice, confirm there is no matching sale, and enter a recovery reason of at least 10 characters.' });
+      }
+    }
     if (action === 'discount') {
       tillSessionId = String(payload?.tillSession?.id || '');
       const activeTill = tillSessionId && await prisma.tillSession.findFirst({

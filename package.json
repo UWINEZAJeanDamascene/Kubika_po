@@ -34,6 +34,7 @@
     "test:phase10": "jest --runInBand test/phase10BudgetPayrollAssetsEbm.test.js",
     "test:phase0-step8": "jest --runInBand test/phase0TransactionsSequences.test.js",
     "test:atomicity": "jest --runInBand test/transactionAtomicity.test.js",
+    "test:pos-e2e": "jest --runInBand --forceExit test/posCheckoutPathRetired.test.js test/posE2eCheckout.test.js test/posE2eTillApprovals.test.js test/salesLegacyPosSerials.test.js",
     "test:agg-parity": "jest --runInBand test/journalAggregationParity.test.js test/prismaAggregateFilters.test.js",
     "test:ai": "npm run ai:check-boundaries && jest --runInBand ai-engine test/aiActionProposalService.test.js test/aiPhase14Observability.test.js test/aiFindingService.test.js test/aiForecastService.test.js test/aiMonitoringService.test.js",
     "test:ai:adversarial": "jest --runInBand ai-engine/tests/adversarial",

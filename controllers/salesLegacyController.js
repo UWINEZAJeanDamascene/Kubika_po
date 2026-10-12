@@ -6,6 +6,7 @@ const Warehouse = require('../models/Warehouse');
 const Company = require('../models/Company');
 const { BankAccount } = require('../models/BankAccount');
 const TillSession = require('../models/TillSession');
+const { findClaimedRegister, registerClaimRequiredError } = require('../services/posRegisterService');
 const StockLevel = require('../models/StockLevel');
 const StockSerialNumber = require('../models/StockSerialNumber');
 const StockBatch = require('../models/StockBatch');
@@ -26,6 +27,10 @@ function resolveProductTaxRate(product) {
   return taxCode === 'B' ? 18 : 0;
 }
 
+function roundMoney(value) {
+  return Math.round((Number(value) + Number.EPSILON) * 100) / 100;
+}
+
 const { runInTransaction } = require('../services/transactionService');
 const inventoryService = require('../services/inventoryService');
 const JournalService = require('../services/journalService');
@@ -40,7 +45,11 @@ const ebmService = require('../services/ebmService');
 const EBMSalesService = require('../services/ebmSalesService');
 
 function hashPosSalePayload(payload) {
-  return createHash('sha256').update(JSON.stringify(payload || {})).digest('hex');
+  const canonical = { ...(payload || {}) };
+  // Device claim is an authorization context, not part of the sale itself.
+  // Excluding it keeps already-saved offline/idempotent checkout keys replayable.
+  delete canonical.deviceId;
+  return createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
 }
 
 async function consumeTrackedBatches(companyId, productId, warehouseId, quantity, session) {
@@ -128,9 +137,14 @@ async function replayPosSaleIfPresent(req, res, { companyId, requestKey, payload
     });
     return true;
   }
-  const tendered = Number(req.body?.paymentAmount) || 0;
+  const tendered = Array.isArray(req.body?.payments) && req.body.payments.length
+    ? req.body.payments.reduce((sum, payment) => sum + (Number(payment?.amount) || 0), 0)
+    : Number(req.body?.paymentAmount) || 0;
   const total = Number(invoice.grandTotal ?? invoice.totalAmount) || 0;
-  const changeDue = req.body?.paymentMethod === 'cash' ? Math.max(0, tendered - total) : 0;
+  const cashTendered = Array.isArray(req.body?.payments) && req.body.payments.length
+    ? req.body.payments.filter((payment) => payment?.paymentMethod === 'cash').reduce((sum, payment) => sum + (Number(payment?.amount) || 0), 0)
+    : req.body?.paymentMethod === 'cash' ? tendered : 0;
+  const changeDue = cashTendered >= Math.max(0, tendered - total) ? Math.max(0, tendered - total) : 0;
   res.status(200).json({ success: true, message: 'This checkout was already completed.', data: invoice, changeDue, replayed: true });
   return true;
 }
@@ -157,10 +171,12 @@ const sendDirectSaleEmail = async (invoice, companyId) => {
 };
 
 /**
- * @desc    Create a direct sales invoice (Legacy/Direct POS workflow)
+ * @desc    Create a direct sales invoice (canonical POS checkout)
  * @route   POST /api/sales-legacy/direct-sale
  * @access  Private
- * 
+ *
+ * This is the only supported POS sale write path. POST /api/pos/sale is retired.
+ *
  * Workflow: Invoice (Direct) → Payment
  * No quotation, no sales order, no delivery note
  * Stock decrement happens immediately via WAC/FIFO
@@ -180,6 +196,9 @@ exports.createDirectSale = async (req, res, next) => {
     if (requestKey && !/^[a-zA-Z0-9_-]{16,100}$/.test(requestKey)) {
       return res.status(400).json({ success: false, code: 'POS_INVALID_IDEMPOTENCY_KEY', message: 'Checkout idempotency key is invalid.' });
     }
+    const requestedRegisterId = String(req.body.registerId || '');
+    const claimedRegister = await findClaimedRegister(companyId, requestedRegisterId, req.body.deviceId);
+    if (!claimedRegister) throw registerClaimRequiredError();
     payloadHash = hashPosSalePayload(req.body);
     if (requestKey && await replayPosSaleIfPresent(req, res, { companyId, requestKey, payloadHash })) return;
 
@@ -192,11 +211,13 @@ exports.createDirectSale = async (req, res, next) => {
       paymentMethod,
       paymentAmount,
       paymentReference,
+      payments: requestedPayments,
       notes,
       dueDate,
       terms,
       bankAccountId,
-      tillSession
+      tillSession,
+      promotionId,
     } = req.body;
 
     // Validation
@@ -214,11 +235,10 @@ exports.createDirectSale = async (req, res, next) => {
       });
     }
 
-    const requestedRegisterId = String(req.body.registerId || `legacy-${req.user.id}`);
     const activeTill = await TillSession.findOne({
       company: companyId,
       openedBy: req.user.id,
-      registerId: requestedRegisterId,
+      registerId: claimedRegister.code,
       status: 'open',
     });
     if (!activeTill) {
@@ -277,6 +297,51 @@ exports.createDirectSale = async (req, res, next) => {
       console.warn('[createDirectSale] Batch product load failed:', batchErr.message);
     }
 
+    let promotion = null;
+    const promotionDiscountPctByIndex = new Map();
+    let promotionDiscountAmount = 0;
+    if (promotionId) {
+      const now = new Date();
+      const promotionRows = await dbClient().$queryRawUnsafe(
+        'SELECT id, name, code, discount_type AS "discountType", value FROM pos_promotions WHERE id = $1 AND company_id = $2 AND is_active = TRUE AND starts_at <= $3 AND ends_at > $3',
+        String(promotionId), String(companyId), now,
+      );
+      promotion = promotionRows[0] || null;
+      if (!promotion) return res.status(409).json({ success: false, code: 'POS_PROMOTION_UNAVAILABLE', message: 'This promotion is no longer active. Refresh the POS promotions and retry.' });
+      const promotionValue = Number(promotion.value);
+      const maxPercent = Math.min(100, Math.max(1, Number(process.env.POS_PROMOTION_MAX_PERCENT) || 50));
+      const maxFixed = Math.max(1, Number(process.env.POS_PROMOTION_MAX_FIXED_RWF) || 1000000);
+      if ((promotion.discountType === 'percent' && (!Number.isFinite(promotionValue) || promotionValue > maxPercent))
+        || (promotion.discountType === 'fixed' && (!Number.isFinite(promotionValue) || promotionValue > maxFixed))) {
+        return res.status(409).json({ success: false, code: 'POS_PROMOTION_ABOVE_CAP', message: 'This promotion exceeds the configured POS manager discount cap.' });
+      }
+      const bases = items.map((item) => {
+        const product = productsMap.get(String(item.productId));
+        const quantity = Number(item.quantity);
+        const price = Number(product?.sellingPrice);
+        const requestedPrice = item.unitPrice == null ? price : Number(item.unitPrice);
+        if (!product || !Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(price)
+          || Math.abs(requestedPrice - price) > 0.000001 || Number(item.discountPct || 0) !== 0) return null;
+        return quantity * price;
+      });
+      if (bases.some((amount) => amount == null)) {
+        return res.status(400).json({ success: false, code: 'POS_PROMOTION_MANUAL_DISCOUNT_CONFLICT', message: 'Promotions cannot be combined with manual discounts or overridden prices. Remove the manual adjustment and apply one promotion.' });
+      }
+      const baseTotal = bases.reduce((sum, amount) => sum + amount, 0);
+      if (baseTotal <= 0) return res.status(400).json({ success: false, code: 'POS_PROMOTION_EMPTY_CART', message: 'A promotion requires a positive-value cart.' });
+      promotionDiscountAmount = promotion.discountType === 'percent'
+        ? Math.round((baseTotal * promotionValue / 100 + Number.EPSILON) * 100) / 100
+        : Math.min(baseTotal, Math.round((promotionValue + Number.EPSILON) * 100) / 100);
+      let allocated = 0;
+      bases.forEach((base, index) => {
+        const lineDiscount = index === bases.length - 1
+          ? Math.max(0, promotionDiscountAmount - allocated)
+          : Math.round((promotionDiscountAmount * base / baseTotal + Number.EPSILON) * 100) / 100;
+        allocated += lineDiscount;
+        promotionDiscountPctByIndex.set(index, base > 0 ? lineDiscount / base * 100 : 0);
+      });
+    }
+
     // Validate all items and build invoice lines
     const invoiceLines = [];
     const stockUpdates = [];
@@ -291,7 +356,7 @@ exports.createDirectSale = async (req, res, next) => {
     );
     let requiresManagerApproval = false;
 
-    for (const item of items) {
+    for (const [itemIndex, item] of items.entries()) {
       const product = productsMap.get(String(item.productId));
       if (!product) {
         missingProducts.push(item.productId);
@@ -301,7 +366,10 @@ exports.createDirectSale = async (req, res, next) => {
       const quantity = Number(item.quantity);
       const productPrice = Number(product.sellingPrice);
       const requestedUnitPrice = item.unitPrice == null ? productPrice : Number(item.unitPrice);
-      const discountPct = item.discountPct == null ? 0 : Number(item.discountPct);
+      const requestedDiscountPct = item.discountPct == null ? 0 : Number(item.discountPct);
+      const discountPct = promotion
+        ? Number(promotionDiscountPctByIndex.get(itemIndex) || 0)
+        : requestedDiscountPct;
       if (item.catalogUnitPrice != null && Math.abs(Number(item.catalogUnitPrice) - productPrice) > 0.000001) {
         return res.status(409).json({
           success: false,
@@ -328,7 +396,7 @@ exports.createDirectSale = async (req, res, next) => {
       const unitPrice = requestedUnitPrice;
       const hasPriceOverride = Math.abs(unitPrice - productPrice) > 0.000001;
       if (hasPriceOverride || discountPct > 0) {
-        requiresManagerApproval = true;
+        if (!promotion) requiresManagerApproval = true;
       }
       
       const isStockable = product.isStockable !== false;
@@ -373,9 +441,9 @@ exports.createDirectSale = async (req, res, next) => {
         }
       }
 
-      const subtotal = quantity * unitPrice;
-      const discountAmount = subtotal * (discountPct / 100);
-      const netAmount = subtotal - discountAmount;
+      const subtotal = roundMoney(quantity * unitPrice);
+      const discountAmount = roundMoney(subtotal * (discountPct / 100));
+      const netAmount = roundMoney(subtotal - discountAmount);
       const taxRate = resolveProductTaxRate(product);
       if (!Number.isFinite(taxRate) || taxRate < 0 || taxRate > 100) {
         return res.status(422).json({
@@ -385,8 +453,8 @@ exports.createDirectSale = async (req, res, next) => {
         });
       }
       const taxCode = product.taxCode || (taxRate > 0 ? 'B' : 'A');
-      const taxAmount = netAmount * (taxRate / 100);
-      const lineTotal = netAmount + taxAmount;
+      const taxAmount = roundMoney(netAmount * (taxRate / 100));
+      const lineTotal = roundMoney(netAmount + taxAmount);
       if (![subtotal, discountAmount, netAmount, taxAmount, lineTotal].every(Number.isFinite)
         || lineTotal > Number.MAX_SAFE_INTEGER) {
         return res.status(400).json({
@@ -443,16 +511,59 @@ exports.createDirectSale = async (req, res, next) => {
     }
 
     // Calculate totals
-    const subtotal = invoiceLines.reduce((sum, line) => sum + line.lineSubtotal, 0);
-    const totalDiscount = invoiceLines.reduce((sum, line) => sum + (line.lineSubtotal * (line.discountPct || 0) / 100), 0);
-    const netSales = subtotal - totalDiscount;
-    const totalTax = invoiceLines.reduce((sum, line) => sum + line.taxAmount, 0);
-    const grandTotal = invoiceLines.reduce((sum, line) => sum + line.lineTotal, 0);
+    const subtotal = roundMoney(invoiceLines.reduce((sum, line) => sum + line.lineSubtotal, 0));
+    const totalDiscount = roundMoney(invoiceLines.reduce((sum, line) => sum + (line.lineSubtotal * (line.discountPct || 0) / 100), 0));
+    const netSales = roundMoney(subtotal - totalDiscount);
+    const totalTax = roundMoney(invoiceLines.reduce((sum, line) => sum + line.taxAmount, 0));
+    const grandTotal = roundMoney(invoiceLines.reduce((sum, line) => sum + line.lineTotal, 0));
 
     // Determine payment status
-    const amountTendered = paymentAmount == null || paymentAmount === '' ? 0 : Number(paymentAmount);
     const normalizedPaymentReference = String(paymentReference || '').trim();
     const supportedPaymentMethods = ['cash', 'card', 'bank_transfer', 'mobile_money', 'cheque'];
+    const rawPayments = Array.isArray(requestedPayments) && requestedPayments.length
+      ? requestedPayments
+      : [{ paymentMethod, amount: paymentAmount, reference: normalizedPaymentReference, bankAccountId }];
+    if (rawPayments.length > 5) {
+      return res.status(400).json({ success: false, code: 'POS_TOO_MANY_TENDERS', message: 'A sale can contain at most five payment methods.' });
+    }
+    const normalizedPayments = [];
+    const transactionReferences = new Set();
+    const placeholderReferences = new Set(['na', 'n/a', 'none', 'null', 'unknown', 'test', 'paid', 'cash', '-', '0', '000']);
+    for (const [index, entry] of rawPayments.entries()) {
+      const method = String(entry?.paymentMethod || (rawPayments.length === 1 ? paymentMethod : '')).toLowerCase();
+      const amount = entry?.amount == null || entry.amount === '' ? 0 : Number(entry.amount);
+      const reference = String(entry?.reference || '').trim();
+      if (!Number.isFinite(amount) || amount < 0 || amount > Number.MAX_SAFE_INTEGER) {
+        return res.status(400).json({ success: false, code: 'ERR_INVALID_PAYMENT_AMOUNT', message: `Payment ${index + 1} must have a valid non-negative amount.` });
+      }
+      if (amount > 0 && method === 'card') {
+        return res.status(409).json({ success: false, code: 'POS_CARD_TERMINAL_NOT_CONFIGURED', message: 'Card payments are unavailable because no payment terminal is configured. No card payment was recorded.' });
+      }
+      if (amount > 0 && !supportedPaymentMethods.includes(method)) {
+        return res.status(400).json({ success: false, code: 'ERR_INVALID_PAYMENT_METHOD', message: `Select a supported method for payment ${index + 1}.` });
+      }
+      if (amount > 0 && ['bank_transfer', 'mobile_money', 'cheque'].includes(method) && !reference) {
+        return res.status(400).json({ success: false, code: 'POS_PAYMENT_REFERENCE_REQUIRED', message: `Enter a verified transaction or cheque reference for payment ${index + 1}.` });
+      }
+      if (amount > 0 && ['bank_transfer', 'mobile_money', 'cheque'].includes(method)
+        && placeholderReferences.has(reference.toLowerCase().replace(/\s+/g, ''))) {
+        return res.status(400).json({ success: false, code: 'POS_PAYMENT_REFERENCE_INVALID', message: `Enter the actual provider or bank reference for payment ${index + 1}; placeholder values are not accepted.` });
+      }
+      if (reference.length > 120) {
+        return res.status(400).json({ success: false, code: 'POS_PAYMENT_REFERENCE_TOO_LONG', message: 'Payment references must be 120 characters or fewer.' });
+      }
+      if (amount > 0 && ['bank_transfer', 'mobile_money', 'cheque'].includes(method)) {
+        const referenceKey = reference.toLowerCase();
+        if (transactionReferences.has(referenceKey)) {
+          return res.status(400).json({ success: false, code: 'POS_PAYMENT_REFERENCE_DUPLICATE', message: 'Each non-cash payment must use its own transaction reference.' });
+        }
+        transactionReferences.add(referenceKey);
+      }
+      normalizedPayments.push({ paymentMethod: method, amount, reference, bankAccountId: entry?.bankAccountId || (rawPayments.length === 1 ? bankAccountId : null) || null });
+    }
+    for (const tender of normalizedPayments) tender.amount = roundMoney(tender.amount);
+    const amountTendered = roundMoney(normalizedPayments.reduce((sum, tender) => sum + tender.amount, 0));
+    const cashTendered = roundMoney(normalizedPayments.filter((tender) => tender.paymentMethod === 'cash').reduce((sum, tender) => sum + tender.amount, 0));
     if (!Number.isFinite(amountTendered) || amountTendered < 0 || amountTendered > Number.MAX_SAFE_INTEGER) {
       return res.status(400).json({
         success: false,
@@ -463,56 +574,40 @@ exports.createDirectSale = async (req, res, next) => {
     // Card is not a cash-equivalent tender. Until a terminal/provider
     // confirms authorization and settlement, accepting it here would mark an
     // unverified payment as paid and post it to the cash-on-hand account.
-    if (amountTendered > 0 && paymentMethod === 'card') {
-      return res.status(409).json({
-        success: false,
-        code: 'POS_CARD_TERMINAL_NOT_CONFIGURED',
-        message: 'Card payments are unavailable because no payment terminal is configured. No card payment was recorded.',
-      });
-    }
-    if (amountTendered > 0 && !supportedPaymentMethods.includes(paymentMethod)) {
-      return res.status(400).json({
-        success: false,
-        code: 'ERR_INVALID_PAYMENT_METHOD',
-        message: 'Select a supported payment method for the received amount',
-      });
-    }
-    if (amountTendered > 0 && ['bank_transfer', 'mobile_money', 'cheque'].includes(paymentMethod)
-      && !normalizedPaymentReference) {
-      return res.status(400).json({
-        success: false,
-        code: 'POS_PAYMENT_REFERENCE_REQUIRED',
-        message: 'Verify the payment outside KUBIKA and enter its transaction or cheque reference before recording it.',
-      });
-    }
-    if (normalizedPaymentReference.length > 120) {
-      return res.status(400).json({
-        success: false,
-        code: 'POS_PAYMENT_REFERENCE_TOO_LONG',
-        message: 'Payment reference must be 120 characters or fewer.',
-      });
-    }
-    if (amountTendered > grandTotal && paymentMethod !== 'cash') {
+    if (amountTendered > grandTotal && cashTendered < amountTendered - grandTotal) {
       return res.status(400).json({
         success: false,
         code: 'ERR_PAYMENT_EXCEEDS_TOTAL',
-        message: 'Only cash payments can include an amount above the sale total',
+        message: 'Any change due from split tender must be covered by the cash portion.',
       });
     }
-    const paidAmount = Math.min(amountTendered, grandTotal);
-    const changeDue = Math.max(0, amountTendered - paidAmount);
+    let paidAmount = Math.min(amountTendered, grandTotal);
+    const changeDue = roundMoney(Math.max(0, amountTendered - paidAmount));
+    let remainingToApply = paidAmount;
+    // Apply non-cash tenders first so any permitted overpayment is returned
+    // from cash, and the posted cash amount equals cash actually retained.
+    const allocationOrder = [
+      ...normalizedPayments.filter((tender) => tender.paymentMethod !== 'cash'),
+      ...normalizedPayments.filter((tender) => tender.paymentMethod === 'cash'),
+    ];
+    const appliedPayments = allocationOrder.map((tender) => {
+      const appliedAmount = Math.min(tender.amount, remainingToApply);
+      remainingToApply = Math.max(0, remainingToApply - appliedAmount);
+      return { ...tender, amount: appliedAmount };
+    }).filter((tender) => tender.amount > 0);
     let paymentStatus = 'draft';
     let amountPaid = 0;
     let amountOutstanding = grandTotal;
 
-    if (paidAmount >= grandTotal) {
+    if (paidAmount >= grandTotal - 0.009) {
       paymentStatus = 'fully_paid';
+      paidAmount = grandTotal;
       amountPaid = grandTotal;
       amountOutstanding = 0;
     } else if (paidAmount > 0) {
       paymentStatus = 'partially_paid';
-      amountPaid = paidAmount;
-      amountOutstanding = grandTotal - paidAmount;
+      amountPaid = roundMoney(paidAmount);
+      amountOutstanding = roundMoney(grandTotal - amountPaid);
     }
 
     // Execute in transaction
@@ -546,6 +641,43 @@ exports.createDirectSale = async (req, res, next) => {
         });
       }
 
+      // Reserve receivables against the customer's configured credit limit
+      // while holding their row lock. This serializes concurrent POS checkouts
+      // for the same account so two tills cannot spend the same credit twice.
+      if (amountOutstanding > 0) {
+        if (!clientId) {
+          const error = new Error('Walk-in sales must be paid in full. Select a customer with an approved credit limit to record an unpaid balance.');
+          error.code = 'POS_WALKIN_CREDIT_NOT_ALLOWED';
+          throw error;
+        }
+        if (!client) {
+          const error = new Error('The selected customer could not be found in this workspace.');
+          error.code = 'POS_CLIENT_NOT_FOUND';
+          throw error;
+        }
+        const lockedClients = await dbClient().$queryRawUnsafe(
+          'SELECT credit_limit, outstanding_balance FROM clients WHERE id = $1 AND company_id = $2 FOR UPDATE',
+          String(client._id), String(companyId),
+        );
+        if (!lockedClients.length) {
+          const error = new Error('The selected customer could not be found in this workspace.');
+          error.code = 'POS_CLIENT_NOT_FOUND';
+          throw error;
+        }
+        const creditLimit = Number(lockedClients[0].credit_limit || 0);
+        const outstandingBalance = Number(lockedClients[0].outstanding_balance || 0);
+        const nextOutstandingBalance = outstandingBalance + amountOutstanding;
+        if (creditLimit <= 0 || nextOutstandingBalance > creditLimit + 0.00005) {
+          const availableCredit = Math.max(0, creditLimit - outstandingBalance);
+          const error = new Error(`Customer credit limit exceeded. Available credit: ${availableCredit.toFixed(2)}; this sale needs ${amountOutstanding.toFixed(2)}.`);
+          error.code = 'POS_CREDIT_LIMIT_EXCEEDED';
+          throw error;
+        }
+        // Client.save below persists customer totals in this same transaction.
+        // Use the freshly locked balance instead of the stale pre-transaction read.
+        client.outstandingBalance = nextOutstandingBalance;
+      }
+
       if (!client) {
         client = await Client.create({
           company: companyId,
@@ -567,6 +699,7 @@ exports.createDirectSale = async (req, res, next) => {
         ebm: autoFiscalSubmission ? { ebmStatus: 'pending', retryCount: 0 } : {},
         currencyCode: invoiceCurrency,
         subtotal: subtotal,
+        totalDiscount: totalDiscount,
         taxAmount: totalTax,
         totalAmount: grandTotal,
         grandTotal: grandTotal,
@@ -583,6 +716,30 @@ exports.createDirectSale = async (req, res, next) => {
       }], { session });
 
       invoice = invoice[0];
+      if (promotion) {
+        await dbClient().$executeRawUnsafe(
+          'UPDATE invoices SET pos_promotion = $1::jsonb WHERE id = $2 AND company_id = $3',
+          JSON.stringify({
+            id: promotion.id,
+            name: promotion.name,
+            code: promotion.code,
+            discountType: promotion.discountType,
+            value: Number(promotion.value),
+            discountAmount: totalDiscount,
+            appliedAt: new Date().toISOString(),
+          }),
+          String(invoice._id), String(companyId),
+        );
+      }
+      const linkedInvoice = await dbClient().$executeRawUnsafe(
+        'UPDATE invoices SET till_session_id = $1, register_id = $2 WHERE id = $3 AND company_id = $4',
+        String(activeTill._id), String(activeTill.registerId || ''), String(invoice._id), String(companyId),
+      );
+      if (linkedInvoice !== 1) {
+        const error = new Error('Could not link the POS sale to its cashier shift. The sale was not completed.');
+        error.code = 'POS_TILL_LINK_FAILED';
+        throw error;
+      }
 
       // 2. Deduct stock using proper inventory service (WAC/FIFO)
       const stockMovementCreates = [];
@@ -734,35 +891,38 @@ exports.createDirectSale = async (req, res, next) => {
       );
 
       const bankPaymentMethods = ['bank_transfer', 'cheque', 'mobile_money'];
-      let paymentBankAccount = null;
-      if (paidAmount > 0 && bankPaymentMethods.includes(paymentMethod)) {
-        if (!bankAccountId) {
-          const error = new Error('Select the bank or mobile money account used for this payment');
+      const paymentAccounts = new Map();
+      for (const tender of appliedPayments) {
+        if (!bankPaymentMethods.includes(tender.paymentMethod)) continue;
+        if (!tender.bankAccountId) {
+          const error = new Error(`Select the bank or mobile money account used for ${tender.paymentMethod}`);
           error.code = 'POS_PAYMENT_ACCOUNT_REQUIRED';
           throw error;
         }
-        paymentBankAccount = await BankAccount.findOne({
-          _id: bankAccountId,
-          company: companyId,
-          isActive: true,
-        }).select('_id ledgerAccountId name').lean();
-        if (!paymentBankAccount) {
-          const error = new Error('The selected payment account is unavailable');
-          error.code = 'POS_PAYMENT_ACCOUNT_INVALID';
-          throw error;
+        const accountKey = String(tender.bankAccountId);
+        if (!paymentAccounts.has(accountKey)) {
+          const account = await BankAccount.findOne({ _id: tender.bankAccountId, company: companyId, isActive: true })
+            .select('_id ledgerAccountId name').lean();
+          if (!account) {
+            const error = new Error('A selected payment account is unavailable');
+            error.code = 'POS_PAYMENT_ACCOUNT_INVALID';
+            throw error;
+          }
+          paymentAccounts.set(accountKey, account);
         }
       }
 
       const revenueLines = [];
-      if (paidAmount > 0) {
+      for (const tender of appliedPayments) {
+        const paymentBankAccount = tender.bankAccountId ? paymentAccounts.get(String(tender.bankAccountId)) : null;
         let settlementAccount;
         if (paymentBankAccount) {
           settlementAccount = paymentBankAccount.ledgerAccountId;
-        } else if (paymentMethod === 'mobile_money') {
+        } else if (tender.paymentMethod === 'mobile_money') {
           settlementAccount = await JournalService.getMappedAccountCode(
             companyId, 'cash', 'mtnMoMo', DEFAULT_ACCOUNTS.mtnMoMo || '1200',
           );
-        } else if (paymentMethod === 'cash' || paymentMethod === 'card') {
+        } else if (tender.paymentMethod === 'cash' || tender.paymentMethod === 'card') {
           settlementAccount = await JournalService.getMappedAccountCode(
             companyId, 'cash', 'cashOnHand', DEFAULT_ACCOUNTS.cashOnHand || '1000',
           );
@@ -771,9 +931,9 @@ exports.createDirectSale = async (req, res, next) => {
             companyId, 'cash', 'cashAtBank', DEFAULT_ACCOUNTS.cashAtBank || '1100',
           );
         }
-        if (!settlementAccount) throw new Error('No ledger account is configured for this payment method');
+        if (!settlementAccount) throw new Error(`No ledger account is configured for ${tender.paymentMethod}`);
         revenueLines.push(JournalService.createDebitLine(
-          settlementAccount, paidAmount, `POS payment - Invoice ${invoice.referenceNo}`,
+          settlementAccount, tender.amount, `POS ${tender.paymentMethod} payment - Invoice ${invoice.referenceNo}`,
         ));
       }
       if (amountOutstanding > 0) {
@@ -816,9 +976,12 @@ exports.createDirectSale = async (req, res, next) => {
         lines: revenueLines,
         isAutoGenerated: true,
         sourceData: {
-          bankAccountId: paymentBankAccount?._id || null,
-          paymentReference: normalizedPaymentReference || null,
-          paymentMethod: paymentMethod || null,
+          payments: appliedPayments.map((tender) => ({
+            amount: tender.amount,
+            paymentMethod: tender.paymentMethod,
+            reference: tender.reference || null,
+            bankAccountId: tender.bankAccountId || null,
+          })),
         },
       }];
       if (cogsLines.length > 0) {
@@ -858,24 +1021,47 @@ exports.createDirectSale = async (req, res, next) => {
       await invoice.save({ session });
 
       // 4. Add payment record if provided
-      if (paidAmount > 0 && paymentMethod) {
-        invoice.payments.push({
-          amount: paidAmount,
-          paymentMethod: paymentMethod,
-          reference: normalizedPaymentReference,
+      if (appliedPayments.length > 0) {
+        const firstCashPayment = appliedPayments.findIndex((tender) => tender.paymentMethod === 'cash');
+        const savedPayments = appliedPayments.map((tender, index) => ({
+          amount: tender.amount,
+          paymentMethod: tender.paymentMethod,
+          reference: tender.reference || '',
+          bankAccountId: tender.bankAccountId || null,
+          ...(changeDue > 0 && tender.paymentMethod === 'cash' && index === firstCashPayment
+            ? { receivedAmount: cashTendered, changeGiven: changeDue }
+            : {}),
           paidDate: new Date(),
-          recordedBy: req.user.id
-        });
+          recordedBy: req.user.id,
+        }));
+        // Preserve change details even when non-cash tenders cover the invoice
+        // and the cash portion is returned completely as change.
+        if (changeDue > 0 && firstCashPayment < 0) {
+          const cashTender = normalizedPayments.find((tender) => tender.paymentMethod === 'cash');
+          savedPayments.push({
+            amount: 0,
+            paymentMethod: 'cash',
+            reference: cashTender?.reference || '',
+            bankAccountId: null,
+            receivedAmount: cashTendered,
+            changeGiven: changeDue,
+            paidDate: new Date(),
+            recordedBy: req.user.id,
+          });
+        }
+        invoice.payments.push(...savedPayments);
         await invoice.save({ session });
 
         // Bank transactions are created from the posted journal line by
         // JournalService. Do not create a second, unlinked transaction here.
       }
 
-      if (paidAmount > 0 && paymentMethod === 'cash') {
+      const cashPaidAmount = appliedPayments.filter((tender) => tender.paymentMethod === 'cash')
+        .reduce((sum, tender) => sum + tender.amount, 0);
+      if (cashPaidAmount > 0) {
         const activity = {
           type: 'cash_sale',
-          amount: paidAmount,
+          amount: cashPaidAmount,
           invoiceId: String(invoice._id),
           reference: invoice.referenceNo,
           recordedBy: String(req.user.id),
@@ -883,7 +1069,7 @@ exports.createDirectSale = async (req, res, next) => {
         };
         const updatedTill = await dbClient().$executeRawUnsafe(
           'UPDATE till_sessions SET expected_cash = expected_cash + $1::numeric, cash_activity = cash_activity || $2::jsonb, updated_at = CURRENT_TIMESTAMP WHERE company_id = $3 AND id = $4 AND opened_by = $5 AND status = \'open\'',
-          paidAmount, JSON.stringify([activity]), String(companyId), String(activeTill._id), String(req.user.id),
+          cashPaidAmount, JSON.stringify([activity]), String(companyId), String(activeTill._id), String(req.user.id),
         );
         if (updatedTill !== 1) {
           const error = new Error('The till closed while this cash sale was being recorded. No sale was completed.');
@@ -896,9 +1082,6 @@ exports.createDirectSale = async (req, res, next) => {
       // credit sales and partially paid invoices.
       client.totalPurchases = (client.totalPurchases || 0) + grandTotal;
       client.lastPurchaseDate = new Date();
-      if (amountOutstanding > 0) {
-        client.outstandingBalance = (client.outstandingBalance || 0) + amountOutstanding;
-      }
       await client.save({ session });
       if (requestKey) {
         const finalized = await dbClient().$executeRawUnsafe(
@@ -911,7 +1094,7 @@ exports.createDirectSale = async (req, res, next) => {
           throw error;
         }
       }
-    });
+    }, { maxWait: 10000, timeout: 90000 });
 
     // Journal posting used the outer sale transaction, so refresh reporting
     // and bank balance caches only after all records have committed.
@@ -947,10 +1130,16 @@ exports.createDirectSale = async (req, res, next) => {
     });
 
   } catch (error) {
-    if (requestKey && ['POS_IDEMPOTENCY_DUPLICATE', 'P2002', '23505'].includes(String(error?.code))) {
+    // The database commit and HTTP response are separate events. A socket,
+    // response serialization, or post-commit side-effect can fail after the
+    // invoice, payment, stock, and idempotency receipt have committed. Resolve
+    // that outcome from the durable receipt for every failure, not only unique
+    // constraint races, so the cashier sees the committed sale on this attempt.
+    if (requestKey && payloadHash) {
       try {
         if (await replayPosSaleIfPresent(req, res, { companyId, requestKey, payloadHash })) return;
       } catch (replayError) {
+        console.error('[createDirectSale] Could not resolve checkout receipt after failure:', replayError);
         return next(replayError);
       }
     }
@@ -964,6 +1153,13 @@ exports.createDirectSale = async (req, res, next) => {
     }
     if (error?.code === 'POS_PAYMENT_ACCOUNT_REQUIRED' || error?.code === 'POS_PAYMENT_ACCOUNT_INVALID') {
       return res.status(400).json({ success: false, code: error.code, message: error.message });
+    }
+    if (['POS_WALKIN_CREDIT_NOT_ALLOWED', 'POS_CREDIT_LIMIT_EXCEEDED', 'POS_CLIENT_NOT_FOUND'].includes(error?.code)) {
+      return res.status(error.code === 'POS_CLIENT_NOT_FOUND' ? 404 : 409).json({
+        success: false,
+        code: error.code,
+        message: error.message,
+      });
     }
     if (error?.code === 'POS_ZERO_VALUE_SALE') {
       return res.status(400).json({ success: false, code: error.code, message: error.message });
@@ -1182,40 +1378,7 @@ exports.getPosAvailableSerialNumbers = async (req, res, next) => {
 };
 
 /**
- * @desc    Get receipt data for printing
- * @route   GET /api/sales-legacy/receipt/:invoiceId
- * @access  Private
+ * @deprecated Receipt printing lives on posController.getReceipt and is mounted
+ * at GET /api/sales-legacy/receipt/:invoiceId (and the retired /api/pos alias).
  */
-exports.getReceipt = async (req, res, next) => {
-  try {
-    const companyId = req.user.company._id;
-    const { invoiceId } = req.params;
-
-    const invoice = await Invoice.findOne({ 
-      _id: invoiceId, 
-      company: companyId 
-    })
-      .populate('client', 'name code contact')
-      .populate('lines.product', 'name sku')
-      .populate('createdBy', 'name')
-      .populate('company');
-
-    if (!invoice) {
-      return res.status(404).json({
-        success: false,
-        message: 'Invoice not found'
-      });
-    }
-
-    res.json({
-      success: true,
-      data: {
-        invoice,
-        receiptDate: new Date(),
-        receiptNumber: `RCP-${invoice.referenceNo}`
-      }
-    });
-  } catch (error) {
-    next(error);
-  }
-};
+exports.getReceipt = require('./posController').getReceipt;
